@@ -323,6 +323,14 @@ _SPECS = [
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
     ], help="Mark one or more tasks blocked"),
+    _cmd("settle-triage", [
+        _TASK_ID,
+        _arg("--expected-terminal-run", type=int, required=True, help="Exact completed loop run id"),
+        _arg("--kind", choices=["capability", "needs_input"], required=True, help="Actual external wait classification"),
+        _arg("--owner", required=True, help="Existing producer that owes the input"),
+        _arg("--required-input", required=True, help="Concrete missing input"),
+        _arg("--event", required=True, help="Substantive owner event needed before guarded unblock"),
+    ], help="Orchestrator-only: settle terminal loop triage into a sticky external-event wait"),
     _cmd("schedule", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),

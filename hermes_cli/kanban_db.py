@@ -3735,11 +3735,10 @@ def invalidate_descendants_for_parent_reopen(
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
+    automatic: bool = False,
 ) -> bool:
-    """Update title/body/assignee (when given) and move ``triage -> todo`` in one
-    txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
-    gating still applies; the audit comment is written only when a field changed.
-    """
+    """Specify eligible triage atomically, then promote subject to parent gating."""
+    from hermes_cli.kanban_db_graph import automatic_triage_eligible
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
@@ -3748,7 +3747,7 @@ def specify_triage_task(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
         ).fetchone()
-        if existing is None:
+        if existing is None or (automatic and not automatic_triage_eligible(conn, task_id)):
             return False
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
@@ -3783,8 +3782,7 @@ def specify_triage_task(
             conn, task_id, "specified",
             {"changed_fields": changed_fields} if changed_fields else None,
         )
-    # Own IMMEDIATE txn (outside the one above): a parent-free specified task
-    # flips to 'ready' now instead of idling until the next tick.
+    # Separate IMMEDIATE txn: parent-free tasks need not wait for the next tick.
     recompute_ready(conn)
     return True
 

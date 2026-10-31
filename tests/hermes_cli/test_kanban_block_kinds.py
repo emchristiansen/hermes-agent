@@ -58,6 +58,136 @@ def _make_running_again(conn, tid):
     assert kb.claim_task(conn, tid, claimer="worker") is not None
 
 
+def _settled_loop(conn):
+    tid = _running_task(conn)
+    assert kb.block_task(conn, tid, kind="capability", reason="missing producer")
+    assert kb.unblock_task(conn, tid)
+    _make_running_again(conn, tid)
+    task = kb.get_task(conn, tid)
+    run_id, claim = task.current_run_id, task.claim_lock
+    with kb.write_txn(conn):
+        kb._append_event(conn, tid, "worker_bound", {
+            "pid": 12345, "claim_lock": claim, "started_at": "test-birth",
+        }, run_id=run_id)
+    assert kb.block_task(conn, tid, kind="capability", reason="missing producer")
+    with kb.write_txn(conn):
+        kb._append_event(conn, tid, "worker_result", {
+            "pid": 12345, "claim_lock": claim, "exit_code": 0,
+        }, run_id=run_id)
+    return tid, run_id
+
+
+def _settle(conn, tid, run_id):
+    from hermes_cli.kanban_db_graph import settle_triage_task
+    return settle_triage_task(
+        conn, tid, expected_terminal_run_id=run_id, kind="capability",
+        owner="source-owner", required_input="qualified source result",
+        event="source-owner supplies the result", author="orchestrator",
+    )
+
+
+def test_settled_loop_wait_preserves_history_and_resumes_once_after_owner_event(kanban_home):
+    with kbc.connect_closing() as conn:
+        tid, run_id = _settled_loop(conn)
+        before = kb.get_task(conn, tid)
+        runs = [tuple(r) for r in conn.execute("SELECT * FROM task_runs ORDER BY id")]
+        events = [tuple(r) for r in conn.execute("SELECT * FROM task_events ORDER BY id")]
+        ok, reason = _settle(conn, tid, run_id)
+        assert ok, reason
+        after = kb.get_task(conn, tid)
+        for field in ("body", "title", "assignee", "workspace_path", "workspace_kind", "block_recurrences"):
+            assert getattr(after, field) == getattr(before, field)
+        assert [tuple(r) for r in conn.execute("SELECT * FROM task_runs ORDER BY id")] == runs
+        assert [tuple(r) for r in conn.execute("SELECT * FROM task_events ORDER BY id")][:len(events)] == events
+        for _ in range(3):
+            assert kb.recompute_ready(conn) == 0
+            assert kb.claim_task(conn, tid, claimer="no-event") is None
+        parent = kb.create_task(conn, title="real prerequisite", assignee="worker")
+        kb.link_tasks(conn, parent_id=parent, child_id=tid)
+        kb.add_comment(conn, tid, author="source-owner", body="Qualified source result delivered: artifact-v2")
+        assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "todo"
+        assert kb.claim_task(conn, tid, claimer="still-parent-gated") is None
+        assert kb.claim_task(conn, parent, claimer="worker")
+        assert kb.complete_task(conn, parent, result="prerequisite supplied")
+        kb.recompute_ready(conn)
+        assert kb.claim_task(conn, tid, claimer="worker")
+        assert kb.claim_task(conn, tid, claimer="second-worker") is None
+
+
+def test_settlement_cli_requires_explicit_fields_and_orchestrator(kanban_home, monkeypatch):
+    from hermes_cli.kanban_parser import build_parser
+    parser = argparse.ArgumentParser()
+    build_parser(parser.add_subparsers(dest="command"))
+    with kbc.connect_closing() as conn:
+        tid, run_id = _settled_loop(conn)
+        before = list(conn.iterdump())
+    argv = ["kanban", "settle-triage", tid, "--expected-terminal-run", str(run_id),
+            "--kind", "capability", "--owner", "producer", "--required-input", "source result",
+            "--event", "source result delivered"]
+    with pytest.raises(SystemExit) as missing:
+        parser.parse_args(argv[:-2])
+    assert missing.value.code == 2
+    args = parser.parse_args(argv)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    assert kanban_cli.kanban_command(args) != 0
+    with kbc.connect_closing() as conn:
+        assert not _settle(conn, tid, run_id)[0]
+        assert list(conn.iterdump()) == before
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.setattr(kanban_cli, "_profile_author", lambda: "orchestrator")
+    assert kanban_cli.kanban_command(args) == 0
+    with kbc.connect_closing() as conn:
+        after = list(conn.iterdump())
+        assert kb.get_task(conn, tid).status == "blocked"
+    assert kanban_cli.kanban_command(args) != 0
+    with kbc.connect_closing() as conn:
+        assert list(conn.iterdump()) == after
+
+
+@pytest.mark.parametrize("drift", [
+    "run", "state", "claim", "expiry", "pid", "current_run", "open_run",
+    "missing_result", "foreign_result", "missing_bound", "unknown_exit", "foreign_pid",
+    "result_before_loop", "missing_loop", "unverified_birth",
+])
+def test_triage_settlement_refuses_drift_and_unknown_without_mutation(kanban_home, drift):
+    with kbc.connect_closing() as conn:
+        tid, run_id = _settled_loop(conn)
+        mutations = {
+            "run": ("SELECT 1", ()),
+            "state": ("UPDATE tasks SET status='ready' WHERE id=?", (tid,)),
+            "claim": ("UPDATE tasks SET claim_lock='other-owner' WHERE id=?", (tid,)),
+            "expiry": ("UPDATE tasks SET claim_expires=1 WHERE id=?", (tid,)),
+            "pid": ("UPDATE tasks SET worker_pid=99999 WHERE id=?", (tid,)),
+            "current_run": ("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, tid)),
+            "open_run": ("UPDATE task_runs SET ended_at=NULL WHERE id=?", (run_id,)),
+            "missing_result": ("DELETE FROM task_events WHERE task_id=? AND kind='worker_result'", (tid,)),
+            "missing_bound": ("DELETE FROM task_events WHERE task_id=? AND kind='worker_bound'", (tid,)),
+            "missing_loop": ("DELETE FROM task_events WHERE task_id=? AND kind='block_loop_detected'", (tid,)),
+            "result_before_loop": (
+                "UPDATE task_events SET id=(SELECT MAX(id)+1 FROM task_events) "
+                "WHERE task_id=? AND kind='block_loop_detected'", (tid,)),
+            "unverified_birth": (
+                "UPDATE task_events SET payload=json_set(payload, '$.started_at', 'unverified') "
+                "WHERE task_id=? AND kind='worker_bound'", (tid,)),
+            "foreign_result": (
+                "UPDATE task_events SET payload=json_set(payload, '$.claim_lock', 'foreign') "
+                "WHERE task_id=? AND kind='worker_result'", (tid,)),
+            "unknown_exit": (
+                "UPDATE task_events SET payload=json_set(payload, '$.exit_code', NULL) "
+                "WHERE task_id=? AND kind='worker_result'", (tid,)),
+            "foreign_pid": (
+                "UPDATE task_events SET payload=json_set(payload, '$.pid', 666) "
+                "WHERE task_id=? AND kind='worker_result'", (tid,)),
+        }
+        with kb.write_txn(conn):
+            conn.execute(*mutations[drift])
+        snapshot = list(conn.iterdump())
+        ok, reason = _settle(conn, tid, run_id + 1 if drift == "run" else run_id)
+        assert not ok and reason
+        assert list(conn.iterdump()) == snapshot
+
+
 # ---------------------------------------------------------------------------
 # Loop breaker
 # ---------------------------------------------------------------------------

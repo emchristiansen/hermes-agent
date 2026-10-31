@@ -18,6 +18,85 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_decompose as decomp
 
 
+@pytest.mark.parametrize("fanout", [False, True])
+@pytest.mark.parametrize("interleaving", ["loop", "parked", "ordinary"])
+def test_automatic_result_rechecks_triage_in_apply_transaction(
+    kanban_home, monkeypatch, fanout, interleaving,
+):
+    """Pause at the provider boundary; another connection changes eligibility."""
+    from gateway.kanban_watchers_dispatcher import _KanbanDispatcher
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="original", body="original body", triage=True)
+    routing = decomp._Routing("worker", "worker", True, [], {"worker"})
+    monkeypatch.setattr(decomp, "_load_routing", lambda **_: routing)
+    prepared = {"fanout": fanout, "title": "specified", "body": "new body",
+                "tasks": [{"title": "child", "body": "child body", "assignee": "worker"}]}
+    captured = {}
+
+    def provider(*args, **kwargs):
+        with kbc.connect_closing() as other:
+            if interleaving != "ordinary":
+                # A real claim/block cycle overtakes the prepared model result.
+                assert kb.specify_triage_task(other, tid, assignee="worker")
+                for _ in range(kb.BLOCK_RECURRENCE_LIMIT):
+                    assert kb.claim_task(other, tid, claimer="test")
+                    assert kb.block_task(other, tid, kind="capability", reason="upstream input")
+                    if kb.get_task(other, tid).status == "blocked":
+                        assert kb.unblock_task(other, tid)
+                if interleaving == "parked":
+                    # Represent another committed parking transition, before apply.
+                    with kb.write_txn(other):
+                        other.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
+                        kb._append_event(other, tid, "blocked", {"kind": "capability"})
+                assert kb.edit_task(other, tid, body="Selected owner continuation: consume the changed source; no repeat audit.")
+            captured["before"] = list(other.iterdump())
+        return jsonlib.dumps(prepared), ""
+
+    monkeypatch.setattr(decomp, "_call_aux", provider)
+    result = _KanbanDispatcher._decompose_one(decomp, "test", tid)
+    with kbc.connect_closing() as conn:
+        if interleaving == "ordinary":
+            assert result == 1
+            assert kb.get_task(conn, tid).status == ("todo" if fanout else "ready")
+        else:
+            assert result == 0
+            assert list(conn.iterdump()) == captured["before"]
+            for _ in range(3):
+                kb.recompute_ready(conn)
+                assert kb.claim_task(conn, tid, claimer="should-not-run") is None
+
+
+def test_automatic_ticks_leave_loop_triage_for_explicit_owner(kanban_home, monkeypatch):
+    import contextlib
+    from gateway import kanban_watchers_dispatcher as kwd
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="await upstream", assignee="worker")
+        for _ in range(kb.BLOCK_RECURRENCE_LIMIT):
+            assert kb.claim_task(conn, tid, claimer="test")
+            assert kb.block_task(conn, tid, kind="capability", reason="producer owes source")
+            if kb.get_task(conn, tid).status == "blocked":
+                assert kb.unblock_task(conn, tid)
+        before = list(conn.iterdump())
+    monkeypatch.setattr(kwd, "_default_profile_secret_scope", contextlib.nullcontext)
+    monkeypatch.setattr(kwd._KanbanDispatcher, "_board_slugs", lambda _: ["default"])
+    calls = []
+    monkeypatch.setattr(decomp, "_call_aux", lambda *a, **k: calls.append(a))
+    dispatcher = kwd._KanbanDispatcher(kb, None)
+    for _ in range(3):
+        assert dispatcher.auto_decompose_tick(5) == 0
+        with kbc.connect_closing() as conn:
+            assert kb.recompute_ready(conn) == 0
+            assert list(conn.iterdump()) == before
+    assert calls == []
+    # An explicit owner disposition is still possible, with recurrence retained.
+    with kbc.connect_closing() as conn:
+        assert kb.specify_triage_task(conn, tid, body="producer supplied source; implement it")
+        assert kb.get_task(conn, tid).status == "ready"
+        assert kb.get_task(conn, tid).block_recurrences == kb.BLOCK_RECURRENCE_LIMIT
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
