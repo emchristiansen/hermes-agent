@@ -123,12 +123,14 @@ def first_failure_landing(conn, task_id, phase):
 
 @contextmanager
 def reclaim_transaction(conn, task_id, write_txn, append_event, *, accounting_required=False):
-    """Keep the stale-claim path's new hold inside its original transaction, including early exits."""
+    """Hold only the exact successful reclaim explicitly witnessed by the caller inside this transaction."""
     with write_txn(conn):
-        before = conn.execute('SELECT current_run_id FROM tasks WHERE id=?', (task_id,)).fetchone()
-        yield
+        before = conn.execute('SELECT status,current_run_id FROM tasks WHERE id=?', (task_id,)).fetchone()
+        transition = {}
+        yield transition
         after = conn.execute('SELECT status,max_retries,current_run_id FROM tasks WHERE id=?', (task_id,)).fetchone()
-        if (before is not None and after is not None
+        if ('run_id' in transition and before is not None and before['status'] == 'running'
+                and before['current_run_id'] == transition['run_id'] and after is not None
                 and after['max_retries'] == 1 and after['status'] in {'ready', 'review'}
                 and after['current_run_id'] is None):
             claimed = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed' ORDER BY id DESC LIMIT 1",

@@ -816,7 +816,7 @@ def detect_stale_running(
             )
             continue
 
-        with reclaim_transaction(conn, tid, _kb.write_txn, _kb._append_event):
+        with reclaim_transaction(conn, tid, _kb.write_txn, _kb._append_event) as transition:
             # Again under the write lock, after the termination wait (see enforce_max_runtime).
             if owner_reclaim_blocked_after_kill(conn, tid, signalled=bool(termination.get("termination_attempted"))):
                 continue
@@ -842,7 +842,7 @@ def detect_stale_running(
             }
             payload.update(termination)
 
-            run_id = _kb._end_run(
+            run_id = transition["run_id"] = _kb._end_run(
                 conn, tid,
                 outcome="stale", status="stale",
                 error=(
@@ -888,7 +888,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
                 "pid %s is alive on this host — deferring", tid, pid,
             )
             continue
-        with reclaim_transaction(conn, tid, _kb.write_txn, _kb._append_event):
+        with reclaim_transaction(conn, tid, _kb.write_txn, _kb._append_event) as transition:
             if owner_reclaim_blocked(conn, tid):
                 continue
             cur = conn.execute(
@@ -908,7 +908,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
                 "worker_pid": int(pid) if pid else None,
                 "now": now,
             }
-            run_id = _kb._end_run(
+            run_id = transition["run_id"] = _kb._end_run(
                 conn, tid,
                 outcome="reclaimed", status="reclaimed",
                 error="orphaned running card (broken claim bookkeeping)",
