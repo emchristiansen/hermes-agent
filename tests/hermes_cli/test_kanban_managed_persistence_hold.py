@@ -464,3 +464,107 @@ def test_stale_scan_cannot_reblock_an_already_released_attempt(board, monkeypatc
         "SELECT * FROM task_events WHERE task_id=? ORDER BY id", (tid,))]) == released_snapshot[0]
     assert actual.status == expected, 'stale losing selector re-blocked an explicitly released attempt'
     assert (kb.claim_review_task if expected == 'review' else kb.claim_task)(conn, tid) is not None
+
+
+@pytest.mark.parametrize('same_claimer', [True, False])
+@pytest.mark.parametrize('selector', ['ttl', 'heartbeat', 'orphan'])
+@pytest.mark.parametrize('phase', ['ready', 'review'])
+@pytest.mark.parametrize('limit', [None, 1])
+def test_old_scan_must_not_end_freshly_authorized_run(board, monkeypatch, phase, limit, selector, same_claimer):
+    conn, path = board
+    tid = kb.create_task(conn, title='private stale selector control', project_id='', max_retries=limit)
+    if phase == 'review':
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+        conn.commit()
+    claim = kb.claim_review_task if phase == 'review' else kb.claim_task
+    task = claim(conn, tid, claimer=None)
+    rid = task.current_run_id
+    old = int(time.time()) - 9999
+    if selector == 'ttl':
+        conn.execute('UPDATE tasks SET claim_expires=? WHERE id=?', (old, tid))
+    elif selector == 'heartbeat':
+        conn.execute('UPDATE tasks SET started_at=?,last_heartbeat_at=? WHERE id=?', (old, old, tid))
+        conn.execute('UPDATE task_runs SET started_at=? WHERE id=?', (old, rid))
+    else:
+        conn.execute('UPDATE tasks SET claim_lock=NULL,claim_expires=NULL WHERE id=?', (tid,))
+    conn.commit()
+
+    def reclaim(connection):
+        if selector == 'ttl':
+            return kb.release_stale_claims(connection, signal_fn=lambda *a: None)
+        if selector == 'heartbeat':
+            return dispatch.detect_stale_running(connection, stale_timeout_seconds=1, signal_fn=lambda *a: None)
+        return dispatch.reconcile_orphaned_running(connection)
+    from hermes_cli import kanban_owner_recovery as owners
+    seam = owners if selector == 'orphan' else kb
+    name = 'owner_reclaim_blocked' if selector == 'orphan' else '_terminate_reclaimed_worker'
+    real = getattr(seam, name)
+    crossed = []
+    next_run = []
+    claimed_snapshot = []
+    expected = 'ready' if selector == 'orphan' and limit is None else phase
+
+    def interleave(*args, **kwargs):
+        result = real(*args, **kwargs)
+        if not crossed:
+            crossed.append(True)
+            other = kbc.connect(path)
+            try:
+                assert reclaim(other)
+                if limit == 1:
+                    assert kb.unblock_task(other, tid, expected_terminal_run=rid)
+                assert kb.get_task(other, tid).status == expected
+                new = (kb.claim_review_task if expected == 'review' else kb.claim_task)(other, tid, claimer=None if same_claimer else 'synthetic-dispatcher:B')
+                assert new is not None and new.current_run_id != rid
+                next_run.append(new.current_run_id)
+                claimed_snapshot.append((image(other, tid), [dict(row) for row in other.execute(
+                    "SELECT * FROM task_events WHERE task_id=? ORDER BY id", (tid,))]))
+            finally:
+                other.close()
+        return result
+    monkeypatch.setattr(seam, name, interleave)
+    reclaimed = reclaim(conn)
+    actual = kb.get_task(conn, tid)
+    events = [dict(x) for x in conn.execute('SELECT kind,run_id,payload FROM task_events WHERE task_id=? ORDER BY id', (tid,))]
+    print('NEW_RUN_SELECTOR=' + json.dumps(dict(same_claimer=same_claimer, new_run=next_run[0], selector=selector, limit=limit, phase=phase, reclaimed=reclaimed, status=actual.status, events=events)))
+    assert (image(conn, tid), [dict(row) for row in conn.execute(
+        "SELECT * FROM task_events WHERE task_id=? ORDER BY id", (tid,))]) == claimed_snapshot[0]
+    assert not reclaimed
+    assert actual.status == 'running' and actual.current_run_id == next_run[0]
+    assert kb.get_run(conn, next_run[0]).ended_at is None
+
+
+@pytest.mark.parametrize("phase", ["ready", "review"])
+@pytest.mark.parametrize("limit", [None, 1])
+def test_scanned_heartbeat_must_still_match_before_retiring_same_run(board, monkeypatch, phase, limit):
+    conn, path = board
+    tid = kb.create_task(conn, title="private renewed heartbeat", project_id="", max_retries=limit)
+    if phase == "review":
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+        conn.commit()
+    task = (kb.claim_review_task if phase == "review" else kb.claim_task)(conn, tid)
+    old = int(time.time()) - 9999
+    conn.execute("UPDATE tasks SET started_at=?,last_heartbeat_at=? WHERE id=?", (old, old, tid))
+    conn.execute("UPDATE task_runs SET started_at=? WHERE id=?", (old, task.current_run_id))
+    conn.commit()
+    original = kb._terminate_reclaimed_worker
+    updated = []
+
+    def renew(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if not updated:
+            other = kbc.connect(path)
+            try:
+                assert dispatch.heartbeat_worker(other, tid, expected_run_id=task.current_run_id)
+                updated.append((image(other, tid), [dict(row) for row in other.execute(
+                    "SELECT * FROM task_events WHERE task_id=? ORDER BY id", (tid,))]))
+            finally:
+                other.close()
+        return result
+
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", renew)
+    assert dispatch.detect_stale_running(conn, stale_timeout_seconds=1, signal_fn=lambda *args: None) == []
+    assert (image(conn, tid), [dict(row) for row in conn.execute(
+        "SELECT * FROM task_events WHERE task_id=? ORDER BY id", (tid,))]) == updated[0]
+    assert kb.get_task(conn, tid).current_run_id == task.current_run_id
+    assert kb.get_run(conn, task.current_run_id).ended_at is None

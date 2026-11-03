@@ -778,7 +778,7 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.worker_started_at, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.current_run_id, t.worker_pid, t.worker_started_at, t.last_heartbeat_at, t.claim_lock, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -826,8 +826,8 @@ def detect_stale_running(
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ?",
-                (retry_status, tid, row["claim_lock"]),
+                "  AND claim_lock IS ? AND current_run_id IS ? AND last_heartbeat_at IS ?",
+                (retry_status, tid, row["claim_lock"], row["current_run_id"], row["last_heartbeat_at"]),
             )
             if cur.rowcount != 1:
                 continue
