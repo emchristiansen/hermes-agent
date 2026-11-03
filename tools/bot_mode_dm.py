@@ -50,7 +50,7 @@ _DM_DIR_NAME = "hermes-dm"
 _DM_STALE_SECONDS = 24 * 60 * 60
 _LIVE_WAIT_SECONDS = 300
 # A live owner may run a turn past one wait window, but each waiting runner holds ~46 MB and the
-# sender's notify slot: past this the runner reports pending (do not resend) and exits.
+# sender's notify slot: past this the runner reports pending and exits, leaving the caller free to follow up.
 _LIVE_WAIT_MAX_SECONDS = 30 * 60
 
 # '<peer>/<agent>' — peer names are lowercase (``hermes peer`` normalizes them).
@@ -332,13 +332,13 @@ def _try_relay_delivery(root: Path, raw_target: str, content: str, me: str, *,
         if not waiter_error:
             return raw
         # The envelope is already queued and the Desktop drains it on its own, so a waiter that
-        # failed to start loses only the reply wake-up. Reporting a hard failure here makes the
-        # sender resend and deliver the message twice. Same shape as the live-owner branch of
+        # failed to start loses only the reply wake-up. Keep that distinction accurate even though the
+        # sender may retry its message. Same shape as the live-owner branch of
         # _start_delivery: queued + notification_error.
         return json.dumps({
             "status": "queued", "delivery_id": envelope["id"], "to": label, "notification_error": waiter_error,
             "detail": (f"Message queued for {label}; the relay delivers it on its own, but the reply "
-                       "waiter did not start, so the reply will NOT wake you. Do NOT resend."),
+                       "waiter did not start, so the reply will NOT wake you. Retry promptly if delivery fails, times out or remains uncertain; duplicate messages do not authorize repeated effects."),
         })
     except Exception:
         logger.debug("relay delivery attempt failed", exc_info=True)
@@ -583,7 +583,7 @@ def _wait_live_dm(home: str, delivery_id: str, *, dm_file: str | os.PathLike | N
     payload = {key: record[key] for key in ("reply", "error", "reason") if record and record.get(key)}
     payload.update(status=status, delivery_id=delivery_id)
     if status in ("queued", "claimed", "ambiguous"):
-        payload["detail"] = "Delivery remains pending or its outcome is unknown. Do not resend; receipt is retained."
+        payload["detail"] = "Delivery remains pending or its outcome is unknown. The receipt is retained; retry the message promptly if needed, without repeating execution effects."
     elif status == "settled" and dm_file is not None:
         # The intent carries the message plaintext so a retry can replay the SAME delivery id;
         # once the owner settled it nothing retries, so it goes along with the dm file (same
@@ -606,7 +606,7 @@ def _local_delivery_home(argv: list[str]) -> Path | None:
 def _live_outcome_unknown(dm_file: str, cause: object) -> str:
     """The runner's stdout when a live admission may have happened but its outcome is unknown."""
     return json.dumps({"status": "ambiguous", "delivery_id": _dm_delivery_id(dm_file),
-                       "error": f"Live admission outcome unknown: {cause}. Do not resend.",
+                       "error": f"Live admission outcome unknown: {cause}. Retry the message promptly if needed; repeated messages do not authorize repeated effects.",
                        "evidence_file": dm_file})
 
 
@@ -698,13 +698,13 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
             return _settled_no_send(dm_file, exc)
         except Exception as exc:
             return json.dumps({"status": "ambiguous", "delivery_id": _dm_delivery_id(dm_file),
-                "error": f"Live delivery admission could not be confirmed: {exc}. Do not resend.",
+                "error": f"Live delivery admission could not be confirmed: {exc}. Retry the message promptly if needed; repeated messages do not authorize repeated effects.",
                 "evidence_file": dm_file})
         if record is not None:
             command = _delivery_command(argv, dm_file, stdin_file=False, profile_home=profile_home, author=author)
             notification = json.loads(_spawn_delivery(command, label, task_id=task_id, agent=agent))
             result = dict(status=record["status"], delivery_id=record["delivery_id"], to=label,
-                          detail="Durably queued for the live Bot Chat owner. Do NOT wait or resend; finish your turn.")
+                          detail="Durably queued for the live Bot Chat owner. Finish your turn to receive the reply notification; retry promptly if delivery fails or remains uncertain.")
             if notification.get("error"):
                 result["notification_error"] = notification["error"]
             elif notification.get("process_id"):
@@ -713,7 +713,7 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
                 if result["reply_delivery"] == "poll":
                     # Same runner, same stdout-borne reply (#101142): a non-push sender must get
                     # the poll instruction here too, not 'finish your turn'.
-                    result["detail"] = f"Durably queued for the live Bot Chat owner. Do NOT resend. {notification['detail']}"
+                    result["detail"] = f"Durably queued for the live Bot Chat owner. Retry promptly if delivery fails, times out or remains uncertain; duplicate messages do not authorize repeated effects. {notification['detail']}"
             return json.dumps(result)
     try:
         command = _delivery_command(argv, dm_file, stdin_file=stdin_file, profile_home=profile_home, author=author)
@@ -852,7 +852,7 @@ def _wait_reply_main(reply_path: str, label: str, budget_seconds: str) -> int:
         # 250ms cadence: stat is cheap and a longer sleep is pure dead air.
         time.sleep(0.25)
     print(f"No reply from {label} within {budget_seconds}s. The message may still be delivered when "
-          "the Desktop reconnects; do not resend blindly.")
+          "the Desktop reconnects; retry promptly if the reply is still needed; a repeated message does not authorize repeated effects.")
     return 1
 
 

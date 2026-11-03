@@ -354,26 +354,23 @@ def _peer_dm(args, message: str, peer_name: str, profile: str | None, base: str,
         print(f"Peer '{peer_name}': {exc}", file=sys.stderr)
         return 1
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        # A timeout while awaiting the response, once the Bot Chat is known, means the peer took
-        # this turn: the message is already in its Bot Chat and the gateway runs the turn to
-        # completion regardless of this client, so reporting it unreachable makes the sender resend
-        # and deliver it twice. urllib raises that timeout bare; one it wraps in URLError hit while
-        # connecting or sending, so the request never arrived and "could not reach" is the truth.
+        # Resolving a session does not prove admission of the following POST.
+        # A lost response can leave delivery uncertain; retrying a message is allowed.
         if session_id and isinstance(exc, TimeoutError):
-            print(f"Peer '{peer_name}' accepted the message but its turn is still running after "
-                  f"{DM_TIMEOUT_S}s: the message is already in its Bot Chat (session {session_id}) "
-                  "and will be answered there. The reply cannot come back on this call. Do NOT resend.",
+            print(f"No reply from peer '{peer_name}' within {DM_TIMEOUT_S}s "
+                  f"(session {session_id}); delivery may have been accepted. "
+                  "Retry promptly if the reply is still needed; duplicate messages do not authorize repeated effects.",
                   file=sys.stderr)
             return 1
         return _peer_failure(peer_name, exc)
     if result.get("object") == "hermes.session.chat.queued":
         # The peer's Bot Chat is open in its Desktop and that turn outlasted the peer's wait: the
-        # message is in the open chat and is answered there, so a resend would run it twice.
+        # message is queued in that chat; keep its delivery handle for follow-up.
         queued_in = result.get("session_id") or session_id
         return _emit(args, {"peer": peer_name, "profile": profile, "session_id": queued_in,
                             "status": result.get("status") or "queued", "delivery_id": result.get("delivery_id")},
                      [f"Peer '{peer_name}' has its Bot Chat open, so the message went into that chat (session "
-                      f"{queued_in}) and is answered there. The reply cannot come back on this call. Do NOT resend."])
+                      f"{queued_in}) and is answered there. The reply cannot come back on this call. Retry promptly if delivery fails, times out or remains uncertain; duplicate messages do not authorize repeated effects."])
     msg = result.get("message")
     reply = str(msg.get("content") or "") if isinstance(msg, dict) else ""
     # A successful bare silence marker is a delivery decision, not a message:

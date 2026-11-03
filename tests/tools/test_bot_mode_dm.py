@@ -788,7 +788,7 @@ def test_live_dm_wait_is_bounded_and_never_cancels_an_admission(tmp_path, monkey
     assert bot_mode_dm._wait_live_dm(str(tmp_path), record["delivery_id"]) == 0
     notice = json.loads(capsys.readouterr().out)
     assert notice["status"] == "queued"
-    assert "Do not resend" in notice["detail"]
+    assert "retry the message promptly" in notice["detail"] and "Do not resend" not in notice["detail"]
     assert live.read_delivery_result(tmp_path, record["delivery_id"])["status"] == "queued"
 
 

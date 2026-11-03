@@ -137,7 +137,7 @@ def test_delivery_runner_that_cannot_activate_after_live_admission_stays_ambiguo
     payload = json.loads(result.stdout)
     assert payload["status"] == "ambiguous"
     assert payload["delivery_id"] == _dm_delivery_id(str(dm_file))
-    assert "Do not resend" in payload["error"]
+    assert "Retry the message promptly" in payload["error"] and "Do not resend" not in payload["error"]
     assert dm_file.exists() and intent.exists()
 
 

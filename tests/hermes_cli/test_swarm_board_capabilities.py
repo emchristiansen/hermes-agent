@@ -153,3 +153,31 @@ def test_grant_follows_bound_profile_and_cleared_child_identity(board, tmp_path,
         assert worker_board_management_enabled()
     with scoped_current_session_id(""):
         assert not worker_board_management_enabled()
+
+
+def test_unbound_gateway_event_does_not_borrow_last_session(board, monkeypatch):
+    from gateway import session_context as sc
+    from agent.swarm_capabilities import attributed_board_payload, peer_session_author
+    monkeypatch.setattr(sc, "_session_context_engaged", True)
+    monkeypatch.setenv("HERMES_SESSION_ID", "unrelated-reconciler")
+    token = sc._SESSION_ID.set(sc._UNSET)
+    try:
+        payload = {"session_id": "actual-worker", "request_id": "actual-admission"}
+        assert attributed_board_payload(payload) == payload
+        assert peer_session_author() is None
+        with sc.scoped_current_session_id("actual-child"):
+            assert attributed_board_payload(payload)["actor"].endswith("/session:actual-child")
+    finally:
+        sc._SESSION_ID.reset(token)
+
+
+def test_standalone_worker_cli_retains_inherited_session(board, monkeypatch):
+    from gateway import session_context as sc
+    from agent.swarm_capabilities import attributed_board_payload
+    monkeypatch.setattr(sc, "_session_context_engaged", False)
+    monkeypatch.setenv("HERMES_SESSION_ID", "actual-cli-worker")
+    token = sc._SESSION_ID.set(sc._UNSET)
+    try:
+        assert attributed_board_payload({})["actor"].endswith("/session:actual-cli-worker")
+    finally:
+        sc._SESSION_ID.reset(token)

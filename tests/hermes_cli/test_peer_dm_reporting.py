@@ -41,7 +41,7 @@ def _run(monkeypatch, capsys, *, base="http://192.168.2.55:8642", raise_on_post=
 @pytest.mark.parametrize(
     ("raise_on_post", "raise_on_session", "expected", "forbidden"),
     [
-        (TimeoutError("timed out"), None, "accepted the message but its turn is still running", "Could not reach"),
+        (TimeoutError("timed out"), None, "delivery may have been accepted", "Could not reach"),
         (urllib.error.URLError(TimeoutError("timed out")), None, "Could not reach peer", "still running"),
         (urllib.error.URLError(ConnectionRefusedError(61, "Connection refused")), None, "Could not reach peer", "still running"),
         (OSError(51, "Network is unreachable"), None, "Could not reach peer", "still running"),
@@ -52,20 +52,18 @@ def _run(monkeypatch, capsys, *, base="http://192.168.2.55:8642", raise_on_post=
     ids=["response-timeout", "connect-timeout", "connection-refused", "network-unreachable",
          "timeout-before-the-session-is-known", "http-rejection"],
 )
-def test_only_a_timeout_on_an_accepted_turn_is_reported_as_delivered(
+def test_timeout_does_not_claim_admission_without_a_receipt(
     monkeypatch, capsys, raise_on_post, raise_on_session, expected, forbidden
 ):
-    """Two things must both hold to call the message delivered: the Bot Chat was already resolved
-    (the peer answered a moment ago) and the timeout hit while awaiting the response (urllib raises
-    that one bare). A connect-phase timeout, a refusal, or a status code proves nothing arrived."""
+    """A known Bot Chat alone does not prove the following message was admitted."""
     code, err = _run(monkeypatch, capsys, raise_on_post=raise_on_post, raise_on_session=raise_on_session)
 
     assert code == 1
     assert expected in err
     assert forbidden not in err
-    if "still running" in expected:
+    if "delivery may have been accepted" in expected:
         assert SESSION in err
-        assert "Do NOT resend" in err
+        assert "Retry promptly" in err and "Do NOT resend" not in err
 
 
 @pytest.mark.parametrize("phase", ["response", "connect"])
@@ -107,6 +105,6 @@ def test_the_real_urllib_stack_raises_the_signatures_the_branch_relies_on(monkey
 
     assert code == 1
     if phase == "response":
-        assert "accepted the message but its turn is still running" in err and "Do NOT resend" in err
+        assert "delivery may have been accepted" in err and "Retry promptly" in err and "Do NOT resend" not in err
     else:
         assert "Could not reach peer" in err and "still running" not in err
