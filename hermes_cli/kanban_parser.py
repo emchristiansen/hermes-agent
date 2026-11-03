@@ -310,6 +310,8 @@ _SPECS = [
         _arg("--body", help="Replace the task body"),
         _arg("--priority", type=int, help="Replace the task priority"),
         _arg("--result", help="Backfilled task result text for a done task"),
+        _arg("--max-retries", type=int, choices=[1], help="Tighten a stopped task to first-failure hold; no other edit fields"),
+        _arg("--expected-terminal-run", type=int, help="Exact latest terminal run required for retry-policy tightening"),
         *_STEP_HANDOFF,
     ], help="Edit task fields or recovery fields on an already-completed task"),
     _cmd("block", [
@@ -339,6 +341,7 @@ _SPECS = [
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
+        _arg("--expected-terminal-run", type=int, help="Fence the single selected first-failure task's release; retain failure history"),
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
     _cmd("request-review", [
         _TASK_ID,

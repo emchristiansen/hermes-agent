@@ -951,10 +951,16 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     title = getattr(args, "title", None)
     body = getattr(args, "body", None)
     priority = getattr(args, "priority", None)
+    limit = getattr(args, "max_retries", None)
+    expected_run = getattr(args, "expected_terminal_run", None)
+    policy = limit is not None or expected_run is not None
+    if policy and (os.environ.get("HERMES_KANBAN_TASK") or limit != 1 or expected_run is None
+                   or any(value is not None for value in (title, body, priority, result, summary, raw_metadata))):
+        return _err("kanban edit: retry tightening is orchestrator-only, exact-run fenced and cannot mix edits", 2)
     if result is None and (summary is not None or raw_metadata is not None):
         return _err("kanban edit: --summary and --metadata require --result", 2)
-    if all(value is None for value in (title, body, priority, result)):
-        return _err("kanban edit: provide --title, --body, --priority, or --result", 2)
+    if not policy and all(value is None for value in (title, body, priority, result)):
+        return _err("kanban edit: provide --title, --body, --priority, --result or guarded --max-retries", 2)
     metadata, rc = _parse_metadata_flag(raw_metadata)
     if rc:
         return rc
@@ -962,6 +968,7 @@ def _cmd_edit(args: argparse.Namespace) -> int:
         ok = kb.edit_task(
             conn, args.task_id, title=title, body=body, priority=priority,
             result=result, summary=summary, metadata=metadata,
+            **({"max_retries": limit, "expected_terminal_run": expected_run} if policy else {}),
         )
     return _ok_or_err(
         ok,
@@ -1039,11 +1046,15 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     ids, rc = _require_ids(args)
     if rc:
         return rc
+    expected_run = getattr(args, "expected_terminal_run", None)
+    if expected_run is not None and len(ids) != 1:
+        return _err("kanban unblock: an exact terminal-run fence requires one task", 2)
     reason = _stripped_or_none(getattr(args, "reason", None))
     author = _profile_author() if reason else None
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
+        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(
+            conn, tid, **({"expected_terminal_run": expected_run} if expected_run is not None else {})))
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
 

@@ -3049,8 +3049,14 @@ def edit_task(
     body: Optional[str] = None, priority: Optional[int] = None,
     result: Optional[str] = None, summary: Optional[str] = None,
     metadata: Optional[dict] = None, board: Optional[str] = None,
+    max_retries: Optional[int] = None, expected_terminal_run: Optional[int] = None,
 ) -> bool:
-    """Edit task fields, optionally backfilling a completed task's result."""
+    """Edit task fields; retry tightening is a separate terminal-run-fenced mode."""
+    policy = max_retries is not None or expected_terminal_run is not None
+    if policy and (os.environ.get("HERMES_KANBAN_TASK") or type(max_retries) is not int or max_retries != 1
+                   or type(expected_terminal_run) is not int
+                   or any(v is not None for v in (title, body, priority, result, summary, metadata))):
+        return False
     changed_fields = [
         field for field, value in (("title", title), ("body", body), ("priority", priority))
         if value is not None
@@ -3059,6 +3065,21 @@ def edit_task(
         status = _task_status(conn, task_id)
         if status is None or (result is not None and status != "done"):
             return False
+        if policy:
+            from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked
+            if owner_reclaim_blocked(conn, task_id):
+                return False
+            task = conn.execute("SELECT claim_lock,worker_pid,current_run_id,max_retries FROM tasks WHERE id=?", (task_id,)).fetchone()
+            latest = conn.execute("SELECT id,ended_at FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+            if (status not in {"blocked", "triage"} or any(task[k] is not None for k in ("claim_lock", "worker_pid", "current_run_id"))
+                    or latest is None or latest["id"] != expected_terminal_run or latest["ended_at"] is None):
+                return False
+            if task["max_retries"] == 1:
+                return True
+            conn.execute("UPDATE tasks SET max_retries=1 WHERE id=?", (task_id,))
+            _append_event(conn, task_id, "edited", {"fields": ["max_retries"], "max_retries": 1,
+                          "expected_terminal_run": expected_terminal_run}, run_id=expected_terminal_run)
+            return True
         assignments = []
         params = []
         for field, value in (("title", title), ("body", body), ("priority", priority)):
@@ -3557,11 +3578,20 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+def unblock_task(conn: sqlite3.Connection, task_id: str, *, expected_terminal_run: Optional[int] = None) -> bool:
+    """Restore the resumable phase; enrolled first-failure releases retain historical counters."""
     now = int(time.time())
     with write_txn(conn):
+        row = conn.execute("SELECT max_retries,current_run_id,claim_lock,worker_pid FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if row is None:
+            return False
+        if row["max_retries"] == 1 or expected_terminal_run is not None:
+            from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked
+            latest = conn.execute("SELECT id,ended_at FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+            if (type(expected_terminal_run) is not int or latest is None or latest["id"] != expected_terminal_run
+                    or latest["ended_at"] is None or any(row[k] is not None for k in ("current_run_id", "claim_lock", "worker_pid"))
+                    or owner_reclaim_blocked(conn, task_id)):
+                return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"
@@ -3578,14 +3608,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             if landing_status == "ready" and resume_status == "review"
             else landing_status
         )
-        # ``block_kind``/``block_recurrences`` deliberately survive the unblock:
-        # resetting them is the amnesia that let cron-unblock <-> re-block loop
-        # unbounded; only complete_task clears them. ``consecutive_failures``
-        # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
-        # is a fresh start for the retry budget.
+        # Enrolled first-failure releases are explicit new occurrences, not failure-history resets.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = CASE WHEN max_retries=1 THEN consecutive_failures ELSE 0 END, last_failure_error = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
         if cur.rowcount != 1:

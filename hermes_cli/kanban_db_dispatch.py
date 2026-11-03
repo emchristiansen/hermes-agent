@@ -1168,7 +1168,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, max_retries "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -1195,13 +1195,15 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
             dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
+            hold = row["max_retries"] == 1
             dead.event_payload["retry_status"] = retry_status
+            landing = "blocked" if hold else retry_status
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, row["id"], pid, row["claim_lock"]),
+                (landing, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -1212,6 +1214,12 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 metadata=dict(dead.event_payload),
             )
             _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
+            if hold:
+                conn.execute("UPDATE tasks SET block_kind='capability' WHERE id=?", (row["id"],))
+                _kb._append_event(conn, row["id"], "blocked", {
+                    "kind": "capability", "retry_status": retry_status,
+                    "reason": "selected first-failure hold; reconcile the exact attempt before explicit release",
+                }, run_id=run_id)
             sweep.exited_hook_payloads.append({
                 "task_id": row["id"],
                 "assignee": row["assignee"],
@@ -1415,6 +1423,8 @@ def _record_task_failure(
             if release_claim
             else ("review" if row["status"] == "review" else "ready")
         )
+        if row["max_retries"] == 1 and row["status"] == "blocked" and not release_claim:
+            retry_status = _kb._resume_status_from_events(conn, task_id)
         failures = int(row["consecutive_failures"]) + (0 if infrastructure else 1)
 
         # Per-task override wins over caller-supplied and default thresholds.
