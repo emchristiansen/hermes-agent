@@ -143,10 +143,11 @@ def kanban_path_is_fenced(path: os.PathLike[str] | str) -> bool:
     process: always for an in-process delegate child (the parent's own board); for a spawned
     descendant only when *path* is the dispatcher-pinned ``HERMES_KANBAN_DB`` or lies under the
     fenced root the marker carries. A legacy ``"1"`` marker fences everything."""
+    from agent.swarm_capabilities import worker_board_management_enabled
     if _DELEGATED_CHILD_CONTEXT.get():
-        return True
+        return not worker_board_management_enabled()
     marker = os.environ.get(DELEGATED_CHILD_ENV_MARKER, "")
-    if not marker:
+    if not marker or worker_board_management_enabled():
         return False
     if marker == "1":
         return True

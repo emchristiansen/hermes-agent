@@ -87,7 +87,8 @@ def settle_triage_task(
     """
     from hermes_cli.kanban_db import _append_event, _json_dict, _latest_event, write_txn
 
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    from agent.swarm_capabilities import worker_board_management_enabled
+    if os.environ.get("HERMES_KANBAN_TASK") and not worker_board_management_enabled():
         return False, "triage settlement is orchestrator-only"
     if type(expected_terminal_run_id) is not int or expected_terminal_run_id <= 0:
         raise ValueError("expected terminal run must be a positive run id")

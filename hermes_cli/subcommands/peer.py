@@ -299,11 +299,12 @@ def _peer_run_ctl(args, action: str, peer_name: str, profile: str | None, base: 
 
 
 def _turn_body(message: str, *, message_key: str, **extra) -> dict:
-    """Request body for one turn. ``author`` is added only when a dispatcher set HERMES_TURN_AUTHOR."""
+    """Request body with the bound swarm session author, else dispatcher-supplied attribution."""
     from agent.turn_author import turn_author_from_env
 
     body = {message_key: message, **extra}
-    author = turn_author_from_env()
+    from agent.swarm_capabilities import peer_session_author
+    author = peer_session_author() or turn_author_from_env()
     if author is not None:
         body["author"] = author
     return body

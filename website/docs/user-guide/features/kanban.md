@@ -1467,3 +1467,23 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 ## Out of scope
 
 Kanban is deliberately single-host. `~/.hermes/kanban.db` is a local SQLite file and the dispatcher spawns workers on the same machine. Running a shared board across two hosts is not supported — there's no coordination primitive for "worker X on host A, worker Y on host B," and the crash-detection path assumes PIDs are host-local. If you need multi-host, run an independent board per host and use `delegate_task` / a message queue to bridge them.
+
+### Shared-board worker coordination
+
+For an explicitly trusted swarm, set `kanban.worker_board_management: true` in each
+participating profile's `config.yaml`. Session-identified finite and delegated agents
+can then use the existing `hermes kanban` CLI to coordinate on their selected board,
+including worker `unblock`. The child marker and board-location pins are retained;
+the grant does not turn a child into its parent's dispatcher worker, supply a run
+claim, or bypass a stale-run check. User task grants and effect custody still apply.
+Without the setting, or without a bound session identity, existing restrictions apply.
+
+The CLI records the actual `profile/session:session_id` as the author of comments and
+other attributed changes, ignoring caller-supplied author labels for these agents.
+`hermes peer dm` and `hermes peer run` likewise send session-qualified structured
+attribution through the existing authenticated peer transport. Configure the peer
+and credentials for that caller normally; this setting grants no peer credentials
+or access to another profile. External agents must carry their own launcher-bound
+`HERMES_SESSION_ID`, never a standing agent's ID. Discover and verify the intended
+canonical peer conversation before sending; retain run IDs for asynchronous replies.
+The CLI is the supported child surface; enabling this setting does not add model tools.

@@ -86,7 +86,9 @@ def terminal_run_matches(conn, task_id, expected_run):
 def edit_retry_policy(conn, task_id, limit, expected_run, mixed_values, *,
                       write_txn, append_event, owner_blocked, notify_updated, board):
     """Tighten only the selected field; leave lifecycle, counts, and original attempts untouched."""
-    if (os.environ.get('HERMES_KANBAN_TASK') or type(limit) is not int or limit != 1
+    from agent.swarm_capabilities import worker_board_management_enabled
+    denied_worker = os.environ.get('HERMES_KANBAN_TASK') and not worker_board_management_enabled()
+    if (denied_worker or type(limit) is not int or limit != 1
             or any(value is not None for value in mixed_values)):
         return False
     with write_txn(conn):
