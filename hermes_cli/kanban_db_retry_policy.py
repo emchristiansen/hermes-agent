@@ -1,7 +1,8 @@
 """Guarded first-failure policy and atomic hold records for existing tasks."""
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from functools import wraps
+from inspect import signature
 import json
 import os
 from pathlib import Path
@@ -13,17 +14,20 @@ from hermes_cli import kanban_owner_recovery
 def guarded_edit(operations):
     """Guard new policy edits; resolve the facade's transaction hook only after its import shims."""
     def decorate(editor):
+        call_signature = signature(editor)
         @wraps(editor)
         def edit(conn, task_id, **values):
+            call_signature.bind(conn, task_id, **values)
             limit = values.get('max_retries')
             expected_run = values.get('expected_terminal_run')
             if limit is None and expected_run is None:
                 return editor(conn, task_id, **values)
             mixed = tuple(values.get(key) for key in ('title', 'body', 'priority', 'result', 'summary', 'metadata'))
-            write_txn, append_event = operations()
+            write_txn, append_event, notify_updated = operations()
             return edit_retry_policy(conn, task_id, limit, expected_run, mixed,
                                      write_txn=write_txn, append_event=append_event,
-                                     owner_blocked=kanban_owner_recovery.owner_reclaim_blocked)
+                                     owner_blocked=kanban_owner_recovery.owner_reclaim_blocked,
+                                     notify_updated=notify_updated, board=values.get('board'))
         return edit
     return decorate
 
@@ -51,6 +55,15 @@ def terminal_run_matches(conn, task_id, expected_run):
     if (task is None or latest is None or latest['id'] != expected_run or latest['ended_at'] is None
             or any(task[key] is not None for key in ('claim_lock', 'worker_pid', 'current_run_id'))):
         return False
+    hold = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='blocked' ORDER BY id DESC LIMIT 1",
+                        (task_id, expected_run)).fetchone()
+    try:
+        pending_account = json.loads(hold['payload']).get('accounting_required', False) if hold else False
+    except (ValueError, TypeError, AttributeError):
+        return False
+    if pending_account and conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind='gave_up'",
+                                        (task_id, expected_run)).fetchone() is None:
+        return False
     # Unlike current-run reclaim, a stopped card requires the exact historical run's owner event.
     event = conn.execute(
         "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='owner_admitted' ORDER BY id DESC LIMIT 1",
@@ -70,7 +83,8 @@ def terminal_run_matches(conn, task_id, expected_run):
         return False
 
 
-def edit_retry_policy(conn, task_id, limit, expected_run, mixed_values, *, write_txn, append_event, owner_blocked):
+def edit_retry_policy(conn, task_id, limit, expected_run, mixed_values, *,
+                      write_txn, append_event, owner_blocked, notify_updated, board):
     """Tighten only the selected field; leave lifecycle, counts, and original attempts untouched."""
     if (os.environ.get('HERMES_KANBAN_TASK') or type(limit) is not int or limit != 1
             or any(value is not None for value in mixed_values)):
@@ -87,7 +101,8 @@ def edit_retry_policy(conn, task_id, limit, expected_run, mixed_values, *, write
         append_event(conn, task_id, 'edited', {
             'fields': ['max_retries'], 'max_retries': 1, 'expected_terminal_run': expected_run,
         }, run_id=expected_run)
-        return True
+    notify_updated(conn, task_id, ['max_retries'], board=board)
+    return True
 
 
 def release_is_fenced(conn, task_id, expected_run):
@@ -100,10 +115,40 @@ def release_is_fenced(conn, task_id, expected_run):
     return terminal_run_matches(conn, task_id, expected_run) and not kanban_owner_recovery.owner_reclaim_blocked(conn, task_id)
 
 
-def record_first_failure_hold(conn, task_id, run_id, phase, append_event):
+def first_failure_landing(conn, task_id, phase):
+    """Select before the reclaim transaction publishes a potentially claimable source phase."""
+    row = conn.execute('SELECT max_retries FROM tasks WHERE id=?', (task_id,)).fetchone()
+    return 'blocked' if row is not None and row['max_retries'] == 1 else phase
+
+
+@contextmanager
+def reclaim_transaction(conn, task_id, write_txn, append_event, *, accounting_required=False):
+    """Keep the stale-claim path's new hold inside its original transaction, including early exits."""
+    with write_txn(conn):
+        before = conn.execute('SELECT current_run_id FROM tasks WHERE id=?', (task_id,)).fetchone()
+        yield
+        after = conn.execute('SELECT status,max_retries,current_run_id FROM tasks WHERE id=?', (task_id,)).fetchone()
+        if (before is not None and after is not None
+                and after['max_retries'] == 1 and after['status'] in {'ready', 'review'}
+                and after['current_run_id'] is None):
+            claimed = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed' ORDER BY id DESC LIMIT 1",
+                                   (task_id, before['current_run_id'])).fetchone()
+            try:
+                source = json.loads(claimed['payload']) if claimed else {}
+            except (ValueError, TypeError):
+                source = {}
+            phase = 'review' if isinstance(source, dict) and source.get('source_status') == 'review' else after['status']
+            conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (task_id,))
+            record_first_failure_hold(conn, task_id, before['current_run_id'], phase, append_event, accounting_required=accounting_required)
+
+
+def record_first_failure_hold(conn, task_id, run_id, phase, append_event, *, accounting_required=False):
     """Called inside the reclaim transaction, before another connection can claim a retry."""
+    row = conn.execute('SELECT max_retries FROM tasks WHERE id=?', (task_id,)).fetchone()
+    if row is None or row['max_retries'] != 1:
+        return
     conn.execute("UPDATE tasks SET block_kind='capability' WHERE id=?", (task_id,))
     append_event(conn, task_id, 'blocked', {
-        'kind': 'capability', 'retry_status': phase,
+        'kind': 'capability', 'retry_status': phase, 'accounting_required': accounting_required,
         'reason': 'selected first-failure hold; reconcile the exact attempt before explicit release',
     }, run_id=run_id)

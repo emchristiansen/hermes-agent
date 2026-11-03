@@ -2378,7 +2378,7 @@ def release_stale_claims(
                 reason="ttl_expired_worker_alive",
             )
             continue
-        with write_txn(conn):
+        with _retry_policy.reclaim_transaction(conn, row["id"], write_txn, _append_event, accounting_required=True):
             # Again under the write lock: an interpreter that bound since the check above
             # changes neither claim_lock nor worker_pid, so the CAS below cannot see it.
             if owner_reclaim_blocked_after_kill(conn, row["id"], signalled=bool(termination.get("termination_attempted"))):
@@ -3045,7 +3045,7 @@ def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> 
     return candidate
 
 
-@_retry_policy.guarded_edit(lambda: (write_txn, _append_event))
+@_retry_policy.guarded_edit(lambda: (write_txn, _append_event, notify_task_updated))
 def edit_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, priority: Optional[int] = None,

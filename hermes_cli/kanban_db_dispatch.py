@@ -28,6 +28,9 @@ from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 from hermes_cli.kanban_db_retry_policy import CrashSweep as _CrashSweep
+from hermes_cli.kanban_db_retry_policy import first_failure_landing
+from hermes_cli.kanban_db_retry_policy import reclaim_transaction
+from hermes_cli.kanban_db_retry_policy import record_first_failure_hold
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -708,13 +711,14 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             if owner_reclaim_blocked_after_kill(conn, tid, signalled=True):
                 continue
             retry_status = _kb._retry_status_for_run(conn, tid)
+            landing = first_failure_landing(conn, tid, retry_status)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, tid, pid, row["claim_lock"]),
+                (landing, tid, pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 payload = {
@@ -729,6 +733,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                     error=error, metadata=payload,
                 )
                 _kb._append_event(conn, tid, "timed_out", payload, run_id=run_id)
+                record_first_failure_hold(conn, tid, run_id, retry_status, _kb._append_event, accounting_required=True)
                 timed_out.append(tid)
         # Outside the write_txn above because ``_record_task_failure`` opens its
         # own. If the breaker trips this flips the task to ``blocked`` and emits
@@ -811,7 +816,7 @@ def detect_stale_running(
             )
             continue
 
-        with _kb.write_txn(conn):
+        with reclaim_transaction(conn, tid, _kb.write_txn, _kb._append_event):
             # Again under the write lock, after the termination wait (see enforce_max_runtime).
             if owner_reclaim_blocked_after_kill(conn, tid, signalled=bool(termination.get("termination_attempted"))):
                 continue
@@ -883,7 +888,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
                 "pid %s is alive on this host — deferring", tid, pid,
             )
             continue
-        with _kb.write_txn(conn):
+        with reclaim_transaction(conn, tid, _kb.write_txn, _kb._append_event):
             if owner_reclaim_blocked(conn, tid):
                 continue
             cur = conn.execute(
@@ -918,7 +923,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             _kb._append_event(conn, tid, "reconciled", payload, run_id=run_id)
             reconciled.append(tid)
         _kb._log.info(
-            "kanban reconcile: requeued orphaned running task %s "
+            "kanban reconcile: reconciled orphaned running task %s "
             "(claim_lock=%r, worker_pid=%r)", tid, row["claim_lock"], pid,
         )
     return reconciled
@@ -1156,7 +1161,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, max_retries "
+            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -1183,9 +1188,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
             dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
-            hold = row["max_retries"] == 1
             dead.event_payload["retry_status"] = retry_status
-            landing = "blocked" if hold else retry_status
+            landing = first_failure_landing(conn, row["id"], retry_status)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
@@ -1202,9 +1206,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 metadata=dict(dead.event_payload),
             )
             _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
-            if hold:
-                from hermes_cli.kanban_db_retry_policy import record_first_failure_hold
-                record_first_failure_hold(conn, row["id"], run_id, retry_status, _kb._append_event)
+            record_first_failure_hold(conn, row["id"], run_id, retry_status, _kb._append_event, accounting_required=not dead.rate_limited)
             sweep.exited_hook_payloads.append({
                 "task_id": row["id"],
                 "assignee": row["assignee"],
@@ -1453,7 +1455,7 @@ def _record_task_failure(
             + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                if release_claim else "")
             + "consecutive_failures = ?, last_failure_error = ? "
-            "WHERE id = ? AND status IN ('running', 'ready', 'review')",
+            "WHERE id = ? AND (status IN ('running', 'ready', 'review') OR (status='blocked' AND max_retries=1))",
             (failures, error, task_id),
         )
         payload = {
@@ -1465,7 +1467,8 @@ def _record_task_failure(
             "retry_status": retry_status,
             **({"infrastructure": True} if infrastructure else {}),
         }
-        run_id = None
+        accounted = conn.execute("SELECT id FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+        run_id = accounted['id'] if task_override == 1 and accounted else None
         if end_run:
             # Only the spawn path has an open run to close.
             run_id = _kb._end_run(
