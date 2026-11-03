@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
+from hermes_cli import kanban_db_retry_policy as _retry_policy
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -3044,6 +3045,7 @@ def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> 
     return candidate
 
 
+@_retry_policy.guarded_edit(lambda: (write_txn, _append_event))
 def edit_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, priority: Optional[int] = None,
@@ -3052,11 +3054,6 @@ def edit_task(
     max_retries: Optional[int] = None, expected_terminal_run: Optional[int] = None,
 ) -> bool:
     """Edit task fields; retry tightening is a separate terminal-run-fenced mode."""
-    policy = max_retries is not None or expected_terminal_run is not None
-    if policy and (os.environ.get("HERMES_KANBAN_TASK") or type(max_retries) is not int or max_retries != 1
-                   or type(expected_terminal_run) is not int
-                   or any(v is not None for v in (title, body, priority, result, summary, metadata))):
-        return False
     changed_fields = [
         field for field, value in (("title", title), ("body", body), ("priority", priority))
         if value is not None
@@ -3065,21 +3062,6 @@ def edit_task(
         status = _task_status(conn, task_id)
         if status is None or (result is not None and status != "done"):
             return False
-        if policy:
-            from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked
-            if owner_reclaim_blocked(conn, task_id):
-                return False
-            task = conn.execute("SELECT claim_lock,worker_pid,current_run_id,max_retries FROM tasks WHERE id=?", (task_id,)).fetchone()
-            latest = conn.execute("SELECT id,ended_at FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
-            if (status not in {"blocked", "triage"} or any(task[k] is not None for k in ("claim_lock", "worker_pid", "current_run_id"))
-                    or latest is None or latest["id"] != expected_terminal_run or latest["ended_at"] is None):
-                return False
-            if task["max_retries"] == 1:
-                return True
-            conn.execute("UPDATE tasks SET max_retries=1 WHERE id=?", (task_id,))
-            _append_event(conn, task_id, "edited", {"fields": ["max_retries"], "max_retries": 1,
-                          "expected_terminal_run": expected_terminal_run}, run_id=expected_terminal_run)
-            return True
         assignments = []
         params = []
         for field, value in (("title", title), ("body", body), ("priority", priority)):
@@ -3582,16 +3564,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str, *, expected_terminal_ru
     """Restore the resumable phase; enrolled first-failure releases retain historical counters."""
     now = int(time.time())
     with write_txn(conn):
-        row = conn.execute("SELECT max_retries,current_run_id,claim_lock,worker_pid FROM tasks WHERE id=?", (task_id,)).fetchone()
-        if row is None:
+        if not _retry_policy.release_is_fenced(conn, task_id, expected_terminal_run):
             return False
-        if row["max_retries"] == 1 or expected_terminal_run is not None:
-            from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked
-            latest = conn.execute("SELECT id,ended_at FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
-            if (type(expected_terminal_run) is not int or latest is None or latest["id"] != expected_terminal_run
-                    or latest["ended_at"] is None or any(row[k] is not None for k in ("current_run_id", "claim_lock", "worker_pid"))
-                    or owner_reclaim_blocked(conn, task_id)):
-                return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"

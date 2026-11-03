@@ -187,3 +187,94 @@ def test_default_unselected_retry_is_unchanged(board):
     assert kb.get_task(conn, tid).status == "ready"
     assert kb.get_task(conn, tid).consecutive_failures == 1
     assert kb.claim_task(conn, tid)
+
+
+@pytest.mark.parametrize("operation", ["edit", "release"])
+def test_unknown_managed_owner_keeps_policy_and_release_unchanged(board, monkeypatch, operation):
+    conn, _ = board
+    tid, run = stopped(conn)
+    if operation == "release":
+        assert kb.edit_task(conn, tid, max_retries=1, expected_terminal_run=run)
+    before = image(conn, tid)
+    monkeypatch.setattr("hermes_cli.kanban_owner_recovery.owner_reclaim_blocked", lambda *a, **k: True)
+    if operation == "edit":
+        assert not kb.edit_task(conn, tid, max_retries=1, expected_terminal_run=run)
+    else:
+        assert not kb.unblock_task(conn, tid, expected_terminal_run=run)
+    assert image(conn, tid) == before
+
+
+@pytest.mark.parametrize("outcome", ["timed_out", "crashed", "spawn_failed"])
+def test_selected_accounted_failure_holds_without_new_counter_budget(board, outcome):
+    conn, _ = board
+    tid = kb.create_task(conn, title="selected failure class", project_id="", max_retries=1)
+    assert kb.claim_task(conn, tid)
+    assert dispatch._record_task_failure(conn, tid, "synthetic classification", outcome=outcome,
+                                         release_claim=True, end_run=True)
+    assert kb.get_task(conn, tid).status == "blocked"
+    for _ in range(3):
+        kb.recompute_ready(conn)
+        assert kb.claim_task(conn, tid) is None
+
+
+@pytest.mark.parametrize("limit", [None, 1])
+def test_infrastructure_refusal_respects_selected_hold_without_counting_it(board, limit):
+    conn, _ = board
+    tid = kb.create_task(conn, title="isolated host refusal", project_id="", max_retries=limit)
+    assert kb.claim_task(conn, tid)
+    dispatch._record_task_failure(conn, tid, "host scope unavailable", outcome="spawn_failed",
+                                   release_claim=True, end_run=True, infrastructure=True)
+    expected = "blocked" if limit == 1 else "ready"
+    assert kb.get_task(conn, tid).status == expected
+    assert kb.get_task(conn, tid).consecutive_failures == 0
+    if limit == 1:
+        for _ in range(3):
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, tid).status == "blocked"
+
+
+@pytest.mark.parametrize("owner_state", ["unknown", "queued", "running", "missing", "terminal"])
+def test_historical_owner_receipt_is_checked_after_current_run_cleared(board, tmp_path, owner_state):
+    import sqlite3
+
+    conn, _ = board
+    tid, run = stopped(conn)
+    owner_path = tmp_path / "owner.sqlite"
+    with sqlite3.connect(owner_path) as owner:
+        owner.execute("CREATE TABLE session_admissions (target_session_id TEXT,request_id TEXT,status TEXT)")
+        if owner_state != "missing":
+            owner.execute("INSERT INTO session_admissions VALUES (?,?,?)", ("exact-session", "exact-request", owner_state))
+    kb._append_event(conn, tid, "owner_admitted", {
+        "db": str(owner_path), "session_id": "exact-session", "request_id": "exact-request",
+    }, run_id=run)
+    conn.commit()
+    before = image(conn, tid)
+    accepted = kb.edit_task(conn, tid, max_retries=1, expected_terminal_run=run)
+    assert accepted is (owner_state == "terminal")
+    if not accepted:
+        assert image(conn, tid) == before
+
+
+def test_repeating_policy_edit_is_idempotent_and_guarded_cli_release_keeps_counts(board):
+    conn, _ = board
+    tid, run = stopped(conn)
+    assert kb.edit_task(conn, tid, max_retries=1, expected_terminal_run=run)
+    before = image(conn, tid)
+    events = conn.execute("SELECT count(*) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0]
+    assert kb.edit_task(conn, tid, max_retries=1, expected_terminal_run=run)
+    assert image(conn, tid) == before
+    assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0] == events
+    assert cli._cmd_unblock(parsed("unblock", tid, "--expected-terminal-run", str(run))) == 0
+    assert kb.get_task(conn, tid).consecutive_failures == 2
+    assert kb.claim_task(conn, tid) is not None
+
+
+def test_policy_edit_does_not_raise_an_unsupported_legacy_zero_limit(board):
+    conn, _ = board
+    tid = kb.create_task(conn, title="legacy zero", project_id="", max_retries=0)
+    task = kb.claim_task(conn, tid)
+    run = task.current_run_id
+    dispatch._record_task_failure(conn, tid, "old failure", outcome="crashed", release_claim=True, end_run=True)
+    before = image(conn, tid)
+    assert not kb.edit_task(conn, tid, max_retries=1, expected_terminal_run=run)
+    assert image(conn, tid) == before

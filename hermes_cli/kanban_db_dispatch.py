@@ -27,6 +27,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from hermes_cli.kanban_db_retry_policy import CrashSweep as _CrashSweep
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -1149,19 +1150,6 @@ def _classify_dead_worker_exit(
     return _DeadWorker(kind, code, error_text, "crashed", event_payload)
 
 
-@dataclass
-class _CrashSweep:
-    """Everything ``detect_crashed_workers`` collects inside its reclaim txn."""
-
-    crashed: list[str] = field(default_factory=list)
-    rate_limited: list[str] = field(default_factory=list)
-    # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
-    # ``_record_task_failure`` (needs its own write_txn).
-    crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
-    # Worker-exit observer payloads, fired only after every reclaim/accounting
-    # txn has committed.
-    exited_hook_payloads: list[dict] = field(default_factory=list)
-
 
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead."""
@@ -1215,11 +1203,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             )
             _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
             if hold:
-                conn.execute("UPDATE tasks SET block_kind='capability' WHERE id=?", (row["id"],))
-                _kb._append_event(conn, row["id"], "blocked", {
-                    "kind": "capability", "retry_status": retry_status,
-                    "reason": "selected first-failure hold; reconcile the exact attempt before explicit release",
-                }, run_id=run_id)
+                from hermes_cli.kanban_db_retry_policy import record_first_failure_hold
+                record_first_failure_hold(conn, row["id"], run_id, retry_status, _kb._append_event)
             sweep.exited_hook_payloads.append({
                 "task_id": row["id"],
                 "assignee": row["assignee"],
@@ -1434,7 +1419,7 @@ def _record_task_failure(
         else:
             effective_limit, limit_source = int(failure_limit), "dispatcher"
 
-        if infrastructure or not (force_trip or failures >= effective_limit):
+        if task_override != 1 and (infrastructure or not (force_trip or failures >= effective_limit)):
             if release_claim:
                 # Spawn path: restore the claimed source phase + clear claim.
                 conn.execute(
@@ -1478,6 +1463,7 @@ def _record_task_failure(
             "error": error,
             "trigger_outcome": outcome,
             "retry_status": retry_status,
+            **({"infrastructure": True} if infrastructure else {}),
         }
         run_id = None
         if end_run:
@@ -1490,11 +1476,11 @@ def _record_task_failure(
                     "effective_limit": effective_limit,
                     "limit_source": limit_source,
                     "retry_status": retry_status,
+                    **({"infrastructure": True} if infrastructure else {}),
                 },
             )
-        if force_trip:
-            # The caller applied its own bounded policy, so the counter cannot
-            # judge this block: ``recompute_ready`` holds it for an operator.
+        if force_trip or task_override == 1:
+            # Explicit first-failure holds include uncounted host refusals; only a deliberate release clears them.
             payload["sticky"] = True
         if event_payload_extra:
             payload.update(event_payload_extra)
