@@ -1189,6 +1189,11 @@ def register(ctx):
             ctx.register_skill(child.name, skill_md)
 ```
 
+`ctx.register_skill(name, path)` accepts either the skill directory or its `SKILL.md`
+file, as a `Path` or string. A directory must contain an immediate regular `SKILL.md`;
+registration does not search nested directories. Hermes stores the index file path so
+supporting-file reads remain confined to that skill directory.
+
 The agent can now load your skills with their namespaced name:
 
 ```python
