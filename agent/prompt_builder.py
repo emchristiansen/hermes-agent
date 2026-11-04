@@ -1035,10 +1035,16 @@ def _dynamic_context_file_max_chars(context_length: Optional[int]) -> int:
     return max(CONTEXT_FILE_MAX_CHARS, min(budget, _CONTEXT_FILE_DYNAMIC_CEILING))
 
 
+def _configured_context_file_max_chars(config: dict) -> Optional[int]:
+    """Normalize the explicit cap; None preserves the runtime model-window fallback."""
+    val = config.get("context_file_max_chars")
+    return int(val) if isinstance(val, (int, float)) and val > 0 else None
+
+
 def _get_context_file_max_chars(context_length: Optional[int] = None) -> int:
     """Context-file truncation limit: explicit config.yaml ``context_file_max_chars`` wins, else the dynamic cap."""
-    val = _config_readonly("context_file_max_chars").get("context_file_max_chars")
-    return int(val) if isinstance(val, (int, float)) and val > 0 else _dynamic_context_file_max_chars(context_length)
+    cap = _configured_context_file_max_chars(_config_readonly("context_file_max_chars"))
+    return cap if cap is not None else _dynamic_context_file_max_chars(context_length)
 
 
 # Truncation warnings for run_agent to surface. A ContextVar so concurrent gateway prompt builds cannot
