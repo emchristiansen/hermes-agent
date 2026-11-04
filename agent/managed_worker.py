@@ -174,9 +174,21 @@ def _die_with_owner():
     threading.Timer(ORPHAN_GRACE_SECONDS, kill).start()
 
 
+def _control_input_stream():
+    """A private buffer cannot strand the interpreter-owned stdin lock on exit."""
+    descriptor = os.dup(sys.stdin.fileno())
+    return os.fdopen(descriptor, 'rb')
+
+
 class WorkerControls:
-    def __init__(self, channel, route):
+    def __init__(self, channel, route, stream=None):
         self.channel, self.route = channel, route
+        # This daemon may still be reading when a failed turn exits. Never hold
+        # the interpreter-owned stdin buffer's lock during Py_Finalize: that
+        # turns an ordinary persistence error into _enter_buffered_busy/ABRT.
+        # main passes the SAME private stream used for bootstrap, preserving
+        # any control frames already read ahead with that bootstrap.
+        self.stream = stream if stream is not None else _control_input_stream()
         self.agent = None
         self.stopped = threading.Event()
         self.finish = threading.Event()
@@ -199,7 +211,7 @@ class WorkerControls:
         from tools.approval import resolve_gateway_approval
         try:
             while True:
-                frame = read_frame(sys.stdin.buffer)
+                frame = read_frame(self.stream)
                 if frame == {'type': 'stop'}:
                     self.stop()
                     continue
@@ -225,6 +237,8 @@ class WorkerControls:
             self.finish.set()
             if not isinstance(exc, ValueError):
                 _die_with_owner()
+        finally:
+            self.stream.close()
 
     def approval(self, data):
         from tools.approval import ack_gateway_approval
@@ -327,7 +341,7 @@ def tool_frame(call_id, name, args, *result):
     return json.loads(json.dumps(frame, default=str))
 
 
-def execute(frame, channel):
+def execute(frame, channel, *, control_stream=None):
     # The owner RPC below imports gateway/config modules (hermes_cli.config, providers,
     # hermes_cli.plugins) transitively; the policy must already be frozen when they load.
     bind_worker_policy(frame)
@@ -356,7 +370,7 @@ def execute(frame, channel):
     os.environ['HERMES_GATEWAY_SESSION'] = '1'
     from gateway.session_worker_construct import checkpoint_agent_kwargs, construct_kwargs, routing_agent_kwargs
     construct = {'ephemeral_system_prompt': policy.skills_prompt, **construct_kwargs(frame)}
-    controls = WorkerControls(channel, frame['route'])
+    controls = WorkerControls(channel, frame['route'], control_stream)
     register_gateway_notify(frame['route'], controls.approval)
     agent = None
     try:
@@ -462,8 +476,11 @@ def main():
     logger.propagate = False
     try:
         channel.send('hello', **hello())
-        frame = validate_bootstrap(read_frame(sys.stdin.buffer))
-        execute(frame, channel)
+        # Bootstrap and controls share a private buffer, never sys.stdin's
+        # interpreter-finalized buffer. The control reader owns it once started.
+        control_stream = _control_input_stream()
+        frame = validate_bootstrap(read_frame(control_stream))
+        execute(frame, channel, control_stream=control_stream)
     except Exception:
         # Runtime exceptions can contain credentials; the owner gets no raw traceback.
         logger.exception('managed worker failed')

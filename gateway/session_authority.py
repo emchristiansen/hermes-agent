@@ -434,10 +434,16 @@ class SessionAuthority:
             from gateway.session_runtime_workers import persist_work_count
             live.task.add_done_callback(lambda task: persist_work_count(self, task))
 
-    def wake_after_worker(self, session_id):
+    async def wake_after_worker(self, session_id):
         """A worker execution on ``session_id`` (a logical owner or its compression continuation)
         ended: a drain that parked behind it re-runs. A no-op while a drain is running."""
-        for sid in dict.fromkeys((session_id, self.logical_owner(session_id))):
+        from gateway.session_authorities import require_serving
+        require_serving(self)
+        # The finish receipt is already committed. Lineage reads can still wait for
+        # the writer lock; only their result, not live scheduling, belongs off-loop.
+        owner = await asyncio.to_thread(self.logical_owner, session_id)
+        require_serving(self)
+        for sid in dict.fromkeys((session_id, owner)):
             if sid in self.sessions:
                 self._schedule(SessionRef(self.profile_id, sid))
 
@@ -721,7 +727,8 @@ class SessionAuthority:
 
     async def receipt(self, actor, ref, admission_id):
         self.authorize(actor, ref, 'session:submit')
-        row = get_session_admission(self.db, admission_id=admission_id)
+        row = await asyncio.to_thread(get_session_admission, self.db, admission_id=admission_id)
+        self.authorize(actor, ref, 'session:submit')
         if row is None or row['target_session_id'] != ref.session_id:
             raise RuntimeStoreError('not_found')
         if row['principal_id'] != actor.subject and 'session:control' not in actor.capabilities:
