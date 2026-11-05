@@ -622,6 +622,15 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         row = self._read_one("SELECT role FROM messages WHERE id = ? AND session_id = ? AND active = 1", (int(row_id), session_id))
         return row[0] if row else None
 
+    def get_message_identity(self, session_id: str, row_id: int) -> Optional[tuple[str, Optional[str]]]:
+        """``(role, message_uid)`` of the active message at *row_id* in *session_id*, or ``None``."""
+        if not session_id:
+            return None
+        row = self._read_one(
+            "SELECT role, message_uid FROM messages WHERE id = ? AND session_id = ? AND active = 1",
+            (int(row_id), session_id))
+        return (row[0], row[1]) if row else None
+
     def _carry_parent_timestamps(self, conn, parent_session_id: str, messages: list[dict[str, Any]]) -> None:
         """Adopt the durable parent row's timestamp onto carried handoff rows so the re-inserted child row keeps
         the original's display identity (see _display_dedupe_key). Idempotent; never overwrites a timestamp the
