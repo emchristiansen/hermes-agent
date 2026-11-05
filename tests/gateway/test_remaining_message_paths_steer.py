@@ -418,3 +418,66 @@ async def test_a_legacy_wake_during_a_drain_is_never_steered(monkeypatch, guarde
     if not guarded:
         runner._session_state(key).turn.agent = None
     assert content is None
+
+
+@pytest.mark.asyncio
+async def test_a_mark_recorded_while_an_older_queue_read_is_in_flight_survives_it(monkeypatch):
+    """The adoption pass reads the queue before B is admitted; B commits and records its mark while that
+    read is still in flight (the authority adopted the agent; the runner still shows the pending sentinel,
+    as in the window before ``_run_agent_track_agent`` polls). The older read must not erase B's mark."""
+    import threading
+    from gateway import session_busy_ingress
+    from gateway.platforms.event import MessageEvent
+    from gateway.session_results import execution_result
+
+    runner, adapter, authority, source, key = await _gateway(monkeypatch)
+    agent = BufferedAgent()
+    running, boundary = asyncio.Event(), asyncio.Event()
+    executed, taken = [], []
+    human = 'also check the staging logs'
+
+    async def turn(event, source, quick_key, run_generation):
+        executed.append(event.text)
+        if event.text == 'A':
+            running.set()
+            await asyncio.wait_for(boundary.wait(), 30)
+            taken.append(_boundary(agent))
+        captured = execution_result.get()
+        if captured is not None:
+            captured['result'] = {'final_response': 'reply ' + event.text, 'messages': []}
+        return 'reply ' + event.text
+    monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
+
+    loop, read_taken, release = asyncio.get_running_loop(), asyncio.Event(), threading.Event()
+    real_list, held = session_busy_ingress.list_session_admissions, []
+
+    def listing(*args, **kwargs):  # the pass's first read after adoption: its snapshot, then held in flight
+        rows = real_list(*args, **kwargs)
+        if not held:
+            held.append(rows)
+            loop.call_soon_threadsafe(read_taken.set)
+            release.wait(30)
+        return rows
+
+    def row_b():
+        return next((r for r in _rows(authority, runner, key) if r['payload'].get('text') == human), None)
+
+    await adapter.handle_message(MessageEvent(text='A', source=source, message_id='A'))
+    await asyncio.wait_for(running.wait(), 30)
+    monkeypatch.setattr(session_busy_ingress, 'list_session_admissions', listing)
+    sid = runner.session_store.peek_session_id(key)
+    authority.adopt_agent(sid, authority.executing[sid], agent)  # the runner still shows the sentinel
+    await asyncio.wait_for(read_taken.wait(), 10)
+    await adapter.handle_message(MessageEvent(text=human, source=source, message_id='B'))
+    live = authority.sessions[sid]
+    assert row_b()['status'] == 'queued' and row_b()['admission_id'] in live.adoption_steers, 'B marked'
+    assert all(r['payload'].get('text') != human for r in held[0]), 'the in-flight read predates B'
+    release.set()
+    await async_wait_until(lambda: (row_b()['status'], row_b()['outcome']) == ('terminal', 'steering'),
+                           timeout=10, what='the rerun to take B')
+    boundary.set()
+    await async_wait_until(lambda: row_b()['outcome'] in ('steered', 'completed') and not runner._is_session_running(key),
+                           timeout=15, what='B to settle')
+    assert executed == ['A'] and row_b()['outcome'] == 'steered'
+    [content] = taken
+    assert human in content and USER_MARKER in content
