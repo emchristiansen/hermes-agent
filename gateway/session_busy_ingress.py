@@ -32,7 +32,10 @@ async def is_message(authority, ref, row):
         return True
     payload = row['payload']
     text = payload.get('text')
-    if row['status'] != 'queued' or automation(payload) is None or not isinstance(text, str) or not text.strip():
+    live = authority.sessions.get(ref.session_id)
+    marked = live is not None and row['admission_id'] in live.adoption_steers  # plain user text, pre-adoption
+    if (row['status'] != 'queued' or (automation(payload) is None and not marked)
+            or not isinstance(text, str) or not text.strip()):
         return False
     try:  # the drain's own route check for the row: never misrouted
         if 'local_automation_v1' in payload:
@@ -77,6 +80,9 @@ async def _pass(authority, ref, live):
         if agent is None or ref.session_id in getattr(authority, '_managed_workers', {}):
             return  # idle (the drain runs them), no agent yet (adoption runs this again), or a managed worker
         rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=ref.session_id)
+        # A mark goes only on evidence about its own row (claimed by the drain, or handed to a transfer):
+        # this read may predate an admission whose mark was recorded while it was in flight.
+        live.adoption_steers -= {row['admission_id'] for row in rows if row['status'] != 'queued'}
         for row in rows:
             if row['status'] != 'queued' or not await is_message(authority, ref, row):
                 continue
@@ -86,6 +92,7 @@ async def _pass(authority, ref, live):
                 # queued waits for the next owner, as the drain makes it.
                 return
             try:
+                live.adoption_steers.discard(row['admission_id'])
                 await transfer(authority, ref, row, generation)
             except RuntimeStoreError as exc:
                 if exc.reason == 'admission_started':

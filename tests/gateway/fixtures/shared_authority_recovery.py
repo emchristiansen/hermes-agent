@@ -52,8 +52,8 @@ async def prepare_crash(runner, adapter, source, peer):
     await adapter.handle_message(MessageEvent(text='BLOCK_FIFO_CRASH', source=source, message_id='crash-started'))
     assert await asyncio.to_thread(peer.blocked.wait, 5)
     sid = authority.register(source).session_id
-    follower = asyncio.create_task(adapter.handle_message(MessageEvent(
-        text='UNKNOWN_FOLLOWER', source=source, message_id='unknown-follower')))
+    follower = asyncio.create_task(adapter.handle_message(MessageEvent(  # explicit: plain text would steer
+        text='/queue UNKNOWN_FOLLOWER', source=source, message_id='unknown-follower')))
     await async_wait_until(lambda: any(r['request_id'] == 'unknown-follower' for r in rows(authority, sid)),
                            timeout=5, what='unknown-follower committed')
     # The receive coroutine is released at durable commit (serial IRC/Signal loops keep
