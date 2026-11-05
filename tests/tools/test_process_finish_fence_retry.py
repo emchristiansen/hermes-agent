@@ -15,10 +15,8 @@ from hermes_cli.active_sessions import _FileLock
 from tools.process_registry import ProcessRegistry, ProcessSession
 from tools.process_registry_results import load_result_record
 
-_POSIX_PTY = pytest.mark.skipif(sys.platform == "win32", reason="POSIX PTY")
 
-
-@_POSIX_PTY
+@pytest.mark.platforms("posix")  # a real POSIX PTY
 @pytest.mark.parametrize("fence", ["fails", "healthy", "heals"])
 def test_a_kill_during_the_readers_finish_leaves_one_result_and_a_closed_pty(monkeypatch, fence):
     """``fails``: the reader's fence entry fails after the kill claimed the completion. ``healthy``: it
