@@ -55,8 +55,9 @@ _HANDLES_PER_PATH_WARN = 4
 # So the read pool also yields when the PROCESS is close to its limit, whatever is consuming it.
 _FD_HEADROOM_RESERVE = 64
 
-# The fd count is a directory listing; cache it briefly so a read burst isn't a
-# syscall per query (staleness lets through at most the ceiling's worth of opens).
+# The fd count is a stat (a directory listing where the kernel cannot size it); cache it
+# briefly so a read burst isn't a syscall per query (staleness lets through at most the
+# ceiling's worth of opens).
 _FD_USAGE_CACHE_SECONDS = 0.25
 
 _process_read_permits = threading.BoundedSemaphore(_READ_POOL_PROCESS_MAX)
@@ -83,7 +84,19 @@ def _proc_fd_targets(pid: int) -> Iterator[tuple[str, str]]:
 
 def _open_fd_count() -> Optional[int]:
     """Open descriptors in THIS process; None when unmeasurable (Windows: no fd
-    dir, correctly inert); -1 when the probe itself hit EMFILE/ENFILE (no headroom)."""
+    dir, correctly inert); -1 when the probe itself hit EMFILE/ENFILE (no headroom).
+
+    Linux (6.2+) reports the count as the size of /proc/self/fd: one stat, which needs no
+    descriptor of its own. Listing the directory instead hands the GIL off once per entry, so
+    beside CPU-bound threads a ~1,200-descriptor gateway spent seconds per count, and every
+    read open queued behind it (its event loop included). Older kernels report size 0 and
+    other platforms have no such file; both fall through to the listing."""
+    try:
+        size = os.stat("/proc/self/fd").st_size
+    except OSError:
+        size = 0
+    if size > 0:
+        return size
     for fd_dir in ("/proc/self/fd", "/dev/fd"):
         try:
             return len(os.listdir(fd_dir))
