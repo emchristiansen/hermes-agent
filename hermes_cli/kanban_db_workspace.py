@@ -121,20 +121,30 @@ def _conn_uses_path(
     return False
 
 
-def _json_pid_sql(column: str) -> str:
-    return f"(CASE WHEN json_valid({column}) THEN json_extract({column}, '$.pid') END)"
+def _json_field_sql(column: str, field: str) -> str:
+    return f"(CASE WHEN json_valid({column}) THEN json_extract({column}, '$.{field}') END)"
 
 
-# A ``worker_bound`` event (alias ``e``) whose interpreter has not recorded its ``worker_result``:
-# that worker's turns may still be running in the card's workspace. ``_record_worker_result``
-# writes the result (same run, same pid) before it runs its own deferred cleanup, so a finished
-# worker never counts. Every such binding counts, not only a card's latest: after a review
-# handoff (``request_review`` then ``claim_review_task``) or a re-dispatch, an earlier run's
-# worker can still be in its turn while a later run's worker binds and finishes.
+# Marks a ``worker_result`` that someone other than the bound interpreter recorded on its behalf:
+# the replacement owner's restart accounting (``gateway.session_kanban.record_owner_restart_result``,
+# exit 79) carries the bound pid but the recording owner's pid under this key.
+OWNER_RECORDED_RESULT_KEY = "recorded_by_owner_pid"
+
+# A ``worker_bound`` event (alias ``e``) whose interpreter has not itself recorded its
+# ``worker_result``: that worker's turns may still be running in the card's workspace. Only the
+# interpreter's own result (``_record_worker_result``: same run, same pid, written before it runs
+# its own deferred cleanup) says it has stopped using the workspace. An owner's accounting result
+# (``OWNER_RECORDED_RESULT_KEY``) settles the attempt, not the workspace: the interpreter may
+# outlive its owner (a tool in flight gets a grace period after owner-pipe EOF), so such a binding
+# stays open and :func:`_binding_may_be_live` decides from the process itself. Every unfinished
+# binding counts, not only a card's latest: after a review handoff (``request_review`` then
+# ``claim_review_task``) or a re-dispatch, an earlier run's worker can still be in its turn while a
+# later run's worker binds and finishes.
 _UNFINISHED_BINDING_SQL = (
     "e.kind = 'worker_bound' AND NOT EXISTS (SELECT 1 FROM task_events r "
     "    WHERE r.task_id = e.task_id AND r.run_id IS e.run_id AND r.kind = 'worker_result' "
-    f"    AND r.id > e.id AND {_json_pid_sql('r.payload')} = {_json_pid_sql('e.payload')})"
+    f"    AND r.id > e.id AND {_json_field_sql('r.payload', 'pid')} = {_json_field_sql('e.payload', 'pid')} "
+    f"    AND {_json_field_sql('r.payload', OWNER_RECORDED_RESULT_KEY)} IS NULL)"
 )
 _OPEN_BINDINGS_SQL = (
     "SELECT t.id, t.workspace_path, e.payload FROM task_events e JOIN tasks t ON t.id = e.task_id "
