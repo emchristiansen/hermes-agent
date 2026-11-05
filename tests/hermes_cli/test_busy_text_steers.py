@@ -1,15 +1,16 @@
 """Messages reaching the classic CLI while a turn runs steer into that turn (Eric, 2026-11-04).
 
 "I want literally every message to always be a steering message." A spoken transcript is the user's
-message: it takes the Enter path's busy routing. A process notice or subagent result that lands while the
-turn runs reaches it at once, framed as Hermes automation's, never the user's (the gateway's busy pass
-does the same for its admitted notices). Only what nothing running takes waits for the next turn, as it
-did. Explicit choices stay what they were: ``/queue`` and Tab ask for the next turn, a barge-in is the
-interrupt control whose transcript is its redirect, and stop/admin commands stay commands.
+message: it takes the Enter path's busy routing. Only what nothing running takes waits for the next turn,
+as it did. Explicit choices stay what they were: ``/queue`` and Tab ask for the next turn, a barge-in is
+the interrupt control whose transcript is its redirect, and stop/admin commands stay commands.
+
+Process notices and subagent results are not the CLI's to steer: the classic CLI is gateway-backed, the
+gateway admits them and its busy pass steers them; the CLI's busy monitor never reads the gateway event
+stream its running turn pumps.
 
 Real ``HermesCLI`` entry points (``_cmd_queue``, the Tab key binding, the voice transcribe handlers, the
-turn's monitor loop and the notification drain); the running agent is the real steer seam
-(``BufferedAgent``) and its boundary the canonical ``apply_pending_steer_to_tool_results``.
+turn's monitor loop); the running agent is a recording ``steer`` seam.
 """
 
 import queue
@@ -19,12 +20,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.agent_runtime_helpers import apply_pending_steer_to_tool_results
 from cli import HermesCLI, _VoiceInputMessage
-from tests.gateway.test_prompt_queued_transfer import BufferedAgent
-from tools.process_registry_notifications import format_process_notification
-
-AUTOMATION_MARKER = "[DELIVERED MESSAGE — from Hermes automation"
 
 
 class _Agent:
@@ -54,12 +50,6 @@ def _drain(q):
     while not q.empty():
         items.append(q.get_nowait())
     return items
-
-
-def _boundary(agent):
-    messages = [{"role": "assistant", "tool_calls": []}, {"role": "tool", "content": "fixture result"}]
-    apply_pending_steer_to_tool_results(agent, messages, 1)
-    return messages[-1]["content"] if messages[-1]["role"] == "user" else None
 
 
 # --- explicit next-turn choices stay next-turn ------------------------------------------------------
@@ -171,6 +161,22 @@ def test_a_spoken_message_the_turn_rejects_keeps_its_voice_form_for_the_next_tur
     assert isinstance(queued, _VoiceInputMessage) and queued.text == "check the logs too"
 
 
+@_transcribed("check the logs too")
+def test_on_a_gateway_session_a_refused_spoken_message_stays_the_next_voice_turn(*_mocks):
+    """The classic CLI is gateway-backed: a refused steer never becomes a plain-text ``/queue`` admission."""
+    from hermes_cli.gateway_session_store import GatewaySessionStore
+    store = GatewaySessionStore.__new__(GatewaySessionStore)
+    enqueued = []
+    c = _recorded(_Agent(accepts=False), session_id="s1", _session_db=store)
+    c._queue_enqueue = enqueued.append
+
+    c._voice_stop_and_transcribe()
+
+    assert enqueued == []
+    [queued] = _drain(c._pending_input)
+    assert isinstance(queued, _VoiceInputMessage) and queued.text == "check the logs too"
+
+
 @_transcribed("check the logs")
 def test_a_spoken_message_while_idle_starts_the_next_turn(*_mocks):
     c = _recorded(None, _agent_running=False)
@@ -198,87 +204,44 @@ def test_a_barge_in_stays_the_interrupt_controls_redirect(tmp_path, monkeypatch)
     assert isinstance(queued, _VoiceInputMessage) and queued.text == "do it differently"
 
 
-# --- process notices and subagent results ---------------------------------------------------------
+# --- the gateway-backed turn's event stream -------------------------------------------------------
 
-def _completion(sid="proc_1"):
-    return {"type": "completion", "session_id": sid, "session_key": "cli-session", "command": "bash build.sh",
-            "exit_code": 0, "completion_reason": "exited", "output": "build ok"}
+def test_the_busy_monitor_never_takes_the_running_turns_gateway_frames(monkeypatch):
+    """The turn's ``GatewayAgent`` pumps ``connection.events``: while it runs, the monitor loop leaves every
+    frame there (``queue_admitted_turn`` is the idle tick's reader, never the busy loop's)."""
+    from hermes_cli.gateway_connection import SessionState
+    from hermes_cli.gateway_session_store import GatewaySessionStore
+    store = GatewaySessionStore.__new__(GatewaySessionStore)
+    states = {}
+    store.connection = SimpleNamespace(events=queue.Queue(), state=lambda sid: states.setdefault(sid, SessionState(sid)))
+    frame = {"method": "event", "params": {"session_id": "s1", "type": "message.delta", "payload": {"text": "hi"}}}
+    store.connection.events.put(frame)
+    c = _busy_cli(_Agent(), session_id="s1", _session_db=store, _voice_mode=False, _clarify_state=None,
+                  _clarify_freetext=None)
+    ticks, enough = [], threading.Event()
 
-
-def _delegation():
-    return {"type": "async_delegation", "delegation_id": "d1", "session_key": "cli-session",
-            "results": [{"status": "completed", "summary": "audit done", "goal": "audit"}]}
-
-
-def _registry(monkeypatch, events):
-    """The process registry, handing each event out once."""
-    from tools.process_registry_notifications import format_process_notification as fmt
-    pending = list(events)
-
-    def drain_notifications(**_kw):
-        out = [(event, fmt(event)) for event in pending]
-        pending.clear()
-        return out
-    monkeypatch.setattr("tools.process_registry.process_registry", SimpleNamespace(
-        drain_notifications=drain_notifications, completion_queue=queue.Queue(), is_completion_consumed=lambda sid: False))
-    monkeypatch.setattr("tools.async_delegation.claim_event_delivery", lambda *a: "claimed")
-    monkeypatch.setattr("tools.async_delegation.complete_event_delivery", lambda *a: None)
-    monkeypatch.setattr("cli.CLI_CONFIG", {"display": {}})
-
-
-@pytest.mark.parametrize("event", [_completion(), _delegation()], ids=["process", "subagent"])
-def test_a_notice_landing_while_a_turn_runs_reaches_that_turn_as_automations(monkeypatch, event):
-    """Through the turn's own monitor loop: the notice is drained while the agent thread runs, and the
-    turn takes it at its next boundary in the Hermes-automation frame."""
-    _registry(monkeypatch, [event])
-    agent, steered = BufferedAgent(), threading.Event()
-    steer = agent.steer
-    agent.steer = lambda *a, **k: (steer(*a, **k), steered.set())[0]
-    c = _busy_cli(agent, session_id="cli-session", _voice_mode=False, _clarify_state=None, _clarify_freetext=None)
-    monkeypatch.setattr(HermesCLI, "_invalidate", lambda self, min_interval=0: None)
-    thread = threading.Thread(target=lambda: steered.wait(10), daemon=True)
+    def invalidate(self, min_interval=0):
+        ticks.append(1)
+        if len(ticks) >= 5:
+            enough.set()
+    monkeypatch.setattr(HermesCLI, "_invalidate", invalidate)
+    thread = threading.Thread(target=lambda: enough.wait(30), daemon=True)
     thread.start()
 
     assert c._chat_monitor_agent_thread(SimpleNamespace(), thread) is None
-    content = _boundary(agent)
 
-    assert steered.is_set() and _drain(c._pending_input) == []
-    assert AUTOMATION_MARKER in content and "a direct message from the user" not in content
-    assert format_process_notification(event).strip()[:40] in content
+    assert enough.is_set(), "the monitor loop idled through several polls"
+    assert store.connection.events.get_nowait() is frame and store.connection.events.empty()
 
 
-def test_a_notice_while_idle_is_the_next_turn_as_before(monkeypatch):
-    _registry(monkeypatch, [_completion()])
+def test_a_delivered_steer_the_turn_never_read_becomes_the_next_turn_still_as_its_senders():
+    """A ticketless delivered steer (a legacy wake steered by the gateway's busy handler) left after the
+    turn's last boundary: the finalizer hands it back as the next turn, still framed as delivered."""
+    from tests.gateway.test_prompt_queued_transfer import BufferedAgent
     agent = BufferedAgent()
-    c = _busy_cli(agent, session_id="cli-session", _agent_running=False)
-
-    c._drain_process_notifications("cli-idle")
-
-    assert agent._pending_steer is None
-    assert len(_drain(c._pending_input)) == 1
-
-
-def test_a_notice_no_running_agent_takes_is_the_next_turn(monkeypatch):
-    """A surface agent without the sender-recording seam is never handed a notice as the user's text."""
-    _registry(monkeypatch, [_delegation()])
-    agent = _Agent()
-    c = _busy_cli(agent, session_id="cli-session")
-
-    c._drain_process_notifications("cli-busy")
-
-    assert agent.steered == []
-    [queued] = _drain(c._pending_input)
-    assert queued.display_kind == "async_delegation_complete"
-
-
-def test_a_notice_the_turn_never_read_becomes_the_next_turn_still_as_automations(monkeypatch):
-    """Steered after the turn's last boundary: the finalizer hands it back as the next turn, framed."""
-    _registry(monkeypatch, [_completion()])
-    agent = BufferedAgent()
-    c = _busy_cli(agent, session_id="cli-session")
-    c._drain_process_notifications("cli-busy")
+    agent.steer("[Kanban task completed] t_11", delivered_by={})
 
     leftover = agent._drain_leftover_steer()
 
-    assert leftover.startswith(AUTOMATION_MARKER) and "build ok" in leftover
+    assert leftover.startswith("[DELIVERED MESSAGE — from Hermes automation") and "t_11" in leftover
     assert agent._pending_steer is None
