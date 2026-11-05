@@ -365,8 +365,9 @@ class GatewayConfigLoadersMixin:
         return modes.get(profile_name, fallback) if isinstance(modes, dict) else fallback
 
     def _effective_busy_input_mode(self, source: SessionSource) -> str:
-        """Resolve busy input mode from the routed profile startup snapshot."""
-        return self._effective_busy_mode(source, "_busy_input_mode")
+        """Always ``steer`` (Eric, 2026-11-04: every message steers): a message reaching a busy session
+        goes into its running turn, whatever ``display.busy_input_mode`` a profile still names."""
+        return "steer"
 
     def _effective_busy_text_mode(self, source: SessionSource) -> str:
         """Resolve legacy busy text mode from the routed profile snapshot."""

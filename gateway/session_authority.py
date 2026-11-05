@@ -59,6 +59,9 @@ class LiveSession:
     # Set by ``_schedule`` while a drain is alive. The claim commits off-loop, so input admitted
     # after its transaction read the FIFO would otherwise be stranded by a drain that exits idle.
     rescan: bool = False
+    # The busy steering pass (``session_busy_ingress``): one at a time; a request during it rereads.
+    steering: asyncio.Task | None = None
+    steer_again: bool = False
     # admission id -> its started claim, from the moment the settlement worker starts the terminal
     # write until the completion frame is published. The write runs outside ``event_stream.lock``
     # (a contended SQLite writer must not stall loop-side lock takers); readers holding that lock
@@ -597,6 +600,8 @@ class SessionAuthority:
     def _schedule_admitted(self, ref, _receipt=None):
         # tracked_write's ``after``: in the admitting caller's own step (see tracked_write).
         self._schedule(ref)
+        from gateway.session_busy_ingress import admitted
+        admitted(self, ref)  # a message admitted while a claim runs steers into it
 
     async def recover_native_sessions(self, bindings):
         """Bind only server-observed native routes; unknown work stays paused."""
@@ -962,6 +967,8 @@ class SessionAuthority:
             latched, steers = self.pending_steers.pop(session_id, (None, ()))
             for text in steers if latched == generation else ():
                 agent.steer(text)
+        from gateway.session_busy_ingress import adopted
+        adopted(self, session_id)  # messages admitted before the agent existed steer into it now
 
     def check_approval_generation(self, session_id, generation):
         handle = self._handle(SessionRef(self.profile_id, session_id))

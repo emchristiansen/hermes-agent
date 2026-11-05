@@ -21,6 +21,15 @@ from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _
 from tests.waiting import async_wait_until, wait_until
 
 
+@pytest.fixture(autouse=True)
+def _explicit_controls_only(monkeypatch):
+    """These are the explicit ``prompt.steer_queued``/``replace_queued`` windows. The automatic busy pass
+    (``session_busy_ingress``, covered in ``test_every_message_steers``) writes through the same
+    ``transfer`` and would take each queued row before the control under test runs."""
+    from gateway import session_busy_ingress
+    monkeypatch.setattr(session_busy_ingress, 'steer_soon', lambda *args: None)
+
+
 async def _drained(authority):
     task = authority.sessions['s'].task
     if task is not None:
