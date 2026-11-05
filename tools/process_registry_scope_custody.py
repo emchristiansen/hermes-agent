@@ -9,7 +9,15 @@ the completed-result receipt keeps ``systemd_unit``, so the next interpreter (th
 managed worker, the owner at startup) can still reach the scope. Holding custody never stops
 anything by itself: an explicit kill, ``kill_all`` (the gateway's shutdown sweep among them) or a
 later recovery that finds the scope empty releases it.
+
+Every interpreter of a profile may recover the profile's checkpoint (each managed-worker admission
+does) while another is still finishing one of its commands, so the finish (scope check, receipt,
+checkpoint) and a recovery's decision about the same command (adopt, hold or stop) are each made
+under ``completion_fence``: a recovery acts on the completion that is durable when it acts, and a
+finish that comes after a recovery decided to stop the scope finds it stopped.
 """
+from contextlib import contextmanager
+import json
 import logging
 from pathlib import Path
 import shutil
@@ -57,6 +65,27 @@ def scope_populated(unit: str) -> Optional[bool]:
         return None
 
 
+@contextmanager
+def completion_fence():
+    """The profile's lock ordering a command's durable finish against a recovery's decision about it,
+    across interpreters (``flock``, so across threads too). Never taken while holding the checkpoint
+    lock or a registry lock. Yields False when it could not be taken: a caller then stops nothing."""
+    from hermes_cli.active_sessions import _FileLock
+    from tools.process_registry import _checkpoint_path
+    path = _checkpoint_path()
+    lock = _FileLock(path.with_name(path.name + ".finish.lock"))
+    try:
+        lock.__enter__()
+    except (OSError, RuntimeError) as exc:  # cannot open the lock file / flock refused
+        logger.warning("Process completion fence %s unavailable: %s", lock.path, exc)
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        lock.__exit__(None, None, None)
+
+
 class ProcessScopeCustodyMixin:
     """The subclass supplies ``_lock``, ``_finished``, ``_write_checkpoint``. See ProcessRegistry."""
 
@@ -73,6 +102,15 @@ class ProcessScopeCustodyMixin:
         carry the unit."""
         if session.systemd_unit:
             session._scope_stop_pending = scope_populated(session.systemd_unit) is not False
+
+    def _finish_with_scope(self, session, mark_exited) -> None:
+        """A reader-observed exit: hold the scope if it is populated, record the exit (``mark_exited``,
+        under the session lock) and persist the outcome, as one step against a recovery's decision."""
+        with completion_fence():
+            self._hold_scope_if_populated(session)
+            with session._lock:
+                mark_exited()
+            self._move_to_finished(session)
 
     def _stop_scope(self, session) -> bool:
         """Stop the session's systemd scope: True when it has none or the stop worked. Every kill
@@ -109,6 +147,18 @@ class ProcessScopeCustodyMixin:
             return None
         return {**entry, "scope_custody": True, "systemd_unit": record["systemd_unit"],
                 **{key: record.get(key) for key in ("exit_code", "completion_reason", "termination_source")}}
+
+    def _durable_entry(self, entry: dict) -> Optional[dict]:
+        """``entry`` as what is durable now decides it (call under ``completion_fence``): the on-disk
+        custody entry of the same process if its finish was persisted meanwhile, else its receipt."""
+        from tools.process_registry import _checkpoint_path
+        try:
+            on_disk = json.loads(_checkpoint_path().read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            on_disk = []
+        held = next((e for e in on_disk if isinstance(e, dict) and e.get("session_id") == entry.get("session_id")
+                     and e.get("scope_custody") and e.get("systemd_unit")), None)
+        return self._entry_with_receipt(held or entry)
 
     def _readopt_scope_custody(self, entry: dict) -> bool:
         """Recovery of a ``scope_custody`` checkpoint entry: its command already finished and its

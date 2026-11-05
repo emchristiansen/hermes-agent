@@ -1548,11 +1548,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
     def _finish_exited(self, session: ProcessSession, exit_code, reason: str = "exited", source: str = "") -> None:
         """Mark a reader-observed exit (a raced kill keeps its own code/reason) and finish.
         Under the session lock, like kill_process's commit: otherwise the kill can land between
-        mark_exited's ``killed`` check and its writes, and the reader overwrites the kill."""
-        self._hold_scope_if_populated(session)  # the root's exit does not empty its scope
-        with session._lock:
-            session.mark_exited(exit_code, reason, source)
-        self._move_to_finished(session)
+        mark_exited's ``killed`` check and its writes, and the reader overwrites the kill.
+        The root's exit does not empty its scope (process_registry_scope_custody)."""
+        self._finish_with_scope(session, lambda: session.mark_exited(exit_code, reason, source))
 
     def _move_to_finished(self, session: ProcessSession) -> bool:
         """Move a session from running to finished.
@@ -1982,14 +1980,12 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                         fcntl.fcntl(fd, fcntl.F_SETFL, flags)
             except Exception as e:
                 logger.debug("Non-blocking drain failed for %s: %s", session.id, e)
-        self._hold_scope_if_populated(session)  # the descendant holding the pipe may be in the scope
-        with session._lock:
-            session.mark_exited(rc)
+        # The descendant holding the pipe may be in the scope: held through the finish if populated.
+        self._finish_with_scope(session, lambda: session.mark_exited(rc))
         logger.info(
             "Reconciled session %s: direct child exited with code %s but reader "
             "was still blocked (orphaned pipe). Flipped to exited.",
             session.id, rc)
-        self._move_to_finished(session)
 
     @staticmethod
     def _status_head(session: ProcessSession) -> dict:

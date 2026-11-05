@@ -89,12 +89,8 @@ class ProcessCheckpointMixin:
     def recover_from_checkpoint(self) -> int:
         """On gateway startup, probe PIDs from the checkpoint file; returns how many
         were recovered as detached sessions."""
-        from tools.process_registry import (
-            ProcessSession, _CHECKPOINT_FIELDS, _checkpoint_path,
-            _CHECKPOINT_DEFAULTS, _WATCHER_ROUTE_KEYS, _stop_systemd_unit,
-        )
-        from tools.process_registry_output_log import adoptable_log
-        from tools.process_registry_results import forget_result_scope
+        from tools.process_registry import _checkpoint_path
+        from tools.process_registry_scope_custody import completion_fence
 
         checkpoint_path = _checkpoint_path()
         if not checkpoint_path.exists():
@@ -126,7 +122,6 @@ class ProcessCheckpointMixin:
             if (decided := self._entry_with_receipt(entry)) is None:
                 released_scopes.add(entry["session_id"])  # finished, scope released: nothing to do
                 continue
-            entry = decided
             # Alive and still ours: re-attach. A start-time probe that cannot
             # be read is not proof the PID was reused — dropping it would leave
             # a live child unsupervised, and marking it exited would invent a
@@ -134,60 +129,83 @@ class ProcessCheckpointMixin:
             # do not adopt it and do not signal it.
             # A custody entry's command already finished (its receipt is durable): only its scope
             # matters, and its root PID, possibly recycled since, is never consulted or signalled.
-            custody = bool(entry.get("scope_custody"))
-            fate = "gone" if custody else self._detached_host_fate(pid, entry.get("host_start_time"))
-            # A worker spawn's output log and recorded exit outlive both the spawner and the PID,
-            # so its reader decides the outcome (a recycled PID is never signalled: fate != running).
-            log = adoptable_log(entry.get("output_log"))
-            if log and not custody:
-                fate = "running"
-            if fate == "reused":
-                logger.info(
-                    "Not recovering session %s: pid %d is alive but its "
-                    "start time no longer matches — PID was recycled onto "
-                    "an unrelated process; refusing to adopt or signal it.",
-                    entry.get("session_id", "?"), pid)
-                continue
-            if fate != "running":
-                # Descendants of a finished command still run in its scope: keep custody, no stop.
-                if custody and self._readopt_scope_custody(entry):
-                    continue
-                systemd_unit = entry.get("systemd_unit", "")
-                if systemd_unit and not _stop_systemd_unit(systemd_unit):
-                    logger.warning(
-                        "Could not reap persisted scope %s for dead wrapper pid %s; "
-                        "retaining checkpoint entry for the next startup",
-                        systemd_unit, pid)
-                    unresolved_scope_entries.append(entry)
-                elif custody:  # verified empty and reaped: the receipt no longer names the scope
-                    forget_result_scope(entry["session_id"])
+            probed = None if decided.get("scope_custody") else self._detached_host_fate(pid, entry.get("host_start_time"))
+            # The command's owner (another interpreter) may have made its finish durable since that
+            # look: decide, and act, on what is durable now, with no finish landing in between.
+            with completion_fence() as fenced:
+                if (decided := self._durable_entry(decided)) is None:
                     released_scopes.add(entry["session_id"])
-                continue
-            fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
-            fields.update(
-                command=entry.get("command", "unknown"),
-                owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
-                started_at=entry.get("started_at", time.time()))
-            # detached: no Popen handle, but can report status + kill; a worker spawn's output log
-            # (and recorded exit) outlives its spawner, so tail it from the start.
-            fields["output_log"] = log
-            session = ProcessSession(id=entry["session_id"], detached=True, **fields)
-            if session.output_log:
-                self._track_started(session, self._log_reader_loop, f"proc-log-reader-{session.id}")
-            else:
-                with self._lock:
-                    self._running[session.id] = session
-            recovered += 1
-            logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
-            # Re-enqueue watcher so gateway can resume notifications
-            if session.watcher_interval > 0:
-                self.pending_watchers.append({
-                    "session_id": session.id,
-                    "check_interval": session.watcher_interval,
-                    "session_key": session.session_key,
-                    **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS},
-                    "notify_on_complete": session.notify_on_complete,
-                    "parent_session_id": session.parent_session_id,
-                })
+                    continue
+                outcome = self._recover_entry(decided, probed, fenced)
+            if outcome == "adopted":
+                recovered += 1
+            elif outcome == "unresolved":
+                unresolved_scope_entries.append(decided)
+            elif outcome == "released":
+                released_scopes.add(entry["session_id"])
         self._write_checkpoint(extra_entries=unresolved_scope_entries, settled=released_scopes)
         return recovered
+
+    def _recover_entry(self, entry: dict[str, Any], probed: Optional[str], fenced: bool) -> str:
+        """Act on one checkpoint entry as decided under ``completion_fence``; ``probed`` is the root PID's
+        fate (None: not probed). Returns adopted, held, released, unresolved or skipped."""
+        from tools.process_registry import (
+            ProcessSession, _CHECKPOINT_FIELDS, _CHECKPOINT_DEFAULTS, _WATCHER_ROUTE_KEYS, _stop_systemd_unit,
+        )
+        from tools.process_registry_output_log import adoptable_log
+        from tools.process_registry_results import forget_result_scope
+        pid, custody = entry.get("pid"), bool(entry.get("scope_custody"))
+        fate = "gone" if custody else probed
+        # A worker spawn's output log and recorded exit outlive both the spawner and the PID,
+        # so its reader decides the outcome (a recycled PID is never signalled: fate != running).
+        log = adoptable_log(entry.get("output_log"))
+        if log and not custody:
+            fate = "running"
+        if fate == "reused":
+            logger.info(
+                "Not recovering session %s: pid %d is alive but its "
+                "start time no longer matches — PID was recycled onto "
+                "an unrelated process; refusing to adopt or signal it.",
+                entry.get("session_id", "?"), pid)
+            return "skipped"
+        if fate != "running":
+            # Descendants of a finished command still run in its scope: keep custody, no stop.
+            if custody and self._readopt_scope_custody(entry):
+                return "held"
+            systemd_unit = entry.get("systemd_unit", "")
+            if systemd_unit and not (fenced and _stop_systemd_unit(systemd_unit)):
+                logger.warning(
+                    "Could not reap persisted scope %s for dead wrapper pid %s; "
+                    "retaining checkpoint entry for the next startup",
+                    systemd_unit, pid)
+                return "unresolved"
+            if custody:  # verified empty and reaped: the receipt no longer names the scope
+                forget_result_scope(entry["session_id"])
+                return "released"
+            return "skipped"
+        fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
+        fields.update(
+            command=entry.get("command", "unknown"),
+            owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
+            started_at=entry.get("started_at", time.time()))
+        # detached: no Popen handle, but can report status + kill; a worker spawn's output log
+        # (and recorded exit) outlives its spawner, so tail it from the start.
+        fields["output_log"] = log
+        session = ProcessSession(id=entry["session_id"], detached=True, **fields)
+        if session.output_log:
+            self._track_started(session, self._log_reader_loop, f"proc-log-reader-{session.id}")
+        else:
+            with self._lock:
+                self._running[session.id] = session
+        logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
+        # Re-enqueue watcher so gateway can resume notifications
+        if session.watcher_interval > 0:
+            self.pending_watchers.append({
+                "session_id": session.id,
+                "check_interval": session.watcher_interval,
+                "session_key": session.session_key,
+                **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS},
+                "notify_on_complete": session.notify_on_complete,
+                "parent_session_id": session.parent_session_id,
+            })
+        return "adopted"
