@@ -174,3 +174,138 @@ def test_retarget_between_the_verdict_and_the_read_cannot_split_files_from_autho
         (".hermes", {LAUNCH_ONLY_KEY: LAUNCH_ONLY_VALUE, "GATEWAY_ALLOW_ALL_USERS": "true"}),
         ("served", {}),
     ], (scope["PROFILE_MARKER"], authority)
+
+
+# --- Without a directory descriptor (review t_983c1ee8 run 2525, SCOPE-FALLBACK-01) -------------
+#
+# Where no directory descriptor is available (no ``dir_fd`` support, e.g. Windows; or a home that
+# refuses one on a platform without O_PATH) ``.env`` is read by path. 7bcce995 then took the
+# launch-home verdict from a path resolution made AFTER the read: read the served home's ``.env``
+# through S, retarget S to the launch home, and the served files came back with the launch env's
+# credential and the allow-all grant. Each case forces that branch explicitly.
+
+
+@pytest.fixture(params=["no-dirfd", "dirfd-refused"])
+def path_read(request, monkeypatch):
+    """Force the no-descriptor branch: no ``dir_fd`` support, or the home refusing the descriptor."""
+    if request.param == "no-dirfd":
+        monkeypatch.setattr(ss, "_HOME_DIR_FD", False)
+    else:
+        real_open = os.open
+
+        def refusing_open(path, flags, *args, **kwargs):
+            if flags == ss._HOME_DIR_FLAGS and "dir_fd" not in kwargs:
+                raise PermissionError(13, "Permission denied", os.fspath(path))
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", refusing_open)
+    return request.param
+
+
+def _on_env_open(monkeypatch, before=None, after=None):
+    """Run *before*/*after* around the FIRST open of a ``.env`` by the scope builder, whichever
+    reader it goes through; returns the list that records that it happened."""
+    import builtins
+    real_open = builtins.open
+    fired = []
+
+    def hooked(file, *args, **kwargs):
+        if fired or not os.fspath(file).endswith(".env"):
+            return real_open(file, *args, **kwargs)
+        fired.append(os.fspath(file))
+        if before:
+            before()
+        handle = real_open(file, *args, **kwargs)
+        if after:
+            after()
+        return handle
+
+    monkeypatch.setattr(ss, "open", hooked, raising=False)
+    return fired
+
+
+def _authority(scope) -> tuple[str | None, dict[str, str], str]:
+    """(marker, launch-only keys in the mapping, allow-all gate as a turn bound to it reads it)."""
+    from gateway.platforms._shared import platform_gate_env
+    held = {k: scope[k] for k in (LAUNCH_ONLY_KEY, "GATEWAY_ALLOW_ALL_USERS") if k in scope}
+    token = ss.set_secret_scope(scope, profile_home="/bound-by-test")
+    try:
+        return scope.get("PROFILE_MARKER"), held, platform_gate_env("GATEWAY_ALLOW_ALL_USERS")
+    finally:
+        ss.reset_secret_scope(token)
+
+
+_LAUNCH_AUTHORITY = {LAUNCH_ONLY_KEY: LAUNCH_ONLY_VALUE, "GATEWAY_ALLOW_ALL_USERS": "true"}
+
+
+def test_path_read_of_a_served_home_then_retarget_to_launch_gains_no_launch_authority(
+        world, tmp_path, monkeypatch, path_read):
+    """The reviewer's witness: S names the served home while its ``.env`` is read, then S is
+    retargeted to the launch home before any later identity check."""
+    from tui_gateway.launch_profile_policy import owner_secret_scope
+
+    launch, served = world
+    _activate_with_bridged_allow_all()
+    alias = tmp_path / "alias"
+    alias.symlink_to(served, target_is_directory=True)
+    fired = _on_env_open(monkeypatch, after=lambda: _retarget(alias, launch))
+    scope = owner_secret_scope(alias)
+    assert fired == [str(alias / ".env")]
+    assert _authority(scope) == ("served", {}, ""), "served files + launch authority"
+
+
+def test_path_read_of_another_homes_env_between_two_launch_resolutions_gains_none(
+        world, tmp_path, monkeypatch, path_read):
+    """S names the launch home before and after the read, but the ``.env`` opened was the served
+    home's: agreement of two resolutions is not enough, the file read must be the launch one."""
+    from tui_gateway.launch_profile_policy import owner_secret_scope
+
+    launch, served = world
+    _activate_with_bridged_allow_all()
+    alias = tmp_path / "alias"
+    alias.symlink_to(launch, target_is_directory=True)
+    fired = _on_env_open(monkeypatch, before=lambda: _retarget(alias, served),
+                         after=lambda: _retarget(alias, launch))
+    scope = owner_secret_scope(alias)
+    assert fired
+    assert _authority(scope) == ("served", {}, ""), "served files + launch authority"
+
+
+def test_path_read_of_the_launch_home_then_retarget_away_is_never_mixed(
+        world, tmp_path, monkeypatch, path_read):
+    from tui_gateway.launch_profile_policy import owner_secret_scope
+
+    launch, served = world
+    _activate_with_bridged_allow_all()
+    alias = tmp_path / "alias"
+    alias.symlink_to(launch, target_is_directory=True)
+    fired = _on_env_open(monkeypatch, after=lambda: _retarget(alias, served))
+    scope = owner_secret_scope(alias)
+    assert fired
+    # Launch files with launch authority, or (failing closed) without it; never another mix.
+    assert _authority(scope) in [(".hermes", _LAUNCH_AUTHORITY, "true"), (".hermes", {}, "")]
+
+
+def test_path_read_keeps_launch_authority_for_the_launch_home_and_only_it(world, tmp_path, path_read):
+    from tui_gateway.launch_profile_policy import owner_secret_scope
+
+    launch, served = world
+    _activate_with_bridged_allow_all()
+    alias = tmp_path / "launch-alias"
+    alias.symlink_to(launch, target_is_directory=True)
+    for home in (launch, alias):
+        assert _authority(owner_secret_scope(home)) == (".hermes", _LAUNCH_AUTHORITY, "true")
+    assert _authority(owner_secret_scope(served)) == ("served", {}, "")
+    (launch / ".env").unlink()  # a launch home with no .env keeps its env-only credentials
+    assert _authority(owner_secret_scope(launch)) == (None, _LAUNCH_AUTHORITY, "true")
+
+
+def test_launch_home_not_created_yet_keeps_its_launch_credentials(tmp_path, monkeypatch, world):
+    from tui_gateway.launch_profile_policy import owner_secret_scope
+
+    _launch, served = world
+    missing = tmp_path / "not-created" / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(missing))
+    hermes_constants.reset_hermes_home_key_cache()
+    assert owner_secret_scope(missing).get(LAUNCH_ONLY_KEY) == LAUNCH_ONLY_VALUE
+    assert LAUNCH_ONLY_KEY not in owner_secret_scope(served)

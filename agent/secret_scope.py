@@ -387,11 +387,19 @@ def read_env_file(env_path: Path, *, dir_fd: Optional[int] = None) -> dict[str, 
     *dir_fd*: an open descriptor of ``env_path.parent``; the file is opened by name relative to
     that directory, so its bytes come from the directory the caller already identified even if a
     path component is retargeted meanwhile (see :func:`_read_profile_home`)."""
+    return _read_env_file(env_path, dir_fd)[0]
+
+
+def _read_env_file(env_path: Path, dir_fd: Optional[int] = None, *,
+                   want_stat: bool = False) -> tuple[dict[str, str], Optional[os.stat_result]]:
+    """:func:`read_env_file`, plus (*want_stat*) the ``fstat`` of the file the bytes were read from,
+    so a caller can name the exact file that supplied them (:func:`_path_read_profile_home`)."""
     key = str(env_path)
     opener = None if dir_fd is None else (lambda name, flags: os.open(name, flags, dir_fd=dir_fd))
     try:
         with open(env_path.name if dir_fd is not None else env_path, "rb", buffering=0, opener=opener) as handle:
             raw = handle.read()
+            file_stat = os.fstat(handle.fileno()) if want_stat else None
     except OSError:
         # Gone or unreadable: drop any entry so a stale map cannot outlive the file.
         invalidate_env_file_cache(env_path)
@@ -401,14 +409,14 @@ def read_env_file(env_path: Path, *, dir_fd: Optional[int] = None) -> dict[str, 
         cached = _ENV_FILE_CACHE.get(key)
         if cached is not None and cached[0] == raw:
             _ENV_FILE_CACHE.move_to_end(key)
-            return dict(cached[1])
+            return dict(cached[1]), file_stat
     secrets = _parse_env_text(_decode_env_bytes(raw))
     with _ENV_FILE_CACHE_LOCK:
         _ENV_FILE_CACHE[key] = (raw, dict(secrets))
         _ENV_FILE_CACHE.move_to_end(key)
         while len(_ENV_FILE_CACHE) > _ENV_FILE_CACHE_MAX:
             _ENV_FILE_CACHE.popitem(last=False)
-    return secrets
+    return secrets, file_stat
 
 
 class _ProfileHomeRead(NamedTuple):
@@ -436,6 +444,40 @@ def _same_directory(home_stat: os.stat_result) -> bool:
     return (home_stat.st_dev, home_stat.st_ino) == (launch.st_dev, launch.st_ino)
 
 
+def _is_launch_env_file(env_stat: Optional[os.stat_result]) -> bool:
+    """Is *env_stat* (the ``fstat`` of a ``.env`` just read, or None when none could be read) the
+    launch home's own ``.env`` as its path names it NOW? None matches only a launch home with no
+    ``.env`` at all; anything that cannot be confirmed answers False."""
+    from hermes_constants import get_routing_process_hermes_home
+    try:
+        launch = os.stat(get_routing_process_hermes_home() / ".env")
+    except FileNotFoundError:
+        return env_stat is None
+    except OSError:
+        return False
+    return env_stat is not None and (env_stat.st_dev, env_stat.st_ino) == (launch.st_dev, launch.st_ino)
+
+
+def _path_read_profile_home(home: Path) -> _ProfileHomeRead:
+    """:func:`_read_profile_home` where no directory descriptor is available (no ``dir_fd`` support,
+    or a home that refuses one): ``.env`` is read by path, so no opened directory names its source.
+
+    The launch-home verdict is therefore granted only when it is bound to the bytes actually read:
+    the home resolves to the launch home both BEFORE and AFTER the read, AND the file read is the
+    launch home's own ``.env`` (its ``fstat`` identity equals a fresh stat of ``<launch>/.env``; when
+    no file could be read, the launch home must have none either). Anything else fails closed: the
+    files are returned without launch authority. A path resolved only after the read (92f9d132's
+    order inverted) would pair a file read from one home with whatever the path names next."""
+    env_path = home / ".env"
+    if not _resolved_is_process_home(home):
+        return _ProfileHomeRead(load_env_file(env_path), False)
+    try:
+        env, env_stat = _read_env_file(env_path, want_stat=True)
+    except OSError:
+        env, env_stat = {}, None
+    return _ProfileHomeRead(env, _resolved_is_process_home(home) and _is_launch_env_file(env_stat))
+
+
 def _read_profile_home(hermes_home: Path) -> _ProfileHomeRead:
     """Read ``<home>/.env`` and decide "is this the launch home?" from the SAME opened directory.
 
@@ -444,20 +486,20 @@ def _read_profile_home(hermes_home: Path) -> _ProfileHomeRead:
     is the profile's data. Taking both from one directory descriptor makes the mix that a path
     re-resolved (or a cached identity) could produce unrepresentable: a home path retargeted
     between the two reads, or after an identity was remembered, cannot pair one home's files with
-    another home's authority. A home that cannot be opened has no ``.env`` to read; its verdict
-    falls back to the fresh path comparison so a launch home that does not exist yet keeps its
-    env-only credentials exactly as before; so does a home that refuses the descriptor (no O_PATH),
-    which is read by path as before."""
+    another home's authority. A home that cannot be opened has no ``.env`` to read: a launch home
+    that does not exist yet keeps its env-only credentials as before, but only while its path still
+    names no directory (a retarget landing after the failed open cannot attach them). Without a
+    descriptor (no ``dir_fd`` support, or a home that refuses one) see :func:`_path_read_profile_home`."""
     home = Path(hermes_home)
     if not _HOME_DIR_FD:
-        return _ProfileHomeRead(load_env_file(home / ".env"), _resolved_is_process_home(home))
+        return _path_read_profile_home(home)
     try:
         fd = os.open(home, _HOME_DIR_FLAGS)
     except PermissionError:
-        # Searchable but unreadable home on a platform without O_PATH: read it by path, as before.
-        return _ProfileHomeRead(load_env_file(home / ".env"), _resolved_is_process_home(home))
+        # Searchable but unreadable home on a platform without O_PATH: read it by path.
+        return _path_read_profile_home(home)
     except OSError:
-        return _ProfileHomeRead({}, _resolved_is_process_home(home))
+        return _ProfileHomeRead({}, _resolved_is_process_home(home) and not home.is_dir())
     try:
         home_stat = os.fstat(fd)
         try:
