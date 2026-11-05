@@ -139,8 +139,11 @@ async def _pre_adoption(monkeypatch, schedule):
         assert row_b()['status'] == 'queued' and agent._pending_steer is None, 'the pass read B before its mark'
         release.set()
         await sending
-        await async_wait_until(lambda: (row_b()['status'], row_b()['outcome']) == ('terminal', 'steering'),
-                               timeout=10, what="the admission's own rerun of the pass to take B")
+        # The committed transfer precedes delivery into the agent (interaction review INT-01): A's boundary
+        # waits for B's text in its buffer, not only for the row.
+        await async_wait_until(lambda: (row_b()['status'], row_b()['outcome']) == ('terminal', 'steering')
+                               and human in (agent._pending_steer or ''),
+                               timeout=10, what="the admission's own rerun of the pass to deliver B")
     else:
         await sending
         await async_wait_until(lambda: row_b() is not None, timeout=10, what='B admitted')
@@ -475,8 +478,8 @@ async def test_a_mark_recorded_while_an_older_queue_read_is_in_flight_survives_i
     assert row_b()['status'] == 'queued' and row_b()['admission_id'] in live.adoption_steers, 'B marked'
     assert all(r['payload'].get('text') != human for r in held[0]), 'the in-flight read predates B'
     release.set()
-    await async_wait_until(lambda: (row_b()['status'], row_b()['outcome']) == ('terminal', 'steering'),
-                           timeout=10, what='the rerun to take B')
+    await async_wait_until(lambda: (row_b()['status'], row_b()['outcome']) == ('terminal', 'steering')
+                           and human in (agent._pending_steer or ''), timeout=10, what='the rerun to deliver B')
     boundary.set()
     await async_wait_until(lambda: row_b()['outcome'] in ('steered', 'completed') and not runner._is_session_running(key),
                            timeout=15, what='B to settle')
@@ -544,6 +547,8 @@ async def test_a_human_message_whose_admission_hook_spans_adoption_steers_into_t
     await _pass(authority, SessionRef(authority.profile_id, sid), live)  # the adoption's own pass, settled
     if live.steering:
         await live.steering
+    if hook_result is None:
+        await async_wait_until(lambda: 'B' in (agent._pending_steer or ''), timeout=10, what='B delivered to A')
     boundary.set()
     await async_wait_until(lambda: not runner._is_session_running(key)
                            and all(r['status'] == 'terminal' for r in _rows(authority, runner, key)),
