@@ -7,7 +7,9 @@ exactly these calls: ``secret_scope._is_process_home`` -> ``Path.resolve`` (1.75
 ``build_profile_terminal_scope`` -> ``load_env_file`` (1.38 s).
 
 The contract under test, counted rather than timed:
-- a warm entry walks no home path (no ``lstat``): home identity comes from ``hermes_home_key``;
+- a warm entry walks no home path (no ``lstat``): the launch-home verdict is the inode of the
+  directory the ``.env`` was read from, compared with one stat of the launch home (never a
+  remembered resolution: see test_profile_scope_identity_binding.py);
 - the profile ``.env`` is opened once for the secret scope and once for the terminal policy, not a
   third time for a separate exists()/read probe;
 - neither shortcut weakens freshness or scoping: an edited ``.env`` (even same-size inside one
@@ -81,22 +83,29 @@ def _hermes_caller() -> bool:
 
 
 def _count_fs_ops(monkeypatch, env_path: Path) -> Counter:
-    """Count the path walks (``lstat``), stats and opens of *env_path* Hermes makes on this thread."""
+    """Count the path walks (``lstat``), stats, fstats and opens Hermes makes on this thread; opens
+    of *env_path* (by path, or by name relative to its home's descriptor) and of its home directory
+    are also counted on their own."""
     counts: Counter = Counter()
     me = threading.get_ident()
-    target = os.fspath(env_path)
+    target, home = os.fspath(env_path), os.fspath(env_path.parent)
 
     def spy(name, real):
         def wrapper(*args, **kwargs):
             if threading.get_ident() == me and _hermes_caller():
                 counts[name] += 1
-                if name == "open" and args and os.fspath(args[0]) == target:
+                opened = os.fspath(args[0]) if name in ("open", "os.open") and args else None
+                if name == "open" and opened in (target, ".env"):  # its opener is the os.open below
                     counts["open .env"] += 1
+                elif name == "os.open" and opened == home:
+                    counts["open home dir"] += 1
             return real(*args, **kwargs)
         return wrapper
 
     monkeypatch.setattr(os, "lstat", spy("lstat", os.lstat))
     monkeypatch.setattr(os, "stat", spy("stat", os.stat))
+    monkeypatch.setattr(os, "fstat", spy("fstat", os.fstat))
+    monkeypatch.setattr(os, "open", spy("os.open", os.open))
     monkeypatch.setattr(builtins, "open", spy("open", builtins.open))
     monkeypatch.setattr(io, "open", spy("open", io.open))
     return counts
@@ -113,10 +122,17 @@ def test_warm_scope_entry_walks_no_home_path_and_opens_the_env_twice(homes, monk
     monkeypatch.undo()
 
     per_entry = {name: n / entries for name, n in counts.items()}
-    # Before: 16 lstat (two resolve() walks in _is_process_home, one in get_secret_source_values)
+    # 92f9d132: 16+ lstat (two resolve() walks in _is_process_home, one in get_secret_source_values)
     # and 3 opens of the .env (secret scope, terminal exists()/read_bytes() probe, terminal parse).
+    # 0a71c6d1: 0 lstat, 2 .env opens, 2 stat; but its identity was a remembered resolution, which a
+    # retargeted alias turned into another home's authority (test_profile_scope_identity_binding.py).
+    # The identity now costs, per entry: one open + fstat of the home directory the .env is read
+    # relative to, and one stat of the launch home (3 stat in all). Still no path walk. The budget:
     assert per_entry.get("lstat", 0) == 0, per_entry
     assert per_entry.get("open .env", 0) == 2, per_entry
+    assert per_entry.get("open home dir", 0) <= 1, per_entry
+    assert per_entry.get("fstat", 0) <= 1, per_entry
+    assert per_entry.get("stat", 0) <= 3, per_entry
 
 
 def test_edited_env_is_seen_by_the_next_entry_even_same_size_in_one_tick(homes):

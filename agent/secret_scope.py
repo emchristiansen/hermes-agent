@@ -379,13 +379,18 @@ def load_env_file(env_path: Path) -> dict[str, str]:
         return {}
 
 
-def read_env_file(env_path: Path) -> dict[str, str]:
+def read_env_file(env_path: Path, *, dir_fd: Optional[int] = None) -> dict[str, str]:
     """:func:`load_env_file` for a caller that must tell "absent" from "unreadable": the ``OSError``
     of the one open/read propagates (``FileNotFoundError`` when there is no file) instead of
-    collapsing to ``{}``, so a fail-closed reader needs no separate exists()/read probe."""
+    collapsing to ``{}``, so a fail-closed reader needs no separate exists()/read probe.
+
+    *dir_fd*: an open descriptor of ``env_path.parent``; the file is opened by name relative to
+    that directory, so its bytes come from the directory the caller already identified even if a
+    path component is retargeted meanwhile (see :func:`_read_profile_home`)."""
     key = str(env_path)
+    opener = None if dir_fd is None else (lambda name, flags: os.open(name, flags, dir_fd=dir_fd))
     try:
-        with open(env_path, "rb") as handle:
+        with open(env_path.name if dir_fd is not None else env_path, "rb", buffering=0, opener=opener) as handle:
             raw = handle.read()
     except OSError:
         # Gone or unreadable: drop any entry so a stale map cannot outlive the file.
@@ -406,11 +411,94 @@ def read_env_file(env_path: Path) -> dict[str, str]:
     return secrets
 
 
-def build_profile_secret_scope(hermes_home: Path) -> dict[str, str]:
+class _ProfileHomeRead(NamedTuple):
+    """A profile home's ``.env`` mapping and its launch-home verdict, taken from ONE directory."""
+
+    env: dict[str, str]
+    is_process_home: bool
+
+
+# Directory descriptors + ``dir_fd`` opens (POSIX). Elsewhere (Windows) the home is resolved afresh.
+_HOME_DIR_FD = (getattr(os, "O_DIRECTORY", 0) != 0 and os.open in os.supports_dir_fd)
+# O_PATH (Linux) needs only search permission on the home, like reading ``<home>/.env`` by path.
+_HOME_DIR_FLAGS = (getattr(os, "O_PATH", 0) or os.O_RDONLY) | getattr(os, "O_DIRECTORY", 0) | getattr(
+    os, "O_CLOEXEC", 0)
+
+
+def _same_directory(home_stat: os.stat_result) -> bool:
+    """Is the directory *home_stat* describes the launch home? Identity is the inode, so the
+    answer is whatever the launch path names NOW (one stat, no per-component walk)."""
+    from hermes_constants import get_routing_process_hermes_home
+    try:
+        launch = os.stat(get_routing_process_hermes_home())
+    except OSError:
+        return False
+    return (home_stat.st_dev, home_stat.st_ino) == (launch.st_dev, launch.st_ino)
+
+
+def _read_profile_home(hermes_home: Path) -> _ProfileHomeRead:
+    """Read ``<home>/.env`` and decide "is this the launch home?" from the SAME opened directory.
+
+    The verdict grants launch-only authority — the launch env's credentials
+    (``owner_secret_scope``) and the bridged ``allow_all_users`` grant (below) — while the mapping
+    is the profile's data. Taking both from one directory descriptor makes the mix that a path
+    re-resolved (or a cached identity) could produce unrepresentable: a home path retargeted
+    between the two reads, or after an identity was remembered, cannot pair one home's files with
+    another home's authority. A home that cannot be opened has no ``.env`` to read; its verdict
+    falls back to the fresh path comparison so a launch home that does not exist yet keeps its
+    env-only credentials exactly as before; so does a home that refuses the descriptor (no O_PATH),
+    which is read by path as before."""
+    home = Path(hermes_home)
+    if not _HOME_DIR_FD:
+        return _ProfileHomeRead(load_env_file(home / ".env"), _resolved_is_process_home(home))
+    try:
+        fd = os.open(home, _HOME_DIR_FLAGS)
+    except PermissionError:
+        # Searchable but unreadable home on a platform without O_PATH: read it by path, as before.
+        return _ProfileHomeRead(load_env_file(home / ".env"), _resolved_is_process_home(home))
+    except OSError:
+        return _ProfileHomeRead({}, _resolved_is_process_home(home))
+    try:
+        home_stat = os.fstat(fd)
+        try:
+            env = read_env_file(home / ".env", dir_fd=fd)
+        except OSError:
+            env = {}
+    finally:
+        os.close(fd)
+    return _ProfileHomeRead(env, _same_directory(home_stat))
+
+
+class ProfileSecretScope(dict):
+    """:func:`build_profile_secret_scope`'s mapping, carrying the launch-home verdict its files were
+    read under (:func:`_read_profile_home`: one opened directory). Launch-only authority (the launch
+    env's credentials, ``owner_secret_scope``) is added on THIS verdict and no other, so it cannot
+    come from a different identity check than the bytes. Any other mapping (a copy, a merged dict, a
+    test double) carries no verdict and gets no launch authority: see :func:`read_as_launch_home`."""
+
+    __slots__ = ("read_as_launch_home",)
+
+    def __init__(self, secrets: Mapping[str, str], read_as_launch_home: bool):
+        super().__init__(secrets)
+        self.read_as_launch_home = read_as_launch_home
+
+
+def read_as_launch_home(scope: Mapping[str, str]) -> bool:
+    """Were *scope*'s files read from the launch home (as :func:`build_profile_secret_scope` saw it)?
+    False for any mapping that does not carry that producer's verdict."""
+    return isinstance(scope, ProfileSecretScope) and scope.read_as_launch_home is True
+
+
+def build_profile_secret_scope(hermes_home: Path) -> ProfileSecretScope:
     """Build a profile's secret mapping from ``<home>/.env`` plus its external
     secret sources. Global vars are NOT copied in — ``get_secret`` reads those
-    from ``os.environ`` — so the scope holds only profile secrets."""
-    secrets = load_env_file(Path(hermes_home) / ".env")
+    from ``os.environ`` — so the scope holds only profile secrets.
+
+    The result carries the launch-home verdict its ``.env`` was read under
+    (:class:`ProfileSecretScope`); the bridged ``allow_all_users`` grant below and the caller's
+    launch-env layer both use that verdict, never a separate identity check."""
+    home_read = _read_profile_home(Path(hermes_home))
+    secrets = home_read.env
     try:
         from hermes_cli.env_loader import get_secret_source_values
         external_secrets = get_secret_source_values(Path(hermes_home))
@@ -422,7 +510,7 @@ def build_profile_secret_scope(hermes_home: Path) -> dict[str, str]:
     # into that profile's own mapping. A secondary never inherits it (#80099 class).
     from gateway.config_loader import bridged_allow_all_users
     bridged = bridged_allow_all_users()
-    if bridged is not None and _is_process_home(hermes_home):
+    if bridged is not None and home_read.is_process_home:
         secrets.setdefault("GATEWAY_ALLOW_ALL_USERS", bridged)
     # Administrator-managed ``.env`` LAST, with override: the launch process applies it that way
     # (``env_loader._apply_managed_env``) so policy beats a user's own value. Under multiplex
@@ -434,21 +522,32 @@ def build_profile_secret_scope(hermes_home: Path) -> dict[str, str]:
     from hermes_cli.managed_scope import load_managed_env  # fail-open: {} when no managed scope
 
     secrets.update((k, v) for k, v in load_managed_env().items() if not _is_global_env(k))
-    return secrets
+    return ProfileSecretScope(secrets, home_read.is_process_home)
+
+
+def _resolved_is_process_home(hermes_home: Path) -> bool:
+    from hermes_constants import get_routing_process_hermes_home
+    try:
+        return Path(hermes_home).resolve() == get_routing_process_hermes_home().resolve()
+    except OSError:
+        return False
 
 
 def _is_process_home(hermes_home: Path) -> bool:
-    """Is *hermes_home* the profile this process serves as its own? Same launch-home identity as
-    ``serves_routed_profile()``: a host that mirrors a served profile into ``HERMES_HOME`` would
-    otherwise seed the launch profile's bridged allow-all grant into that profile's scope."""
-    from hermes_constants import get_routing_process_hermes_home, hermes_home_key
-    # ``hermes_home_key`` is that identity, remembered per existing home: a fresh resolve() here
-    # walked both paths component by component (one lstat each) on every scope entry, on the
-    # gateway's event loop.
-    try:
-        return hermes_home_key(hermes_home) == hermes_home_key(get_routing_process_hermes_home())
-    except OSError:
-        return False
+    """Is *hermes_home* the profile this process serves as its own, as the filesystem names it NOW?
+    The launch-home identity of ``serves_routed_profile()`` (a host that mirrors a served profile into
+    ``HERMES_HOME`` would otherwise seed the launch profile's bridged allow-all grant into that
+    profile's scope), decided afresh: never a remembered resolution, which a retargeted alias would
+    turn into another home's authority. Directory identity (two stats) where the home exists; the
+    fresh path comparison where it does not. A caller that also reads the home's files takes the
+    verdict from that read instead (:func:`read_as_launch_home` on :func:`build_profile_secret_scope`'s
+    result), so both come from one directory."""
+    if _HOME_DIR_FD:
+        try:
+            return _same_directory(os.stat(hermes_home))
+        except OSError:
+            pass
+    return _resolved_is_process_home(Path(hermes_home))
 
 
 def refresh_installed_secret_scope(hermes_home: Path) -> bool:
