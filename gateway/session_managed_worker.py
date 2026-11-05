@@ -29,6 +29,20 @@ STOP_ACK_SECONDS = 30
 WORKER_POPEN = {'start_new_session': True, 'close_fds': True}
 
 
+def _describe_exit(returncode):
+    """``returncode`` for the loss log: the signal's name when one ended the child, ``running`` when
+    it has not exited yet."""
+    if returncode is None:
+        return 'running'
+    if returncode < 0:
+        import signal
+        try:
+            return f'{returncode} ({signal.Signals(-returncode).name})'
+        except ValueError:
+            return str(returncode)
+    return str(returncode)
+
+
 class ManagedExecutionUnknown(RuntimeError):
     """The committed unknown verdict stops the FIFO without forging failed settlement."""
 
@@ -674,15 +688,19 @@ async def execute_managed(authority, ref, row, policy):
             raise RuntimeStoreError('invalid_worker_frame')
     except (Exception, asyncio.CancelledError) as exc:
         import logging
-        logging.getLogger(__name__).warning('Managed worker lost: %s',
-            exc.reason if isinstance(exc, RuntimeStoreError) else type(exc).__name__)
+        reason = exc.reason if isinstance(exc, RuntimeStoreError) else type(exc).__name__
         if scope is None:
+            logging.getLogger(__name__).warning('Managed worker lost: %s', reason)
             if isinstance(exc, asyncio.CancelledError) or (
                     isinstance(exc, RuntimeStoreError) and exc.reason == 'managed_worker_stopped'):
                 # Stopped before the child ever received its bootstrap: nothing executed, so
                 # this settles like an ordinary interrupted turn (the finally kills the child).
                 return _interrupted_before_bootstrap(authority, row, worker.stop_cause)
             raise
+        # The reserved child's exit status tells its own exit from a kill (a negative code names
+        # the signal). Read without waiting: nothing may delay or cancel the loss write below.
+        logging.getLogger(__name__).warning('Managed worker lost: %s (pid %s, exit %s)', reason,
+            process.pid, _describe_exit(process.poll()))
         from gateway.session_worker_reservation import lose_admission_worker
         from gateway.session_runtime_workers import tracked_write
         await tracked_write(authority, partial(lose_admission_worker, authority, row, scope))

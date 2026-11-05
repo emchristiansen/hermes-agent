@@ -221,8 +221,26 @@ def _watch_submitter(db, run_id):
                 except sqlite3.Error:
                     continue
                 if row and row[0] and row[0] != os.getpid() and not _worker_alive(row[0], row[1]):
-                    os._exit(1)
+                    # Exiting hard prints nothing: say why on stderr (the owner drains it into
+                    # managed-worker.log), or the owner's EOF reads as an unexplained death.
+                    try:
+                        _note_on_stderr(f'kanban run {run_id}: submitter pid {row[0]} exited; ending this bound worker\n')
+                    finally:
+                        os._exit(1)  # whatever the note did
     threading.Thread(target=watch, name='kanban-submitter-watch', daemon=True).start()
+
+
+def _note_on_stderr(text):
+    """Write ``text`` to fd 2, waiting at most a second: a full pipe nobody drains must not hold
+    back the exit that follows."""
+    import os
+
+    def write():
+        with contextlib.suppress(OSError):
+            os.write(2, text.encode())
+    writer = threading.Thread(target=write, name='kanban-submitter-note', daemon=True)
+    writer.start()
+    writer.join(1)
 
 
 def run_worker_turns(agent, frame, history):
