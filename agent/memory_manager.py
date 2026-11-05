@@ -10,6 +10,7 @@ import contextvars
 import inspect
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -40,6 +41,9 @@ _LEGACY_PRE_COMPRESS_API_VERSION = 1
 # blocks interpreter exit.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+# An opted-in provider expires its own operation at the shared deadline; allow its
+# exception handling/formatting to finish without racing the host's thread join.
+_PREFETCH_EPILOGUE_S = 1.0
 # A background provider call (sync_turn / queue_prefetch) running longer than this is treated as
 # stuck. Well above the shutdown drain bound and the prefetch timeout so a slow-but-healthy backend
 # is never counted.
@@ -82,6 +86,24 @@ def _accepts_require_checkpoint(fn: Callable[..., Any]) -> bool:
         return False
     kind = getattr(params.get("require_checkpoint"), "kind", None)
     return _has_var_kwargs(params) or kind in (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+
+
+def _synchronous_prefetch_timeout(provider: MemoryProvider) -> Optional[float]:
+    """Validate the opt-in contract before starting any provider work."""
+    budget = getattr(provider, "prefetch_timeout", None)
+    if budget is None:
+        return None
+    if (type(budget) not in (int, float) or not math.isfinite(budget)
+            or not 0 < budget <= threading.TIMEOUT_MAX - _PREFETCH_EPILOGUE_S):
+        raise ValueError("prefetch_timeout must be positive and fit a finite thread wait, or be None")
+    params = _signature_params(provider.prefetch)
+    parameter = params.get("deadline") if params is not None else None
+    accepts_deadline = parameter is not None and parameter.kind in (
+        inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    )
+    if params is None or not (_has_var_kwargs(params) or accepts_deadline):
+        raise ValueError("prefetch_timeout requires prefetch(..., deadline=...)")
+    return float(budget)
 
 
 # -- Provider egress scrubbing -----------------------------------------------
@@ -211,6 +233,7 @@ class MemoryManager:
         self._tool_to_provider: dict[str, MemoryProvider] = {}
         self._external_prefetch_spill_config: Optional[dict[str, Any]] = None
         self._has_external: bool = False
+        self._prefetch_injected: Optional[set[int]] = None
         timeout = external_prefetch_timeout
         timeout = _EXTERNAL_PREFETCH_TIMEOUT_S if timeout is None else float(timeout)
         if timeout <= 0:
@@ -345,13 +368,18 @@ class MemoryManager:
 
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
         """Merge non-empty prefetch context from all providers (failures are non-fatal)."""
+        self._prefetch_injected = set()
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query or not self._owner_allows("prefetch"):
             return ""
         clean_query = _redact_for_provider(clean_query)
-        parts = self._each_provider(
-            "prefetch failed (non-fatal)", lambda p: self._prefetch_provider(p, clean_query, session_id=session_id),
-        )
+        def prefetch(provider: MemoryProvider) -> str:
+            result = self._prefetch_provider(provider, clean_query, session_id=session_id)
+            if result and result.strip():
+                self._prefetch_injected.add(id(provider))
+            return result
+
+        parts = self._each_provider("prefetch failed (non-fatal)", prefetch)
         return "\n\n".join(p for p in parts if p and p.strip())
 
     def _prefetch_provider(self, provider: MemoryProvider, query: str, *, session_id: str = "") -> str:
@@ -360,20 +388,29 @@ class MemoryManager:
         if provider.name == "builtin":
             return provider.prefetch(query, session_id=session_id)
 
+        budget = _synchronous_prefetch_timeout(provider)
+        deadline = None if budget is None else time.monotonic() + budget
+        kwargs: dict[str, Any] = {"session_id": session_id}
+        timeout = self._external_prefetch_timeout
+        if deadline is not None:
+            kwargs["deadline"] = deadline
+            timeout = budget + _PREFETCH_EPILOGUE_S
+
         result_box: dict[str, Any] = {}
 
         key = self._registry_key(provider)
 
         def _run() -> None:
             try:
-                result_box["value"] = provider.prefetch(query, session_id=session_id) or ""
+                result_box["value"] = provider.prefetch(query, **kwargs) or ""
             except Exception as exc:  # pragma: no cover - re-raised by caller
                 result_box["error"] = exc
             finally:
+                result_box["finished_at"] = time.monotonic()
                 self._PREFETCH_GATE.leave(key, thread, ok="error" not in result_box)
 
         thread = spawn_context_thread(_run, name=f"memory-prefetch-{provider.name}")
-        skipped = self._PREFETCH_GATE.enter(key, thread, self._external_prefetch_timeout)
+        skipped = self._PREFETCH_GATE.enter(key, thread, timeout)
         if skipped:
             logger.debug("Memory provider '%s' prefetch skipped (%d stuck, %d in flight)",
                          provider.name, *skipped[:2])
@@ -385,17 +422,21 @@ class MemoryManager:
             self._PREFETCH_GATE.leave(key, thread, ok=False)
             raise
 
-        thread.join(self._external_prefetch_timeout)
+        wait_timeout = timeout if deadline is None else max(0.0, deadline - time.monotonic()) + _PREFETCH_EPILOGUE_S
+        thread.join(wait_timeout)
         if thread.is_alive():
             logger.warning(
                 "Memory provider '%s' prefetch timed out after %.1fs; the call keeps running in the "
                 "background (later turns may skip it while the provider stays stuck)", provider.name,
-                self._external_prefetch_timeout,
+                timeout,
             )
             return ""
 
         if "error" in result_box:
             raise result_box["error"]
+        if deadline is not None and result_box["finished_at"] > deadline:
+            logger.warning("Memory provider '%s' prefetch exhausted its %.1fs recall budget", provider.name, budget)
+            return ""
         result = result_box.get("value", "")
         if result and result.strip():
             # Opt-in spill limits recall replayed with the user turn's api_content;
@@ -410,7 +451,9 @@ class MemoryManager:
         """Deterministic recall indicator line (e.g. ``"🧠 Provider — recalled 3 memories"``); ``""`` if none.
         Call right after :meth:`prefetch_all` so the user SEES memory was used even if the model is silent."""
         segments: list[str] = []
-        for status in self._each_provider("recall_status failed (non-fatal)", lambda p: p.recall_status()):
+        eligible = [p for p in self._providers
+                    if self._prefetch_injected is None or id(p) in self._prefetch_injected]
+        for status in self._each_provider("recall_status failed (non-fatal)", lambda p: p.recall_status(), providers=eligible):
             if status is None:
                 continue
             # count <= 0: content injected but no discrete count (reflect)
