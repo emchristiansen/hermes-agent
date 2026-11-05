@@ -39,6 +39,9 @@ from gateway.session import (
 from gateway.turn_lease import TurnLeaseTimeoutError
 from typing import Any, Dict, List, Optional, Tuple
 
+# Inputs whose producer reads the turn's own result: a whole job, never steered into another turn.
+_JOB_PRODUCER_PLATFORMS = frozenset({"a2a", "webhook", "api_server", "msgraph_webhook"})
+
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner
     from gateway.run_turn_runner import TurnRunner
@@ -678,6 +681,20 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
     def _hm_text_only(event: MessageEvent) -> bool:
         return event.message_type == MessageType.TEXT and not event.media_urls and not event.media_types
 
+    def _hm_steer_at_adoption(self, event: MessageEvent, source, _quick_key: str) -> None:
+        """Mark (in memory, never on the row) a messaging user's plain text that reached a running turn
+        and that ``_hm_busy_preempt`` did not steer, so the authority's busy pass steers it into that
+        turn's agent (every message steers, Eric 2026-11-04): at adoption when the turn had none yet, or
+        at once when it adopted one while this admission awaited (a post-admission hook). An explicit
+        ``/queue`` (``_fifo_only``), a job producer's input, media, another busy mode or a drain keeps
+        its own next turn."""
+        if (self._is_session_running(_quick_key)
+                and not getattr(event, "_fifo_only", False) and not self._draining
+                and self._hm_text_only(event) and (event.text or "").strip()
+                and source.platform.value not in _JOB_PRODUCER_PLATFORMS
+                and self._effective_busy_input_mode(source) == "steer"):
+            event._steer_at_adoption = True
+
     def _hm_steer_delivered(self, event: MessageEvent, _quick_key: str) -> bool:
         """Steer an internal event's text into the running turn as a delivered message (its
         ``turn_author``, or Hermes automation): True when the running agent took it."""
@@ -696,6 +713,27 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         except Exception as exc:  # health: allow BLE001 -- as _hm_busy_steer: a failed steer queues the event as before
             logger.warning("Internal-event steer failed for session %s: %s", _quick_key, exc)
             return False
+
+    def _hm_steer_pending_at_adoption(self, source: SessionSource, _quick_key: str) -> None:
+        """The running turn just adopted its agent: each internal wake that waits in the adapter's
+        pending slot steers into it now, as it would have on arrival (``_hm_steer_delivered``), in
+        arrival order. The first event the turn does not take keeps its place, and everything behind it
+        stays behind it: user text, commands, plugin payloads and job producers' events are never taken."""
+        adapter = self._delivery_adapter_for(source)
+        slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
+        if not isinstance(slot, dict):
+            return
+        while (event := slot.get(_quick_key)) is not None:
+            if (not getattr(event, "internal", False) or not event.allow_gateway_control or event.get_command()
+                    or event.source.platform.value in _JOB_PRODUCER_PLATFORMS):
+                return
+            del slot[_quick_key]  # _hm_steer_delivered keeps arrival order while an earlier event waits
+            if not self._hm_steer_delivered(event, _quick_key):
+                slot[_quick_key] = event
+                return
+            overflow = self._overflow_queue(_quick_key)
+            if overflow:
+                slot[_quick_key] = overflow.pop(0)
 
     def _hm_busy_steer(self, event: MessageEvent, running_agent: Any, _quick_key: str) -> None:
         """Steer mode: inject text mid-run via ``agent.steer()``, else fall back to queue semantics."""
@@ -1250,6 +1288,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                     return True, _consumer_reply
                 if getattr(event, "_fifo_only", False) and event._stop_epoch != self._route_stop_epoch(_quick_key):
                     return True, None  # a /stop or /new came after its command, as it clears the slot
+                self._hm_steer_at_adoption(event, source, _quick_key)
                 # A failed admit stays the authority's answer (refusal notice or turn error), never a
                 # pending legacy turn: that would run unadmitted, outside the FIFO's order.
                 return True, await admit_message(authority, event)

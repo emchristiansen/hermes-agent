@@ -62,6 +62,10 @@ class LiveSession:
     # The busy steering pass (``session_busy_ingress``): one at a time; a request during it rereads.
     steering: asyncio.Task | None = None
     steer_again: bool = False
+    # Admission ids of a messaging user's plain text admitted while the running turn had no agent yet
+    # (``_hm_steer_at_adoption``): the adoption pass steers them. In memory only: lost with this owner,
+    # such a row runs as its own next turn, as before.
+    adoption_steers: set = field(default_factory=set)
     # admission id -> its started claim, from the moment the settlement worker starts the terminal
     # write until the completion frame is published. The write runs outside ``event_stream.lock``
     # (a contended SQLite writer must not stall loop-side lock takers); readers holding that lock
@@ -597,6 +601,10 @@ class SessionAuthority:
             event._gateway_accepted = True
             if row['status'] == 'queued' and (committed := getattr(event, '_on_commit', None)) is not None:
                 committed()  # a queued slash command's ack follows its commit (``_queue_command_turn``)
+            if row['status'] == 'queued' and getattr(event, '_steer_at_adoption', False) and ref.session_id in self.sessions:
+                # Recorded in this write's ``then``, before its ``after`` (``_schedule_admitted``) reruns the
+                # steering pass: a pass that read the row before this mark is followed by one that sees it.
+                self.sessions[ref.session_id].adoption_steers.add(row['admission_id'])
         self._publish_pending(ref)
         return self._receipt(row)
 

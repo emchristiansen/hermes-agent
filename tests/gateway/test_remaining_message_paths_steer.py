@@ -1,8 +1,11 @@
 """The remaining message paths into a busy session steer (Eric, 2026-11-04).
 
-(1) A native FIFO row keeps its own turn: a messaging user's text admitted before the running turn
-adopted its agent, an explicit ``/queue`` (before or after adoption) and an A2A task are the same row
-shape, and an explicit next-turn choice or a whole job must not be steered (reviewer GW-F01/GW-F02).
+(1) A messaging user's plain text admitted before the running turn adopted its agent steers into it at
+adoption: the busy path marks it in memory (``_hm_steer_at_adoption``) before the row is written, since
+the row cannot tell it from an explicit ``/queue`` or an A2A task, which keep their own turns (reviewer
+GW-F01/GW-F02). Without a live mark (a drain, a restart) it keeps its own next turn, as before. A
+post-admission hook that awaits while the turn adopts its agent leaves the text marked too, and the busy
+pass steers it at once (reviewer ADM-02); a hook that consumes it still consumes it.
 
 (2) A wake with NO session authority (legacy path): ``gateway.wake.deliver_wake`` falls back to the
 adapter's ``handle_message``. When the runner's session state holds a running agent with the steer
@@ -65,10 +68,14 @@ def _rows(authority, runner, key):
     return list_session_admissions(authority.db, session_id=owner, pending_only=False) if owner else []
 
 
-@pytest.mark.asyncio
-async def test_a_human_message_before_adoption_keeps_its_own_turn(monkeypatch):
-    """A messaging user's text admitted while the turn still builds its agent is a native FIFO row, which
-    the row cannot tell apart from an explicit ``/queue`` (reviewer GW-F01): it keeps R5's next turn."""
+async def _pre_adoption(monkeypatch, schedule):
+    """Turn A runs and is still building its agent when the messaging user's plain text B arrives; A then
+    adopts its agent, the adoption pass settles, and A crosses one tool/result boundary. ``schedule``:
+    ``steer`` (the ordinary case), ``race`` (the adoption pass reads B's committed row before B's
+    admission records its in-memory mark), ``drain_before_adoption`` and ``marks_lost`` (this owner's
+    in-memory marks gone, as after a restart; a draining owner refuses B's admission itself). Returns what ran as turns, what
+    A's boundary took, and B's row."""
+    import threading
     from gateway.platforms.event import MessageEvent
     from gateway.run import _AGENT_PENDING_SENTINEL
     from gateway.session_busy_ingress import _pass
@@ -79,6 +86,7 @@ async def test_a_human_message_before_adoption_keeps_its_own_turn(monkeypatch):
     agent = BufferedAgent()
     running, adopt_now, adopted, boundary = asyncio.Event(), asyncio.Event(), asyncio.Event(), asyncio.Event()
     executed, taken = [], []
+    human = 'also check the staging logs'
 
     async def turn(event, source, quick_key, run_generation):
         executed.append(event.text)
@@ -96,22 +104,82 @@ async def test_a_human_message_before_adoption_keeps_its_own_turn(monkeypatch):
         return 'reply ' + event.text
     monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
 
+    loop, committed, release = asyncio.get_running_loop(), asyncio.Event(), threading.Event()
+    if schedule == 'race':
+        write = authority._admit_native_write
+
+        def held_write(**kwargs):  # B's row commits, then its loop-side ``then`` waits for the test
+            row = write(**kwargs)
+            if kwargs['payload'].get('text') == human:
+                loop.call_soon_threadsafe(committed.set)
+                release.wait(30)
+            return row
+        monkeypatch.setattr(authority, '_admit_native_write', held_write)
+
+    def row_b():
+        return next((r for r in _rows(authority, runner, key) if r['payload'].get('text') == human), None)
+
+    async def adoption_pass():
+        await asyncio.wait_for(adopted.wait(), 10)
+        sid = runner.session_store.peek_session_id(key)
+        live = authority.sessions[sid]
+        await _pass(authority, SessionRef(authority.profile_id, sid), live)
+        if live.steering:
+            await live.steering
+        return live
+
     await adapter.handle_message(MessageEvent(text='A', source=source, message_id='A'))
     await asyncio.wait_for(running.wait(), 30)
     assert runner._peek_session_state(key).turn.agent is _AGENT_PENDING_SENTINEL, 'no agent built yet'
-    human = 'also check the staging logs'
-    await adapter.handle_message(MessageEvent(text=human, source=source, message_id='B'))
-    await async_wait_until(lambda: len(_rows(authority, runner, key)) == 2, timeout=10, what='the human row')
-    adopt_now.set()
-    await asyncio.wait_for(adopted.wait(), 10)
-    sid = runner.session_store.peek_session_id(key)
-    live = authority.sessions[sid]
-    await _pass(authority, SessionRef(authority.profile_id, sid), live)  # the adoption pass, settled first
-    if live.steering:
-        await live.steering
+    sending = asyncio.create_task(adapter.handle_message(MessageEvent(text=human, source=source, message_id='B')))
+    if schedule == 'race':
+        await asyncio.wait_for(committed.wait(), 10)
+        adopt_now.set()
+        await adoption_pass()
+        assert row_b()['status'] == 'queued' and agent._pending_steer is None, 'the pass read B before its mark'
+        release.set()
+        await sending
+        # The committed transfer precedes delivery into the agent (interaction review INT-01): A's boundary
+        # waits for B's text in its buffer, not only for the row.
+        await async_wait_until(lambda: (row_b()['status'], row_b()['outcome']) == ('terminal', 'steering')
+                               and human in (agent._pending_steer or ''),
+                               timeout=10, what="the admission's own rerun of the pass to deliver B")
+    else:
+        await sending
+        await async_wait_until(lambda: row_b() is not None, timeout=10, what='B admitted')
+        runner._draining = schedule == 'drain_before_adoption'
+        if schedule == 'marks_lost':
+            authority.sessions[runner.session_store.peek_session_id(key)].adoption_steers.clear()
+        adopt_now.set()
+        await adoption_pass()
+    runner._draining = False
     boundary.set()
-    await async_wait_until(lambda: executed == ['A', human], timeout=15, what='the human text to run as its own turn')
+    await async_wait_until(lambda: row_b()['outcome'] in ('steered', 'completed') and not runner._is_session_running(key),
+                           timeout=15, what='B to settle')
+    return executed, taken, row_b()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('schedule', ['steer', 'race'])
+async def test_a_human_message_before_adoption_steers_into_the_turn_at_adoption(monkeypatch, schedule):
+    executed, [content], row = await _pre_adoption(monkeypatch, schedule)
+
+    assert executed == ['A'], 'the human text never ran as its own turn'
+    assert (row['status'], row['outcome']) == ('terminal', 'steered')
+    assert content is not None and 'also check the staging logs' in content
+    assert USER_MARKER in content and '[DELIVERED MESSAGE' not in content, 'the user\'s own text, never delivered'
+    assert content.index('Gateway message origin') < content.index('also check the staging logs'), 'origin kept'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('schedule', ['drain_before_adoption', 'marks_lost'])
+async def test_a_human_message_before_adoption_keeps_its_own_turn_without_a_live_mark(monkeypatch, schedule):
+    """A drain, or this owner's lost in-memory mark (a restart), leaves B its own next turn, as before."""
+    executed, taken, row = await _pre_adoption(monkeypatch, schedule)
+
     assert taken == [None], 'nothing reached the running turn'
+    assert executed == ['A', 'also check the staging logs']
+    assert (row['status'], row['outcome']) == ('terminal', 'completed')
 
 
 @pytest.mark.asyncio
@@ -355,3 +423,143 @@ async def test_a_legacy_wake_during_a_drain_is_never_steered(monkeypatch, guarde
     if not guarded:
         runner._session_state(key).turn.agent = None
     assert content is None
+
+
+@pytest.mark.asyncio
+async def test_a_mark_recorded_while_an_older_queue_read_is_in_flight_survives_it(monkeypatch):
+    """The adoption pass reads the queue before B is admitted; B commits and records its mark while that
+    read is still in flight (the authority adopted the agent; the runner still shows the pending sentinel,
+    as in the window before ``_run_agent_track_agent`` polls). The older read must not erase B's mark."""
+    import threading
+    from gateway import session_busy_ingress
+    from gateway.platforms.event import MessageEvent
+    from gateway.session_results import execution_result
+
+    runner, adapter, authority, source, key = await _gateway(monkeypatch)
+    agent = BufferedAgent()
+    running, boundary = asyncio.Event(), asyncio.Event()
+    executed, taken = [], []
+    human = 'also check the staging logs'
+
+    async def turn(event, source, quick_key, run_generation):
+        executed.append(event.text)
+        if event.text == 'A':
+            running.set()
+            await asyncio.wait_for(boundary.wait(), 30)
+            taken.append(_boundary(agent))
+        captured = execution_result.get()
+        if captured is not None:
+            captured['result'] = {'final_response': 'reply ' + event.text, 'messages': []}
+        return 'reply ' + event.text
+    monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
+
+    loop, read_taken, release = asyncio.get_running_loop(), asyncio.Event(), threading.Event()
+    real_list, held = session_busy_ingress.list_session_admissions, []
+
+    def listing(*args, **kwargs):  # the pass's first read after adoption: its snapshot, then held in flight
+        rows = real_list(*args, **kwargs)
+        if not held:
+            held.append(rows)
+            loop.call_soon_threadsafe(read_taken.set)
+            release.wait(30)
+        return rows
+
+    def row_b():
+        return next((r for r in _rows(authority, runner, key) if r['payload'].get('text') == human), None)
+
+    await adapter.handle_message(MessageEvent(text='A', source=source, message_id='A'))
+    await asyncio.wait_for(running.wait(), 30)
+    monkeypatch.setattr(session_busy_ingress, 'list_session_admissions', listing)
+    sid = runner.session_store.peek_session_id(key)
+    authority.adopt_agent(sid, authority.executing[sid], agent)  # the runner still shows the sentinel
+    await asyncio.wait_for(read_taken.wait(), 10)
+    await adapter.handle_message(MessageEvent(text=human, source=source, message_id='B'))
+    live = authority.sessions[sid]
+    assert row_b()['status'] == 'queued' and row_b()['admission_id'] in live.adoption_steers, 'B marked'
+    assert all(r['payload'].get('text') != human for r in held[0]), 'the in-flight read predates B'
+    release.set()
+    await async_wait_until(lambda: (row_b()['status'], row_b()['outcome']) == ('terminal', 'steering')
+                           and human in (agent._pending_steer or ''), timeout=10, what='the rerun to deliver B')
+    boundary.set()
+    await async_wait_until(lambda: row_b()['outcome'] in ('steered', 'completed') and not runner._is_session_running(key),
+                           timeout=15, what='B to settle')
+    assert executed == ['A'] and row_b()['outcome'] == 'steered'
+    [content] = taken
+    assert human in content and USER_MARKER in content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('hook_result', [None, {'action': 'handled'}], ids=['passes', 'consumes'])
+async def test_a_human_message_whose_admission_hook_spans_adoption_steers_into_the_turn(monkeypatch, hook_result):
+    """Reviewer ADM-02 schedule: B reaches the busy path while A has no agent (so ``_hm_busy_preempt``
+    declines), then awaits a registered ``post_gateway_admission`` hook while A adopts and promotes its
+    agent. A passing hook leaves B to steer into A at its next boundary; a consuming hook consumes B."""
+    from types import SimpleNamespace
+    from gateway.platforms.event import MessageEvent
+    from gateway.run import _AGENT_PENDING_SENTINEL
+    from gateway.session_busy_ingress import _pass
+    from gateway.session_contract import SessionRef
+    from gateway.session_results import execution_result
+    from hermes_cli.plugins import PluginContext, PluginManifest, get_plugin_manager
+
+    runner, adapter, authority, source, key = await _gateway(monkeypatch)
+    agent = BufferedAgent()
+    running, boundary, in_hook, resume_hook = (asyncio.Event() for _ in range(4))
+    executed, taken, calls, generations = [], [], [], []
+
+    async def turn(event, source, quick_key, run_generation):
+        executed.append(event.text)
+        if event.text == 'A':
+            generations.append(run_generation)
+            running.set()
+            await asyncio.wait_for(boundary.wait(), 30)
+            taken.append(_boundary(agent))
+        captured = execution_result.get()
+        if captured is not None:
+            captured['result'] = {'final_response': 'reply ' + event.text, 'messages': []}
+        return 'reply ' + event.text
+    monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
+
+    async def hook(text, **kwargs):
+        calls.append(text)
+        if text == 'B':
+            assert runner._peek_session_state(key).turn.agent is _AGENT_PENDING_SENTINEL, 'B saw no agent'
+            in_hook.set()
+            await asyncio.wait_for(resume_hook.wait(), 30)
+            return hook_result
+    manager = get_plugin_manager()
+    manager._discovered = True
+    PluginContext(PluginManifest(name='adm02', key='adm02', source='user'), manager).register_hook(
+        'post_gateway_admission', hook)
+
+    await adapter.handle_message(MessageEvent(text='A', source=source, message_id='A'))
+    await asyncio.wait_for(running.wait(), 30)
+    sending = asyncio.create_task(adapter.handle_message(MessageEvent(text='B', source=source, message_id='B')))
+    await asyncio.wait_for(in_hook.wait(), 30)
+    sid = runner.session_store.peek_session_id(key)
+    authority.adopt_agent(sid, authority.executing[sid], agent)
+    await runner._run_agent_track_agent(SimpleNamespace(
+        source=source, session_key=key, run_generation=generations[0], agent_holder=[agent]))
+    assert runner._peek_session_state(key).turn.agent is agent
+    resume_hook.set()
+    await asyncio.wait_for(sending, 30)
+    live = authority.sessions[sid]
+    await _pass(authority, SessionRef(authority.profile_id, sid), live)  # the adoption's own pass, settled
+    if live.steering:
+        await live.steering
+    if hook_result is None:
+        await async_wait_until(lambda: 'B' in (agent._pending_steer or ''), timeout=10, what='B delivered to A')
+    boundary.set()
+    await async_wait_until(lambda: not runner._is_session_running(key)
+                           and all(r['status'] == 'terminal' for r in _rows(authority, runner, key)),
+                           timeout=15, what='every admitted row to settle')
+
+    assert calls == ['A', 'B'], 'the hook ran once per message, never again at execution'
+    assert executed == ['A'], 'B never ran as its own turn'
+    rows = _rows(authority, runner, key)
+    if hook_result is not None:
+        assert taken == [None] and [r['payload'].get('text') for r in rows] == ['A'], 'the hook consumed B'
+        return
+    [content] = taken
+    assert content is not None and '\n\nB\n' in content and USER_MARKER in content
+    assert next(r for r in rows if r['payload'].get('text') == 'B')['outcome'] == 'steered'

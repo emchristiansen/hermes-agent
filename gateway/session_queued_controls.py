@@ -139,11 +139,22 @@ def delivered_by(row):
     return None if descriptor is None else dict(descriptor.get('turn_author') or {})
 
 
+def steered_text(authority, row):
+    """The text a hand-over gives the turn: a messaging user's own row (native, not automation) keeps its
+    origin, as the messaging busy path steers it (``_steer_text_with_origin``); any other row its text."""
+    payload = row['payload']
+    if 'native_text_v1' not in payload or automation(payload) is not None:
+        return payload['text']
+    from gateway.session_envelope import restore_native
+    runner = authority.runner
+    return runner._steer_text_with_origin(payload['text'].strip(), restore_native(payload, runner))
+
+
 def _deliver(authority, session_id, generation, agent, row):
     """Hand the committed row's text to the claim's agent, as its own sender's (``delivered_by``); the
     caller holds the stream lock. False once the claim stopped executing (its settlement then decides
     the row) or its agent refused the text."""
-    admission_id, text, sender = row['admission_id'], row['payload']['text'], delivered_by(row)
+    admission_id, text, sender = row['admission_id'], steered_text(authority, row), delivered_by(row)
     entry = authority.steer_transfers.get(session_id)
     if (entry is None or entry[0] != generation or admission_id not in entry[1]
             or _receiving_agent(authority, session_id, generation) is not agent):
