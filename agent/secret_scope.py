@@ -373,6 +373,16 @@ def load_env_file(env_path: Path) -> dict[str, str]:
     returns a fresh dict: callers mutate what they get back (``build_profile_secret_scope`` layers
     external secrets over it).
     """
+    try:
+        return read_env_file(env_path)
+    except OSError:
+        return {}
+
+
+def read_env_file(env_path: Path) -> dict[str, str]:
+    """:func:`load_env_file` for a caller that must tell "absent" from "unreadable": the ``OSError``
+    of the one open/read propagates (``FileNotFoundError`` when there is no file) instead of
+    collapsing to ``{}``, so a fail-closed reader needs no separate exists()/read probe."""
     key = str(env_path)
     try:
         with open(env_path, "rb") as handle:
@@ -380,7 +390,7 @@ def load_env_file(env_path: Path) -> dict[str, str]:
     except OSError:
         # Gone or unreadable: drop any entry so a stale map cannot outlive the file.
         invalidate_env_file_cache(env_path)
-        return {}
+        raise
 
     with _ENV_FILE_CACHE_LOCK:
         cached = _ENV_FILE_CACHE.get(key)
@@ -431,9 +441,12 @@ def _is_process_home(hermes_home: Path) -> bool:
     """Is *hermes_home* the profile this process serves as its own? Same launch-home identity as
     ``serves_routed_profile()``: a host that mirrors a served profile into ``HERMES_HOME`` would
     otherwise seed the launch profile's bridged allow-all grant into that profile's scope."""
-    from hermes_constants import get_routing_process_hermes_home
+    from hermes_constants import get_routing_process_hermes_home, hermes_home_key
+    # ``hermes_home_key`` is that identity, remembered per existing home: a fresh resolve() here
+    # walked both paths component by component (one lstat each) on every scope entry, on the
+    # gateway's event loop.
     try:
-        return Path(hermes_home).resolve() == get_routing_process_hermes_home().resolve()
+        return hermes_home_key(hermes_home) == hermes_home_key(get_routing_process_hermes_home())
     except OSError:
         return False
 
