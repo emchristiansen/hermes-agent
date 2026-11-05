@@ -6,6 +6,7 @@ until the scope is empty or stopped, so kill / kill_all in this or a later inter
 it; holding custody never stops anything. The real-systemd path is in test_worker_spawn_unit_scope.
 """
 import json
+import threading
 import time
 
 import pytest
@@ -146,3 +147,101 @@ def test_scope_populated_reads_the_kernel_cgroup(monkeypatch, tmp_path):
     assert custody.scope_populated("x.scope") is False
     Shown.returncode = 1  # no user bus: unknown, so custody is kept
     assert custody.scope_populated("x.scope") is None
+
+
+def _hold_before_the_file_lock(monkeypatch, thread_name):
+    """Pause ``thread_name`` just before it takes the real checkpoint file lock."""
+    from hermes_cli.active_sessions import _FileLock
+
+    ready, release = threading.Event(), threading.Event()
+
+    class Gated(_FileLock):
+        def __enter__(self):
+            if threading.current_thread().name == thread_name:
+                ready.set()
+                assert release.wait(10), "test schedule timed out"
+            return super().__enter__()
+    monkeypatch.setattr("hermes_cli.active_sessions._FileLock", Gated)
+    return ready, release
+
+
+def _root(logged):
+    session = ProcessSession(id=SID, command="daemonize", task_id="t1", pid=999_999_999, pid_scope="host",
+                             started_at=time.time(), systemd_unit=UNIT, notify_on_complete=True)
+    if logged:  # a worker spawn: its log and recorded exit outlive it
+        from tools.process_registry_output_log import output_dir
+        output_dir().mkdir(parents=True, exist_ok=True)
+        (output_dir() / f"{SID}.log").write_text("done\n", encoding="utf-8")
+        (output_dir() / f"{SID}.exit").write_text("0\n", encoding="utf-8")
+        session.output_log = str(output_dir() / f"{SID}.log")
+    return session
+
+
+def _assert_recovery_keeps_custody(stops):
+    receipt = load_result_record(SID)
+    assert receipt["exit_code"] == 0 and receipt["systemd_unit"] == UNIT
+    successor = ProcessRegistry()
+    assert successor.recover_from_checkpoint() == 0  # not re-adopted as running: no second completion
+    assert stops[0] == []  # never stops a retained scope on the strength of an older snapshot
+    restored = successor._finished[SID]
+    assert restored.exited and restored.exit_code == 0 and restored._scope_stop_pending
+    assert successor.completion_queue.empty() and load_result_record(SID) == receipt
+    assert [(e["session_id"], e.get("scope_custody")) for e in _checkpoint()] == [(SID, True)]
+
+
+@pytest.mark.parametrize("logged", [False, True], ids=["pipe", "log-backed"])
+def test_an_older_snapshot_cannot_undo_custody_around_the_file_lock(monkeypatch, stops, logged):
+    """BG-SCOPE-03: a writer that started before the completion reaches the real file lock only after
+    the completion wrote custody and its receipt. Its write must not supersede custody, and a fresh
+    recovery must neither stop the scope nor collect the command a second time."""
+    _populated(monkeypatch, True)
+    registry = ProcessRegistry()
+    session = registry._running[SID] = _root(logged)
+    ready, release = _hold_before_the_file_lock(monkeypatch, "older-writer")
+    writer = threading.Thread(target=registry._write_checkpoint, name="older-writer")
+    writer.start()
+    assert ready.wait(10)
+    try:
+        registry._finish_exited(session, 0)
+    finally:
+        release.set()
+        writer.join(10)
+    assert not writer.is_alive()
+    assert [(e["session_id"], e.get("scope_custody")) for e in _checkpoint()] == [(SID, True)]
+    _assert_recovery_keeps_custody(stops)
+
+
+@pytest.mark.parametrize("logged", [False, True], ids=["pipe", "log-backed"])
+def test_another_interpreters_running_copy_cannot_undo_custody(monkeypatch, stops, logged):
+    """The same race across interpreters: one that adopted the process still holds it as running
+    when the owner finishes it, then rewrites the shared checkpoint."""
+    _populated(monkeypatch, True)
+    owner, adopter = ProcessRegistry(), ProcessRegistry()
+    session = owner._running[SID] = _root(logged)
+    adopter._running[SID] = _root(logged)
+    owner._write_checkpoint()
+    owner._finish_exited(session, 0)
+    adopter._write_checkpoint()
+    _assert_recovery_keeps_custody(stops)
+
+
+@pytest.mark.parametrize("receipt_unit", [UNIT, ""], ids=["retained", "released"])
+def test_a_completed_receipt_outranks_a_running_checkpoint_entry(monkeypatch, stops, receipt_unit):
+    """A checkpoint entry that lost its custody marker (a writer predating it) is still a finished
+    command when its receipt says so: retained scope -> readopt, released scope -> nothing to do."""
+    _populated(monkeypatch, True)
+    registry = ProcessRegistry()
+    session = registry._running[SID] = _root(True)
+    registry._write_checkpoint()
+    stale = _checkpoint()
+    registry._finish_exited(session, 0)
+    if not receipt_unit:
+        _populated(monkeypatch, False)
+        assert registry.kill_process(SID)["status"] == "already_exited"  # releases custody
+        stops[0].clear()
+    (get_hermes_home() / "processes.json").write_text(json.dumps(stale), encoding="utf-8")
+    successor = ProcessRegistry()
+    assert successor.recover_from_checkpoint() == 0 and successor.completion_queue.empty()
+    assert stops[0] == []
+    assert (SID in successor._finished) == bool(receipt_unit)
+    assert load_result_record(SID)["systemd_unit"] == receipt_unit

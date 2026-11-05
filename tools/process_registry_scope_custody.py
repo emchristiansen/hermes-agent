@@ -61,6 +61,12 @@ class ProcessScopeCustodyMixin:
     """The subclass supplies ``_lock``, ``_finished``, ``_write_checkpoint``. See ProcessRegistry."""
 
     @staticmethod
+    def _sweepable(session) -> bool:
+        """Still something to stop: the root runs, or its scope is in custody. ``kill_all`` and the turn
+        baseline (``snapshot_running_ids``) share it, so a turn's timeout spares an older retained scope."""
+        return not session.exited or session._scope_stop_pending
+
+    @staticmethod
     def _hold_scope_if_populated(session) -> None:
         """The root exited (or its PID is gone): keep the scope in custody unless it is verifiably
         empty. Called before the session is persisted as finished, so its receipt and checkpoint
@@ -86,6 +92,23 @@ class ProcessScopeCustodyMixin:
                 save_completed_result(session)
             self._write_checkpoint()
         return stopped
+
+    @staticmethod
+    def _entry_with_receipt(entry: dict) -> Optional[dict]:
+        """A recovered checkpoint entry as its durable receipt decides. Only a finished command has a
+        receipt, so a running entry with one is an older writer's snapshot: it becomes a custody entry
+        while the receipt still names the scope, and None (nothing to adopt or stop) once it names none.
+        No receipt, or one written before scope custody existed: the entry stands."""
+        if entry.get("scope_custody"):
+            return entry
+        from tools.process_registry_results import load_result_record
+        record = load_result_record(str(entry.get("session_id", "")))
+        if record is None or "systemd_unit" not in record:
+            return entry
+        if not record["systemd_unit"]:
+            return None
+        return {**entry, "scope_custody": True, "systemd_unit": record["systemd_unit"],
+                **{key: record.get(key) for key in ("exit_code", "completion_reason", "termination_source")}}
 
     def _readopt_scope_custody(self, entry: dict) -> bool:
         """Recovery of a ``scope_custody`` checkpoint entry: its command already finished and its

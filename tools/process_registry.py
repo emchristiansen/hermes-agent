@@ -2483,12 +2483,12 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         return self._any_running(lambda s: True)
 
     def snapshot_running_ids(self, task_id: str) -> frozenset[str]:
-        """Running IDs owned by ``task_id`` — a turn-boundary marker: on timeout
-        only processes absent from the starting snapshot belong to the abandoned
-        turn; older ones intentionally span turns and must survive. Ownership is
-        ``owner_task_id``: ``task_id`` is the container key (``session:<key>``,
-        ``default``), shared across turns and sessions, not the turn's id."""
-        return frozenset(s.id for s in self.running_owned_by(task_id))
+        """IDs ``kill_all(task_id)`` reaches now (running, or finished with its scope in custody): a turn-boundary
+        marker; on timeout only processes absent from it belong to the abandoned turn, older ones must survive.
+        Matched on ``owner_task_id``; ``task_id`` is the container key (``session:<key>``, ``default``), not a turn id."""
+        with self._lock:
+            return frozenset(s.id for s in (*self._running.values(), *self._finished.values())
+                             if s.owner_task_id == task_id and self._sweepable(s))
 
     # Kill sources that are agent-lifecycle cleanup (session end / compression / error
     # recovery / turn abandon), not a deliberate stop: those must skip persist_on_release
@@ -2520,7 +2520,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             targets = [
                 s for s in (*self._running.values(), *self._finished.values())
                 if (task_id is None or s.owner_task_id == task_id)
-                and s.id not in exclude_ids and (not s.exited or s._scope_stop_pending)
+                and s.id not in exclude_ids and self._sweepable(s)
                 and not (lifecycle and s.persist_on_release)
             ]
         results = [self.kill_process(s.id, source=source, consume_output=consume_output) for s in targets]

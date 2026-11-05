@@ -19,59 +19,68 @@ class ProcessCheckpointMixin:
 
     def _write_checkpoint(self, extra_entries: Optional[list[dict[str, Any]]] = None, settled=()):
         """Write running process metadata to the checkpoint file atomically. ``settled``: on-disk
-        entries this writer resolved without tracking them (a custody scope a recovery reaped)."""
-        from tools.process_registry import _checkpoint_path, _CHECKPOINT_FIELDS
+        entries this writer resolved without tracking them (a custody scope a recovery reaped).
 
+        Every interpreter of the profile (owner, each managed worker) rewrites this file from its own
+        table, so the snapshot is taken under the file lock (one taken before it could land after a
+        newer writer's and undo its transition), and a finish is never undone: an on-disk custody
+        entry outranks a writer's running copy of the same process."""
+        from hermes_cli.active_sessions import _FileLock
+        from tools.process_registry import _checkpoint_path
+        from utils import atomic_json_write
         try:
-            with self._lock:
-                entries = []
-                # A finished session stays while its scope is in custody (process_registry_scope_custody).
-                for s in (*self._running.values(), *self._finished.values()):
-                    custody = bool(s.exited and s._scope_stop_pending and s.systemd_unit)
-                    if s.exited and not custody:
-                        continue
-                    # Backfill the start time so recovery can detect PID recycling
-                    # even for sessions spawned before this field existed.
-                    if s.host_start_time is None and s.pid_scope == "host" and s.pid:
-                        s.host_start_time = self._safe_host_start_time(s.pid)
-                    entry = {"session_id": s.id, **{f: getattr(s, f) for f in _CHECKPOINT_FIELDS}}
-                    # Redact inline credentials before persisting (~/.hermes/processes.json).
-                    # Recovery uses command only for display (adoption re-validates the
-                    # PID, never re-runs it), so masking is lossless.
-                    # See #77484.
-                    entry["command"] = redact_sensitive_text(s.command, code_file=True)
-                    entry["owner_task_id"] = s.owner_task_id or s.task_id
-                    if custody:
-                        entry.update(scope_custody=True, exit_code=s.exit_code,
-                                     completion_reason=s.completion_reason, termination_source=s.termination_source)
-                    entries.append(entry)
-                if extra_entries:
-                    tracked_ids = {item.get("session_id") for item in entries}
-                    entries.extend(item for item in extra_entries if item.get("session_id") not in tracked_ids)
-                known = {*self._running, *self._finished, *settled, *(item.get("session_id") for item in entries)}
-            from hermes_cli.active_sessions import _FileLock
-            from utils import atomic_json_write
             path = _checkpoint_path()
-            # Every interpreter of the profile (owner, each managed worker) rewrites this file from
-            # its own table; a worker's output-log handoff is its only path to the next one, so a
-            # writer keeps the handoffs it does not track (read-merge-write under one file lock).
             with _FileLock(path.with_name(path.name + ".lock")):
-                entries.extend(self._foreign_handoffs(path, known))
-                atomic_json_write(path, entries)
+                try:
+                    on_disk = [e for e in json.loads(path.read_text(encoding="utf-8-sig")) if isinstance(e, dict)]
+                except (OSError, ValueError):
+                    on_disk = []
+                entries, known = self._checkpoint_snapshot(extra_entries, settled)
+                custody = {e.get("session_id"): e for e in on_disk if e.get("scope_custody") and e.get("systemd_unit")}
+                entries = [entry if entry.get("scope_custody") else custody.get(entry.get("session_id"), entry)
+                           for entry in entries]
+                atomic_json_write(path, entries + self._foreign_handoffs(on_disk, known))
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 
-    def _foreign_handoffs(self, path, known) -> list[dict[str, Any]]:
+    def _checkpoint_snapshot(self, extra_entries, settled):
+        """This registry's entries (running, or finished with its scope in custody) and the IDs it decides."""
+        from tools.process_registry import _CHECKPOINT_FIELDS
+        with self._lock:
+            entries = []
+            # A finished session stays while its scope is in custody (process_registry_scope_custody).
+            for s in (*self._running.values(), *self._finished.values()):
+                custody = bool(s.exited and s._scope_stop_pending and s.systemd_unit)
+                if s.exited and not custody:
+                    continue
+                # Backfill the start time so recovery can detect PID recycling
+                # even for sessions spawned before this field existed.
+                if s.host_start_time is None and s.pid_scope == "host" and s.pid:
+                    s.host_start_time = self._safe_host_start_time(s.pid)
+                entry = {"session_id": s.id, **{f: getattr(s, f) for f in _CHECKPOINT_FIELDS}}
+                # Redact inline credentials before persisting (~/.hermes/processes.json).
+                # Recovery uses command only for display (adoption re-validates the
+                # PID, never re-runs it), so masking is lossless.
+                # See #77484.
+                entry["command"] = redact_sensitive_text(s.command, code_file=True)
+                entry["owner_task_id"] = s.owner_task_id or s.task_id
+                if custody:
+                    entry.update(scope_custody=True, exit_code=s.exit_code,
+                                 completion_reason=s.completion_reason, termination_source=s.termination_source)
+                entries.append(entry)
+            if extra_entries:
+                tracked_ids = {item.get("session_id") for item in entries}
+                entries.extend(item for item in extra_entries if item.get("session_id") not in tracked_ids)
+            return entries, {*self._running, *self._finished, *settled, *(item.get("session_id") for item in entries)}
+
+    def _foreign_handoffs(self, on_disk, known) -> list[dict[str, Any]]:
         """On-disk worker handoffs this registry never tracked whose log still decides an outcome:
-        the process is alive (same start time) or its recorded exit is waiting to be read; and
-        scopes another interpreter holds in custody (only a recovery may release those)."""
+        the process is alive (same start time) or its recorded exit is waiting to be read (a worker's
+        output-log handoff is its only path to the next interpreter); and scopes another interpreter
+        holds in custody (only a recovery may release those)."""
         from pathlib import Path
         from tools.process_registry_output_log import _exit_path, adoptable_log
-        try:
-            on_disk = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError):
-            return []
-        return [entry for entry in on_disk if isinstance(entry, dict) and entry.get("session_id") not in known
+        return [entry for entry in on_disk if entry.get("session_id") not in known
                 and ((entry.get("scope_custody") and entry.get("systemd_unit"))
                      or ((log := adoptable_log(entry.get("output_log"))) and Path(log).exists()
                          and (_exit_path(log).exists() or self._detached_host_fate(
@@ -113,6 +122,11 @@ class ProcessCheckpointMixin:
                     "Skipping recovery for non-host process: %s (pid=%s, scope=%s)",
                     entry.get("command", "unknown")[:60], pid, pid_scope)
                 continue
+            # A receipt exists only for a finished command: it outranks an older running snapshot.
+            if (decided := self._entry_with_receipt(entry)) is None:
+                released_scopes.add(entry["session_id"])  # finished, scope released: nothing to do
+                continue
+            entry = decided
             # Alive and still ours: re-attach. A start-time probe that cannot
             # be read is not proof the PID was reused — dropping it would leave
             # a live child unsupervised, and marking it exited would invent a
