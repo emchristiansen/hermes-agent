@@ -38,6 +38,7 @@ from tools.process_registry_checkpoint import ProcessCheckpointMixin
 from tools.process_registry_output_log import (
     ProcessOutputLogMixin, open_output_log, record_exit_command, worker_output_log, worker_spawn_outlives_unit)
 from tools.process_registry_termination import ProcessTerminationMixin
+from tools.process_registry_scope_custody import ProcessScopeCustodyMixin
 from tools.process_registry_results import load_completed_results, save_completed_result
 from tools.process_registry_env_log import log_delta_command
 from tools.process_registry_wsl import _is_wsl_launcher_command
@@ -601,8 +602,8 @@ class ProcessSession:
     # Set by the _move_to_finished call that moved the session out of _running; only that call
     # publishes the completion, so a duplicate finisher must not release waiters early.
     _finish_claimed: bool = field(default=False, repr=False)
-    # The last stop of ``systemd_unit`` failed, so its descendants may still be alive; bulk
-    # cleanup retries the stop even after the session finished.
+    # Scope custody: a stop of ``systemd_unit`` failed, or the root exited while the scope still held
+    # descendants; bulk cleanup stops it even after the session finished (process_registry_scope_custody).
     _scope_stop_pending: bool = field(default=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
@@ -672,7 +673,7 @@ _WSL_CHAIN_NOTE = (
 )
 
 
-class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOutputLogMixin):
+class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOutputLogMixin, ProcessScopeCustodyMixin):
     """In-memory registry of running and finished background processes.
     Thread-safe: accessed from executor threads (terminal_tool, process handlers),
     the gateway asyncio loop (watchers, reset checks) and the cleanup thread."""
@@ -1009,6 +1010,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         fate = self._detached_host_fate(session.pid, session.host_start_time)
         if fate == "running":
             return session
+        self._hold_scope_if_populated(session)
         if fate == "gone":
             return self._prune_uncollected_detached(session)
         self._close_reused_detached(session)
@@ -1547,6 +1549,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         """Mark a reader-observed exit (a raced kill keeps its own code/reason) and finish.
         Under the session lock, like kill_process's commit: otherwise the kill can land between
         mark_exited's ``killed`` check and its writes, and the reader overwrites the kill."""
+        self._hold_scope_if_populated(session)  # the root's exit does not empty its scope
         with session._lock:
             session.mark_exited(exit_code, reason, source)
         self._move_to_finished(session)
@@ -1979,6 +1982,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                         fcntl.fcntl(fd, fcntl.F_SETFL, flags)
             except Exception as e:
                 logger.debug("Non-blocking drain failed for %s: %s", session.id, e)
+        self._hold_scope_if_populated(session)  # the descendant holding the pipe may be in the scope
         with session._lock:
             session.mark_exited(rc)
         logger.info(
@@ -2220,16 +2224,6 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 "termination_source": session.termination_source, **output}
         except Exception as e:
             return {"status": "error", "error": str(e)}
-
-    @staticmethod
-    def _stop_scope(session: ProcessSession) -> bool:
-        """Stop the session's systemd scope: True when it has none or the stop worked. Every kill
-        path stops the scope through here, so a failed stop always leaves it marked for retry."""
-        if not session.systemd_unit:
-            return True
-        stopped = _stop_systemd_unit(session.systemd_unit)
-        session._scope_stop_pending = not stopped
-        return stopped
 
     def _signal_kill(self, session: ProcessSession, session_id: str, consume_output: bool) -> Optional[dict]:
         """Deliver the kill via PTY, local Popen tree, sandbox exec or recovered host

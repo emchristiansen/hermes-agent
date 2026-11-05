@@ -17,15 +17,18 @@ class ProcessCheckpointMixin:
 
     # ----- Checkpoint (crash recovery) -----
 
-    def _write_checkpoint(self, extra_entries: Optional[list[dict[str, Any]]] = None):
-        """Write running process metadata to the checkpoint file atomically."""
+    def _write_checkpoint(self, extra_entries: Optional[list[dict[str, Any]]] = None, settled=()):
+        """Write running process metadata to the checkpoint file atomically. ``settled``: on-disk
+        entries this writer resolved without tracking them (a custody scope a recovery reaped)."""
         from tools.process_registry import _checkpoint_path, _CHECKPOINT_FIELDS
 
         try:
             with self._lock:
                 entries = []
-                for s in self._running.values():
-                    if s.exited:
+                # A finished session stays while its scope is in custody (process_registry_scope_custody).
+                for s in (*self._running.values(), *self._finished.values()):
+                    custody = bool(s.exited and s._scope_stop_pending and s.systemd_unit)
+                    if s.exited and not custody:
                         continue
                     # Backfill the start time so recovery can detect PID recycling
                     # even for sessions spawned before this field existed.
@@ -38,11 +41,14 @@ class ProcessCheckpointMixin:
                     # See #77484.
                     entry["command"] = redact_sensitive_text(s.command, code_file=True)
                     entry["owner_task_id"] = s.owner_task_id or s.task_id
+                    if custody:
+                        entry.update(scope_custody=True, exit_code=s.exit_code,
+                                     completion_reason=s.completion_reason, termination_source=s.termination_source)
                     entries.append(entry)
                 if extra_entries:
                     tracked_ids = {item.get("session_id") for item in entries}
                     entries.extend(item for item in extra_entries if item.get("session_id") not in tracked_ids)
-                known = {*self._running, *self._finished}
+                known = {*self._running, *self._finished, *settled, *(item.get("session_id") for item in entries)}
             from hermes_cli.active_sessions import _FileLock
             from utils import atomic_json_write
             path = _checkpoint_path()
@@ -57,7 +63,8 @@ class ProcessCheckpointMixin:
 
     def _foreign_handoffs(self, path, known) -> list[dict[str, Any]]:
         """On-disk worker handoffs this registry never tracked whose log still decides an outcome:
-        the process is alive (same start time) or its recorded exit is waiting to be read."""
+        the process is alive (same start time) or its recorded exit is waiting to be read; and
+        scopes another interpreter holds in custody (only a recovery may release those)."""
         from pathlib import Path
         from tools.process_registry_output_log import _exit_path, adoptable_log
         try:
@@ -65,9 +72,10 @@ class ProcessCheckpointMixin:
         except (OSError, ValueError):
             return []
         return [entry for entry in on_disk if isinstance(entry, dict) and entry.get("session_id") not in known
-                and (log := adoptable_log(entry.get("output_log"))) and Path(log).exists()
-                and (_exit_path(log).exists() or self._detached_host_fate(
-                    entry.get("pid"), entry.get("host_start_time")) == "running")]
+                and ((entry.get("scope_custody") and entry.get("systemd_unit"))
+                     or ((log := adoptable_log(entry.get("output_log"))) and Path(log).exists()
+                         and (_exit_path(log).exists() or self._detached_host_fate(
+                             entry.get("pid"), entry.get("host_start_time")) == "running")))]
 
     def recover_from_checkpoint(self) -> int:
         """On gateway startup, probe PIDs from the checkpoint file; returns how many
@@ -77,6 +85,7 @@ class ProcessCheckpointMixin:
             _CHECKPOINT_DEFAULTS, _WATCHER_ROUTE_KEYS, _stop_systemd_unit,
         )
         from tools.process_registry_output_log import adoptable_log
+        from tools.process_registry_results import forget_result_scope
 
         checkpoint_path = _checkpoint_path()
         if not checkpoint_path.exists():
@@ -87,6 +96,7 @@ class ProcessCheckpointMixin:
             return 0
         recovered = 0
         unresolved_scope_entries: list[dict[str, Any]] = []
+        released_scopes: set[str] = set()
         for entry in entries:
             pid, pid_scope = entry.get("pid"), entry.get("pid_scope", "host")
             if not pid:
@@ -94,7 +104,8 @@ class ProcessCheckpointMixin:
             # The registry is process-global, so every profile's checkpoint carries every live
             # process; a multiplexer recovering several homes must adopt each session once.
             with self._lock:
-                already_tracked = entry.get("session_id") in self._running
+                already_tracked = entry.get("session_id") in self._running or (
+                    entry.get("session_id") in self._finished and entry.get("scope_custody"))
             if already_tracked:
                 continue
             if pid_scope != "host":  # in-sandbox PIDs mean nothing once the env handle is gone
@@ -107,11 +118,14 @@ class ProcessCheckpointMixin:
             # a live child unsupervised, and marking it exited would invent a
             # completion. A positive mismatch means the number was recycled:
             # do not adopt it and do not signal it.
-            fate = self._detached_host_fate(pid, entry.get("host_start_time"))
+            # A custody entry's command already finished (its receipt is durable): only its scope
+            # matters, and its root PID, possibly recycled since, is never consulted or signalled.
+            custody = bool(entry.get("scope_custody"))
+            fate = "gone" if custody else self._detached_host_fate(pid, entry.get("host_start_time"))
             # A worker spawn's output log and recorded exit outlive both the spawner and the PID,
             # so its reader decides the outcome (a recycled PID is never signalled: fate != running).
             log = adoptable_log(entry.get("output_log"))
-            if log:
+            if log and not custody:
                 fate = "running"
             if fate == "reused":
                 logger.info(
@@ -121,6 +135,9 @@ class ProcessCheckpointMixin:
                     entry.get("session_id", "?"), pid)
                 continue
             if fate != "running":
+                # Descendants of a finished command still run in its scope: keep custody, no stop.
+                if custody and self._readopt_scope_custody(entry):
+                    continue
                 systemd_unit = entry.get("systemd_unit", "")
                 if systemd_unit and not _stop_systemd_unit(systemd_unit):
                     logger.warning(
@@ -128,6 +145,9 @@ class ProcessCheckpointMixin:
                         "retaining checkpoint entry for the next startup",
                         systemd_unit, pid)
                     unresolved_scope_entries.append(entry)
+                elif custody:  # verified empty and reaped: the receipt no longer names the scope
+                    forget_result_scope(entry["session_id"])
+                    released_scopes.add(entry["session_id"])
                 continue
             fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
             fields.update(
@@ -155,5 +175,5 @@ class ProcessCheckpointMixin:
                     "notify_on_complete": session.notify_on_complete,
                     "parent_session_id": session.parent_session_id,
                 })
-        self._write_checkpoint(extra_entries=unresolved_scope_entries)
+        self._write_checkpoint(extra_entries=unresolved_scope_entries, settled=released_scopes)
         return recovered
