@@ -286,7 +286,8 @@ def _cached_status(cache_file: Path, identity: dict, now: float) -> Optional[dic
             and isinstance(cached.get("status"), dict) and cached["status"].get("supported") is True):
         return None
     status = cached.get("status", {})
-    ttl = _UPDATE_CHECK_FAILURE_CACHE_SECONDS if status.get("error") else _UPDATE_CHECK_CACHE_SECONDS
+    unsettled = status.get("error") or status.get("releaseRelation") == "unknown"
+    ttl = _UPDATE_CHECK_FAILURE_CACHE_SECONDS if unsettled else _UPDATE_CHECK_CACHE_SECONDS
     ts = cached.get("ts")
     return status if isinstance(ts, (float, int)) and 0 <= now - ts < ttl else None
 
@@ -408,18 +409,18 @@ def _hold_refused_release(result: dict, co: _Checkout, home: Path) -> None:
         result.update(updateAvailable=False, behind=0, held="downgrade", rollback=False)
 
 
-def _embedded_contains(co: _Checkout, commit: str) -> bool:
-    """Whether an embedded build contains release ``commit``, unless shown otherwise.
+def _embedded_contains(co: _Checkout, commit: str) -> Optional[bool]:
+    """Whether an embedded build contains release ``commit``: True, False, or None when unknown.
 
     It has no history to ask, so its upstream base stands in for HEAD. Equal is proof without
-    network. Otherwise only GitHub showing that base behind or diverged from ``commit`` counts
-    as absence; an unknown relation keeps the build, like
-    ``source_releases._head_containing`` for a shallow checkout.
+    network. Otherwise GitHub's compare of ``commit`` with that base decides: ``ahead`` or
+    ``identical`` contains it, ``behind`` or ``diverged`` does not. Any other answer (a refused,
+    rate-limited or missing compare) is unknown, not containment.
     """
     if commit == co.upstream:
         return True
     status = (_github_compare(commit, co.upstream, co.repository or OFFICIAL_REPOSITORY) or {}).get("status")
-    return status not in ("behind", "diverged")
+    return {"ahead": True, "identical": True, "behind": False, "diverged": False}.get(status)
 
 
 def _resolve_channel(result: dict, channel: str, co: _Checkout, *, forward_only: bool = False):
@@ -434,10 +435,16 @@ def _resolve_channel(result: dict, channel: str, co: _Checkout, *, forward_only:
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         result.update(error="release-unavailable", message=f"Could not resolve the {channel} source channel: {exc}")
         return None
-    if (forward_only and co.embedded and source_target.commit and source_target.commit != co.head
-            and _embedded_contains(co, source_target.commit)):
-        # The forward-only guard resolve_source_target applies with Git, for a build without it.
-        source_target = replace(source_target, commit=co.head, ahead=True)
+    if forward_only and co.embedded and source_target.commit and source_target.commit != co.head:
+        contains = _embedded_contains(co, source_target.commit)
+        if contains is not False:
+            # The forward-only guard resolve_source_target applies with Git, for a build without it.
+            # An unknown relation keeps the build, like ``source_releases._head_containing`` for a
+            # shallow checkout, but says so: it is cached as a failure and asked again, rather than
+            # hiding a newer release for a day as though the build were known to be ahead.
+            source_target = replace(source_target, commit=co.head, ahead=True)
+            if contains is None:
+                result["releaseRelation"] = "unknown"
     if source_target.commit:
         target = source_target.commit
         result.pop("branch", None)

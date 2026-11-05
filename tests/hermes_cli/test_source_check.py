@@ -685,6 +685,59 @@ def test_declaring_an_upstream_base_is_not_answered_from_the_old_cache(embedded_
     assert check_for_updates(home=home)["updateAvailable"] is True
 
 
+@pytest.mark.parametrize("code", [403, 429, 404])
+def test_an_unanswered_compare_is_retried_after_the_failure_ttl_not_hidden_for_a_day(
+        installation, embedded_build, monkeypatch, code):
+    """INT01-CACHE-01: with a declared upstream base, a newer release whose compare GitHub refuses
+    (rate limit, 404) keeps the build but is no proof the build contains it. It is reported as an
+    unknown relation and cached only for the failure TTL, so the next passive check asks again and
+    offers the release once GitHub answers ``behind`` (not after 24 hours, or only on force)."""
+    from hermes_cli import source_check
+    from hermes_cli.source_check import UPDATE_AVAILABLE_NO_COUNT, check_for_updates
+
+    clock = [1_000_000.0]
+    monkeypatch.setattr(source_check.time, "time", lambda: clock[0])
+    home, requests, build = embedded_build
+    compare_path = build(upstream=RELEASE_BASE, release=NEWER_RELEASE)
+    responses = installation[5]
+    responses[compare_path] = (code, {"message": "refused"})
+
+    status = check_for_updates(home=home)
+    assert compare_path in requests
+    assert status["updateAvailable"] is False and status["rollback"] is False, status
+    assert status["releaseRelation"] == "unknown"
+
+    # GitHub recovers. Within the failure TTL the cached unknown answer stands, with no request...
+    responses[compare_path] = (200, {"status": "behind"})
+    clock[0] += source_check._UPDATE_CHECK_FAILURE_CACHE_SECONDS - 1
+    del requests[:]
+    assert check_for_updates(home=home)["updateAvailable"] is False
+    assert requests == []
+    # ...and once it expires the relation is asked again and the newer release is offered.
+    clock[0] += 2
+    status = check_for_updates(home=home)
+    assert compare_path in requests
+    assert status["updateAvailable"] is True and status["targetSha"] == NEWER_RELEASE, status
+    assert status["behind"] == UPDATE_AVAILABLE_NO_COUNT and "releaseRelation" not in status
+
+
+def test_a_known_containing_relation_is_still_cached_for_a_day(embedded_build, monkeypatch):
+    """The settled answer keeps the 24-hour cache: only an unknown relation is retried early."""
+    from hermes_cli import source_check
+    from hermes_cli.source_check import check_for_updates
+
+    clock = [1_000_000.0]
+    monkeypatch.setattr(source_check.time, "time", lambda: clock[0])
+    home, requests, build = embedded_build
+    compare_path = build(upstream=RELEASE_BASE, release=NEWER_RELEASE, compare={"status": "ahead"})
+    status = check_for_updates(home=home)
+    assert status["updateAvailable"] is False and "releaseRelation" not in status, status
+    clock[0] += source_check._UPDATE_CHECK_FAILURE_CACHE_SECONDS + 1
+    del requests[:]
+    assert check_for_updates(home=home)["updateAvailable"] is False
+    assert compare_path not in requests and requests == []
+
+
 @pytest.mark.parametrize("ledgered", [True, False])
 @pytest.mark.parametrize("divergent", [True, False], ids=["beside-history", "in-history"])
 def test_stable_release_the_updater_refuses_is_held_not_offered(
