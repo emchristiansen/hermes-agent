@@ -158,6 +158,10 @@ def _settled(admission, params, board_db):
     # The attempt's reply ends the log, as a one-shot worker's did: crash diagnostics quote it.
     if result.get('last_output'):
         print(result['last_output'])
+    from hermes_cli.kanban_db_retry_policy import KANBAN_OWNER_RESTART_EXIT_CODE
+    if result.get('exit_code') == KANBAN_OWNER_RESTART_EXIT_CODE:
+        print(f'Kanban attempt interrupted by its owner\'s restart (admission {admission.receipt["admission_id"]} '
+              'settled interrupted; not replayed)', file=sys.stderr)
     return result.get('exit_code', 1)
 
 

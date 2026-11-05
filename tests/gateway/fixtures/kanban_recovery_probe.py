@@ -16,6 +16,10 @@ from kanban_owner_probe import Model as BaseModel
 from local_recovery_probe import daemon, websocket, rpc
 
 
+# The attempt ends under its live owner before the owner changes: its ordinary crash booking stands.
+AFTER_LIVE_END = ('kill_then_restart', 'interrupt_then_restart')
+
+
 class Model(BaseModel):
     def do_POST(self):
         try:
@@ -54,6 +58,7 @@ def main():
         if key.startswith('HERMES_KANBAN_'):
             env.pop(key)
     from hermes_cli import kanban_db as kb, kanban_db_dispatch as dispatch
+    from hermes_cli.kanban_db_retry_policy import KANBAN_OWNER_RESTART_EXIT_CODE
     from hermes_cli.kanban_db_connect import connect
     os.environ['HERMES_KANBAN_CRASH_GRACE_SECONDS'] = '0'
     clients, receipt = [], {'mode': mode}
@@ -119,20 +124,58 @@ def main():
                 assert peer.blocked.is_set(), 'Owner failed to discover dispatcher board'
                 first = admission()
                 receipt.update(session_id=first['target_session_id'], run_id=task.current_run_id, claim_lock=task.claim_lock)
+                bound = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='worker_bound' "
+                                     "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+                bound_pid = json.loads(bound[0])['pid']
                 if mode == 'restart':
                     proc.kill(); proc.wait(timeout=10)
                     # Model effects are ambiguous: terminate the exact owned executing interpreter.
-                    bound = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='worker_bound' "
-                                         "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
-                    os.kill(json.loads(bound[0])['pid'], signal.SIGKILL)
+                    os.kill(bound_pid, signal.SIGKILL)
                     dispatch._recent_worker_exits.clear()
                     swept = dispatch.dispatch_once(conn, board='owned', max_spawn=1)
                     assert not swept.spawned and kb.get_task(conn, tid).current_run_id == task.current_run_id
+                elif mode in AFTER_LIVE_END:
+                    # The attempt ends under its LIVE owner (interpreter killed, or the turn
+                    # interrupted); only then does the owner change. The submitter is held so it
+                    # first reads the settled receipt from the NEXT owner: that is not an owner restart.
+                    for child in clients:
+                        os.kill(child.pid, signal.SIGSTOP)
+                    if mode == 'kill_then_restart':
+                        os.kill(bound_pid, signal.SIGKILL)
+                    else:
+                        async def interrupt():
+                            async with websocket(owner, desc) as ws:
+                                answer = await rpc(ws, 'session.interrupt', session_id=first['target_session_id'],
+                                                   execution_generation=admission()['generation'])
+                                assert 'result' in answer, answer
+                        asyncio.run(interrupt())
+                    wait_for(lambda: admission()['status'] == 'terminal')
+                    receipt['settled_under_live_owner'] = admission()['outcome']
+                    proc.kill(); proc.wait(timeout=10)
                 else:
                     peer.release.set()
                     wait_for(lambda: admission()['status'] == 'terminal')
                     wait_for(lambda: kb.get_task(conn, tid).status == 'done')
                     assert asyncio.run(retry(desc, params))['session_id'] == first['target_session_id']
+            if mode in AFTER_LIVE_END:
+                with daemon(root, owner, env, barrier=False) as (proc, desc):
+                    for child in clients:
+                        os.kill(child.pid, signal.SIGCONT)
+                    wait_for(lambda: all(p.poll() is not None for p in clients))
+                    assert [p.returncode for p in clients] != [KANBAN_OWNER_RESTART_EXIT_CODE], clients
+                    assert len(peer.requests) == 1, peer.requests
+                    assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='worker_result' "
+                                            "AND payload LIKE '%recorded_by_owner_pid%'", (tid,)).fetchone()
+                    conn.execute('UPDATE tasks SET claim_expires=1,last_heartbeat_at=1,max_runtime_seconds=1 WHERE id=?', (tid,))
+                    conn.execute('UPDATE task_runs SET started_at=1 WHERE id=?', (task.current_run_id,))
+                    conn.commit()
+                    dispatch._recent_worker_exits.clear()
+                    dispatch.dispatch_once(conn, board='owned', max_spawn=0, stale_timeout_seconds=1)
+                    same = kb.get_task(conn, tid)
+                    run = conn.execute('SELECT outcome FROM task_runs WHERE id=?', (task.current_run_id,)).fetchone()
+                    # Ended under its live owner: still the card's own crash, counted as before.
+                    assert (same.consecutive_failures, run[0]) == (1, 'crashed'), (same, run[0])
+                receipt['live_end_counted'] = True
             if mode == 'restart':
                 cfg['model']['default'] = 'changed-default'
                 (owner / 'config.yaml').write_text(json.dumps(cfg))
@@ -148,9 +191,11 @@ def main():
                         assert frozen['policy']['model'] == 'frozen-model', frozen
                         private = json.loads(frozen['policy']['kanban_json'])
                         assert private['db'] == str(board_path.resolve()) and private['claim_lock'] == task.claim_lock
-                    # The attempt's interpreter and its spawned worker are both gone: an ordinary crash,
-                    # booked once and re-queued once (same as a killed one-shot worker), never duplicated.
+                    # The attempt was lost because its owner ended: the next owner recorded that cause
+                    # before settling it, so the submitter exits with the owner-restart code and the
+                    # card is re-queued once WITHOUT counting a failure, never duplicated.
                     wait_for(lambda: all(p.poll() is not None for p in clients))
+                    assert [p.returncode for p in clients] == [KANBAN_OWNER_RESTART_EXIT_CODE], clients
                     assert len(peer.requests) == 1, peer.requests  # the restart never replays the lost call
                     conn.execute('UPDATE tasks SET claim_expires=1,last_heartbeat_at=1,max_runtime_seconds=1 WHERE id=?', (tid,))
                     conn.execute('UPDATE task_runs SET started_at=1 WHERE id=?', (task.current_run_id,))
@@ -160,11 +205,11 @@ def main():
                     same = kb.get_task(conn, tid)
                     run = conn.execute('SELECT outcome FROM task_runs WHERE id=?', (task.current_run_id,)).fetchone()
                     # 'running' when the owner's own dispatcher already re-queued it onto a fresh run.
-                    assert same.status in {'ready', 'running'} and (same.consecutive_failures, run[0]) == (1, 'crashed'), (same, run[0])
+                    assert same.status in {'ready', 'running'} and (same.consecutive_failures, run[0]) == (0, 'owner_restarted'), (same, run[0])
                     assert same.current_run_id != task.current_run_id or same.status == 'ready', same
                     dispatch.dispatch_once(conn, board='owned', max_spawn=0, stale_timeout_seconds=1)
-                    assert kb.get_task(conn, tid).consecutive_failures == 1
-                receipt['crash_requeued_once'] = True
+                    assert kb.get_task(conn, tid).consecutive_failures == 0
+                receipt['owner_restart_requeued_once_uncounted'] = True
             receipt.update(inference_calls=len(peer.requests), frozen_model=peer.requests[0]['model'])
             assert peer.requests[0]['model'] == 'frozen-model'
             wait_for(lambda: all(p.poll() is not None for p in clients))

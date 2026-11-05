@@ -43,6 +43,17 @@ def _describe_exit(returncode):
     return str(returncode)
 
 
+async def _fence_lost_worker(authority, row, scope):
+    """Fence a lost worker's admission ``unknown``. The loss's cause is bound here, where it is found:
+    an owner already stopping lost it to its own end, and that cause commits with the fence itself,
+    so the settlement that follows (this drain's, or a later owner's boot) owes the card its restart
+    result. A kill under a live owner stays a crash even if a stop begins afterwards."""
+    from gateway.session_runtime_workers import tracked_write
+    from gateway.session_unattended_unknown import owner_ending
+    from gateway.session_worker_reservation import lose_admission_worker
+    await tracked_write(authority, partial(lose_admission_worker, authority, row, scope, owner_ending(authority)))
+
+
 class ManagedExecutionUnknown(RuntimeError):
     """The committed unknown verdict stops the FIFO without forging failed settlement."""
 
@@ -701,9 +712,7 @@ async def execute_managed(authority, ref, row, policy):
         # the signal). Read without waiting: nothing may delay or cancel the loss write below.
         logging.getLogger(__name__).warning('Managed worker lost: %s (pid %s, exit %s)', reason,
             process.pid, _describe_exit(process.poll()))
-        from gateway.session_worker_reservation import lose_admission_worker
-        from gateway.session_runtime_workers import tracked_write
-        await tracked_write(authority, partial(lose_admission_worker, authority, row, scope))
+        await _fence_lost_worker(authority, row, scope)
         live = authority.sessions[ref.session_id]
         with live.event_stream.lock:
             live.controls.snapshot(ref.session_id, None)

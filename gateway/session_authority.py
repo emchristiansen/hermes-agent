@@ -21,7 +21,7 @@ from gateway.session_contract import (
 from gateway.session_events import SessionEvents
 from gateway.session_pending_controls import PendingControls
 from hermes_state_runtime import (
-    STEERING, RuntimeStoreError, admit_session_input, begin_runtime_epoch,
+    OWNER_RESTART, STEERING, RuntimeStoreError, admit_session_input, begin_runtime_epoch,
     cancel_session_input, claim_session_input, get_session_admission,
     list_session_admissions, recover_session_inputs, resolve_unknown_session_input,
 )
@@ -393,7 +393,10 @@ class SessionAuthority:
 
     def _receipt(self, row):
         status, outcome = row['status'], row['outcome']
-        if outcome == STEERING:  # handed to the running claim: it reads as that execution until settled
+        # Handed to the running claim, or a card attempt lost to its owner's end that still owes its
+        # board the restart result: it reads as that execution until settled (a submitter that read
+        # ``unknown`` would exit before the cause it waits for is published).
+        if outcome == STEERING or (status, outcome) == ('unknown', OWNER_RESTART):
             status, outcome = 'started', None
         return AdmissionReceipt(row['admission_id'], SessionRef(self.profile_id, row['target_session_id']),
                                 row['seq'], status, outcome, row['owner_epoch'] or self.epoch, row['generation'])

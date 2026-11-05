@@ -330,6 +330,61 @@ def _record_worker_result(context, code, last_output):
                  'last_output': last_output}, run_id=context['run_id'])
 
 
+def record_owner_restart_result(card, board_db) -> bool:
+    """The profile owner ended under a card attempt: record that as the run's result.
+
+    Called only where the owner itself settles the attempt's lost turn ``interrupted`` because it
+    is stopping or restarting (``session_unattended_unknown``): a drain that fenced the lost worker
+    while this owner was ending, or the next owner's boot recovery of a turn its predecessor left in
+    flight. A turn that ended any other way (its interpreter killed under a live owner, a cancel)
+    was terminal before that and never reaches here, so it keeps its ordinary crash booking.
+
+    Writes the ``worker_result`` the bound interpreter would have, under the bound pid and claim, with
+    ``KANBAN_OWNER_RESTART_EXIT_CODE``: the submitter returns it and the dispatcher requeues without
+    counting a failure. Only for the task's CURRENT run under its live claim, and never over a result
+    the interpreter already recorded. ``board_db``: the board file the attempt's session policy names
+    (``card_board_db``). False when nothing was recorded."""
+    import os
+    from hermes_cli.kanban_db_connect import connect_closing
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_retry_policy import KANBAN_OWNER_RESTART_EXIT_CODE
+    if not isinstance(card, dict) or not isinstance(card.get('task_id'), str) or type(card.get('run_id')) is not int:
+        return False
+    path = Path(board_db)
+    if not path.is_file():
+        return False
+    task_id, run_id = card['task_id'], card['run_id']
+    with connect_closing(path) as conn, kb.write_txn(conn):
+        row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_bound' "
+                           "ORDER BY id DESC LIMIT 1", (task_id, run_id)).fetchone()
+        bound = json.loads(row[0]) if row else {}
+        task = conn.execute('SELECT current_run_id, claim_lock FROM tasks WHERE id=?', (task_id,)).fetchone()
+        if (not bound.get('claim_lock') or task is None or task[0] != run_id or task[1] != bound['claim_lock']
+                or conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_result'",
+                                (task_id, run_id)).fetchone()):
+            return False
+        kb._append_event(conn, task_id, 'worker_result',
+            {'pid': bound.get('pid'), 'claim_lock': bound['claim_lock'], 'exit_code': KANBAN_OWNER_RESTART_EXIT_CODE,
+             'last_output': '', 'recorded_by_owner_pid': os.getpid()}, run_id=run_id)
+    return True
+
+
+def card_board_db(conn, row):
+    """The board file of the card attempt ``row`` admitted, from its session's frozen policy (the same
+    ``kanban_json`` its bound interpreter records into); None unless that policy is this attempt's."""
+    from hermes_state_local import POLICY_PREFIX
+    card = (row.get('payload') or {}).get('kanban_card_v1') or {}
+    saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (POLICY_PREFIX + row['target_session_id'],)).fetchone()
+    try:
+        kanban = json.loads(json.loads(saved[0])['policy'].get('kanban_json') or 'null') if saved else None
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return None
+    if (not isinstance(kanban, dict) or kanban.get('task_id') != card.get('task_id')
+            or kanban.get('run_id') != card.get('run_id') or not isinstance(kanban.get('db'), str)):
+        return None
+    return kanban['db']
+
+
 def _bound_worker_matches(conn, context):
     import os
     row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_bound' ORDER BY id DESC LIMIT 1",
