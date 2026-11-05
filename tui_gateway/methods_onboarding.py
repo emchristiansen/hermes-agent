@@ -174,8 +174,9 @@ def _(rid, params: dict) -> dict:
     from agent.onboarding_text import CHAT_TITLE, opening_prompt
     from hermes_cli.auth_constants import AuthError
     from hermes_cli import free_tier_bootstrap
-    # The app's once-per-launch start: closing the app mid-run does not count, so that run's chat goes
-    # and the run starts over. A second window or a reconnect sends no flag and gets the run back.
+    # The app's once-per-launch start: closing the app mid-run does not count, so that run ends as
+    # replaced (its chat stays in the history) and the run starts over. A second window or a reconnect
+    # sends no flag and gets the run back.
     fresh_launch = bool(params.get("fresh_launch"))
     # Held through the opening submit: two windows pressing start at once get one chat and one opening.
     with _onboarding_start_lock:
@@ -204,13 +205,17 @@ def _(rid, params: dict) -> dict:
                 # One open run at a time. The kept run is open before the others end, so the install
                 # flag never closes in between; finishing it closes the flag.
                 replaced = [sid for sid in open_ids if sid != stored]
+                closed = []
                 if fresh_launch:
-                    _discard_unfinished_runs(db, replaced)
-                else:
-                    for old in replaced:
-                        advance(db, old, End("replaced"))
+                    # A backend that outlived the app still shows the chats the app was closed on: close
+                    # them so the old flow cannot go on. Each chat keeps its messages.
+                    closed = _live_session_ids(replaced)
+                    for sid in closed:
+                        _close_session_by_id(sid, end_reason="onboarding_restart")
+                for old in replaced:
+                    advance(db, old, End("replaced"))
                 if created:
-                    # After the discard, so a run started over keeps the title its deleted chat had.
+                    # A replaced chat keeps its title, so a run started over takes the next one in the lineage.
                     db.set_session_title(stored, db.get_next_title_in_lineage(CHAT_TITLE))
                 # A chat with no messages never got its opening (a restart between start and the first turn).
                 opening = None if (db.get_session(stored) or {}).get("message_count") else opening_prompt(facts)
@@ -228,7 +233,7 @@ def _(rid, params: dict) -> dict:
         if claimed is not None:
             # Outside the default-profile scope: setup.status serves the launch profile's record.
             free_tier_bootstrap.refresh_record()
-        _withdraw_setup_cards([] if fresh_launch else replaced)
+        _withdraw_setup_cards(closed + _live_session_ids(replaced))
         resumed = _methods["session.resume"](rid, {**_ONBOARDING_PROFILE, "session_id": stored, "source": "desktop"})
         if "error" in resumed:
             return resumed
@@ -268,31 +273,11 @@ def _live_session_ids(stored_ids: list[str]) -> list[str]:
                 if (getattr(sess.get("agent"), "session_id", None) or sess.get("session_key")) in stored_ids]
 
 
-def _withdraw_setup_cards(stored_ids: list[str]) -> None:
-    """Close the card still waiting in a chat whose run just ended; its answer would be refused."""
-    for sid in _live_session_ids(stored_ids):
+def _withdraw_setup_cards(live_ids: list[str]) -> None:
+    """Close the card still waiting in each session (a runtime id) whose run just ended; its answer would
+    be refused. A session a fresh launch closed is told too: its turn may still wait on the card."""
+    for sid in live_ids:
         _cancel_session_requests(sid, "resolved", method="setup_beat")
-
-
-def _discard_unfinished_runs(db, stored_ids: list[str]) -> None:
-    """A new launch's start: the runs the app was closed on never count as done. Each chat is closed if
-    still live here (a backend that outlived the app), then deleted the way ``session.delete`` deletes
-    it, which ends its run (``deleted``) and tells every window. A chat the delete refuses keeps its
-    messages, and its run ends as ``replaced`` so it is never resumed."""
-    from agent.onboarding_flow import End
-    from agent.onboarding_record import advance, delete_chat
-    for sid in _live_session_ids(stored_ids):
-        _close_session_by_id(sid, end_reason="onboarding_restart")
-    sessions_dir = Path(_profile_home("default") or get_hermes_home()) / "sessions"
-    for old in stored_ids:
-        try:
-            deleted = delete_chat(db, old, lambda old=old: db.delete_session(
-                old, sessions_dir=sessions_dir, exclude_active_write_guards=True))
-        except Exception:
-            logger.exception("onboarding.start could not delete unfinished chat %s", old)
-            deleted = False
-        if not deleted:
-            advance(db, old, End("replaced"))
 
 
 def _setup_beat_request(sid: str, payload: dict) -> dict | None:

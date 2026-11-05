@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import threading
 import uuid
 from functools import partial
 
@@ -67,25 +66,12 @@ async def start(connection, ref, params):
     async with lock:
         plan = await asyncio.to_thread(_choose_run, authority, request)
         stored = plan['stored'] or await _create_chat(connection)
-        from gateway.session_mutations import retire_live_sessions
         from gateway.session_runtime_workers import tracked_write
-        discards = _discards(authority)
-        if request.fresh_launch:
-            discards.ids.update(sid for sid in plan['replaced']
-                                if (live := authority.sessions.get(sid)) is None or not live.subscribers)
-
-        def retire(deleted):
-            retire_live_sessions(authority, deleted)
-            return deleted
-        try:
-            deleted = await tracked_write(authority, partial(_settle_runs, authority, request, plan, stored, discards),
-                                          retire)
-        finally:
-            discards.ids.difference_update(plan['replaced'])
+        await tracked_write(authority, partial(_settle_runs, authority, plan, stored))
         if plan['claimed'] is not None:
             from hermes_cli import free_tier_bootstrap
             await asyncio.to_thread(free_tier_bootstrap.refresh_record)
-        _withdraw_setup_cards(authority, [sid for sid in plan['replaced'] if sid not in deleted])
+        _withdraw_setup_cards(authority, plan['replaced'])
         chat = SessionRef(authority.profile_id, stored)
         await connection.resume(chat, {})
         opening = plan['opening'] if plan['stored'] else await asyncio.to_thread(_opening_for, authority, stored)
@@ -161,45 +147,11 @@ async def _create_chat(connection):
     return restore_local_session(authority, staged['session_id']).session_id
 
 
-class _Discards:
-    """The chats a fresh launch's start deletes because no window watched them when it looked. A window
-    that resumes one before its delete takes it back (``keep_from_discard``); the lock makes the take-back
-    and the delete one or the other, never a viewer on a deleted chat."""
-
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.ids = set()
-
-
-def _discards(authority):
-    discards = getattr(authority, '_onboarding_discards', None)
-    if discards is None:
-        discards = authority._onboarding_discards = _Discards()
-    return discards
-
-
-async def keep_from_discard(authority, session_id):
-    """``attach``, after its last other await: a chat a fresh launch was about to delete is kept. The
-    take-back itself never yields, so the viewer joins in the same loop step and a later start sees it
-    watched; a start claims only on the loop. A delete in flight holds the lock across its write, so
-    that wait runs off the loop and the take-back is retried after it."""
-    discards = getattr(authority, '_onboarding_discards', None)
-    while discards is not None and session_id in discards.ids:
-        if discards.lock.acquire(blocking=False):
-            discards.ids.discard(session_id)
-            discards.lock.release()
-            return
-
-        def delete_finished():
-            with discards.lock:
-                pass
-        await asyncio.to_thread(delete_finished)
-
-
-def _settle_runs(authority, request, plan, stored, discards):
-    """The new chat's record and title, and the end of every other open run; returns the chats it
-    deleted. One open run at a time: the kept run is open before the others end, so the install flag
-    never closes in between."""
+def _settle_runs(authority, plan, stored):
+    """The new chat's record and title, and the end of every other open run. One open run at a time:
+    the kept run is open before the others end, so the install flag never closes in between. A fresh
+    launch's start ends the runs the app was closed on the same way: each chat stays in the history with
+    its messages, and its run ends as ``replaced`` (every window is told) so it is never resumed."""
     from agent.onboarding_flow import End
     from agent.onboarding_record import advance, start
     from agent.onboarding_text import CHAT_TITLE
@@ -207,39 +159,11 @@ def _settle_runs(authority, request, plan, stored, discards):
     if plan['stored'] is None:
         # The record exists before any agent is built, so the first turn already folds the toolset in.
         start(db, stored, plan['facts'])
-    deleted = []
-    if request.fresh_launch:
-        deleted = _discard_unfinished_runs(db, plan['replaced'], discards)
     for old in plan['replaced']:
-        if old not in deleted:
-            advance(db, old, End('replaced'))
+        advance(db, old, End('replaced'))
     if plan['stored'] is None:
-        # After the discard, so a run started over keeps the title its deleted chat had.
+        # A replaced chat keeps its title, so a run started over takes the next one in the lineage.
         db.set_session_title(stored, db.get_next_title_in_lineage(CHAT_TITLE))
-    return deleted
-
-
-def _discard_unfinished_runs(db, stored_ids, discards):
-    """A new launch's start: the runs the app was closed on never count as done. A chat no window
-    watches (still in *discards*) is deleted the way ``session.delete`` deletes it, which ends its run
-    (``deleted``) and tells every window; the caller retires the deleted ids from the authority. A chat a
-    window reopened, or one a turn still writes (the delete refuses it), is kept, and its run ends as
-    ``replaced`` so it is never resumed."""
-    from pathlib import Path
-    from agent.onboarding_record import delete_chat
-    sessions_dir = Path(db.db_path).parent / 'sessions'
-    deleted = []
-    for old in stored_ids:
-        with discards.lock:
-            if old not in discards.ids:
-                continue
-            try:
-                if delete_chat(db, old, lambda old=old: db.delete_session(
-                        old, sessions_dir=sessions_dir, exclude_active_write_guards=True)):
-                    deleted.append(old)
-            except Exception:
-                logger.exception('onboarding.start could not delete unfinished chat %s', old)
-    return deleted
 
 
 def ending_run_on_delete(db, session_id, commit):
