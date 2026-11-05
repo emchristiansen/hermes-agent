@@ -135,7 +135,7 @@ def _tool_call(call_id: str):
                            function=SimpleNamespace(name=_PROBE_TOOL, arguments="{}"))
 
 
-def _run_turn(monkeypatch, tmp_path, *, tool_rounds: int = 2):
+def _run_turn(monkeypatch, tmp_path, *, tool_rounds: int = 2, compress: bool = True, loop_compress: bool = False):
     from tests.agent.test_run_agent import _mock_response
 
     agent, db = _make_agent(monkeypatch, tmp_path)
@@ -154,6 +154,8 @@ def _run_turn(monkeypatch, tmp_path, *, tool_rounds: int = 2):
         if len(payloads) > tool_rounds:
             return _mock_response(content="Handled.", finish_reason="stop")
         if len(payloads) == 1:
+            if not compress:  # no summary call to land in: the wake is handed over during the first request
+                assert agent.steer(WAKE, ticket="admission-481", delivered_by={}) is True
             return _mock_response(content=None, finish_reason="tool_calls", tool_calls=[_tool_call("call_1")])
         if len(payloads) == 2:
             # The next admission is transferred while this request is in flight; the post-batch drain
@@ -163,9 +165,10 @@ def _run_turn(monkeypatch, tmp_path, *, tool_rounds: int = 2):
 
     agent._interruptible_api_call = model_call
     compressor = agent.context_compressor
-    compressor.threshold_tokens = 2_000
+    # loop_compress (with compress=False): no turn-start pass; the loop's pre-API gate compacts after the merge.
+    compressor.threshold_tokens = 2_000 if compress or loop_compress else 10**9
     compressor.note_usage_less_response()
-    estimates = iter([50_000])
+    estimates = iter([50_000] if compress else [])
 
     def estimate(*_a, **_k):
         return next(estimates, 500)

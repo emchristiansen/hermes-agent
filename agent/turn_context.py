@@ -593,6 +593,7 @@ def _bind_turn_identity(
     ids. Returns ``(effective_task_id, turn_id)``."""
     agent._stream_callback = stream_callback  # picked up by _interruptible_api_call
     agent._persist_user_message_idx = None
+    agent._turn_user_message = None
     agent._persist_user_message_override = persist_user_message
     agent._persist_user_message_timestamp = persist_user_timestamp
     agent._persist_user_message_platform_id = persist_user_platform_id
@@ -1136,6 +1137,8 @@ def build_turn_context(
     append_message(messages, user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
+    # The turn's own dict: its uid/row id prove the prompt row after a repair folds it (persisted_turn_receipt).
+    agent._turn_user_message = user_msg
 
     agent._user_turn_count += 1
     # Copilot x-initiator: the first API call of this user turn is user-initiated;

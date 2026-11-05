@@ -87,17 +87,21 @@ def _persisted_turn(agent, agent_history, result, compressions) -> dict | None:
     publish: clients bind the streamed reply to its stored row instead of comparing words. The
     agent copies ``conversation_history`` into its message list, so an untouched pre-turn prefix
     is the same dicts (transcript rows here carry no ``_row_id`` to compare)."""
-    from agent.persisted_turn_receipt import persisted_turn_receipt
+    from agent.persisted_turn_receipt import persisted_turn_receipt, row_identity_lookup, verify_receipt_rows
     if not isinstance(result, dict):
         return None
     status = ("interrupted" if result.get("interrupted")
               else "error" if result.get("failed") or result.get("error") else "complete")
-    return persisted_turn_receipt(
+    rows = row_identity_lookup(getattr(agent, "_session_db", None), getattr(agent, "session_id", None))
+    return verify_receipt_rows(persisted_turn_receipt(
         result.get("messages"), getattr(agent, "_persist_user_message_idx", None), agent_history,
         result.get("final_response"), status,
         compression_unchanged=type(compressions) is int and compressions == getattr(
             getattr(agent, "context_compressor", None), "compression_count", None),
-        prefix_row_matches=lambda before, after: before is after)
+        prefix_row_matches=lambda before, after: before is after,
+        turn_message=getattr(agent, "_turn_user_message", None),
+        turn_override=getattr(agent, "_persist_user_message_override", None), row_identity=rows,
+    ), rows)
 
 
 class _NoStreamConsumer(RuntimeError):
