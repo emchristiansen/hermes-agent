@@ -106,9 +106,13 @@ class TestFallbackChainInit:
 
 class TestBusyInputMode:
 
-    def test_busy_input_mode_queue_is_honored(self):
-        cli = _make_cli(config_overrides={"display": {"busy_input_mode": "queue"}})
-        assert cli.busy_input_mode == "queue"
+    @pytest.mark.parametrize("configured", ["queue", "interrupt", "steer"])
+    def test_every_configured_busy_input_mode_steers(self, configured):
+        """Every message steers (Eric, 2026-11-04): the configured mode no longer picks the behaviour."""
+        cli = _make_cli(config_overrides={"display": {"busy_input_mode": configured}})
+        assert cli.busy_input_mode == "steer"
+        cli.busy_input_mode = "interrupt"  # /busy, the gateway mirror: nothing changes it
+        assert cli.busy_input_mode == "steer"
 
 
     def test_queue_command_works_while_busy(self):

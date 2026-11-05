@@ -678,6 +678,25 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
     def _hm_text_only(event: MessageEvent) -> bool:
         return event.message_type == MessageType.TEXT and not event.media_urls and not event.media_types
 
+    def _hm_steer_delivered(self, event: MessageEvent, _quick_key: str) -> bool:
+        """Steer an internal event's text into the running turn as a delivered message (its
+        ``turn_author``, or Hermes automation): True when the running agent took it."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        state = self._peek_session_state(_quick_key)
+        agent = state.turn.agent if state else None
+        text = (event.text or "").strip()
+        adapter = self._delivery_adapter_for(event.source)
+        if (self._draining or getattr(getattr(self, "session_authority", None), "retiring", False)  # the busy pass's gate
+                or agent is None or agent is _AGENT_PENDING_SENTINEL or not text or not self._hm_text_only(event)
+                or not callable(getattr(agent, "withdraw_steer", None))  # only the seam that records a sender
+                or (adapter and _quick_key in getattr(adapter, "_pending_messages", {}))):  # keep arrival order
+            return False
+        try:
+            return bool(agent.steer(text, delivered_by=dict((event.metadata or {}).get("turn_author") or {})))
+        except Exception as exc:  # health: allow BLE001 -- as _hm_busy_steer: a failed steer queues the event as before
+            logger.warning("Internal-event steer failed for session %s: %s", _quick_key, exc)
+            return False
+
     def _hm_busy_steer(self, event: MessageEvent, running_agent: Any, _quick_key: str) -> None:
         """Steer mode: inject text mid-run via ``agent.steer()``, else fall back to queue semantics."""
         steer_text = (event.text or "").strip()
@@ -745,9 +764,11 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         busy_input_mode queue/steer, subagent and compression protection demote to queue."""
         from gateway.run import _AGENT_PENDING_SENTINEL
         if getattr(event, "internal", False) and not event.get_command():
-            # Main's rule (run_busy's busy handler, which the shared runtime's busy dispatch skips):
-            # an internal synthetic event never interrupts or steers the running turn.
-            self._queue_or_replace_pending_event(_quick_key, event)
+            # An internal synthetic event never interrupts the running turn (main's rule). Every message
+            # steers (Eric, 2026-11-04): it reaches that turn as its sender's, never the user's, and is
+            # queued as before only when nothing running can take it.
+            if not self._hm_steer_delivered(event, _quick_key):
+                self._queue_or_replace_pending_event(_quick_key, event)
             return None
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)
         if not _handled:

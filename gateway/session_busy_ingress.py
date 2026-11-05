@@ -9,12 +9,12 @@ An idle session still runs the message as its own turn at once (the drain is unc
 The pass runs after each admission while a claim executes, and when the claim adopts its agent (a
 message admitted before that has no agent to reach yet). Messages are interactive plain text (what
 ``prompt.steer_queued`` already offers) and local automation text: Kanban and process notices, liveness
-ticks and Bot Chat deliveries, including the Desktop relay's; these reach the turn framed with their
-sender, never as the user's text. A row whose route no longer belongs to this session is left to the
+ticks and Bot Chat deliveries, including the Desktop relay's, and a messaging route's wakes; these reach
+the turn framed with their sender, never as the user's text. A row whose route no longer belongs to this session is left to the
 drain, which refuses it as before, and nothing steers while the runtime drains (a restart's queued
 input waits for the next owner, as the drain makes it). Whole jobs keep their own turn:
 attachments, finite/cron/Kanban/API/A2A/hosted runs and hidden prompts, whose producers read that
-turn's own result. Messaging-platform text steers through the messaging busy path, before admission.
+turn's own result. A messaging user's own text steers through the messaging busy path, before admission.
 """
 import asyncio
 import logging
@@ -25,18 +25,24 @@ from hermes_state_runtime import RuntimeStoreError, list_session_admissions
 logger = logging.getLogger(__name__)
 
 
-def is_message(authority, ref, row):
+async def is_message(authority, ref, row):
     """True when the queued ``row`` is a message to steer, False when it is a whole job."""
-    from gateway.session_queued_controls import queued_controls
+    from gateway.session_queued_controls import automation, queued_controls
     if 'steer' in queued_controls(authority, row):
         return True
     payload = row['payload']
     text = payload.get('text')
-    if row['status'] != 'queued' or set(payload) != {'text', 'local_automation_v1'} or not isinstance(text, str) or not text.strip():
+    if row['status'] != 'queued' or automation(payload) is None or not isinstance(text, str) or not text.strip():
         return False
-    from gateway.session_automation import check_local_automation
-    try:
-        check_local_automation(authority, ref, row)  # the drain's own route check: never misrouted
+    try:  # the drain's own route check for the row: never misrouted
+        if 'local_automation_v1' in payload:
+            from gateway.session_automation import check_local_automation
+            check_local_automation(authority, ref, row)
+        else:
+            from gateway.session_envelope import check_native_route
+            live = authority.sessions[ref.session_id]
+            await check_native_route(authority.runner, payload, authority.physical_target(ref), live.source,
+                                     authority.runner._adapter_for_source(live.source))
     except RuntimeStoreError:
         return False
     return True
@@ -72,7 +78,7 @@ async def _pass(authority, ref, live):
             return  # idle (the drain runs them), no agent yet (adoption runs this again), or a managed worker
         rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=ref.session_id)
         for row in rows:
-            if row['status'] != 'queued' or not is_message(authority, ref, row):
+            if row['status'] != 'queued' or not await is_message(authority, ref, row):
                 continue
             if authority.runner._draining or authority.retiring:
                 # The drain's own gate, decided at each transfer with no await before ``transfer`` registers

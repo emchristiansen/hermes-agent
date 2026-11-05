@@ -111,6 +111,13 @@ class DrainedSteer(str):
     segments: tuple = ()
 
 
+class DeliveredText(str):
+    """A ticketless steer's text another principal delivered (a producer notice the surface holds itself,
+    not a gateway transfer): it carries its ``sender`` with it."""
+
+    sender: dict = {}
+
+
 def _steer_senders(agent) -> dict:
     """``{ticket: sender}`` for ticketed steers another principal delivered (a Bot Chat delivery, a
     producer notice); ``sender`` is that author (``{}`` for Hermes automation). Kept until settlement."""
@@ -120,11 +127,14 @@ def _steer_senders(agent) -> dict:
 def _drained_text(agent, parts: list):
     text = "\n".join(part_text for _, part_text in parts) or None
     senders = _steer_senders(agent)
-    if text is None or not any(ticket in senders for ticket, _ in parts if ticket is not None):
+
+    def sender(ticket, part_text):
+        return senders.get(ticket) if ticket is not None else getattr(part_text, "sender", None)
+    segments = tuple((sender(ticket, part_text), part_text) for ticket, part_text in parts)
+    if text is None or all(who is None for who, _ in segments):
         return text
     drained = DrainedSteer(text)
-    drained.segments = tuple((senders.get(ticket) if ticket is not None else None, part_text)
-                             for ticket, part_text in parts)
+    drained.segments = segments
     return drained
 
 
@@ -337,11 +347,14 @@ class InterruptControlMixin:
         """Queue user text for delivery as its own user row after the current tool batch finishes (no
         interrupt); multiple calls concatenate with newlines. Returns False for empty text. ``ticket``
         names the submission, so ``withdraw_steer`` can settle exactly it, whatever text others carry.
-        ``delivered_by`` (a ticketed steer only): the text is another principal's delivered message, not
-        the user's: that author dict, or ``{}`` for Hermes automation."""
+        ``delivered_by``: the text is another principal's delivered message, not the user's: that author
+        dict, or ``{}`` for Hermes automation (recorded by ticket, or carried by a ticketless text)."""
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        if delivered_by is not None and ticket is None:
+            cleaned = DeliveredText(cleaned)
+            cleaned.sender = dict(delivered_by)
         with _ic_lock(self, "_pending_steer_lock"):
             if delivered_by is not None and ticket is not None:
                 _steer_senders(self)[ticket] = dict(delivered_by)
@@ -445,7 +458,11 @@ class InterruptControlMixin:
         with _ic_lock(self, "_pending_steer_lock"):
             parts = _steer_parts(self)
             _set_steer_parts(self, [part for part in parts if part[0] is not None])
-        return "\n".join(text for ticket, text in parts if ticket is None) or None
+        from agent.prompt_builder import format_delivered_message  # a delivered text keeps its sender
+
+        def leftover(text):
+            return format_delivered_message(text, text.sender) if isinstance(text, DeliveredText) else text
+        return "\n".join(leftover(text) for ticket, text in parts if ticket is None) or None
 
     def withdraw_steer(self, ticket) -> bool:
         """Settle one ``steer(text, ticket=...)`` by identity (the gateway's transfer of a queued prompt):

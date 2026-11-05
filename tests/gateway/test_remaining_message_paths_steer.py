@@ -1,0 +1,357 @@
+"""The remaining message paths into a busy session steer (Eric, 2026-11-04).
+
+(1) A native FIFO row keeps its own turn: a messaging user's text admitted before the running turn
+adopted its agent, an explicit ``/queue`` (before or after adoption) and an A2A task are the same row
+shape, and an explicit next-turn choice or a whole job must not be steered (reviewer GW-F01/GW-F02).
+
+(2) A wake with NO session authority (legacy path): ``gateway.wake.deliver_wake`` falls back to the
+adapter's ``handle_message``. When the runner's session state holds a running agent with the steer
+seam, the busy handler that receives it steers it framed as Hermes automation, never interrupting and
+never queueing it: the adapter's busy path when the adapter holds the running turn's guard (the normal
+legacy turn, ``_handle_active_session_busy_message``), else the runner's
+(``_hm_handle_running_session_message``). With no built agent, another event already waiting, or the
+gateway draining (reviewer GW-F03), it queues behind the turn as before.
+
+Real GatewayRunner, DiscordAdapter, (in (1)) SessionAuthority, admission ledger and drain over SQLite;
+the turn body is a stand-in; the boundary is the canonical ``apply_pending_steer_to_tool_results``.
+"""
+import asyncio
+
+import pytest
+
+from agent.agent_runtime_helpers import apply_pending_steer_to_tool_results
+from tests.gateway.test_prompt_queued_transfer import BufferedAgent
+from tests.waiting import async_wait_until
+
+USER_MARKER = 'a direct message from the user'
+AUTOMATION_MARKER = '[DELIVERED MESSAGE — from Hermes automation'
+
+
+def _boundary(agent):
+    """The turn's tool/result boundary: the steer, if any, appended after a tool result."""
+    messages = [{'role': 'assistant', 'tool_calls': []}, {'role': 'tool', 'content': 'fixture result'}]
+    apply_pending_steer_to_tool_results(agent, messages, 1)
+    return messages[-1]['content'] if messages[-1]['role'] == 'user' else None
+
+
+async def _gateway(monkeypatch, *, authority=True):
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from gateway.platforms.base import SendResult
+    from gateway.run import GatewayRunner
+    from gateway.session_authority import initialize_session_authority
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    monkeypatch.setenv('DISCORD_ALLOWED_USERS', '42')
+    runner = GatewayRunner(GatewayConfig())
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token='fixture-token', typing_indicator=False))
+    sent = []
+
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        sent.append(content)
+        return SendResult(success=True, message_id=f's{len(sent)}')
+    monkeypatch.setattr(adapter, 'send', send)
+    adapter.gateway_runner = runner  # as GatewayRunner._create_adapter binds every adapter
+    runner.adapters = {Platform.DISCORD: adapter}
+    owner = await initialize_session_authority(runner, profile_id='default', instance_id='owner') if authority else None
+    runner._wire_adapter_handlers(adapter)
+    source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
+    key = runner.session_store._generate_session_key(source)
+    return runner, adapter, owner, source, key
+
+
+def _rows(authority, runner, key):
+    from hermes_state_runtime import list_session_admissions
+    owner = runner.session_store.peek_session_id(key)
+    return list_session_admissions(authority.db, session_id=owner, pending_only=False) if owner else []
+
+
+@pytest.mark.asyncio
+async def test_a_human_message_before_adoption_keeps_its_own_turn(monkeypatch):
+    """A messaging user's text admitted while the turn still builds its agent is a native FIFO row, which
+    the row cannot tell apart from an explicit ``/queue`` (reviewer GW-F01): it keeps R5's next turn."""
+    from gateway.platforms.event import MessageEvent
+    from gateway.run import _AGENT_PENDING_SENTINEL
+    from gateway.session_busy_ingress import _pass
+    from gateway.session_contract import SessionRef
+    from gateway.session_results import execution_result
+
+    runner, adapter, authority, source, key = await _gateway(monkeypatch)
+    agent = BufferedAgent()
+    running, adopt_now, adopted, boundary = asyncio.Event(), asyncio.Event(), asyncio.Event(), asyncio.Event()
+    executed, taken = [], []
+
+    async def turn(event, source, quick_key, run_generation):
+        executed.append(event.text)
+        if event.text == 'A':
+            running.set()
+            await asyncio.wait_for(adopt_now.wait(), 30)  # the turn is still building its agent
+            owner = runner.session_store.peek_session_id(key)
+            authority.adopt_agent(owner, authority.executing[owner], agent)
+            adopted.set()
+            await asyncio.wait_for(boundary.wait(), 30)
+            taken.append(_boundary(agent))
+        captured = execution_result.get()
+        if captured is not None:
+            captured['result'] = {'final_response': 'reply ' + event.text, 'messages': []}
+        return 'reply ' + event.text
+    monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
+
+    await adapter.handle_message(MessageEvent(text='A', source=source, message_id='A'))
+    await asyncio.wait_for(running.wait(), 30)
+    assert runner._peek_session_state(key).turn.agent is _AGENT_PENDING_SENTINEL, 'no agent built yet'
+    human = 'also check the staging logs'
+    await adapter.handle_message(MessageEvent(text=human, source=source, message_id='B'))
+    await async_wait_until(lambda: len(_rows(authority, runner, key)) == 2, timeout=10, what='the human row')
+    adopt_now.set()
+    await asyncio.wait_for(adopted.wait(), 10)
+    sid = runner.session_store.peek_session_id(key)
+    live = authority.sessions[sid]
+    await _pass(authority, SessionRef(authority.profile_id, sid), live)  # the adoption pass, settled first
+    if live.steering:
+        await live.steering
+    boundary.set()
+    await async_wait_until(lambda: executed == ['A', human], timeout=15, what='the human text to run as its own turn')
+    assert taken == [None], 'nothing reached the running turn'
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_wake_steers_into_the_runners_running_agent_as_hermes_automation(monkeypatch):
+    """No authority; the runner's session state holds the running turn's agent (steer seam) while the
+    adapter holds no guard for it: the wake's adapter admission reaches the runner's busy branch."""
+    from gateway.wake import deliver_wake
+
+    runner, adapter, authority, source, key = await _gateway(monkeypatch, authority=False)
+    assert authority is None and getattr(runner, 'session_authority', None) is None
+    agent, interrupts, executed = BufferedAgent(), [], []
+    monkeypatch.setattr(agent, 'interrupt', lambda *a, **k: interrupts.append(a), raising=False)
+
+    async def turn(event, source, quick_key, run_generation):
+        executed.append(event.text)
+        return 'never'
+    monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
+    runner._session_state(key).turn.agent = agent  # the built, running agent
+    assert runner._is_session_running(key) and key not in adapter._active_sessions
+
+    wake = '[Kanban task completed] t_9 result ready'
+    await asyncio.wait_for(deliver_wake(adapter, text=wake, source=source), 10)  # accepted, no raise
+    await async_wait_until(lambda: agent._pending_steer is not None and key not in adapter._active_sessions,
+                           timeout=10, what='the wake to steer into the running agent and the handler to finish')
+    assert interrupts == [], 'an internal wake never interrupts'
+    assert executed == [], 'the wake never ran as its own turn'
+    assert key not in adapter._pending_messages, 'never queued behind the turn'
+    assert runner._peek_session_state(key).turn.agent is agent, 'the running turn kept its agent'
+    content = _boundary(agent)
+    assert content is not None and AUTOMATION_MARKER in content, content
+    frame = content[content.index(AUTOMATION_MARKER):]
+    assert wake in frame, 'the wake text sits inside the automation frame'
+    assert USER_MARKER not in content, 'never promoted to the user'
+    assert _boundary(agent) is None, 'delivered once'
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_wake_with_no_running_agent_still_queues(monkeypatch):
+    """No authority; the runner's turn is still building its agent (pending sentinel): the runner's busy
+    branch has nothing to steer into and queues the wake behind the turn, as before."""
+    from gateway.run import _AGENT_PENDING_SENTINEL
+    from gateway.wake import deliver_wake
+
+    runner, adapter, _, source, key = await _gateway(monkeypatch, authority=False)
+    executed = []
+
+    async def turn(event, source, quick_key, run_generation):
+        executed.append(event.text)
+    monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
+    queued = asyncio.Event()
+    original = runner._queue_or_replace_pending_event
+
+    def queue(session_key, event):
+        original(session_key, event)
+        queued.set()
+    monkeypatch.setattr(runner, '_queue_or_replace_pending_event', queue)
+    state = runner._session_state(key)
+    state.turn.agent = _AGENT_PENDING_SENTINEL
+
+    wake = '[Kanban task completed] t_10 result ready'
+    await asyncio.wait_for(deliver_wake(adapter, text=wake, source=source), 10)
+    await asyncio.wait_for(queued.wait(), 10)
+    assert executed == [], 'nothing ran while the turn holds the session'
+    state.turn.agent = None  # the running turn ends: the queued wake runs as its own turn
+    await async_wait_until(lambda: wake in executed, timeout=10, what='the queued wake to run as its own turn')
+    assert executed == [wake]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('agent_built', [True, False])
+async def test_a_legacy_wake_to_an_adapter_guarded_turn_steers_into_its_built_agent(monkeypatch, agent_built):
+    """No authority; the turn runs through the adapter's own guard (the normal legacy turn). The adapter's
+    busy path (``_handle_active_session_busy_message``) steers the internal wake into the built agent as
+    Hermes automation's; before the agent is built it leaves it to the base adapter queue, to run as its
+    own turn after the running one. It never interrupts."""
+    from gateway.platforms.event import MessageEvent
+    from gateway.wake import deliver_wake
+
+    runner, adapter, _, source, key = await _gateway(monkeypatch, authority=False)
+    agent, interrupts = BufferedAgent(), []
+    monkeypatch.setattr(agent, 'interrupt', lambda *a, **k: interrupts.append(a), raising=False)
+    running, finish, executed = asyncio.Event(), asyncio.Event(), []
+
+    async def turn(event, source, quick_key, run_generation):
+        executed.append(event.text)
+        if event.text == 'A':
+            if agent_built:
+                runner._session_state(quick_key).turn.agent = agent  # the built, running agent
+            running.set()
+            await asyncio.wait_for(finish.wait(), 30)
+        return 'reply ' + event.text
+    monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
+
+    await adapter.handle_message(MessageEvent(text='A', source=source, message_id='A'))
+    await asyncio.wait_for(running.wait(), 30)
+    assert key in adapter._active_sessions
+    wake = '[Kanban task completed] t_11 result ready'
+    await asyncio.wait_for(deliver_wake(adapter, text=wake, source=source), 10)  # accepted, no raise
+    assert interrupts == [], 'an internal wake never interrupts'
+    if agent_built:
+        assert key not in adapter._pending_messages, 'never queued'
+        content = _boundary(agent)
+        finish.set()
+        await async_wait_until(lambda: key not in adapter._active_sessions, timeout=10, what='the turn to end')
+        assert executed == ['A'], 'never its own turn'
+        assert AUTOMATION_MARKER in content and wake in content and USER_MARKER not in content
+        return
+    assert key in adapter._pending_messages and adapter._pending_messages[key].text == wake, 'queued behind'
+    assert agent._pending_steer is None
+    finish.set()
+    await async_wait_until(lambda: wake in executed, timeout=10, what='the wake to run as its own turn')
+    assert executed == ['A', wake]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('before_adopt', [False, True])
+async def test_an_explicit_native_queue_keeps_its_next_turn(monkeypatch, before_adopt):
+    """Reviewer GW-F01 schedule: ``/queue`` sent while A runs, before or after A adopted its agent."""
+    from gateway.platforms.event import MessageEvent
+    from gateway.session_busy_ingress import _pass
+    from gateway.session_contract import SessionRef
+    from gateway.session_results import execution_result
+    runner, adapter, authority, source, key = await _gateway(monkeypatch)
+    agent, running, finish, executed = BufferedAgent(), asyncio.Event(), asyncio.Event(), []
+
+    async def turn(event, source, quick_key, run_generation):
+        executed.append(event.text)
+        if event.text == 'A':
+            if not before_adopt:
+                sid = runner.session_store.peek_session_id(key)
+                authority.adopt_agent(sid, authority.executing[sid], agent)
+            running.set()
+            await asyncio.wait_for(finish.wait(), 20)
+        captured = execution_result.get()
+        if captured is not None:
+            captured['result'] = {'final_response': 'ok', 'messages': []}
+        return 'ok'
+    monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
+    await adapter.handle_message(MessageEvent(text='A', source=source, message_id='A'))
+    await asyncio.wait_for(running.wait(), 10)
+    await adapter.handle_message(MessageEvent(text='/queue only-after-A', source=source, message_id='Q'))
+    await async_wait_until(lambda: len(_rows(authority, runner, key)) == 2, timeout=10, what='the /queue admission')
+    sid = runner.session_store.peek_session_id(key)
+    if before_adopt:
+        authority.adopt_agent(sid, authority.executing[sid], agent)
+    live = authority.sessions[sid]
+    await _pass(authority, SessionRef(authority.profile_id, sid), live)
+    if live.steering:
+        await live.steering
+    content = _boundary(agent)
+    finish.set()
+    await async_wait_until(lambda: executed == ['A', 'only-after-A'], timeout=15, what='the /queue text as its own turn')
+    assert content is None
+
+
+@pytest.mark.asyncio
+async def test_a_native_a2a_task_keeps_its_own_execution(monkeypatch):
+    """Reviewer GW-F02 schedule: a second A2A task in the same context, admitted before adoption."""
+    from gateway.config import GatewayConfig, PlatformConfig
+    from gateway.run import GatewayRunner
+    from gateway.session_authority import initialize_session_authority
+    from gateway.session_busy_ingress import _pass
+    from gateway.session_contract import SessionRef
+    from gateway.session_results import execution_result
+    from plugins.platforms.a2a.adapter import A2AAdapter
+    runner = GatewayRunner(GatewayConfig())
+    adapter = A2AAdapter(PlatformConfig(enabled=True))
+    adapter.gateway_runner, adapter._loop = runner, asyncio.get_running_loop()
+    runner.adapters = {adapter.platform: adapter}
+    authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    runner._wire_adapter_handlers(adapter)
+    source = adapter.build_source(chat_id='ctx-review', chat_type='dm', user_id='peer-review', user_name='peer-review')
+    key = runner.session_store._generate_session_key(source)
+    agent, running, finish, executed = BufferedAgent(), asyncio.Event(), asyncio.Event(), []
+
+    async def turn(event, source, quick_key, run_generation):
+        executed.append(event.text)
+        if len(executed) == 1:
+            running.set()
+            await asyncio.wait_for(finish.wait(), 20)
+        captured = execution_result.get()
+        if captured is not None:
+            captured['result'] = {'final_response': 'job reply', 'messages': []}
+        return 'job reply'
+    monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
+
+    def submit(text):
+        return adapter._prepare_task({'message': {'role': 'user', 'contextId': 'ctx-review',
+                                                  'parts': [{'kind': 'text', 'text': text}]}}, 'peer-review')
+    await asyncio.to_thread(submit, 'job A')
+    await asyncio.wait_for(running.wait(), 10)
+    await asyncio.to_thread(submit, 'job B')
+    await async_wait_until(lambda: len(_rows(authority, runner, key)) == 2, timeout=10, what='task B admission')
+    sid = runner.session_store.peek_session_id(key)
+    authority.adopt_agent(sid, authority.executing[sid], agent)
+    live = authority.sessions[sid]
+    await _pass(authority, SessionRef(authority.profile_id, sid), live)
+    if live.steering:
+        await live.steering
+    content = _boundary(agent)
+    finish.set()
+    await async_wait_until(lambda: len(executed) == 2, timeout=15, what='task B to run as its own job')
+    assert content is None and 'job B' in executed[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('guarded', [False, True])
+async def test_a_legacy_wake_during_a_drain_is_never_steered(monkeypatch, guarded):
+    """Reviewer GW-F03 schedule: the gateway is already draining when the wake arrives."""
+    from gateway.platforms.event import MessageEvent
+    from gateway.wake import deliver_wake
+    runner, adapter, _, source, key = await _gateway(monkeypatch, authority=False)
+    agent, running, finish, handled = BufferedAgent(), asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def turn(event, source, quick_key, run_generation):
+        if event.text == 'A':
+            runner._session_state(quick_key).turn.agent = agent
+            running.set()
+            await asyncio.wait_for(finish.wait(), 20)
+        return 'ok'
+    monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
+    if guarded:
+        await adapter.handle_message(MessageEvent(text='A', source=source, message_id='A'))
+        await asyncio.wait_for(running.wait(), 10)
+    else:
+        runner._session_state(key).turn.agent = agent
+    runner._draining = True
+    original = runner._hm_handle_running_session_message
+
+    async def observe(*args, **kwargs):
+        try:
+            return await original(*args, **kwargs)
+        finally:
+            handled.set()
+    monkeypatch.setattr(runner, '_hm_handle_running_session_message', observe)
+    await deliver_wake(adapter, text='wake-during-drain', source=source)
+    if not guarded:
+        await asyncio.wait_for(handled.wait(), 10)
+    content = _boundary(agent)
+    finish.set()
+    if not guarded:
+        runner._session_state(key).turn.agent = None
+    assert content is None
