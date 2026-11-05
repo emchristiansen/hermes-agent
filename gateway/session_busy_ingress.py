@@ -27,13 +27,12 @@ logger = logging.getLogger(__name__)
 
 async def is_message(authority, ref, row):
     """True when the queued ``row`` is a message to steer, False when it is a whole job."""
-    from gateway.session_queued_controls import automation, native_message, queued_controls
+    from gateway.session_queued_controls import automation, queued_controls
     if 'steer' in queued_controls(authority, row):
         return True
     payload = row['payload']
     text = payload.get('text')
-    if (row['status'] != 'queued' or (automation(payload) is None and not native_message(payload))
-            or not isinstance(text, str) or not text.strip()):
+    if row['status'] != 'queued' or automation(payload) is None or not isinstance(text, str) or not text.strip():
         return False
     try:  # the drain's own route check for the row: never misrouted
         if 'local_automation_v1' in payload:

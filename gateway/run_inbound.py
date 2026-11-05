@@ -686,7 +686,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         agent = state.turn.agent if state else None
         text = (event.text or "").strip()
         adapter = self._delivery_adapter_for(event.source)
-        if (agent is None or agent is _AGENT_PENDING_SENTINEL or not text or not self._hm_text_only(event)
+        if (self._draining or getattr(getattr(self, "session_authority", None), "retiring", False)  # the busy pass's gate
+                or agent is None or agent is _AGENT_PENDING_SENTINEL or not text or not self._hm_text_only(event)
                 or not callable(getattr(agent, "withdraw_steer", None))  # only the seam that records a sender
                 or (adapter and _quick_key in getattr(adapter, "_pending_messages", {}))):  # keep arrival order
             return False
