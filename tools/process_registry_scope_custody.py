@@ -94,7 +94,8 @@ def completion_fence():
 
 class ProcessScopeCustodyMixin:
     """The subclass supplies ``_lock``, ``_finished``, ``_write_checkpoint``, ``_move_to_finished``,
-    ``_prune_uncollected_detached`` and ``_close_reused_detached``. See ProcessRegistry."""
+    ``_release_finished_handles``, ``_prune_uncollected_detached`` and ``_close_reused_detached``.
+    See ProcessRegistry."""
 
     @staticmethod
     def _sweepable(session) -> bool:
@@ -115,7 +116,9 @@ class ProcessScopeCustodyMixin:
         under the session lock) and persist the outcome, as one step against a recovery's decision.
         While the fence cannot be taken nothing is recorded: the session stays running with its output
         and the finish is retried, here with backoff (``block``, a reader thread) until it lands or
-        another path (a kill) finalised the session, else by the caller's next poll. True: finished."""
+        another path (a kill) finalised the session, else by the caller's next poll. True: finished.
+        Abandoning it to that other path still releases the handles this caller owns (a PTY the kill
+        left to its live reader), as the duplicate finish would: never through an unfenced publish."""
         delay = _FENCE_RETRY_FIRST_SECONDS
         while True:
             with completion_fence() as fenced:
@@ -128,7 +131,10 @@ class ProcessScopeCustodyMixin:
             if delay == _FENCE_RETRY_FIRST_SECONDS:
                 logger.log(logging.WARNING if block else logging.DEBUG, "Completion of %s is pending: the "
                            "process completion fence is unavailable; retrying", session.id)
-            if not block or session._finish_claimed:
+            if session._finish_claimed:  # the kill owns the result; only the local handles are ours
+                self._release_finished_handles(session)
+                return False
+            if not block:
                 return False
             time.sleep(delay)
             delay = min(delay * 2, _FENCE_RETRY_MAX_SECONDS)
