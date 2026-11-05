@@ -715,6 +715,27 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             logger.warning("Internal-event steer failed for session %s: %s", _quick_key, exc)
             return False
 
+    def _hm_steer_pending_at_adoption(self, source: SessionSource, _quick_key: str) -> None:
+        """The running turn just adopted its agent: each internal wake that waits in the adapter's
+        pending slot steers into it now, as it would have on arrival (``_hm_steer_delivered``), in
+        arrival order. The first event the turn does not take keeps its place, and everything behind it
+        stays behind it: user text, commands, plugin payloads and job producers' events are never taken."""
+        adapter = self._delivery_adapter_for(source)
+        slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
+        if not isinstance(slot, dict):
+            return
+        while (event := slot.get(_quick_key)) is not None:
+            if (not getattr(event, "internal", False) or not event.allow_gateway_control or event.get_command()
+                    or event.source.platform.value in _JOB_PRODUCER_PLATFORMS):
+                return
+            del slot[_quick_key]  # _hm_steer_delivered keeps arrival order while an earlier event waits
+            if not self._hm_steer_delivered(event, _quick_key):
+                slot[_quick_key] = event
+                return
+            overflow = self._overflow_queue(_quick_key)
+            if overflow:
+                slot[_quick_key] = overflow.pop(0)
+
     def _hm_busy_steer(self, event: MessageEvent, running_agent: Any, _quick_key: str) -> None:
         """Steer mode: inject text mid-run via ``agent.steer()``, else fall back to queue semantics."""
         steer_text = (event.text or "").strip()
