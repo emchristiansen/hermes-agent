@@ -2085,10 +2085,10 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
                         "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
                         (resume_status, task_id),
                     )
-                _append_event(
-                    conn, task_id, "promoted",
-                    {"status": resume_status} if resume_status != "ready" else None,
-                )
+                payload = {"status": resume_status} if resume_status != "ready" else {}
+                if cur_status == "blocked":  # breaker park auto-recovering: not a release (active_pr)
+                    payload["from"] = "blocked"
+                _append_event(conn, task_id, "promoted", payload or None)
                 promoted += 1
     return promoted
 

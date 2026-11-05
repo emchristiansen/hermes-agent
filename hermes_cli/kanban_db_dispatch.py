@@ -1569,10 +1569,9 @@ def check_respawn_guard(
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
-    handoff or an unblock followed the comment: the named profile must work on
-    that PR, or an operator resumed the card with it). The review lane skips the
-    last two: they are the *inputs* to a review handoff. Stale / dead claim locks
-    are NOT a guard reason — the reclaim passes own those.
+    handoff, unblock or dependency release followed the comment: the named profile must work on
+    that PR, or the card was resumed with it). The review lane skips the last two (the *inputs* to
+    a review handoff). Stale / dead claim locks are NOT a guard reason — reclaim passes own those.
     """
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
@@ -1638,11 +1637,11 @@ def check_respawn_guard(
         return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #    Exception: a handoff AFTER the newest PR comment (operator reassign,
-    #    reviewer changes_requested, review reopen) names the profile that must
-    #    now work on THAT PR — a closer or the implementer finishing it, not a
-    #    duplicate implementation (#111910); so does an operator's ``unblock``. A
-    #    crash/reclaim is neither, so the PR's worker is not re-spawned against it.
+    #    Exception: a release AFTER the newest PR comment names who must now work on THAT PR, not a
+    #    duplicate implementation (#111910): a handoff (reassign, changes_requested, review reopen),
+    #    an operator ``unblock``, or a dependency release (``promoted``/``promoted_manual``: the card
+    #    parked on a parent on purpose). Crash/reclaim, reprioritize and a breaker park's auto-recovery
+    #    (``promoted`` from ``blocked``) are none, so the PR's worker is not re-spawned against it.
     pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
                                           cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
                 if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
@@ -1650,7 +1649,8 @@ def check_respawn_guard(
         # Strictly after: a same-second tie stays guarded (fail closed).
         if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
                 conn, "task_events", task_id, max(pr_times),
-                "AND kind IN ('assigned', 'changes_requested', 'review_reopened', 'unblocked')", cols=", kind, payload", strict=True)):
+                "AND kind IN ('assigned', 'changes_requested', 'review_reopened', 'unblocked', "
+                "'promoted', 'promoted_manual')", cols=", kind, payload", strict=True)):
             return None
         return "active_pr"
 
@@ -1676,16 +1676,16 @@ def _rows_since(conn: sqlite3.Connection, table: str, task_id: str, since: int, 
 
 
 def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
-    """Only an ``assigned`` event that moves the card to a DIFFERENT profile is
-    a handoff. A no-op re-assign (dev→dev via CLI/dashboard/``reassign
-    --reclaim``), an unassign, or the dispatcher's own
-    ``kanban.default_assignee`` write would otherwise lift ``active_pr`` for
-    the very implementer that opened the PR. Events without ``from`` (written
-    before it was recorded) are not trusted as handoffs — fail closed."""
+    """Only an ``assigned`` event that moves the card to a DIFFERENT profile is a handoff. A
+    no-op re-assign (dev→dev via CLI/dashboard/``reassign --reclaim``), an unassign, or the
+    dispatcher's own ``kanban.default_assignee`` write would otherwise lift ``active_pr`` for
+    the very implementer that opened the PR. Events without ``from`` (written before it was
+    recorded) are not trusted as handoffs — fail closed. Nor is a breaker park recovering on its
+    own (``recompute_ready``'s ``promoted`` marked ``from: blocked``)."""
+    data = _kb._json_dict(payload)
     if kind != "assigned":
-        return True
-    data = _kb._json_or(payload, {})
-    if not isinstance(data, dict) or data.get("source") == "kanban.default_assignee":
+        return not (kind == "promoted" and data.get("from") == "blocked")
+    if data.get("source") == "kanban.default_assignee":
         return False
     to = data.get("assignee")
     return bool(to) and "from" in data and data["from"] != to
