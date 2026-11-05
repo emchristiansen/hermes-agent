@@ -359,12 +359,21 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return _managed_scratch_path_info(p)[0]
 
 
-def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
+def _cleanup_workspace(conn: sqlite3.Connection, task_id: str, *, worker_ended: bool = False) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
     Called from :func:`complete_task` after the transaction commits; best-effort
     so cleanup never blocks completion. ``scratch`` is removed; ``worktree``
     only when provably free of work (clean tree, every commit reachable from a
-    remote-tracking ref); ``dir`` is intentionally preserved."""
+    remote-tracking ref); ``dir`` is intentionally preserved.
+
+    The card's own worker (or a tool it runs) completing it defers all of this,
+    including a parent's deferred cleanup: its turn goes on in its workspace (the
+    model reads the tool result, steered comments arrive), and that workspace may
+    be, or lie inside, a directory removed here. The bound worker runs the cleanup
+    with ``worker_ended`` once its turns are over."""
+    if not worker_ended and os.environ.get("HERMES_KANBAN_TASK") == task_id:
+        _kb._log.debug("Deferring workspace cleanup for task %s to the end of its worker", task_id)
+        return
     try:
         row = conn.execute(_WORKSPACE_ROW_SQL, (task_id,)).fetchone()
         if not row:

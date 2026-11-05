@@ -321,13 +321,28 @@ def _record_worker_result(context, code, last_output):
     import os
     from hermes_cli.kanban_db_connect import connect_closing
     from hermes_cli import kanban_db as kb
-    with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
-        if _bound_worker_matches(conn, context):
-            # Closing a run clears its claim/PID and replaces metadata; keep the
-            # result in the immutable attempt event stream instead.
-            kb._append_event(conn, context['task_id'], 'worker_result',
-                {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
-                 'last_output': last_output}, run_id=context['run_id'])
+    with connect_closing(Path(context['db'])) as conn:
+        with kb.write_txn(conn):
+            if _bound_worker_matches(conn, context):
+                # Closing a run clears its claim/PID and replaces metadata; keep the
+                # result in the immutable attempt event stream instead.
+                kb._append_event(conn, context['task_id'], 'worker_result',
+                    {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
+                     'last_output': last_output}, run_id=context['run_id'])
+        _remove_finished_workspace(conn, context)
+
+
+def _remove_finished_workspace(conn, context):
+    """A card completed or archived by its own worker deferred its workspace cleanup while this
+    worker's turn still ran (``_cleanup_workspace``); the turn is over now, so step out of any
+    directory the cleanup may remove and run it."""
+    import os
+    from hermes_cli import kanban_db as kb
+    task = kb.get_task(conn, context['task_id'])
+    if task is None or task.status not in ('done', 'archived'):
+        return
+    os.chdir(Path(context['db']).resolve().parent)  # the board directory, never removed by cleanup
+    kb._cleanup_workspace(conn, context['task_id'], worker_ended=True)
 
 
 def _bound_worker_matches(conn, context):
