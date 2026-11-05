@@ -333,16 +333,19 @@ def _record_worker_result(context, code, last_output):
 
 
 def _remove_finished_workspace(conn, context):
-    """A card completed or archived by its own worker deferred its workspace cleanup while this
-    worker's turn still ran (``_cleanup_workspace``); the turn is over now, so step out of any
-    directory the cleanup may remove and run it."""
+    """Workspace cleanup never removes a directory while a live bound worker works at or under it
+    (``_workspace_in_use_by_other``), so a done or archived card's cleanup, and the parent sweep it
+    runs, was held back while this worker's turn went on. This worker's ``worker_result`` is
+    recorded now, so it no longer counts as live: step out of any directory the cleanup may
+    remove and run it again. Directories another live worker still uses stay until that worker's
+    own end runs this."""
     import os
     from hermes_cli import kanban_db as kb
     task = kb.get_task(conn, context['task_id'])
     if task is None or task.status not in ('done', 'archived'):
         return
     os.chdir(Path(context['db']).resolve().parent)  # the board directory, never removed by cleanup
-    kb._cleanup_workspace(conn, context['task_id'], worker_ended=True)
+    kb._cleanup_workspace(conn, context['task_id'])
 
 
 def _bound_worker_matches(conn, context):

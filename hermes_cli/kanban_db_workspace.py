@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 from typing import TYPE_CHECKING
 import contextlib
+import json
 
 from hermes_cli.worktree_ops import release_lsp_clients
 
@@ -120,6 +121,45 @@ def _conn_uses_path(
     return False
 
 
+# Each card's latest bound worker that has not recorded its ``worker_result``: its turns may
+# still be running in the card's workspace. ``_record_worker_result`` writes the result before
+# that worker runs its own deferred cleanup, so a finished worker never counts here.
+_OPEN_BOUND_WORKERS_SQL = (
+    "SELECT t.id, t.workspace_path, e.payload FROM tasks t "
+    "JOIN task_events e ON e.id = (SELECT MAX(b.id) FROM task_events b "
+    "    WHERE b.task_id = t.id AND b.kind = 'worker_bound') "
+    "WHERE t.workspace_path IS NOT NULL AND NOT EXISTS (SELECT 1 FROM task_events r "
+    "    WHERE r.task_id = t.id AND r.run_id IS e.run_id AND r.kind = 'worker_result' AND r.id > e.id)"
+)
+
+
+def _conn_live_worker_inside(conn: sqlite3.Connection, key: str) -> Optional[str]:
+    """The card whose bound worker is still alive with its workspace at or under *key*, else None.
+
+    Card status says nothing here: a worker goes on with its turn after completing its card (the
+    model reads the tool result, steered comments arrive), and so may a worker whose card someone
+    else completed or archived. The card's own worker counts too. Liveness is the
+    ``worker_bound`` pid with its start fingerprint, so a hard-killed worker (or a recycled pid)
+    no longer holds the directory."""
+    from hermes_cli.kanban_db_dispatch import _worker_alive  # late: import cycle
+
+    target = Path(key)
+    for row in conn.execute(_OPEN_BOUND_WORKERS_SQL).fetchall():
+        try:
+            workspace = Path(_path_key(Path(row["workspace_path"]).expanduser().resolve(strict=False)))
+        except OSError:
+            continue
+        if workspace != target and not workspace.is_relative_to(target):
+            continue
+        try:
+            bound = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(bound, dict) and _worker_alive(bound.get("pid"), bound.get("started_at")):
+            return row["id"]
+    return None
+
+
 def _sibling_board_db_files(conn: sqlite3.Connection) -> list[Path]:
     """Every other board's ``kanban.db``. Raises ``OSError`` when the set is unknown.
 
@@ -153,12 +193,14 @@ def _sibling_board_db_files(conn: sqlite3.Connection) -> list[Path]:
     return found
 
 
-def _other_board_uses_path(db_file: Path, task_id: str, key: str) -> bool:
+def _other_board_in_use(db_file: Path, task_id: str, key: str) -> Optional[str]:
     uri = db_file.as_uri() + "?mode=ro"
     other = sqlite3.connect(uri, uri=True, timeout=1.0)
     try:
         other.row_factory = sqlite3.Row
-        return _conn_uses_path(other, task_id, key, exclude_task_id=False)
+        if _conn_live_worker_inside(other, key):
+            return "live_worker"
+        return "shared" if _conn_uses_path(other, task_id, key, exclude_task_id=False) else None
     finally:
         other.close()
 
@@ -166,7 +208,15 @@ def _other_board_uses_path(db_file: Path, task_id: str, key: str) -> bool:
 def _workspace_in_use_by_other(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> Optional[str]:
-    """Why *path* must be kept: ``"shared"``, ``"unknown"``, or None when free.
+    """Why *path* must be kept: ``"live_worker"``, ``"shared"``, ``"unknown"``, or None when free.
+
+    ``"live_worker"``: a bound worker that has not ended works at or under *path*, whatever its
+    card's status and whether or not that card is *task_id* itself. Every removal route (the
+    card's own cleanup, the deferred parent sweep, ``gc``) asks here first, so a directory is
+    removed only once the last worker using it has ended. A done or archived card's worker runs
+    its card's cleanup, and so its parents' sweep, at its end
+    (``gateway.session_kanban._remove_finished_workspace``); anything else held back this way
+    stays until its card is archived or ``gc`` runs.
 
     ``gc``, completion and deferred parent cleanup used to ``rmtree`` a shared
     ``workspace_path`` as soon as one of its tasks went terminal. Compare the
@@ -185,6 +235,11 @@ def _workspace_in_use_by_other(
     if not key:
         return None
     try:
+        worker_task = _conn_live_worker_inside(conn, key)
+        if worker_task:
+            _kb._log.debug("Workspace %s of task %s is still in use by the live worker of task %s",
+                           path, task_id, worker_task)
+            return "live_worker"
         if _conn_uses_path(conn, task_id, key):
             return "shared"
     except sqlite3.Error as exc:
@@ -197,8 +252,9 @@ def _workspace_in_use_by_other(
         return "unknown"
     for db_file in siblings:
         try:
-            if _other_board_uses_path(db_file, task_id, key):
-                return "shared"
+            reason = _other_board_in_use(db_file, task_id, key)
+            if reason:
+                return reason
         except (OSError, sqlite3.Error) as exc:
             _kb._log.warning(
                 "Cannot read board db %s for task %s: %s", db_file, task_id, exc,
@@ -210,11 +266,15 @@ def _workspace_in_use_by_other(
 def _defer_shared_workspace_cleanup(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> bool:
-    """Skip removal and record why, when *path* may still be used by a live task."""
+    """Skip removal and record why, when *path* may still be used by a live task or worker."""
     reason = _workspace_in_use_by_other(conn, task_id, path)
     if reason is None:
         return False
-    if reason == "shared":
+    if reason == "live_worker":
+        # Ordinary: a worker that completed its own card is still in its turn. Its end retries.
+        _kb._log.info("Deferring workspace cleanup for task %s: a live worker still uses %s",
+                      task_id, path)
+    elif reason == "shared":
         _kb._log.warning(
             "Deferring workspace cleanup for task %s: %s is still used by "
             "another non-terminal task",
@@ -359,21 +419,18 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return _managed_scratch_path_info(p)[0]
 
 
-def _cleanup_workspace(conn: sqlite3.Connection, task_id: str, *, worker_ended: bool = False) -> None:
+def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
     Called from :func:`complete_task` after the transaction commits; best-effort
     so cleanup never blocks completion. ``scratch`` is removed; ``worktree``
     only when provably free of work (clean tree, every commit reachable from a
     remote-tracking ref); ``dir`` is intentionally preserved.
 
-    The card's own worker (or a tool it runs) completing it defers all of this,
-    including a parent's deferred cleanup: its turn goes on in its workspace (the
-    model reads the tool result, steered comments arrive), and that workspace may
-    be, or lie inside, a directory removed here. The bound worker runs the cleanup
-    with ``worker_ended`` once its turns are over."""
-    if not worker_ended and os.environ.get("HERMES_KANBAN_TASK") == task_id:
-        _kb._log.debug("Deferring workspace cleanup for task %s to the end of its worker", task_id)
-        return
+    Nothing is removed while a live bound worker, this card's own included, works
+    at or under the directory (:func:`_workspace_in_use_by_other`), whether this is
+    the card's own workspace or a parent's in the deferred sweep. A done or archived
+    card's worker re-runs this cleanup when its turns end, so the last of a card's
+    and its children's workers to end removes what nothing needs any more."""
     try:
         row = conn.execute(_WORKSPACE_ROW_SQL, (task_id,)).fetchone()
         if not row:

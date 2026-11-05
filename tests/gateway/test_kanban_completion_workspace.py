@@ -4,12 +4,16 @@
 that was its own cwd, while the turn went on (the model reads the tool result; a steered comment
 arrived). The next system-prompt rebuild during compression raised FileNotFoundError from
 ``os.getcwd()``, the worker exited 1 after its card was already done, and its admission settled
-interrupted. Removal (and any parent cleanup it triggers) now waits until the bound worker's
-turns are over; the worker then steps out to the board directory and runs it.
+interrupted. No route removes a directory while a live bound worker (of this card or any other)
+works at or under it; the last such worker's end steps out to the board directory and runs the
+cleanup.
 """
+import argparse
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -76,13 +80,64 @@ def test_turn_after_completion_keeps_its_workspace_until_the_worker_ends(bound_s
     assert Path.cwd() == Path(path).resolve().parent  # stepped out to the board directory
 
 
-def test_completion_by_another_process_still_removes_it_at_once(bound_scratch_worker, monkeypatch, tmp_path):
-    """An orchestrator (any process that is not the card's own worker) keeps today's behavior."""
+def _ended_process_identity():
+    """``(pid, started_at)`` of a process that has exited, fingerprinted as ``bind_worker_context``
+    records a bound worker: what a hard-killed worker leaves behind in ``worker_bound``."""
+    from hermes_cli.kanban_db_dispatch import _process_fingerprint
+    process = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE)
+    fingerprint = _process_fingerprint(process.pid)
+    process.communicate(b"", timeout=30)
+    assert fingerprint
+    return process.pid, fingerprint
+
+
+def _rebind(path, context, pid, started_at):
+    with connect_closing(path) as conn, kb.write_txn(conn):
+        kb._append_event(conn, context["task_id"], "worker_bound",
+                         {"pid": pid, "claim_lock": context["claim_lock"], "started_at": started_at},
+                         run_id=context["run_id"])
+
+
+def test_completion_by_another_process_removes_it_once_no_worker_is_live(bound_scratch_worker, monkeypatch, tmp_path):
+    """An orchestrator completing a card whose worker died hard (no ``worker_result``) removes
+    the workspace at once: a dead bound pid no longer holds it."""
+    path, context, workspace = bound_scratch_worker
+    _rebind(path, context, *_ended_process_identity())
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.chdir(tmp_path)
+    with connect_closing(path) as conn:
+        assert kb.complete_task(conn, context["task_id"], summary="done elsewhere")
+    assert not workspace.exists()
+
+
+def test_completion_by_another_process_waits_for_the_live_worker(bound_scratch_worker, monkeypatch, tmp_path):
+    """An orchestrator completing a card while its worker's turn still runs there keeps the
+    workspace; the worker's end removes it."""
     path, context, workspace = bound_scratch_worker
     monkeypatch.delenv("HERMES_KANBAN_TASK")
     monkeypatch.chdir(tmp_path)
     with connect_closing(path) as conn:
         assert kb.complete_task(conn, context["task_id"], summary="done elsewhere")
+    assert workspace.is_dir()
+    session_kanban._record_worker_result(context, 0, "done")
+    assert not workspace.exists()
+
+
+def test_gc_keeps_an_archived_cards_workspace_while_its_worker_is_live(bound_scratch_worker, monkeypatch, tmp_path):
+    """``kanban gc`` asks the same question: an archived card's scratch stays while its bound
+    worker is alive, and goes once that worker has died hard."""
+    from hermes_cli import kanban_ops
+    path, context, workspace = bound_scratch_worker
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.chdir(tmp_path)
+    args = argparse.Namespace(event_retention_days=0, log_retention_days=0)
+    with connect_closing(path) as conn:
+        assert kb.archive_task(conn, context["task_id"], signal_fn=lambda *_: None)
+    assert workspace.is_dir()
+    assert kanban_ops._cmd_gc(args) == 0
+    assert workspace.is_dir()
+    _rebind(path, context, *_ended_process_identity())
+    assert kanban_ops._cmd_gc(args) == 0
     assert not workspace.exists()
 
 
@@ -199,3 +254,121 @@ def test_a_waiting_childs_handoff_survives_the_parents_worker_end(bound_scratch_
     with connect_closing(path) as conn:
         assert kb.complete_task(conn, child, summary="consumed")
     assert not workspace.exists()
+
+
+# A second, real worker process: it claims its card, binds as the owner binds a managed worker
+# (environment, ``worker_bound`` with its pid fingerprint, cwd = its workspace) and runs a real
+# task turn whose scripted model completes the card, then waits for "continue" on stdin before
+# the rest of its turn (a prompt rebuild and a relative write in its cwd). Its turn's end runs
+# the real finalizer. (Derived from the t_99ab13a0 reviewer probe.)
+_OVERLAP_WORKER = r'''
+import json, sys
+repo, db, task_id = sys.argv[1:]
+sys.path.insert(0, repo)
+from pathlib import Path
+from types import SimpleNamespace
+from gateway import session_kanban
+from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_db_connect import connect_closing
+with connect_closing(Path(db)) as conn:
+    task = kb.claim_task(conn, task_id, claimer="overlap-worker")
+context = dict(task_id=task_id, board="default", db=db, run_id=task.current_run_id, claim_lock=task.claim_lock,
+               workspace=task.workspace_path, workspaces_root=str(kb.workspaces_root()), profile="default",
+               branch=None, tenant=None, goal_mode=False, max_runtime_seconds=None, skills=[], context="")
+frame = {"text": "work", "policy": {"source": "kanban", "kanban_json": json.dumps(context)}}
+session_kanban.bind_worker_context(frame)
+
+
+def conversation(*_args, **_kwargs):
+    from agent.prompt_builder import build_context_files_prompt
+    from tools import kanban_tools
+    assert json.loads(kanban_tools._handle_complete({"summary": "child delivered"}))["ok"]
+    print("COMPLETED", flush=True)
+    assert sys.stdin.readline().strip() == "continue"
+    seen = {}
+    try:
+        seen["prompt"] = build_context_files_prompt(cwd=None)
+        Path("late-child.txt").write_text("child late bytes")
+        seen["late"] = Path(context["workspace"], "late-child.txt").read_text()
+    except Exception as exc:
+        seen["error"] = f"{type(exc).__name__}: {exc}"
+    print(json.dumps(seen), flush=True)
+    return {"completed": True, "final_response": "done"}
+
+
+session_kanban.run_worker_turns(SimpleNamespace(session_id="overlap", run_conversation=conversation), frame, [])
+print(json.dumps({"exit_code": session_kanban.worker_exit_code(db, context)}), flush=True)
+'''
+
+
+def _start_overlap_worker(db, task_id):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_KANBAN_")}
+    repo = Path(__file__).resolve().parents[2]
+    worker = subprocess.Popen([sys.executable, "-u", "-c", _OVERLAP_WORKER, str(repo), str(db), task_id],
+                              cwd=repo, env=env, text=True,
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    line = worker.stdout.readline()
+    if line.strip() != "COMPLETED":
+        worker.kill()
+        raise AssertionError((line, worker.communicate(timeout=30)))
+    return worker
+
+
+def _finish_overlap_worker(worker):
+    """Let the worker's turn go on, then end; returns what its late turn saw."""
+    out, err = worker.communicate("continue\n", timeout=120)
+    assert worker.returncode == 0, (out, err)
+    seen, ended = (json.loads(line) for line in out.strip().splitlines()[-2:])
+    assert ended == {"exit_code": 0}, (out, err)
+    return seen
+
+
+@pytest.mark.parametrize("order,kind", [("child-first", "separate"), ("parent-first", "dir"),
+                                        ("parent-first", "scratch")])
+def test_overlapping_worker_turns_keep_each_live_workers_workspace(bound_scratch_worker, order, kind):
+    """t_99ab13a0 CWD-03, two real worker processes whose post-completion turns overlap.
+    child-first: a child with its own workspace ends while the parent's turn still runs; the
+    child's finalizer swept the parent's workspace (the parent's cwd). parent-first: the parent
+    ends while a child sharing its workspace (dir or scratch) is still in its turn; the parent's
+    finalizer removed the child's cwd. Card status cannot tell; the bound workers' liveness does.
+    The last worker to end removes what nothing needs any more."""
+    from agent.prompt_builder import build_context_files_prompt
+    from tools import kanban_tools
+
+    path, parent, workspace = bound_scratch_worker
+    parent.update(skills=[], context="", goal_mode=False)
+    (workspace / "AGENTS.md").write_text("overlap sentinel\n")
+    child_workspace = workspace.parent / "overlap-child" if kind == "separate" else workspace
+    child_workspace.mkdir(exist_ok=True)
+    with connect_closing(path) as conn:
+        child = kb.create_task(conn, title="overlap child", assignee="default", parents=[parent["task_id"]],
+                               workspace_kind="scratch" if kind == "separate" else kind,
+                               workspace_path=str(child_workspace))
+    observed = {}
+
+    def parent_turn(*_args, **_kwargs):
+        assert json.loads(kanban_tools._handle_complete({"summary": "parent delivered"}))["ok"]
+        worker = _start_overlap_worker(path, child)
+        if order == "parent-first":
+            observed["worker"] = worker
+        else:
+            observed["child"] = _finish_overlap_worker(worker)  # child's turn and finalizer end first
+            assert not child_workspace.exists()  # its own scratch: nothing else uses it
+            # this parent's turn goes on in its workspace
+            assert "overlap sentinel" in build_context_files_prompt(cwd=None)
+            Path("late-parent.txt").write_text("parent late bytes")
+            assert (workspace / "late-parent.txt").read_text() == "parent late bytes"
+        return {"completed": True, "final_response": "done"}
+
+    agent = SimpleNamespace(session_id="overlap-parent", run_conversation=parent_turn)
+    assert session_kanban.run_worker_turns(agent, {"text": "work", "policy": {"kanban_json": json.dumps(parent)}}, [])
+    assert session_kanban.worker_exit_code(path, parent) == 0
+    if order == "parent-first":
+        assert workspace.is_dir()  # the child's worker is still in its turn there
+        observed["child"] = _finish_overlap_worker(observed["worker"])
+        assert "overlap sentinel" in observed["child"].get("prompt", ""), observed["child"]
+        assert observed["child"].get("late") == "child late bytes", observed["child"]
+    assert "error" not in observed["child"], observed["child"]
+    assert not workspace.exists()  # the last worker's end removed it
+    with connect_closing(path) as conn:
+        assert {kb.get_task(conn, t).status for t in (parent["task_id"], child)} == {"done"}
