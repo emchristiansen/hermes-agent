@@ -88,7 +88,7 @@ async def admit_process_notice(runner, authority, adapter, event, evt):
         event.metadata['heartbeat_tick'] = {'output': str(evt.get('output') or ''),
                                             'omitted': int(evt.get('omitted') or 0)}
         if evt.get('_replaces'):
-            return await authority.admit_automation(adapter, event, identity, replaces=evt['_replaces'])
+            return await authority.admit_automation(adapter, event, identity, replaces=(evt['_replaces'],))
     if evt.get('type') != 'completion':
         return await authority.admit_automation(adapter, event, identity)
     async with _heartbeat_lock(runner):
@@ -147,16 +147,17 @@ def _tick_metadata(metadata):
     return {'tick': dict(tick)}
 
 
-def _replace_queued(admission_id, session_id, replaced):
-    """Write guard: cancel the replaced queued tick in the replacement's own transaction; refuse the
-    replacement when that tick was claimed or settled first (its output already ran)."""
+def _replace_queued(admission_ids, session_id, replaced):
+    """Write guard: cancel the replaced queued rows in the replacement's own transaction; refuse the
+    replacement, cancelling none of them, when any was claimed or settled first (it already ran)."""
     def guard(conn):
-        changed = conn.execute("UPDATE session_admissions SET status='terminal',outcome='cancelled' "
-                               "WHERE admission_id=? AND target_session_id=? AND status='queued'",
-                               (admission_id, session_id)).rowcount
-        if changed != 1:
-            raise RuntimeStoreError('stale_generation')
-        replaced[:] = [admission_id]
+        for admission_id in admission_ids:
+            changed = conn.execute("UPDATE session_admissions SET status='terminal',outcome='cancelled' "
+                                   "WHERE admission_id=? AND target_session_id=? AND status='queued'",
+                                   (admission_id, session_id)).rowcount
+            if changed != 1:
+                raise RuntimeStoreError('stale_generation')
+        replaced[:] = list(admission_ids)
     return guard
 
 
@@ -462,10 +463,11 @@ def restore_local_automation(authority, ref, row):
     return event
 
 
-async def admit_automation(authority, adapter, event, identity, replaces=None):
-    """``replaces``: a queued automation row of the same session this input supersedes (a liveness
-    tick carrying the output of the one still waiting). Its cancellation commits in this admission's
-    own transaction, so neither lands without the other."""
+async def admit_automation(authority, adapter, event, identity, replaces=()):
+    """``replaces``: the queued automation rows of the same session this input supersedes (a liveness
+    tick carrying the output of the one still waiting, a Kanban wake carrying the notices still
+    waiting). Their cancellation commits in this admission's own transaction, so none lands without
+    the others."""
     authority._require_admission_open()
     payload, entry = snapshot_automation(authority, adapter, event, identity)
     from gateway.session_authority import LiveSession
@@ -475,15 +477,15 @@ async def admit_automation(authority, adapter, event, identity, replaces=None):
     from functools import partial
     from gateway.session_runtime_workers import tracked_write
     admitted, replaced = partial(authority._admitted, ref, event), []
-    if replaces is not None:
+    if replaces:
         def admitted(row, admitted=admitted):
-            if replaced:  # the guard ran in the committed write; an exact replay runs no guard
-                authority._settle_cancelled(ref, replaces)
+            for admission_id in replaced:  # the guard ran in the committed write; a replay runs none
+                authority._settle_cancelled(ref, admission_id)
             return admitted(row)
     return await tracked_write(authority, partial(
         admit_session_input, authority.db, epoch=authority.epoch, principal_id='automation:' + entry.session_key,
         session_id=ref.session_id, request_id=identity, payload=deepcopy(payload),
-        _authorize_write=authority._admission_gate(replaces and _replace_queued(replaces, ref.session_id, replaced))),
+        _authorize_write=authority._admission_gate(_replace_queued(replaces, ref.session_id, replaced) if replaces else None)),
         then=admitted, ordered=True, after=partial(authority._schedule_admitted, ref))
 
 
@@ -652,6 +654,46 @@ async def reset_and_rehome_messages(runner, session_key, old_session_id):
     return entry, release
 
 
+def _queued_kanban_wake(row, route, category):
+    """Whether *row* is *route*'s own queued Kanban wake of *category*: the route's producer admitted
+    ``["kanban-wake", route, uuid]`` carrying only notice text. A client input whose id merely looks
+    like one, or a wake of the other category, never matches."""
+    if row['status'] != 'queued' or row['principal_id'] != 'automation:' + route:
+        return False
+    descriptor = _descriptor(row['payload'])
+    if descriptor.get('notification_category', 'result') != category or set(descriptor) - _FOLDABLE_WAKE_KEYS:
+        return False
+    return any(len(identity) == 3 and identity[:2] == ['kanban-wake', route]
+               for identity in _identities([row['request_id']]))
+
+
+# A Kanban wake's descriptor (local and native), plain or folded: nothing a fold could drop.
+_FOLDABLE_WAKE_KEYS = frozenset({'identity', 'owner', 'route', 'target', 'notification_category', 'identities'})
+
+
+async def _fold_queued_kanban_wakes(authority, entry, identity, text, category):
+    """The wake text to admit, the route's queued Kanban wakes it supersedes and the identities it
+    then carries (``automation_identities``: every superseded wake's, transitively, and its own).
+    Each queued wake is one task's notice; a busy session would otherwise run one turn per notice
+    and fill its admission FIFO (``ADMISSION_QUEUE_MAX``), refusing its human inputs (2026-11-04:
+    Interlocutor held 31 queued notices from its 144 subscriptions; at about a minute a turn they
+    refilled every freed slot). The new wake carries every waiting notice, oldest first, so the
+    session keeps at most one queued wake and loses none: a refused fold cancels nothing and the
+    notifier retries."""
+    import asyncio
+    pending = await asyncio.to_thread(list_session_admissions, authority.db,
+                                      session_id=_route_owner(authority, entry))
+    waiting = [row for row in pending if _queued_kanban_wake(row, entry.session_key, category)]
+    if not waiting:
+        return text, (), ()
+    carried = {identity}
+    for row in waiting:
+        descriptor = _descriptor(row['payload'])
+        carried.update(descriptor.get('identities') or (descriptor['identity'],))
+    return ('\n\n'.join([*(row['payload']['text'] for row in waiting), text]),
+            tuple(row['admission_id'] for row in waiting), tuple(sorted(carried)))
+
+
 async def admit_route_wake(runner, adapter, source, text, producer, metadata=None):
     """Commit a producer wake (Kanban push wake, /loop tick) for ``source``'s route into the
     authority FIFO, like heartbeats and process completions, instead of a classic turn that
@@ -666,6 +708,12 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
         return False
     import uuid
     identity = json.dumps([producer, key, uuid.uuid4().hex], separators=(',', ':'))
+    replaces = ()
+    if producer == 'kanban-wake':
+        text, replaces, carried = await _fold_queued_kanban_wakes(
+            authority, entry, identity, text, (metadata or {}).get('notification_category', 'result'))
+        if carried:
+            metadata = {**(metadata or {}), 'automation_identities': list(carried)}
     if source.platform == Platform.LOCAL:
         # A local route has no messaging provenance to borrow: its wake rides local_automation_v1 on
         # the live session's own source object (``snapshot_local_automation`` checks identity).
@@ -676,7 +724,7 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
                              message_id=identity, metadata={'gateway_session_key': key,
                                                             'gateway_session_id': entry.session_id,
                                                             **(metadata or {})})
-        await authority.admit_automation(adapter, event, identity)
+        await authority.admit_automation(adapter, event, identity, replaces)
         return True
     from gateway.session_envelope import restore_native
     envelope = committed_route_envelope(authority, entry)
@@ -689,5 +737,5 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
                          message_id=identity, metadata={'gateway_session_key': key,
                                                         'gateway_session_id': entry.session_id,
                                                         **(metadata or {})})
-    await authority.admit_automation(adapter, event, identity)
+    await authority.admit_automation(adapter, event, identity, replaces)
     return True

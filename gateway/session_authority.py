@@ -464,7 +464,7 @@ class SessionAuthority:
             if waiter is not None and not waiter.done():
                 waiter.set_exception(RuntimeStoreError(reason))
 
-    async def admit_automation(self, adapter, event, identity, replaces=None):
+    async def admit_automation(self, adapter, event, identity, replaces=()):
         from gateway.session_automation import admit_automation
         return await admit_automation(self, adapter, event, identity, replaces)
 

@@ -154,14 +154,17 @@ def admit_session_input(db, *, epoch: int, principal_id: str, session_id: str,
             if _replay_guard is not None:
                 _replay_guard(conn)
             return _row(old)
+        # The guard runs before the cap is counted: a replacement cancels the queued rows it
+        # supersedes inside this transaction, so it needs only the room they leave (a fold of a
+        # full FIFO's waiting wakes). Any refusal below rolls those cancellations back.
+        if _authorize_write is not None:
+            _authorize_write(conn)
         queued = conn.execute('''SELECT COUNT(*) FROM session_admissions WHERE target_session_id=?
             AND status='queued' ''', (session_id,)).fetchone()[0]
         # Main's cap holds in both states: a FIFO paused behind an unknown turn runs every accepted
         # input after Discard, so it must not grow without bound while nobody resolves it.
         if queued >= ADMISSION_QUEUE_MAX:
             raise RuntimeStoreError('queue_full')
-        if _authorize_write is not None:
-            _authorize_write(conn)
         admission_id = uuid.uuid4().hex
         conn.execute('''INSERT INTO session_admissions(admission_id,request_id,principal_id,
             target_session_id,lineage_json,payload_json,payload_digest,intent,status,owner_epoch)
