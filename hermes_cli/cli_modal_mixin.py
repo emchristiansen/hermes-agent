@@ -168,14 +168,8 @@ class CLIModalMixin:
             return
 
         if self._agent_running:
-            # Agent busy → honour the configured busy-input behaviour (interrupt/steer remain
-            # reachable via the normal Enter path).
-            if self.busy_input_mode == "interrupt":
-                self._interrupt_queue.put(text)
-            else:
-                self._pending_input.put(text)
-            preview = text[:80] + ("..." if len(text) > 80 else "")
-            _cprint(f"  {t('cli.editor.queued_next_turn', preview=preview)}")
+            # Agent busy → the Enter path's own routing: every message steers the running turn.
+            self._tui_enter_while_busy(text, [], text)
         else:
             self._pending_input.put(text)
         _done()

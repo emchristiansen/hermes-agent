@@ -111,6 +111,9 @@ def lease_handed_over(cli, held):
 
 
 class CLIInitMixin:
+    # Every message steers (Eric, 2026-11-04): Enter while Hermes works steers the running turn, whatever
+    # ``display.busy_input_mode`` or ``/busy`` names; stopping the turn stays its own explicit command.
+    busy_input_mode = property(lambda self: "steer", lambda self, _value: None)
     """HermesCLI constructor phases: display options, model/provider routing, turn limits, toolsets, checkpoints, prompt/reasoning, runtime state, session store and UI state."""
 
     def _init_display_options(self, verbose, compact):
@@ -144,12 +147,9 @@ class CLIInitMixin:
             enabled=display.get("persistent_output", True),
             max_lines=display.get("persistent_output_max_lines", 200),
         )
-        from hermes_cli.cli_modern_layout import busy_input_mode_from_config, layout_from_config, set_active
+        from hermes_cli.cli_modern_layout import layout_from_config, set_active
         self._modern_layout = layout_from_config(display)  # display.cli_layout: modern | classic
         set_active(self._modern_layout)
-        # busy_input_mode: "interrupt" (redirect the run) | "queue" (next turn) | "steer" (inject mid-run).
-        _bim = busy_input_mode_from_config(display)
-        self.busy_input_mode = _bim if _bim in ("queue", "steer") else "interrupt"
 
         # verbose ONLY controls global DEBUG logging; tool_progress="verbose" is independent
         # (coupling them spewed every module's DEBUG logs to the console).
