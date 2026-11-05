@@ -338,3 +338,50 @@ async def test_a_restart_that_begins_while_the_pass_reads_the_queue_still_holds_
         row = get_session_admission(db, admission_id=admitted['admission_id'])
     assert 'next-owner' not in (turn.taken[0] or ''), 'never into the old turn'
     assert (row['status'], row['outcome']) == ('queued', None)
+
+
+@pytest.mark.asyncio
+async def test_an_operator_replay_of_a_transferred_delivery_keeps_its_sender(bot, monkeypatch):
+    """An operator's ``prompt.steer_queued`` of a Bot Chat delivery the busy pass already committed (before
+    the pass handed it over) replays the transfer: whoever hands it over, the row's own sender frames it."""
+    from gateway import session_runtime_workers
+    from gateway.session_bot import deliver
+    from gateway.session_controls import AuthorityConnection
+    agent, ran, taken = BufferedAgent(), [], []
+    running, release, committed, handover = (asyncio.Event() for _ in range(4))
+
+    async def execute(authority, ref, row):
+        ran.append(row['payload']['text'])
+        authority.adopt_agent(ref.session_id, row['generation'], agent)
+        running.set()
+        await asyncio.wait_for(release.wait(), 30)
+        taken.append(_boundary(agent))
+        return 'done'
+    monkeypatch.setattr(session_finite, 'execute_finite_admission', execute)
+    write = session_runtime_workers.tracked_write
+
+    async def held_after_commit(authority, operation, *args, **kwargs):
+        result = await write(authority, operation, *args, **kwargs)
+        if getattr(getattr(operation, 'func', None), '__name__', '') == 'steer_session_input' and not committed.is_set():
+            committed.set()
+            await asyncio.wait_for(handover.wait(), 30)  # the pass's hand-over waits; the operator's replay runs
+        return result
+    monkeypatch.setattr(session_runtime_workers, 'tracked_write', held_after_commit)
+    author = {'id': 'bot:fixture-peer', 'name': 'Fixture peer', 'is_bot': True}
+    first = asyncio.create_task(deliver(bot.connection, dict(id='a' * 32, profile='default', message='running')))
+    await asyncio.wait_for(running.wait(), 30)
+    await deliver(bot.connection, dict(id=KEY, profile='default', message='peer-report', author=author))
+    await asyncio.wait_for(committed.wait(), 30)
+    row = next(r for r in _admissions(bot) if r['payload']['text'] == 'peer-report')
+    operator = AuthorityConnection(bot.authority, object(), {'user_id': bot.connection.actor.subject}, operator=True)
+    reply = await _call(operator, 'prompt.steer_queued', admission_id=row['admission_id'], session_id=bot.chat)
+    handover.set()
+    await _pass_done(bot.authority, bot.chat)
+    release.set()
+    await first
+    await _settle_quietly(bot)
+    assert 'error' not in reply, reply
+    [content] = taken
+    assert content.count('peer-report') == 1 and 'Fixture peer' in content and 'bot:fixture-peer' in content
+    assert 'a direct message from the user' not in content
+    assert ran == ['running']
