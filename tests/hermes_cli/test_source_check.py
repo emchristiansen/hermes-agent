@@ -581,6 +581,8 @@ def test_stable_release_the_checkout_already_contains_is_a_rollback(installation
     git("tag", "v1.2.3", shas[release], cwd=bare)
     git("remote", "set-url", "origin", str(bare))
     git("checkout", "-q", "--detach", shas[on])
+    # An embedded build's upstream base is no fact about a checkout: its Git history decides.
+    (root / "install-stamp.json").write_text(json.dumps({"upstreamCommit": shas[release]}))
     api = "/repos/NousResearch/hermes-agent"
     responses[f"{api}/releases/latest"] = (200, {"draft": False, "prerelease": False, "tag_name": "v1.2.3"})
     responses[f"{api}/commits/v1.2.3"] = (200, {"sha": shas[release]})
@@ -590,6 +592,97 @@ def test_stable_release_the_checkout_already_contains_is_a_rollback(installation
     assert status.get("targetSha") == shas[release], status
     assert status["updateAvailable"] is True
     assert status["rollback"] is rollback
+
+
+RELEASE_BASE, NEWER_RELEASE, FORK_REVISION = "b0" * 20, "c1" * 20, "d5" * 20
+
+
+@pytest.fixture
+def embedded_build(installation, monkeypatch):
+    """The running Nix build of a fork: HERMES_REVISION and its stamp name the fork's revision,
+    and the stamp may name the official commit it was built on. No checkout exists to ask."""
+    _root, _linked, home, _base, _head, responses, requests, _git = installation
+    tree = home / "nix-install"
+    tree.mkdir()
+    monkeypatch.setenv("HERMES_REVISION", FORK_REVISION)
+    monkeypatch.setattr("hermes_cli.config.get_project_root", lambda: tree)
+    monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda root: "nix")
+    api = "/repos/NousResearch/hermes-agent"
+
+    def build(*, upstream=None, release=RELEASE_BASE, compare=None, stable_default=True):
+        stamp = {"schemaVersion": 2, "commit": FORK_REVISION, "dirty": False, "baseVersion": "0.22.5",
+                 "displayVersion": "0.22.5", "distance": 0, "source": "nix", "distribution": "nix",
+                 "updateMechanism": "external", "payload": "bootstrap", "tag": None}
+        if upstream:
+            stamp["upstreamCommit"] = upstream
+        (tree / "install-stamp.json").write_text(json.dumps(stamp))
+        if stable_default:
+            # The deployed Nix build defaults to stable (nix-config's stable-notifications patch).
+            monkeypatch.setattr("hermes_cli.update_channel.default_channel", lambda root=None: "stable")
+        responses[f"{api}/releases/latest"] = (200, {"draft": False, "prerelease": False, "tag_name": "v0.22.6"})
+        responses[f"{api}/commits/v0.22.6"] = (200, {"sha": release})
+        compare_path = f"{api}/compare/{release}...{upstream or FORK_REVISION}"
+        if compare is not None:
+            responses[compare_path] = (200, compare)
+        return compare_path
+
+    return home, requests, build
+
+
+@pytest.mark.parametrize("upstream,release,compare,offered", [
+    (RELEASE_BASE, RELEASE_BASE, None, False),  # the stable release IS the fork's upstream base
+    (RELEASE_BASE, NEWER_RELEASE, {"status": "behind"}, True),  # a release after that base
+    (RELEASE_BASE, NEWER_RELEASE, {"status": "ahead"}, False),  # an older release the base contains
+    (RELEASE_BASE, NEWER_RELEASE, None, False),  # GitHub never answered: unknown keeps the build
+    (None, RELEASE_BASE, None, False),  # a fork revision GitHub does not know: unknown keeps it
+], ids=["base", "newer", "older", "unanswered", "undeclared"])
+def test_embedded_fork_is_not_offered_the_release_it_is_built_on(embedded_build, upstream, release, compare,
+                                                                 offered):
+    """INT-01: an embedded fork already containing the stable release was offered it as an update
+    (SHA inequality). Its stamp's upstream base stands in for Git ancestry, as the forward-only
+    guard does for a checkout, while the reported revision stays the fork's own."""
+    from hermes_cli.source_check import UPDATE_AVAILABLE_NO_COUNT, check_for_updates
+
+    home, requests, build = embedded_build
+    compare_path = build(upstream=upstream, release=release, compare=compare)
+
+    status = check_for_updates(home=home)
+
+    assert status["supported"] is True and status["channel"] == "stable", status
+    assert status["currentSha"] == FORK_REVISION
+    assert status["updateAvailable"] is offered, status
+    assert status["rollback"] is False
+    assert status["aheadOfRelease"] is not offered
+    assert status["targetSha"] == (release if offered else FORK_REVISION)
+    assert status["behind"] == (UPDATE_AVAILABLE_NO_COUNT if offered else 0)
+    # Equality with the declared base is proof without asking GitHub.
+    assert (compare_path in requests) is (upstream != release)
+
+
+@pytest.mark.parametrize("release,rollback", [(RELEASE_BASE, True), (NEWER_RELEASE, False)])
+def test_non_default_stable_names_an_embedded_forks_base_a_rollback(embedded_build, release, rollback):
+    """Stable that is not the default subscription may move back, as for a checkout: the base is
+    then named a rollback, not a newer release."""
+    from hermes_cli.source_check import check_for_updates
+
+    home, _requests, build = embedded_build
+    build(upstream=RELEASE_BASE, release=release, stable_default=False)
+
+    status = check_for_updates(home=home, channel="stable")
+
+    assert status["currentSha"] == FORK_REVISION and status["targetSha"] == release, status
+    assert status["updateAvailable"] is True and status["aheadOfRelease"] is False
+    assert status["rollback"] is rollback
+
+
+def test_declaring_an_upstream_base_is_not_answered_from_the_old_cache(embedded_build):
+    from hermes_cli.source_check import check_for_updates
+
+    home, _requests, build = embedded_build
+    build(release=NEWER_RELEASE)
+    assert check_for_updates(home=home)["updateAvailable"] is False  # unknown relation, cached
+    build(upstream=RELEASE_BASE, release=NEWER_RELEASE, compare={"status": "behind"})
+    assert check_for_updates(home=home)["updateAvailable"] is True
 
 
 @pytest.mark.parametrize("ledgered", [True, False])
