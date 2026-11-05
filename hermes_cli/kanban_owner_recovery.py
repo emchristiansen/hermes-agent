@@ -192,6 +192,30 @@ def owner_reclaim_blocked_after_kill(conn, task_id, *, signalled: bool) -> bool:
     return owner_reclaim_blocked(conn, task_id, crash_sweep=signalled)
 
 
+def attempt_result(conn, task_id, run_id):
+    """The ``worker_result`` that classifies run ``run_id``'s attempt for accounting, ``{}`` when none.
+
+    A run can carry two results. A replacement owner that settles the attempt's lost turn records
+    ``owner_restarted`` (exit 79, ``recorded_by_owner_pid``) only when no result exists yet
+    (``session_kanban.record_owner_restart_result``). The bound interpreter, which may outlive its
+    owner, records its own result when its turn ends. That later result stays the interpreter's own
+    fact (and ends its workspace binding, ``kanban_db_workspace``), but the owner already accounted
+    for the attempt: its record decides, so a restart stays uncounted whichever arrives first at a
+    reader. Without an owner record, the latest result decides, as before."""
+    from hermes_cli.kanban_db_workspace import OWNER_RECORDED_RESULT_KEY
+    results = []
+    for (payload,) in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_result' ORDER BY id",
+            (task_id, run_id)).fetchall():
+        try:
+            result = json.loads(payload) if payload else {}
+        except ValueError:
+            result = {}
+        results.append(result if isinstance(result, dict) else {})
+    owner = [r for r in results if OWNER_RECORDED_RESULT_KEY in r]
+    return owner[0] if owner else (results[-1] if results else {})
+
+
 def managed_run_exit_code(conn, task_id, worker_pid, claim_lock):
     """The exit code a managed run's authority recorded for the task's CURRENT run, else None.
 
@@ -200,7 +224,8 @@ def managed_run_exit_code(conn, task_id, worker_pid, claim_lock):
     reaped here). It speaks for the run only under the same claim and from a pid of this run:
     the dispatcher's own worker, or the owner-side interpreter ``worker_bound`` recorded under
     that claim — ``session_kanban._record_worker_result`` writes the interpreter's pid, never the
-    spawned submitter's ``tasks.worker_pid``."""
+    spawned submitter's ``tasks.worker_pid``. The run's result is its accounting result
+    (:func:`attempt_result`)."""
     def latest(kind):
         row = conn.execute(
             "SELECT e.payload FROM task_events e JOIN tasks t ON t.current_run_id=e.run_id "
@@ -211,6 +236,8 @@ def managed_run_exit_code(conn, task_id, worker_pid, claim_lock):
             return {}
         return payload if isinstance(payload, dict) else {}
 
-    result, bound = latest('worker_result'), latest('worker_bound')
+    run = conn.execute('SELECT current_run_id FROM tasks WHERE id=?', (task_id,)).fetchone()
+    result = attempt_result(conn, task_id, run[0]) if run and run[0] is not None else {}
+    bound = latest('worker_bound')
     pids = {worker_pid, *([bound.get('pid')] if bound.get('claim_lock') == claim_lock else [])}
     return result.get('exit_code') if result.get('claim_lock') == claim_lock and result.get('pid') in pids else None

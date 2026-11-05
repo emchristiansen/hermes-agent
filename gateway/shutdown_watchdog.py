@@ -20,7 +20,7 @@ import threading
 import time
 from datetime import datetime, timezone, UTC
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
 from hermes_constants import get_hermes_home, get_process_hermes_home
@@ -41,6 +41,9 @@ DEFAULT_LOOP_WATCHDOG_TIMEOUT_S = 10.0
 # the loop it monitors) is fixed at the root by the off-loop heartbeat write + two-witness probe (#90502),
 # so the default stays tight for genuine wedges.
 DEFAULT_LOOP_WATCHDOG_MAX_STRIKES = 3
+# What ``asyncio.run`` still does once the gateway coroutine returned (cancel leftover tasks, close async
+# generators, join the default executor) is not gateway work: it gets this long before a hard exit.
+EXIT_TEARDOWN_LEASH_S = 5.0
 _HEARTBEAT_RELATIVE = ("state", "gateway.heartbeat")
 _WATCHDOG_DUMP_RELATIVE = ("logs", "gateway-shutdown-watchdog.log")
 
@@ -156,18 +159,21 @@ def _hard_exit(exit_code: int) -> None:
     os._exit(exit_code)
 
 
-def _mark_exited_quietly(exit_code: int, reason: str) -> None:
+def _mark_exited_quietly(exit_code: int, reason: str, *, runtime_status: bool = True) -> None:
     """Best-effort terminal stamp on BOTH lifecycle records before ``os._exit`` skips teardown:
     the lifecycle ledger (so the next boot names the watchdog, not SIGKILL/OOM) and
     ``gateway_state.json`` (so ``hermes gateway status`` and every other reader of that file stop
     seeing ``running`` for a process the watchdog killed — #113372). The runtime-status write goes
-    LAST: it is the record housekeeping refreshes, so nothing may overwrite it after we stamp it."""
+    LAST: it is the record housekeeping refreshes, so nothing may overwrite it after we stamp it.
+    ``runtime_status=False`` keeps the exit state a completed stop already persisted."""
     with contextlib.suppress(Exception):
         from gateway.lifecycle_ledger import mark_exited
         mark_exited(exit_code, reason=reason)
     with contextlib.suppress(Exception):  # os._exit skips atexit: stamp the exit-metrics marker now
         from hermes_cli.observability.shared_metrics_process import stamp_exit
         stamp_exit("watchdog")
+    if not runtime_status:
+        return
     with contextlib.suppress(Exception):
         from gateway.status import write_runtime_status
         # Only the supervisor-restart code asserts a restart; other codes leave the recorded
@@ -264,10 +270,11 @@ def _write_watchdog_dump(dump_path: Path, *, delay_s: float, snapshot: Optional[
 def arm_shutdown_watchdog(
     delay_s: float, *, done_event: Optional[threading.Event] = None,
     snapshot_fn: Optional[Callable[[], dict[str, Any]]] = None, exit_code: int = 1,
-    dump_path: Optional[Path] = None, name: str = "gateway-shutdown-watchdog") -> threading.Event:
+    dump_path: Optional[Path] = None, name: str = "gateway-shutdown-watchdog",
+    reason: str = "shutdown_watchdog", runtime_status: bool = True) -> threading.Event:
     """Arm a daemon-thread hard-exit backstop for a wedged shutdown path: exits quietly if
-    ``done_event`` is set within ``delay_s``, else dumps diagnostics and ``os._exit(exit_code)``.
-    Never raises; returns ``done_event`` for disarming."""
+    ``done_event`` is set within ``delay_s``, else dumps diagnostics and ``os._exit(exit_code)``,
+    recording ``reason``. Never raises; returns ``done_event`` for disarming."""
     done = done_event if done_event is not None else threading.Event()
     delay = _coerce_float(delay_s, DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S)
     if delay <= 0:
@@ -285,7 +292,7 @@ def arm_shutdown_watchdog(
         except Exception as exc:
             snapshot = {"snapshot_error": repr(exc)}
         target = dump_path if dump_path is not None else get_shutdown_watchdog_dump_path()
-        _write_watchdog_dump(target, delay_s=delay, snapshot=snapshot)
+        _write_watchdog_dump(target, delay_s=delay, snapshot=snapshot, event=f"{reason}_fired")
         with contextlib.suppress(Exception):
             logger.critical("Shutdown watchdog fired after %.0fs — forcing process exit "
                             "(asyncio drain path appears wedged; see %s)", delay, target)
@@ -304,13 +311,37 @@ def arm_shutdown_watchdog(
         with contextlib.suppress(Exception):
             from hermes_logging import drain_log_queue
             drain_log_queue(timeout=1.0)
-        _mark_exited_quietly(exit_code, "shutdown_watchdog")
+        _mark_exited_quietly(exit_code, reason, runtime_status=runtime_status)
         _hard_exit(exit_code)
     try:
         threading.Thread(target=_watchdog, daemon=True, name=name).start()
     except Exception:
         logger.debug("Failed to arm shutdown watchdog", exc_info=True)
     return done
+
+
+async def run_with_exit_backstop(lifecycle: Callable[[], Awaitable[Any]],
+                                 *, leash_s: float = EXIT_TEARDOWN_LEASH_S) -> Any:
+    """Await the gateway ``lifecycle()`` as ``asyncio.run``'s main coroutine, then keep a hard-exit backstop
+    armed until the entrypoint's own ``os._exit``. The stop disarms its watchdog when it returns, but
+    ``asyncio.run`` then still cancels and awaits leftover tasks and joins the default executor (up to
+    300 s on 3.12+, unbounded before), i.e. waits on work the stop gave up on (a cancel-deaf send, a
+    stalled ``to_thread``). The backstop exits with the code the entrypoint would have used. Skipped
+    under pytest, like the stop's own watchdog."""
+    exit_code = 1
+    try:
+        result = await lifecycle()
+        exit_code = 0 if result else 1
+        return result
+    except SystemExit as exc:  # the entrypoints' mapping of SystemExit codes
+        exit_code = 0 if exc.code is None else exc.code if isinstance(exc.code, int) else 1
+        raise
+    finally:
+        if not os.environ.get("PYTEST_CURRENT_TEST"):
+            # Never disarmed: the process exit ends it.
+            arm_shutdown_watchdog(leash_s, exit_code=exit_code, name="gateway-exit-watchdog",
+                                  reason="exit_teardown_watchdog", runtime_status=False,
+                                  snapshot_fn=lambda: {"phase": "asyncio.run teardown", "exit_code": exit_code})
 
 
 async def _tick_socket_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:

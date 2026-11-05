@@ -433,11 +433,12 @@ def _bound_claim_is_live(context):
 
 
 def worker_result(path, params):
-    """Read only the dispatcher's exact attempt; never infer success from admission settlement."""
+    """Read only the dispatcher's exact attempt; never infer success from admission settlement.
+    The attempt's accounting result (``kanban_owner_recovery.attempt_result``): an owner's
+    restart record outranks the interpreter's later result for the same run."""
+    from hermes_cli.kanban_owner_recovery import attempt_result
     with closing(sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True)) as conn:
-        row = conn.execute("SELECT payload FROM task_events WHERE run_id=? AND task_id=? AND kind='worker_result' ORDER BY id DESC LIMIT 1",
-            (params['run_id'], params['task_id'])).fetchone()
-        result = json.loads(row[0]) if row else {}
+        result = attempt_result(conn, params['task_id'], params['run_id'])
         return result if result.get('claim_lock') == params['claim_lock'] else {}
 
 
