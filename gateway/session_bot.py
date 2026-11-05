@@ -14,7 +14,7 @@ from agent.turn_author import parse_turn_author
 from gateway.session_contract import Principal, SessionRef
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent
-from hermes_state_runtime import RuntimeStoreError, get_session_admission
+from hermes_state_runtime import STEERING, RuntimeStoreError, get_session_admission
 from tools.bot_failure_reasons import HELD_NOT_SENT
 from tools.bot_live_delivery import _TERMINAL, _delivery_id, _read
 logger = logging.getLogger(__name__)
@@ -345,8 +345,14 @@ def _admission_outcome(authority, admission_id, fallback=None):
     # A terminal row without a result blob is still definitive when the outcome says the
     # input never ran (cancelled) or was refused/failed; ambiguous is reserved for the
     # durable unknown state and for missing evidence (completed/interrupted without result).
+    # A delivery steered into a running claim has no result of its own: ``steering`` is still
+    # bound to that claim (pending: it settles with it, or returns to the queue); ``steered``
+    # is committed proof its text reached the claim's agent and that claim completed, so it is
+    # delivered with no reply of its own. ``interrupted`` (taken, claim did not complete) stays
+    # ambiguous.
     status = {'queued': 'queued', 'started': 'claimed', 'unknown': 'ambiguous',
-              'terminal': {'cancelled': 'cancelled', 'rejected': 'failed', 'failed': 'failed'}.get(row['outcome'], 'ambiguous')}[row['status']]
+              'terminal': {'cancelled': 'cancelled', 'rejected': 'failed', 'failed': 'failed',
+                           STEERING: 'claimed', 'steered': 'settled'}.get(row['outcome'], 'ambiguous')}[row['status']]
     from gateway.session_results import admission_result
     saved = admission_result(authority.db, admission_id)
     reply = (fallback or {}).get('reply', '')
