@@ -1230,38 +1230,6 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             tasks = self._deferred_agent_cleanup_tasks = set()
         self._track_task_in(tasks, asyncio.create_task(_cleanup_when_done()))
 
-    async def _cleanup_agent_resources_off_loop(
-        self, agent: Any, *, context: str = "", session_key: Optional[str] = None,
-    ) -> None:
-        """Run _cleanup_agent_resources in a worker thread, bounded; on timeout the worker is left alone.
-
-        The teardown fires the memory-provider lifecycle hooks (``flush_pending`` → ``on_session_end`` →
-        ``shutdown`` → ``close``), which read credentials/home at call time. In-turn callers carry the
-        profile scope through ``_run_housekeeping_in_executor``; shutdown does not (it runs on the main
-        loop, outside any adapter handler), so under multiplexing ``on_session_end`` failed closed and the
-        session tail was never committed (#110622). ``_run_release_in_profile_scope`` enters the OWNING
-        profile's scope from ``session_key`` when the caller has none, exactly like cache eviction."""
-        if agent is None:
-            return
-        if context.startswith("shutdown") or context == "session expiry":
-            with suppress(Exception):
-                agent._end_session_on_close = False
-        ctx_label = f" ({context})" if context else ""
-        try:
-            await asyncio.wait_for(
-                self._run_housekeeping_in_executor(
-                    self._run_release_in_profile_scope, self._cleanup_agent_resources, (agent,), session_key,
-                ),
-                timeout=self._CLEANUP_TIMEOUT_S,
-            )
-        except TimeoutError:
-            logger.warning(
-                "Agent resource cleanup%s exceeded %ss; proceeding without blocking the event loop (the worker "
-                "thread is left to finish on its own). (#53175)", ctx_label, self._CLEANUP_TIMEOUT_S,
-            )
-        except Exception as cleanup_exc:
-            logger.warning("Agent resource cleanup%s failed: %s (#53175)", ctx_label, cleanup_exc)
-
     def _cleanup_agent_resources(self, agent: Any) -> None:
         """Best-effort cleanup for temporary or cached agent instances."""
         if agent is None:
@@ -2198,9 +2166,11 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         ctx = GatewayShutdownMixin._StopContext(
             deferred_count=getattr(self, "_active_deferred_agent_worker_count", lambda: 0)
         )
+        leash = _effective_watchdog_leash(self)
+        self._stop_deadline = time.monotonic() + leash  # what _stop_wait_budget clamps the post-settle waits to
         if not os.environ.get("PYTEST_CURRENT_TEST"):
             arm_shutdown_watchdog(
-                _effective_watchdog_leash(self), done_event=_watchdog_done,
+                leash, done_event=_watchdog_done,
                 snapshot_fn=lambda: GatewayRunner._shutdown_watchdog_snapshot(self, ctx), exit_code=1,
             )
         try:
