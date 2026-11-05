@@ -261,3 +261,71 @@ def test_a_quota_wall_ending_in_the_same_second_as_an_older_attempt_keeps_its_co
     assert dict(res.respawn_guarded).get(tid) == "rate_limit_cooldown"
     assert kbd.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
     assert _history(conn, tid)[2] == (1 if older == "crashed" else 0)
+
+
+# ---------------------------------------------------------------------------
+# Backward wall clock (CHRONO-01): ``ended_at`` is a wall clock. A clock correction, or a board
+# exported and imported onto a machine whose clock is behind, ends a newer attempt at an EARLIER
+# second than an older one. "Latest" and "later" must still be attempt order; the timestamp only
+# measures a cooldown's elapsed time.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("lane", ["ready", "review"])
+@pytest.mark.parametrize("transfer", [False, True])
+def test_a_fresh_auth_failure_is_not_superseded_by_an_older_attempt_with_a_later_clock(
+        conn, clock, tmp_path, transfer, lane):
+    from hermes_cli import kanban_transfer as kt
+
+    tid = kb.create_task(conn, title="clock behind", assignee="w")
+    restarted = _owner_restarted_attempt(conn, tid)
+    assert tid in kbd.dispatch_once(conn, dry_run=True).owner_restarted
+    target, board = conn, None
+    if transfer:
+        # Supported transfer keeps the run's id, end and ``spawned`` event but clears its pid.
+        archive = kt.export_board("default", str(tmp_path / "export"), include_attachments=False)["archive"]
+        board = kt.import_board(archive, slug="clock-behind", activate=False)["board"]
+        target = kbc.connect(board=board)
+        moved = target.execute("SELECT worker_pid FROM task_runs WHERE id = ?",
+                               (restarted.current_run_id,)).fetchone()
+        assert moved["worker_pid"] is None
+        assert target.execute("SELECT 1 FROM task_events WHERE run_id = ? AND kind = 'spawned'",
+                              (restarted.current_run_id,)).fetchone()
+    clock[0] -= 60  # the next attempt ends a minute "before" the previous one
+    try:
+        def spawn_rejected(task, workspace, board=None):
+            raise RuntimeError("401 Unauthorized: invalid API key")
+
+        kbd.dispatch_once(target, spawn_fn=spawn_rejected, failure_limit=5, board=board)
+        runs = _runs(target, tid)
+        assert [r["outcome"] for r in runs] == ["owner_restarted", "spawn_failed"]
+        assert runs[1]["ended_at"] < runs[0]["ended_at"]
+        stamped = _history(target, tid)
+        assert stamped[0] == "ready" and "401 Unauthorized" in stamped[1]
+
+        assert kbd.check_respawn_guard(target, tid, lane=lane) == "blocker_auth"
+        res = kbd.dispatch_once(target, dry_run=True, board=board)
+        assert dict(res.respawn_guarded).get(tid) == "blocker_auth"
+        assert _history(target, tid) == stamped
+    finally:
+        if transfer:
+            target.close()
+
+
+def test_a_quota_wall_ending_at_an_earlier_second_than_an_older_attempt_keeps_its_cooldown(conn, clock):
+    tid = kb.create_task(conn, title="clock behind quota", assignee="w")
+    _owner_restarted_attempt(conn, tid)
+    clock[0] += 60  # booked by a clock a minute fast...
+    kbd.dispatch_once(conn, dry_run=True)
+    clock[0] -= 60  # ...then corrected (not before a spawn: the crash grace reads the real pid start)
+    _rate_limited_attempt(conn, tid)
+    res = kbd.dispatch_once(conn, dry_run=True)
+    assert tid in res.rate_limited
+    runs = _runs(conn, tid)
+    assert [r["outcome"] for r in runs] == ["owner_restarted", "rate_limited"]
+    assert runs[1]["ended_at"] < runs[0]["ended_at"]
+    # The newest attempt is the quota wall: its cooldown runs from its own end...
+    assert dict(res.respawn_guarded).get(tid) == "rate_limit_cooldown"
+    clock[0] += COOLDOWN + 1
+    # ...and once elapsed the card retries, not ``blocker_auth`` on the quota text.
+    assert kbd.check_respawn_guard(conn, tid) is None

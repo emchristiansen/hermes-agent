@@ -25,11 +25,14 @@ RESPAWN_BLOCKER_RE = re.compile(
     re.IGNORECASE,
 )
 
-# The guard's one total order over a card's ended runs, newest first. ``ended_at`` is
-# whole seconds, so a sweep and a spawn failure in one dispatch tick tie; the id breaks
-# it, since a card's runs open one at a time (``current_run_id``) under an ascending
-# AUTOINCREMENT id. Every "latest run" / "later run" decision of the guard uses it.
-LATEST_RUN_FIRST = "ended_at DESC, id DESC"
+# The guard's one total order over a card's ended runs, newest attempt first. A card's
+# runs open one at a time (``current_run_id``) under an ascending AUTOINCREMENT id, so
+# the id is the attempt order. ``ended_at`` is not: it is whole seconds (a sweep and a
+# spawn failure in one dispatch tick tie) and a wall clock (a clock correction, or a
+# board imported onto a machine whose clock is behind, ends a newer attempt at an
+# earlier second). Every "latest run" / "later run" decision of the guard uses this
+# order; ``ended_at`` is read only for elapsed-time cooldowns.
+LATEST_RUN_FIRST = "id DESC"
 
 
 def stamp_superseded(conn, task_id, err) -> bool:
@@ -48,7 +51,7 @@ def stamp_superseded(conn, task_id, err) -> bool:
     from hermes_cli.kanban_db import _lossy_text
     origin = None
     for run in conn.execute(
-        "SELECT id, ended_at, error FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+        "SELECT id, error FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
         f"AND error IS NOT NULL ORDER BY {LATEST_RUN_FIRST}",
         (task_id,),
     ):
@@ -57,11 +60,10 @@ def stamp_superseded(conn, task_id, err) -> bool:
             break
     if origin is None:
         return False
-    # "Later" in the same order: a later second, or the same second and a higher id.
+    # "Later" in the same order: a higher id, whatever either run's wall-clock ended_at.
     return conn.execute(
-        "SELECT 1 FROM task_runs r WHERE r.task_id = ? AND r.ended_at IS NOT NULL "
-        "AND (r.ended_at > ? OR (r.ended_at = ? AND r.id > ?)) "
+        "SELECT 1 FROM task_runs r WHERE r.task_id = ? AND r.id > ? AND r.ended_at IS NOT NULL "
         "AND (r.worker_pid IS NOT NULL OR EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = r.task_id "
         "AND e.run_id = r.id AND e.kind IN ('spawned', 'worker_registered'))) LIMIT 1",
-        (task_id, origin["ended_at"], origin["ended_at"], origin["id"]),
+        (task_id, origin["id"]),
     ).fetchone() is not None

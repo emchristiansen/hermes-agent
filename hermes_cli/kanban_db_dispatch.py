@@ -1571,8 +1571,8 @@ def check_respawn_guard(
     #    LATEST run only: a newer crash/completion supersedes the rate-limit run.
     #    An infrastructure spawn refusal (#114720) shares the cooldown: the host
     #    condition is not the card's, so it retries forever, spaced, and never
-    #    reaches the breaker. Runs ending in one second are ordered by id: a card's
-    #    runs open one at a time, so its ids ascend in run order (``LATEST_RUN_FIRST``).
+    #    reaches the breaker. "Latest" is attempt order (``LATEST_RUN_FIRST``), not the
+    #    wall-clock ended_at, which only measures the cooldown's elapsed time.
     rl_cooldown = _kb._resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
         "SELECT outcome, ended_at, metadata FROM task_runs "
