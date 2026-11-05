@@ -121,43 +121,88 @@ def _conn_uses_path(
     return False
 
 
-# Each card's latest bound worker that has not recorded its ``worker_result``: its turns may
-# still be running in the card's workspace. ``_record_worker_result`` writes the result before
-# that worker runs its own deferred cleanup, so a finished worker never counts here.
-_OPEN_BOUND_WORKERS_SQL = (
-    "SELECT t.id, t.workspace_path, e.payload FROM tasks t "
-    "JOIN task_events e ON e.id = (SELECT MAX(b.id) FROM task_events b "
-    "    WHERE b.task_id = t.id AND b.kind = 'worker_bound') "
-    "WHERE t.workspace_path IS NOT NULL AND NOT EXISTS (SELECT 1 FROM task_events r "
-    "    WHERE r.task_id = t.id AND r.run_id IS e.run_id AND r.kind = 'worker_result' AND r.id > e.id)"
+def _json_pid_sql(column: str) -> str:
+    return f"(CASE WHEN json_valid({column}) THEN json_extract({column}, '$.pid') END)"
+
+
+# A ``worker_bound`` event (alias ``e``) whose interpreter has not recorded its ``worker_result``:
+# that worker's turns may still be running in the card's workspace. ``_record_worker_result``
+# writes the result (same run, same pid) before it runs its own deferred cleanup, so a finished
+# worker never counts. Every such binding counts, not only a card's latest: after a review
+# handoff (``request_review`` then ``claim_review_task``) or a re-dispatch, an earlier run's
+# worker can still be in its turn while a later run's worker binds and finishes.
+_UNFINISHED_BINDING_SQL = (
+    "e.kind = 'worker_bound' AND NOT EXISTS (SELECT 1 FROM task_events r "
+    "    WHERE r.task_id = e.task_id AND r.run_id IS e.run_id AND r.kind = 'worker_result' "
+    f"    AND r.id > e.id AND {_json_pid_sql('r.payload')} = {_json_pid_sql('e.payload')})"
+)
+_OPEN_BINDINGS_SQL = (
+    "SELECT t.id, t.workspace_path, e.payload FROM task_events e JOIN tasks t ON t.id = e.task_id "
+    f"WHERE t.workspace_path IS NOT NULL AND {_UNFINISHED_BINDING_SQL}"
 )
 
 
+def _binding_may_be_live(payload: Optional[str]) -> bool:
+    """Whether the worker a ``worker_bound`` payload names may still be running, failing closed.
+
+    False only when the process is provably gone: its pid is dead, or the pid now belongs to a
+    process with a readable, different start fingerprint (recycled). An unreadable payload or an
+    unreadable fingerprint of a live pid proves nothing, so it counts as live; ``_worker_alive``
+    alone reads an unreadable fingerprint as recycled, which is right for signalling but not for
+    deleting a directory."""
+    from hermes_cli.kanban_db_dispatch import _pid_alive, _process_fingerprint, _worker_alive  # late: import cycle
+
+    try:
+        bound = json.loads(payload or "")
+        pid = int(bound["pid"])
+    except (TypeError, ValueError, KeyError):
+        return True
+    if pid <= 0:
+        return True
+    if not _pid_alive(pid):
+        return False
+    if _worker_alive(pid, bound.get("started_at")):
+        return True
+    return _process_fingerprint(pid) is None
+
+
 def _conn_live_worker_inside(conn: sqlite3.Connection, key: str) -> Optional[str]:
-    """The card whose bound worker is still alive with its workspace at or under *key*, else None.
+    """A card with a live bound worker whose workspace is at or under *key*, else None.
 
     Card status says nothing here: a worker goes on with its turn after completing its card (the
     model reads the tool result, steered comments arrive), and so may a worker whose card someone
-    else completed or archived. The card's own worker counts too. Liveness is the
-    ``worker_bound`` pid with its start fingerprint, so a hard-killed worker (or a recycled pid)
-    no longer holds the directory."""
-    from hermes_cli.kanban_db_dispatch import _worker_alive  # late: import cycle
-
+    else completed, archived or handed to review. The card's own workers count too. Liveness is
+    each unfinished ``worker_bound`` pid with its start fingerprint
+    (:func:`_binding_may_be_live`), so a hard-killed worker (or a recycled pid) no longer holds
+    the directory."""
     target = Path(key)
-    for row in conn.execute(_OPEN_BOUND_WORKERS_SQL).fetchall():
+    for row in conn.execute(_OPEN_BINDINGS_SQL).fetchall():
         try:
             workspace = Path(_path_key(Path(row["workspace_path"]).expanduser().resolve(strict=False)))
         except OSError:
             continue
         if workspace != target and not workspace.is_relative_to(target):
             continue
-        try:
-            bound = json.loads(row["payload"] or "{}")
-        except (TypeError, ValueError):
-            continue
-        if isinstance(bound, dict) and _worker_alive(bound.get("pid"), bound.get("started_at")):
+        if _binding_may_be_live(row["payload"]):
             return row["id"]
     return None
+
+
+def _prune_terminal_events(conn: sqlite3.Connection, cutoff: int) -> int:
+    """Delete done/archived cards' events created before *cutoff*, except ``decomposed`` and any
+    unfinished ``worker_bound`` whose worker may still be live, however old: that binding is the
+    only evidence that the worker still uses its card's workspace (:func:`_conn_live_worker_inside`).
+    It is pruned once the worker is gone. Returns the number of events deleted."""
+    terminal = "created_at < ? AND task_id IN (SELECT id FROM tasks WHERE status IN ('done', 'archived'))"
+    with _kb.write_txn(conn):
+        old_bindings = conn.execute(
+            f"SELECT e.id, e.payload FROM task_events e WHERE e.{terminal} AND {_UNFINISHED_BINDING_SQL}",
+            (cutoff,)).fetchall()
+        live = [row[0] for row in old_bindings if _binding_may_be_live(row[1])]
+        cur = conn.execute(
+            f"DELETE FROM task_events WHERE {terminal} AND kind != 'decomposed' "
+            "AND id NOT IN (SELECT value FROM json_each(?))", (cutoff, json.dumps(live)))
+    return int(cur.rowcount or 0)
 
 
 def _sibling_board_db_files(conn: sqlite3.Connection) -> list[Path]:
@@ -215,8 +260,9 @@ def _workspace_in_use_by_other(
     card's own cleanup, the deferred parent sweep, ``gc``) asks here first, so a directory is
     removed only once the last worker using it has ended. A done or archived card's worker runs
     its card's cleanup, and so its parents' sweep, at its end
-    (``gateway.session_kanban._remove_finished_workspace``); anything else held back this way
-    stays until its card is archived or ``gc`` runs.
+    (``gateway.session_kanban._remove_finished_workspace``). Archiving a card runs its cleanup,
+    and ``kanban gc`` retries archived cards only, so a done card held back for some other
+    card's worker keeps its directory until it is archived.
 
     ``gc``, completion and deferred parent cleanup used to ``rmtree`` a shared
     ``workspace_path`` as soon as one of its tasks went terminal. Compare the

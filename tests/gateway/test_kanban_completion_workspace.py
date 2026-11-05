@@ -92,7 +92,11 @@ def _ended_process_identity():
 
 
 def _rebind(path, context, pid, started_at):
+    """Replace the fixture's live binding (this process, now finished) with a worker ``pid``."""
     with connect_closing(path) as conn, kb.write_txn(conn):
+        kb._append_event(conn, context["task_id"], "worker_result",
+                         {"pid": os.getpid(), "claim_lock": context["claim_lock"], "exit_code": 0},
+                         run_id=context["run_id"])
         kb._append_event(conn, context["task_id"], "worker_bound",
                          {"pid": pid, "claim_lock": context["claim_lock"], "started_at": started_at},
                          run_id=context["run_id"])
@@ -263,7 +267,7 @@ def test_a_waiting_childs_handoff_survives_the_parents_worker_end(bound_scratch_
 # the real finalizer. (Derived from the t_99ab13a0 reviewer probe.)
 _OVERLAP_WORKER = r'''
 import json, sys
-repo, db, task_id = sys.argv[1:]
+repo, db, task_id, *lane = sys.argv[1:]
 sys.path.insert(0, repo)
 from pathlib import Path
 from types import SimpleNamespace
@@ -271,7 +275,10 @@ from gateway import session_kanban
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect_closing
 with connect_closing(Path(db)) as conn:
-    task = kb.claim_task(conn, task_id, claimer="overlap-worker")
+    if lane == ["review"]:
+        task = kb.claim_review_task(conn, task_id, claimer="overlap-worker")
+    else:
+        task = kb.claim_task(conn, task_id, claimer="overlap-worker")
 context = dict(task_id=task_id, board="default", db=db, run_id=task.current_run_id, claim_lock=task.claim_lock,
                workspace=task.workspace_path, workspaces_root=str(kb.workspaces_root()), profile="default",
                branch=None, tenant=None, goal_mode=False, max_runtime_seconds=None, skills=[], context="")
@@ -301,10 +308,10 @@ print(json.dumps({"exit_code": session_kanban.worker_exit_code(db, context)}), f
 '''
 
 
-def _start_overlap_worker(db, task_id):
+def _start_overlap_worker(db, task_id, lane="work"):
     env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_KANBAN_")}
     repo = Path(__file__).resolve().parents[2]
-    worker = subprocess.Popen([sys.executable, "-u", "-c", _OVERLAP_WORKER, str(repo), str(db), task_id],
+    worker = subprocess.Popen([sys.executable, "-u", "-c", _OVERLAP_WORKER, str(repo), str(db), task_id, lane],
                               cwd=repo, env=env, text=True,
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     line = worker.stdout.readline()
@@ -372,3 +379,89 @@ def test_overlapping_worker_turns_keep_each_live_workers_workspace(bound_scratch
     assert not workspace.exists()  # the last worker's end removed it
     with connect_closing(path) as conn:
         assert {kb.get_task(conn, t).status for t in (parent["task_id"], child)} == {"done"}
+
+
+def test_a_review_handoff_keeps_the_implementers_workspace_until_it_ends(bound_scratch_worker):
+    """t_3d35658c CWD-04: the implementer hands its card to review (``kanban_request_review``)
+    and its turn goes on; a reviewer process claims the same card as a new run
+    (``claim_review_task``), completes it and ends first. Only the card's latest binding used to
+    count, so the reviewer's finalizer removed the implementer's cwd. Every unfinished binding
+    counts now; the implementer's own end removes the workspace."""
+    from agent.prompt_builder import build_context_files_prompt
+    from tools import kanban_tools
+
+    path, implementer, workspace = bound_scratch_worker
+    implementer.update(skills=[], context="", goal_mode=False)
+    (workspace / "AGENTS.md").write_text("implementer sentinel\n")
+    seen = {}
+
+    def implementer_turn(*_args, **_kwargs):
+        assert json.loads(kanban_tools._handle_request_review({"summary": "candidate ready"}))["ok"]
+        seen["reviewer"] = _finish_overlap_worker(_start_overlap_worker(path, implementer["task_id"], "review"))
+        with connect_closing(path) as conn:
+            seen["status"] = kb.get_task(conn, implementer["task_id"]).status
+        seen["prompt"] = build_context_files_prompt(cwd=None)
+        Path("late-implementer.txt").write_text("late bytes")
+        seen["late"] = (workspace / "late-implementer.txt").read_text()
+        return {"completed": True, "final_response": "handed off"}
+
+    agent = SimpleNamespace(session_id="implementer", run_conversation=implementer_turn)
+    session_kanban.run_worker_turns(agent, {"text": "work", "policy": {"kanban_json": json.dumps(implementer)}}, [])
+    assert "error" not in seen["reviewer"], seen["reviewer"]
+    assert seen["status"] == "done"  # the reviewer completed the card and its worker ended
+    assert "implementer sentinel" in seen["prompt"]
+    assert seen["late"] == "late bytes"
+    assert not workspace.exists()  # the implementer, the last worker, removed it at its end
+
+
+def _bindings(path, task_id):
+    with connect_closing(path) as conn:
+        return conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='worker_bound'",
+                            (task_id,)).fetchone()[0]
+
+
+def test_event_retention_keeps_a_live_workers_binding(bound_scratch_worker, monkeypatch, tmp_path):
+    """t_3d35658c CWD-05: ``kanban gc`` with positive event retention pruned an old unfinished
+    ``worker_bound`` of a still-live worker; the next ``gc`` found no live worker and removed its
+    archived card's workspace. (The binding is aged artificially, not a 31-day run.) The binding
+    is kept while its worker lives and pruned, with the workspace, once it is gone."""
+    from hermes_cli import kanban_ops
+    path, context, workspace = bound_scratch_worker
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.chdir(tmp_path)
+    with connect_closing(path) as conn:
+        assert kb.archive_task(conn, context["task_id"], signal_fn=lambda *_: None)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_events SET created_at = created_at - 31 * 86400 WHERE task_id = ?",
+                         (context["task_id"],))
+    args = argparse.Namespace(event_retention_days=30, log_retention_days=0)
+    for _ in range(2):
+        assert kanban_ops._cmd_gc(args) == 0
+        assert workspace.is_dir()
+        assert _bindings(path, context["task_id"]) == 1
+    _rebind(path, context, *_ended_process_identity())  # the worker ends without a result
+    with connect_closing(path) as conn, kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET created_at = created_at - 31 * 86400 WHERE task_id = ?",
+                     (context["task_id"],))
+    assert kanban_ops._cmd_gc(args) == 0
+    assert _bindings(path, context["task_id"]) == 0  # a dead worker's binding is pruned
+    assert kanban_ops._cmd_gc(args) == 0
+    assert not workspace.exists()
+
+
+def test_only_a_recycled_pid_releases_a_binding(bound_scratch_worker, monkeypatch, tmp_path):
+    """A live pid with a readable, different start fingerprint is another process: it does not
+    hold the workspace. A live pid whose fingerprint cannot be read proves nothing: it does."""
+    from hermes_cli import kanban_db_dispatch
+    path, context, workspace = bound_scratch_worker
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.chdir(tmp_path)
+    _rebind(path, context, os.getpid(), kanban_db_dispatch._process_fingerprint(os.getpid()))
+    with monkeypatch.context() as unreadable, connect_closing(path) as conn:
+        unreadable.setattr(kanban_db_dispatch, "_process_fingerprint", lambda _pid: None)
+        assert kb.complete_task(conn, context["task_id"], summary="done elsewhere")
+    assert workspace.is_dir()  # unreadable identity: kept
+    _rebind(path, context, os.getpid(), "0|0")  # this pid, someone else's birth
+    with connect_closing(path) as conn:
+        kanban_db_workspace._cleanup_workspace(conn, context["task_id"])
+    assert not workspace.exists()
