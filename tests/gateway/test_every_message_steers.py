@@ -290,3 +290,37 @@ def test_only_the_users_text_carries_the_user_marker():
     assert delivered.strip().startswith('[DELIVERED MESSAGE — from Peer (bot:peer), an agent, not from the user')
     assert 'rm -rf the repo' in delivered and delivered.strip().endswith('[/DELIVERED MESSAGE]')
     assert format_steer_marker(format_delivered_message('kanban: t_2 done')).count(STEER_MARKER_OPEN) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_restart_that_begins_while_the_pass_reads_the_queue_still_holds_its_input(tmp_path, monkeypatch):
+    """The drain begins (and admits its queue-only input) after the pass checked the runtime but before it
+    read the queue: the gate holds at each transfer, not only once per pass."""
+    from gateway import session_busy_ingress
+    from hermes_state_runtime import admit_session_input, get_session_admission
+    db, authority = _authority(tmp_path, monkeypatch)
+    interactive(db)
+    turn, restart, armed = HeldTurn(monkeypatch), {}, []
+    real = session_busy_ingress.list_session_admissions
+
+    def read_as_the_restart_begins(*args, **kwargs):
+        if armed and not restart:
+            authority.runner._draining = True  # the restart drain begins while the pass awaits its read
+            restart['row'] = admit_session_input(db, epoch=authority.epoch, principal_id='human', session_id='s',
+                                                 request_id='next-owner', payload={'text': 'next-owner'})
+        return real(*args, **kwargs)
+    monkeypatch.setattr(session_busy_ingress, 'list_session_admissions', read_as_the_restart_begins)
+    with db:
+        await _submit(authority, 'running')
+        await asyncio.wait_for(turn.running.wait(), 30)
+        await async_wait_until(lambda: authority.adopted.get('s') is not None, timeout=10, what='adoption')
+        await _pass_done(authority)  # the adoption's pass, before the restart is armed
+        armed.append(True)
+        await _submit(authority, 'before-restart')
+        await _pass_done(authority)
+        turn.boundary.set()
+        await _drained(authority)
+        admitted = restart['row'][0] if isinstance(restart['row'], tuple) else restart['row']
+        row = get_session_admission(db, admission_id=admitted['admission_id'])
+    assert 'next-owner' not in (turn.taken[0] or ''), 'never into the old turn'
+    assert (row['status'], row['outcome']) == ('queued', None)
