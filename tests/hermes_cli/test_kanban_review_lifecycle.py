@@ -573,6 +573,49 @@ def test_active_pr_guard_holds_through_same_profile_reassign_and_unassign(
         assert kbd.check_respawn_guard(conn, tid) is None
 
 
+def test_active_pr_guard_lifts_after_explicit_unblock_but_not_after_reclaim(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator's ``unblock`` after the PR comment resumes the card's own assignee.
+
+    A worker that opened a PR and then failed into ``blocked`` can only come back
+    through an explicit release; holding that release for the whole PR window left
+    the card ``ready`` with zero workers (2026-11-04, t_674db54b). An automatic
+    return to ``ready`` (operator reclaim of a running claim) is still not a
+    release of a block, and a newer PR comment after the unblock guards again.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    pr_comment = "Landed https://github.com/example/repo/pull/44 (merged)."
+    with kbc.connect() as conn:
+        reclaimed = kb.create_task(conn, title="reclaimed after pr", assignee="dev")
+        kb.claim_task(conn, reclaimed)
+        kb.add_comment(conn, reclaimed, author="dev", body=pr_comment)
+        _backdate_comments(conn, reclaimed)
+        assert kb.reclaim_task(conn, reclaimed, reason="operator reclaim") is True
+        assert kb.get_task(conn, reclaimed).status == "ready"
+        assert kbd.check_respawn_guard(conn, reclaimed) == "active_pr"
+
+        tid = kb.create_task(conn, title="blocked after pr", assignee="dev")
+        claimed = kb.claim_task(conn, tid)
+        kb.add_comment(conn, tid, author="dev", body=pr_comment)
+        assert kb.block_task(conn, tid, reason="crash hold", expected_run_id=claimed.current_run_id)
+        _backdate_comments(conn, tid)
+        assert kb.unblock_task(conn, tid) is True
+        assert kb.get_task(conn, tid).status == "ready"
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert tid in [s[0] for s in res.spawned]
+        assert dict(res.respawn_guarded).get(reclaimed) == "active_pr"
+
+        kb.add_comment(conn, tid, author="dev", body="Opened https://github.com/example/repo/pull/45")
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
 def test_active_pr_guard_lifts_for_implementer_after_changes_requested(
     kanban_home: Path,
 ) -> None:
