@@ -703,7 +703,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         agent = state.turn.agent if state else None
         text = (event.text or "").strip()
         adapter = self._delivery_adapter_for(event.source)
-        if (self._draining or getattr(getattr(self, "session_authority", None), "retiring", False)  # the busy pass's gate
+        if (self._draining or self._hm_owner_retiring()  # the busy pass's gate, for this scope's owner
                 or agent is None or agent is _AGENT_PENDING_SENTINEL or not text or not self._hm_text_only(event)
                 or not callable(getattr(agent, "withdraw_steer", None))  # only the seam that records a sender
                 or (adapter and _quick_key in getattr(adapter, "_pending_messages", {}))):  # keep arrival order
@@ -713,6 +713,16 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         except Exception as exc:  # health: allow BLE001 -- as _hm_busy_steer: a failed steer queues the event as before
             logger.warning("Internal-event steer failed for session %s: %s", _quick_key, exc)
             return False
+
+    def _hm_owner_retiring(self) -> bool:
+        """True when the authority owning the active (routed) scope is retiring, or that scope has no
+        serving authority (a removed profile); never under a runner without session authorities."""
+        launch = getattr(self, "session_authority", None)
+        if launch is None:
+            return False
+        from gateway.session_authorities import active_authority
+        owner = active_authority(self)
+        return launch.retiring or owner is None or owner.retiring
 
     def _hm_steer_pending_at_adoption(self, source: SessionSource, _quick_key: str) -> None:
         """The running turn just adopted its agent: each internal wake that waits in the adapter's
