@@ -81,12 +81,15 @@ async def _pass(authority, ref, live):
             agent = None if generation is None else _receiving_agent(authority, ref.session_id, generation)
         if agent is None or ref.session_id in getattr(authority, '_managed_workers', {}):
             return  # idle (the drain runs them), no agent yet (adoption runs this again), or a managed worker
-        if authority.runner._draining or authority.retiring:
-            return  # the drain's own gate: what is queued during a restart waits for the next owner
         rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=ref.session_id)
         for row in rows:
             if row['status'] != 'queued' or not is_message(authority, ref, row):
                 continue
+            if authority.runner._draining or authority.retiring:
+                # The drain's own gate, decided at each transfer with no await before ``transfer`` registers
+                # it: once a restart drain began (whose queue-only input exists only from then), what is
+                # queued waits for the next owner, as the drain makes it.
+                return
             try:
                 await transfer(authority, ref, row, generation, steered_text(row))
             except RuntimeStoreError as exc:
