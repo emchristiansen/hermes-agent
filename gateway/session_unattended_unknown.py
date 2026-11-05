@@ -10,6 +10,11 @@ notices (a Bot Chat sat ten hours behind one).
 Such a row settles through the same fenced resolution a person's Discard uses
 (``resolve_unknown_session_input``): terminal ``interrupted``, never requeued or replayed, with a
 Hermes transcript notice committed in the same transaction. No second recovery store.
+
+A Kanban card attempt lost because its owner itself ended (this owner already stopping or restarting
+when it fenced the lost worker, or a predecessor that left the turn in flight) also gets that cause
+recorded as the run's result before it settles (``record_owner_restart``), so the dispatcher requeues
+the card without counting a failure. A turn lost under a live, continuing owner keeps its crash booking.
 """
 from __future__ import annotations
 
@@ -38,9 +43,47 @@ def _unattended_unknown(rows):
     return [row for row in rows if row['status'] == 'unknown' and is_unattended(row)]
 
 
-def settle_recovered_unattended(db, epoch) -> int:
+def owner_ending(authority) -> bool:
+    """This owner is stopping or restarting: a drain, a profile retirement, or a stop signal."""
+    runner = getattr(authority, 'runner', None)
+    return bool(getattr(authority, 'retiring', False) or getattr(runner, '_draining', False)
+                or getattr(runner, '_stop_requested_by_signal', False)
+                or getattr(runner, '_signal_initiated_shutdown', False)
+                or getattr(runner, '_restart_requested', False))
+
+
+def record_owner_restart(db, row) -> None:
+    """Record that this card attempt was lost because its owner ended, BEFORE its terminal settlement
+    is written, so a submitter that reads the terminal receipt also reads the cause. Callers decide
+    the cause where the loss is fenced: the managed-worker loss path (this owner already ending when
+    it found the worker lost) or boot recovery (a row its predecessor left running). Best effort: a
+    failure only leaves the attempt's ordinary crash booking."""
+    card = (row.get('payload') or {}).get('kanban_card_v1')
+    if card is None:
+        return
+    from gateway.session_kanban import card_board_db, record_owner_restart_result
+    try:
+        with db._read_ctx() as conn:
+            board_db = card_board_db(conn, row)
+        if board_db is not None and record_owner_restart_result(card, board_db):
+            logger.info('Kanban attempt %s/%s run %s: owner restart recorded (not replayed)',
+                        card.get('board'), card.get('task_id'), card.get('run_id'))
+    except Exception:
+        logger.warning('Kanban attempt %r: owner restart not recorded', card, exc_info=True)
+
+
+def inflight_admissions(db) -> frozenset:
+    """Admissions a previous owner left ``started``: read before ``recover_session_inputs`` fences them."""
+    with db._read_ctx() as conn:
+        return frozenset(r[0] for r in conn.execute(
+            "SELECT admission_id FROM session_admissions WHERE status='started'").fetchall())
+
+
+def settle_recovered_unattended(db, epoch, inflight=frozenset()) -> int:
     """Boot recovery, right after ``recover_session_inputs`` fenced lost turns ``unknown`` and before
-    any FIFO is scheduled: settle every unattended one. Synchronous; runs off the owner loop."""
+    any FIFO is scheduled: settle every unattended one. Synchronous; runs off the owner loop.
+    ``inflight``: admissions the previous owner left running (``inflight_admissions``), so lost because
+    that owner ended; a row it had already fenced ``unknown`` itself is not one of them."""
     from agent.turn_failure_copy import AUTOMATION_INTERRUPTED_NOTICE
     from gateway.session_ingress_media import release_admission_media
     from gateway.session_results import close_discarded_turn
@@ -50,6 +93,9 @@ def settle_recovered_unattended(db, epoch) -> int:
             "SELECT * FROM session_admissions WHERE status='unknown' ORDER BY seq").fetchall()]
     settled = 0
     for row in _unattended_unknown(rows):
+        if row['admission_id'] in inflight:
+            # Before the terminal write: whoever reads the settled receipt also finds its cause.
+            record_owner_restart(db, row)
         try:
             resolve_unknown_session_input(
                 db, epoch=epoch, admission_id=row['admission_id'], generation=row['generation'],

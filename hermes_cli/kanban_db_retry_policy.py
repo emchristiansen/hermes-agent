@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+from typing import Optional
 
 from hermes_cli import kanban_owner_recovery
 
@@ -38,8 +39,46 @@ class CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    owner_restarted: list[str] = field(default_factory=list)
     crash_details: list[tuple[str, int, str, object]] = field(default_factory=list)
     exited_hook_payloads: list[dict] = field(default_factory=list)
+
+
+
+# Worker result "the attempt's owner ended under it" (``session_kanban.record_owner_restart_result``):
+# requeued WITHOUT counting a failure, as the host's restart is not the card's.
+KANBAN_OWNER_RESTART_EXIT_CODE = 79
+
+
+@dataclass
+class DeadWorker:
+    """How ``detect_crashed_workers`` should book one dead worker."""
+
+    kind: str
+    code: Optional[int]
+    error_text: str
+    event_kind: str
+    event_payload: dict
+    protocol_violation: bool = False
+    rate_limited: bool = False
+    owner_restarted: bool = False
+    """``KANBAN_OWNER_RESTART_EXIT_CODE``: the owner, not the card, ended the attempt."""
+    terminal_provider: bool = False
+    """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
+    credential/model — trips the breaker on this first occurrence."""
+
+    @property
+    def run_outcome(self) -> str:
+        # A rate-limited requeue is recorded as ``rate_limited`` so board history
+        # doesn't show a phantom crash for a quota wall.
+        if self.rate_limited:
+            return "rate_limited"
+        return "owner_restarted" if self.owner_restarted else "crashed"
+
+    @property
+    def counts_failure(self) -> bool:
+        """Whether the death is the card's: a quota wall or its owner's restart is the host's."""
+        return not (self.rate_limited or self.owner_restarted)
 
 
 def terminal_run_matches(conn, task_id, expected_run):

@@ -27,7 +27,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
-from hermes_cli.kanban_db_retry_policy import CrashSweep as _CrashSweep
+from hermes_cli.kanban_db_retry_policy import CrashSweep as _CrashSweep, DeadWorker as _DeadWorker, KANBAN_OWNER_RESTART_EXIT_CODE
 from hermes_cli.kanban_db_retry_policy import first_failure_landing
 from hermes_cli.kanban_db_retry_policy import reclaim_transaction
 from hermes_cli.kanban_db_retry_policy import record_first_failure_hold
@@ -146,6 +146,9 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    owner_restarted: list[str] = field(default_factory=list)
+    """Task ids whose attempt the profile owner recorded as interrupted by its own
+    stop/restart (``KANBAN_OWNER_RESTART_EXIT_CODE``): released WITHOUT counting a failure."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -255,6 +258,8 @@ def _exit_code_kind(code: int) -> tuple[str, int]:
         return ("rate_limited", code)
     if code == _kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE:
         return ("terminal_provider", code)
+    if code == KANBAN_OWNER_RESTART_EXIT_CODE:
+        return ("owner_restart", code)
     return ("nonzero_exit", code)
 
 
@@ -966,7 +971,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ).fetchall()
     for row in rows:
         outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
+        if outcome in ("rate_limited", "owner_restarted"):
             continue
         if outcome == "crashed" and (
             _kb._json_dict(row["metadata"]).get("protocol_violation")
@@ -1043,28 +1048,6 @@ def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
     return " ".join(lines)[-400:]
 
 
-@dataclass
-class _DeadWorker:
-    """How ``detect_crashed_workers`` should book one dead worker."""
-
-    kind: str
-    code: Optional[int]
-    error_text: str
-    event_kind: str
-    event_payload: dict
-    protocol_violation: bool = False
-    rate_limited: bool = False
-    terminal_provider: bool = False
-    """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
-    credential/model — trips the breaker on this first occurrence."""
-
-    @property
-    def run_outcome(self) -> str:
-        # A rate-limited requeue is recorded as ``rate_limited`` so board history
-        # doesn't show a phantom crash for a quota wall.
-        return "rate_limited" if self.rate_limited else "crashed"
-
-
 def _classify_dead_worker(
     pid: int, claimer: Optional[str], exit_code=None, *, task_id: Optional[str] = None,
     board: Optional[str] = None,
@@ -1129,6 +1112,18 @@ def _classify_dead_worker_exit(
             "rate_limited",
             {"pid": pid, "claimer": claimer, "exit_code": code},
             rate_limited=True,
+        )
+    if kind == "owner_restart":
+        # The profile owner itself recorded that it was stopping/restarting when it settled this
+        # attempt's lost turn interrupted (``session_kanban.record_owner_restart_result``): the
+        # host's restart, not the card's failure. Never replayed; the retry is a fresh attempt.
+        return _DeadWorker(
+            kind, code,
+            f"pid {pid}: the attempt's profile owner stopped or restarted under it; its turn was settled "
+            "interrupted (not replayed) — requeued without counting a failure",
+            "owner_restarted",
+            {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code},
+            owner_restarted=True,
         )
     if kind == "terminal_provider":
         # The worker classified its own provider failure as unhealable (credential
@@ -1206,7 +1201,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 metadata=dict(dead.event_payload),
             )
             _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
-            record_first_failure_hold(conn, row["id"], run_id, retry_status, _kb._append_event, accounting_required=not dead.rate_limited)
+            record_first_failure_hold(conn, row["id"], run_id, retry_status, _kb._append_event, accounting_required=dead.counts_failure)
             sweep.exited_hook_payloads.append({
                 "task_id": row["id"],
                 "assignee": row["assignee"],
@@ -1229,6 +1224,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 )
             if dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
+            elif dead.owner_restarted:
+                sweep.owner_restarted.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
@@ -1333,6 +1330,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     # requeues did NOT count a failure and are NOT crashes.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_owner_restarted = sweep.owner_restarted  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -2228,6 +2226,7 @@ def _run_reclaim_phase(
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    result.owner_restarted.extend(getattr(detect_crashed_workers, "_last_owner_restarted", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 

@@ -1392,10 +1392,11 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     db_key = await asyncio.to_thread(Path(db.db_path).resolve)
     epoch = await asyncio.to_thread(begin_runtime_epoch, db, instance_id=instance_id)
     # Hot-serve builds a profile while the loop serves the others: both writes stay off it.
+    from gateway.session_unattended_unknown import inflight_admissions, settle_recovered_unattended
+    inflight = await asyncio.to_thread(inflight_admissions, db)
     await asyncio.to_thread(recover_session_inputs, db, epoch=epoch)
     # A lost automation turn has nobody to resolve it: it settles interrupted before any FIFO runs.
-    from gateway.session_unattended_unknown import settle_recovered_unattended
-    await asyncio.to_thread(settle_recovered_unattended, db, epoch)
+    await asyncio.to_thread(settle_recovered_unattended, db, epoch, inflight)
     await asyncio.to_thread(backfill_legacy_session_owners, db)
     await asyncio.to_thread(backfill_compression_created_sources, db)
     authority = SessionAuthority(runner, profile_id=profile_id, instance_id=instance_id, db=db, epoch=epoch)
