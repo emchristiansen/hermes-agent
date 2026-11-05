@@ -450,18 +450,82 @@ def test_event_retention_keeps_a_live_workers_binding(bound_scratch_worker, monk
 
 
 def test_only_a_recycled_pid_releases_a_binding(bound_scratch_worker, monkeypatch, tmp_path):
-    """A live pid with a readable, different start fingerprint is another process: it does not
-    hold the workspace. A live pid whose fingerprint cannot be read proves nothing: it does."""
+    """A live pid whose identity reads differently is another process: it does not hold the
+    workspace. A live pid whose identity cannot be read proves nothing: it does."""
+    from gateway import status
     from hermes_cli import kanban_db_dispatch
     path, context, workspace = bound_scratch_worker
     monkeypatch.delenv("HERMES_KANBAN_TASK")
     monkeypatch.chdir(tmp_path)
     _rebind(path, context, os.getpid(), kanban_db_dispatch._process_fingerprint(os.getpid()))
     with monkeypatch.context() as unreadable, connect_closing(path) as conn:
-        unreadable.setattr(kanban_db_dispatch, "_process_fingerprint", lambda _pid: None)
+        unreadable.setattr(status, "get_process_start_time", lambda _pid: None)
         assert kb.complete_task(conn, context["task_id"], summary="done elsewhere")
     assert workspace.is_dir()  # unreadable identity: kept
     _rebind(path, context, os.getpid(), "0|0")  # this pid, someone else's birth
     with connect_closing(path) as conn:
         kanban_db_workspace._cleanup_workspace(conn, context["task_id"])
+    assert not workspace.exists()
+
+
+@pytest.mark.parametrize("route", ["complete", "gc"])
+@pytest.mark.parametrize("reading", ["matching", "unknown", "recovered", "epoch-unknown", "foreign", "dead"])
+def test_one_identity_reading_decides_whether_a_worker_is_live(bound_scratch_worker, monkeypatch, route, reading):
+    """t_bc10a050 CWD-06: the live worker's identity was read twice; an unreadable first read
+    and a matching second one released the binding, so completion removed the live cwd and
+    positive-retention event GC pruned its binding (the next cleanup removed the cwd). Only the
+    identity reads are faulted; the pid, database, completion, ``gc_events``, cleanup and prompt
+    builder are real. A binding is released only by a reading that succeeds and differs, or a
+    dead pid; otherwise both the binding and the workspace survive until the worker ends."""
+    from agent.prompt_builder import build_context_files_prompt
+    from gateway import drain_control, status
+    from hermes_cli import kanban_db_dispatch
+    path, context, workspace = bound_scratch_worker
+    worker = _ended_process_identity() if reading == "dead" else (
+        os.getpid(), kanban_db_dispatch._process_fingerprint(os.getpid()))
+    _rebind(path, context, *worker)
+    (workspace / "AGENTS.md").write_text("identity sentinel\n")
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    actual = status.get_process_start_time(os.getpid())
+    reads = []
+
+    def start_time(_pid):
+        reads.append(_pid)
+        if reading == "unknown" or (reading == "recovered" and len(reads) == 1):
+            return None
+        return actual + 100000 if reading == "foreign" else actual
+
+    with connect_closing(path) as conn:
+        if route == "gc":
+            assert kb.archive_task(conn, context["task_id"], signal_fn=lambda *_: None)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE task_events SET created_at = created_at - 31 * 86400 "
+                             "WHERE task_id = ? AND kind = 'worker_bound'", (context["task_id"],))
+        with monkeypatch.context() as fault:
+            fault.setattr(status, "get_process_start_time", start_time)
+            if reading == "epoch-unknown":
+                fault.setattr(drain_control, "current_instantiation_epoch", lambda: "")
+            if route == "complete":
+                assert kb.complete_task(conn, context["task_id"], summary="completed by another actor")
+            else:
+                kb.gc_events(conn, older_than_seconds=30 * 86400)
+        if route == "gc":
+            kanban_db_workspace._cleanup_workspace(conn, context["task_id"])  # a healthy later sweep
+    released = reading in ("foreign", "dead")
+    assert bool(reads) is (reading != "dead")  # a dead pid needs no identity reading
+    # The binding is the live worker's only protection: kept unless the worker is provably gone
+    # (the gc route prunes a released one; completion never touches events).
+    with connect_closing(path) as conn:
+        kept = [json.loads(payload) for (payload,) in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'worker_bound'", (context["task_id"],))]
+    assert sum((b["pid"], b.get("started_at")) == worker for b in kept) == (0 if released and route == "gc" else 1)
+    if released:
+        assert not workspace.exists()
+        return
+    try:
+        assert "identity sentinel" in build_context_files_prompt(cwd=None)
+        Path("late.txt").write_text("still running")
+    finally:
+        monkeypatch.chdir(Path(path).parent)
+    session_kanban._record_worker_result(context, 0, "finished")
     assert not workspace.exists()

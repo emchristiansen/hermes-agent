@@ -145,12 +145,13 @@ _OPEN_BINDINGS_SQL = (
 def _binding_may_be_live(payload: Optional[str]) -> bool:
     """Whether the worker a ``worker_bound`` payload names may still be running, failing closed.
 
-    False only when the process is provably gone: its pid is dead, or the pid now belongs to a
-    process with a readable, different start fingerprint (recycled). An unreadable payload or an
-    unreadable fingerprint of a live pid proves nothing, so it counts as live; ``_worker_alive``
-    alone reads an unreadable fingerprint as recycled, which is right for signalling but not for
-    deleting a directory."""
-    from hermes_cli.kanban_db_dispatch import _pid_alive, _process_fingerprint, _worker_alive  # late: import cycle
+    False only when the process is provably gone: its pid is dead, or the pid's identity was
+    read and differs from the recorded one (the pid was recycled). Anything unreadable (the
+    payload, the pid, the recorded or the current identity) counts as live. Each identity part is
+    read once and that one reading decides (:func:`_identity_differs`); ``_worker_alive`` reads
+    an unreadable identity as recycled, which is right for signalling but not for deleting a
+    directory."""
+    from hermes_cli.kanban_db_dispatch import _pid_alive  # late: import cycle
 
     try:
         bound = json.loads(payload or "")
@@ -161,9 +162,42 @@ def _binding_may_be_live(payload: Optional[str]) -> bool:
         return True
     if not _pid_alive(pid):
         return False
-    if _worker_alive(pid, bound.get("started_at")):
-        return True
-    return _process_fingerprint(pid) is None
+    return not _identity_differs(pid, bound.get("started_at"))
+
+
+def _identity_differs(pid: int, recorded) -> bool:
+    """True only when a reading of live *pid*'s identity succeeds and differs from *recorded*,
+    the ``started_at`` that ``bind_worker_context`` stored: ``"<instantiation epoch>|<start>"``
+    (``kanban_db_dispatch._process_fingerprint``), a legacy integer start time, the
+    ``unverified`` marker or nothing. The start time is read once; the epoch decides only when
+    both its recorded and its current value are complete (``"<boot_id>:<pid1 start>"``)."""
+    from gateway.drain_control import current_instantiation_epoch
+    from gateway.status import _start_times_agree, get_process_start_time
+    from hermes_cli.kanban_db_dispatch import UNVERIFIED_WORKER_FINGERPRINT
+
+    if recorded is None or recorded == UNVERIFIED_WORKER_FINGERPRINT:
+        return False
+    if isinstance(recorded, str) and "|" in recorded:
+        recorded_epoch, recorded_start = recorded.rsplit("|", 1)
+        current = get_process_start_time(pid)
+        if current is None:
+            return False
+        if str(current) != recorded_start:
+            return True
+        epoch = current_instantiation_epoch()
+        return _complete_epoch(recorded_epoch) and _complete_epoch(epoch) and epoch != recorded_epoch
+    current = get_process_start_time(pid)
+    if current is None:
+        return False
+    try:
+        return not _start_times_agree(current, recorded)
+    except (TypeError, ValueError):
+        return False  # an unreadable recorded identity proves nothing
+
+
+def _complete_epoch(epoch: str) -> bool:
+    boot_id, _, pid1_start = epoch.partition(":")
+    return bool(boot_id and pid1_start)
 
 
 def _conn_live_worker_inside(conn: sqlite3.Connection, key: str) -> Optional[str]:
