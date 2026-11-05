@@ -1050,6 +1050,7 @@ def _cmd_settle_triage(args: argparse.Namespace) -> int:
 
 def _cmd_unblock(args: argparse.Namespace) -> int:
     from agent.swarm_capabilities import worker_board_management_enabled
+    from hermes_cli.kanban_db_retry_policy import unblock_refusal
     if os.environ.get("HERMES_KANBAN_TASK") and not worker_board_management_enabled():
         return _err("kanban unblock is orchestrator-only; workers must hand off their assigned task")
     ids, rc = _require_ids(args)
@@ -1065,7 +1066,7 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
         op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(
             conn, tid, **({"expected_terminal_run": expected_run} if expected_run is not None else {})))
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
-                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+                           lambda tid: f"cannot unblock {tid}: {unblock_refusal(conn, tid, expected_run)}")
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:

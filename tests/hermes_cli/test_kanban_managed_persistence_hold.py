@@ -568,3 +568,130 @@ def test_scanned_heartbeat_must_still_match_before_retiring_same_run(board, monk
         "SELECT * FROM task_events WHERE task_id=? ORDER BY id", (tid,))]) == updated[0]
     assert kb.get_task(conn, tid).current_run_id == task.current_run_id
     assert kb.get_run(conn, task.current_run_id).ended_at is None
+
+
+def owner_store(tmp_path, status, outcome):
+    """An owner state DB holding the attempt's admission, as ``owner_admitted`` names it."""
+    import sqlite3
+
+    path = tmp_path / f"owner-{status}-{outcome}.sqlite"
+    with sqlite3.connect(path) as owner:
+        owner.execute("CREATE TABLE session_admissions (target_session_id TEXT, request_id TEXT, status TEXT, outcome TEXT)")
+        owner.execute("INSERT INTO session_admissions VALUES ('owner-session', 'request', ?, ?)", (status, outcome))
+    return path, {"db": str(path), "session_id": "owner-session", "request_id": "request"}
+
+
+def selected_and_scheduled(conn, *, owner_receipt=None, exit_code=0):
+    """A first-failure card whose next claimed attempt yields by scheduling itself; its bound worker
+    then records ``exit_code`` (None: no worker result yet)."""
+    tid, run = stopped(conn)
+    assert kb.edit_task(conn, tid, max_retries=1, expected_terminal_run=run)
+    assert kb.unblock_task(conn, tid, expected_terminal_run=run)
+    task = kb.claim_task(conn, tid)
+    assert task is not None
+    if owner_receipt is not None:
+        kb._append_event(conn, tid, "owner_admitted", owner_receipt, run_id=task.current_run_id)
+        conn.commit()
+    assert kb.schedule_task(conn, tid, reason="await the author's callback")
+    if exit_code is not None:
+        kb._append_event(conn, tid, "worker_result", {"pid": 1, "claim_lock": task.claim_lock, "exit_code": exit_code,
+                                                       "last_output": ""}, run_id=task.current_run_id)
+        conn.commit()
+    assert kb.get_task(conn, tid).status == "scheduled"
+    return tid, task.current_run_id
+
+
+def test_ordinary_callback_wakes_a_selected_card_that_cleanly_scheduled_itself(board, tmp_path):
+    """2026-11-04, t_674db54b run549: the card scheduled itself for a callback, its worker exited
+    0 and its owner admission completed, and the author's plain ``unblock`` was refused because
+    max_retries=1 demanded an exact run; only ``--expected-terminal-run 549`` woke it."""
+    conn, _ = board
+    _, receipt = owner_store(tmp_path, "terminal", "completed")
+    tid, _own_run = selected_and_scheduled(conn, owner_receipt=receipt)
+    failures = kb.get_task(conn, tid).consecutive_failures
+    assert cli._cmd_unblock(parsed("unblock", tid)) == 0
+    task = kb.get_task(conn, tid)
+    assert task.status == "ready"
+    assert task.consecutive_failures == failures  # a wake is not a failure-history reset
+    assert kb.unblock_task(conn, tid) is False  # already woken: nothing to release
+
+
+@pytest.mark.parametrize("admission, exit_code", [
+    (("terminal", "interrupted"), None),  # owner lost the attempt: no worker result
+    (("terminal", "interrupted"), 0),
+    (("terminal", "failed"), 1),
+    (("terminal", "completed"), 1),  # the worker failed after scheduling
+    (("unknown", None), 0),
+    (("started", None), None),  # the worker is still running
+    (None, None),  # unmanaged attempt whose worker has not exited
+    (None, 1),
+])
+def test_only_a_clean_yield_wakes_without_the_exact_run(board, tmp_path, admission, exit_code):
+    """t_93eb808d: a scheduled attempt that was interrupted, failed, lost or is still running is an
+    uncertain effect, not a deliberate yield; its release still names the exact run (and still
+    passes every terminal/owner check when it does)."""
+    conn, _ = board
+    receipt = owner_store(tmp_path, *admission)[1] if admission else None
+    tid, own_run = selected_and_scheduled(conn, owner_receipt=receipt, exit_code=exit_code)
+    assert not kb.unblock_task(conn, tid)
+    assert kb.get_task(conn, tid).status == "scheduled"
+    exact = kb.unblock_task(conn, tid, expected_terminal_run=own_run)
+    assert exact == (admission is None or admission[0] == "terminal")
+
+
+def test_callback_wake_waits_for_the_clean_attempts_owner_to_settle(board, tmp_path):
+    """Scheduling ends the run before its worker exits; until the owner admission completes,
+    neither an ordinary nor an exact release may start a competing attempt."""
+    import sqlite3
+
+    owner_db, receipt = owner_store(tmp_path, "started", None)
+    tid, own_run = selected_and_scheduled(board[0], owner_receipt=receipt)
+    conn = board[0]
+    assert not kb.unblock_task(conn, tid)
+    assert not kb.unblock_task(conn, tid, expected_terminal_run=own_run)
+    with sqlite3.connect(owner_db) as owner:
+        owner.execute("UPDATE session_admissions SET status='terminal', outcome='completed'")
+    assert kb.unblock_task(conn, tid)
+    assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_scheduling_a_held_card_keeps_the_exact_run_fence(board):
+    """A first-failure hold that an orchestrator parks in ``scheduled`` ends no claimed attempt
+    of its own, so its release still names the exact run."""
+    conn, _ = board
+    tid, run = stopped(conn)
+    assert kb.edit_task(conn, tid, max_retries=1, expected_terminal_run=run)
+    assert kb.schedule_task(conn, tid, reason="parked by an operator")
+    assert kb.get_task(conn, tid).status == "scheduled"
+    latest = conn.execute("SELECT max(id) FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0]
+    assert cli._cmd_unblock(parsed("unblock", tid)) != 0
+    assert kb.get_task(conn, tid).status == "scheduled"
+    assert kb.unblock_task(conn, tid, expected_terminal_run=latest)
+
+
+def test_refused_unblock_names_its_actual_reason(board, tmp_path, capsys):
+    """The refusal used to read ``not blocked/scheduled?`` for every cause, including a scheduled
+    card refused only for a missing exact-run operand."""
+    conn, _ = board
+    tid, run = stopped(conn)
+    assert kb.edit_task(conn, tid, max_retries=1, expected_terminal_run=run)
+
+    def refusal(*arguments):
+        capsys.readouterr()
+        assert cli._cmd_unblock(parsed("unblock", tid, *arguments)) != 0
+        captured = capsys.readouterr()
+        return captured.out + captured.err
+
+    assert "exact terminal run is named (--expected-terminal-run)" in refusal()
+    assert f"run {run - 1} is not the latest attempt (latest is {run})" in refusal("--expected-terminal-run", str(run - 1))
+    assert kb.unblock_task(conn, tid, expected_terminal_run=run)
+    assert "status is ready, not blocked/scheduled" in refusal()
+
+    _, receipt = owner_store(tmp_path, "started", None)
+    task = kb.claim_task(conn, tid)
+    kb._append_event(conn, tid, "owner_admitted", receipt, run_id=task.current_run_id)
+    conn.commit()
+    assert kb.schedule_task(conn, tid, reason="await a callback")
+    assert f"run {task.current_run_id} owner admission is not terminal yet (started)" in refusal(
+        "--expected-terminal-run", str(task.current_run_id))
+    assert "only a clean self-scheduled yield" in refusal()
