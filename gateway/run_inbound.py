@@ -39,6 +39,9 @@ from gateway.session import (
 from gateway.turn_lease import TurnLeaseTimeoutError
 from typing import Any, Dict, List, Optional, Tuple
 
+# Inputs whose producer reads the turn's own result: a whole job, never steered into another turn.
+_JOB_PRODUCER_PLATFORMS = frozenset({"a2a", "webhook", "api_server", "msgraph_webhook"})
+
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner
     from gateway.run_turn_runner import TurnRunner
@@ -678,6 +681,21 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
     def _hm_text_only(event: MessageEvent) -> bool:
         return event.message_type == MessageType.TEXT and not event.media_urls and not event.media_types
 
+    def _hm_steer_at_adoption(self, event: MessageEvent, source, _quick_key: str) -> None:
+        """Mark (in memory, never on the row) a messaging user's plain text that reached a running turn
+        before it built its agent, so the authority's adoption pass steers it as ``_hm_busy_preempt``
+        would have (every message steers, Eric 2026-11-04). An explicit ``/queue`` (``_fifo_only``), a
+        job producer's input, media, another busy mode or a drain keeps its own next turn."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        state = self._peek_session_state(_quick_key)
+        agent = state.turn.agent if state else None
+        if (self._is_session_running(_quick_key) and (agent is None or agent is _AGENT_PENDING_SENTINEL)
+                and not getattr(event, "_fifo_only", False) and not self._draining
+                and self._hm_text_only(event) and (event.text or "").strip()
+                and source.platform.value not in _JOB_PRODUCER_PLATFORMS
+                and self._effective_busy_input_mode(source) == "steer"):
+            event._steer_at_adoption = True
+
     def _hm_steer_delivered(self, event: MessageEvent, _quick_key: str) -> bool:
         """Steer an internal event's text into the running turn as a delivered message (its
         ``turn_author``, or Hermes automation): True when the running agent took it."""
@@ -1250,6 +1268,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                     return True, _consumer_reply
                 if getattr(event, "_fifo_only", False) and event._stop_epoch != self._route_stop_epoch(_quick_key):
                     return True, None  # a /stop or /new came after its command, as it clears the slot
+                self._hm_steer_at_adoption(event, source, _quick_key)
                 # A failed admit stays the authority's answer (refusal notice or turn error), never a
                 # pending legacy turn: that would run unadmitted, outside the FIFO's order.
                 return True, await admit_message(authority, event)
