@@ -77,6 +77,23 @@ def call_off_event_loop(fn, *args, **kwargs):
         return pool.submit(context.run, fn, *args, **kwargs).result()
 
 
+# What the owner may spend answering a call beyond its receipt write's own lock patience: the claim
+# check, the executor hop and an event loop slowed by in-process compaction work.
+_OWNER_DISPATCH_MARGIN_S = 60.0
+
+
+def receipt_budget_s():
+    """How long a sent owner call waits for its reply before its outcome is unknown.
+
+    The owner answers ``worker.persist`` only after its receipt transaction, which may itself wait
+    ``SessionDB._TRANSCRIPT_WRITE_PATIENCE_S`` for the write lock (``apply_worker_receipt``). A budget
+    inside that window abandons receipts the owner goes on to commit: the lost ACK becomes a sticky
+    ``worker_receipt_timeout`` and interrupts the turn even though every write landed.
+    """
+    from hermes_state import SessionDB
+    return SessionDB._TRANSCRIPT_WRITE_PATIENCE_S + _OWNER_DISPATCH_MARGIN_S
+
+
 class _OwnerLink:
     """One owner WebSocket and the only thread that reads it. Events the owner broadcasts to every
     transport are discarded as they arrive, idle or not: left queued, websockets' bounded receive
@@ -194,7 +211,7 @@ class WorkerRPC:
                     self._drop()
                     link = self._connection()
                     link.send(request_id, message)
-                response = link.receive(20)
+                response = link.receive(receipt_budget_s())
             except BaseException:
                 # Outcome unknown once sent: surface the error and never resend; the next call redials.
                 self._drop()

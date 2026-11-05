@@ -219,8 +219,8 @@ def test_idle_broadcasts_past_the_receive_high_water_mark_keep_the_connection(ow
 
 
 def test_owner_stall_shorter_than_the_receipt_budget_does_not_fail_on_a_ping_deadline(owner, tmp_path, monkeypatch):
-    """The receipt budget (20 s) is the only per-call deadline: a library keepalive whose pong is held
-    by the same stall must not close the connection first. The library defaults (20 s / 20 s) are
+    """The receipt budget is the only per-call deadline: a library keepalive whose pong is held by the
+    same stall must not close the connection first. The library defaults (20 s / 20 s) are
     scaled down so an inherited keepalive would fire inside the stall."""
     from websockets.sync import client
     from agent.runtime_session_store import WorkerRPC
@@ -238,6 +238,24 @@ def test_owner_stall_shorter_than_the_receipt_budget_does_not_fail_on_a_ping_dea
     assert time.monotonic() - started >= 1.4
     assert rpc('worker.persist')['n'] == 3
     assert owner.connections == 1
+
+
+def test_a_receipt_held_inside_the_owners_write_patience_is_still_received(owner, tmp_path):
+    """Regression for the 2026-11-04 managed-worker interruptions: owners committed every receipt,
+    but answered past the worker's fixed 20 s budget, so each worker failed sticky
+    ``worker_receipt_timeout`` on a lost ACK. The owner's receipt write alone may wait out
+    ``SessionDB._TRANSCRIPT_WRITE_PATIENCE_S``; a reply held 21 s is inside it and must arrive."""
+    from agent.runtime_session_store import WorkerRPC
+    from hermes_state import SessionDB
+    held = 21.0
+    assert held < SessionDB._TRANSCRIPT_WRITE_PATIENCE_S
+    rpc = WorkerRPC(tmp_path)
+    assert rpc('worker.persist')['n'] == 1
+    started = time.monotonic()
+    assert rpc('stall', seconds=held) == {'n': 2, 'seconds': held}
+    assert time.monotonic() - started >= held - 0.5
+    assert rpc('worker.persist')['n'] == 3
+    assert (owner.connections, owner.tickets) == (1, 1)
 
 
 def test_concurrent_callers_are_serialized_and_each_gets_its_own_reply(owner, tmp_path):
