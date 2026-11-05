@@ -7,12 +7,15 @@ instead of comparing words.
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 from typing import Any, Callable
 
 from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.conversation_compression_archive import MERGED_DURABLE_ROWS
 from agent.message_metadata import ABSORBED_MESSAGE_UIDS, MERGED_TURN_PREFIX, message_uid_or_none, uid_list
+
+logger = logging.getLogger(__name__)
 
 
 def committed_row_id(message: Any) -> int | None:
@@ -38,7 +41,8 @@ RowIdentity = Callable[[int], "tuple[str, str | None] | None"]
 
 def row_identity_lookup(session_db: Any, session_id: Any) -> RowIdentity | None:
     """``row id -> (role, message_uid)`` of an ACTIVE stored row of ``session_id`` (None when absent);
-    None when there is no store to ask. Anything but that pair reads as absent."""
+    None when there is no store to ask. Anything but that pair reads as absent. A store error
+    (``sqlite3.Error``) propagates to the one receipt boundary, ``verified_persisted_turn_receipt``."""
     get = getattr(session_db, "get_message_identity", None)
     if not callable(get) or not session_id:
         return None
@@ -57,7 +61,10 @@ def _prompt_row_id(
     turn appended (``agent._turn_user_message``), ``turn_override`` its clean persisted text.
 
     - Unfolded anchor: its own row, unless both carry uids and they differ (another message).
-    - A folded anchor that is the turn's own message (it absorbed later text): its own row.
+    - A folded anchor that is the turn's own message (it absorbed later rows, e.g. a steer): None. Its
+      stored row is either the pre-fold prompt (marker stale) or a composite row compaction inserted
+      under the prompt's uid that spans every absorbed occurrence; neither is proven to be the
+      original prompt row alone, and the absorbed occurrences have no row of their own in the turn.
     - The repair folded this turn into an older unanswered row (the anchor holds ``prefix + "\n\n" +``
       the turn's text, live or override-cleaned; its own ``_row_id`` is the OLDER row): ``folded``. The
       prompt is the single row the merge witness absorbed, only when its uid is the turn's (when the turn
@@ -72,8 +79,8 @@ def _prompt_row_id(
         if turn_uid is not None and anchor_uid is not None and anchor_uid != turn_uid:
             return None, False
         return committed_row_id(anchor), False
-    if turn_uid is not None and anchor_uid == turn_uid:
-        return committed_row_id(anchor), False
+    if turn_message is anchor or (turn_uid is not None and anchor_uid == turn_uid):
+        return None, False
     texts = (turn_message.get("content") if isinstance(turn_message, dict) else None, turn_override)
     if not any(holds_merged_turn(anchor, text) for text in texts):
         return None, False
@@ -87,15 +94,13 @@ def _prompt_row_id(
 def verify_receipt_rows(receipt: dict | None, row_identity: RowIdentity | None) -> dict | None:
     """Keep only what SQLite confirms: every listed id an active stored row, the prompt and steer ids
     user rows, the final id an assistant row. A failed identity is omitted (fail closed); an address
-    SQLite does not hold is dropped and the receipt is no longer complete."""
+    SQLite does not hold is dropped and the receipt is no longer complete. A store error propagates
+    to ``verified_persisted_turn_receipt``, the one boundary shared with the proof reads."""
     if not receipt or row_identity is None:
         return receipt
     ids = {*receipt.get("row_ids", ()), *receipt.get("user_row_ids", ())}
     ids.update(receipt[k] for k in ("user_row_id", "final_assistant_row_id") if k in receipt)
-    try:
-        roles = {rid: (row_identity(rid) or (None,))[0] for rid in ids}
-    except sqlite3.Error:
-        return None  # the store cannot confirm anything: publish no receipt
+    roles = {rid: (row_identity(rid) or (None,))[0] for rid in ids}
     out = dict(receipt)
     out["row_ids"] = [rid for rid in receipt.get("row_ids", ()) if roles.get(rid) is not None]
     if not out["row_ids"]:
@@ -148,10 +153,17 @@ def persisted_turn_receipt(
         receipt["user_row_id"] = prompt_id
     # Every rendered user row of the turn in order (the prompt, then each steer/redirect row), so a
     # client binds its optimistic bubbles even when the turn holds more than one prompt row. Only a
-    # fully proven list is published: a gap would shift every later pairing.
+    # fully proven one-to-one list is published: a gap would shift every later pairing. A dict that
+    # folds other rows stands for more than one of this turn's occurrences while taking one list
+    # slot, so its absorbed occurrences would silently vanish from the list (no ``None`` marks them).
+    # The one proven exception is an anchor whose fold is an older pre-turn row (a notice) plus
+    # exactly this turn's own stored prompt row (``folded`` with a proven ``prompt_id``).
     users = [message for message in tail if message.get("role") == "user" and message.get("display_kind") != "hidden"]
+    one_to_one = all(
+        not _folds_other_rows(message) or (message is tail[0] and folded and prompt_id is not None)
+        for message in users)
     user_row_ids = [prompt_id if message is tail[0] else _single_row_id(message) for message in users]
-    if users and None not in user_row_ids:
+    if users and one_to_one and None not in user_row_ids:
         receipt["user_row_ids"] = user_row_ids
     last = tail[-1]
     # Equality only verifies the structurally selected final row's body: it never selects an identity.
@@ -166,3 +178,24 @@ def persisted_turn_receipt(
         and sum(message.get("role") == "user" for message in tail) == 1
         and "final_assistant_row_id" in receipt)
     return receipt
+
+
+def verified_persisted_turn_receipt(
+    session_db: Any, session_id: Any, messages: Any, start: Any, history: list, raw: Any, status: str, *,
+    compression_unchanged: bool, prefix_row_matches: Callable[[Any, Any], bool], turn_message: Any = None,
+    turn_override: Any = None,
+) -> dict | None:
+    """The receipt every completion producer publishes: ``persisted_turn_receipt`` proven against the
+    store, then ``verify_receipt_rows``. This is the ONE store-failure boundary for both phases: a
+    ``sqlite3.Error`` from an absorbed-row proof read or from a verification read publishes no
+    receipt (it is optional), and never reaches the caller's turn completion."""
+    try:
+        rows = row_identity_lookup(session_db, session_id)
+        return verify_receipt_rows(persisted_turn_receipt(
+            messages, start, history, raw, status, compression_unchanged=compression_unchanged,
+            prefix_row_matches=prefix_row_matches, turn_message=turn_message, turn_override=turn_override,
+            row_identity=rows), rows)
+    except sqlite3.Error as exc:
+        logger.warning("persisted_turn receipt omitted for session %s: store identity read failed: %s",
+                       session_id, exc)
+        return None

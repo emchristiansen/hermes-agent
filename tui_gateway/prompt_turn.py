@@ -883,15 +883,15 @@ def _absorb_turn_result(
 
 def _persisted_turn_receipt(st: _TurnRun, raw: Any, status: str) -> dict | None:
     """Committed row addresses of this turn (``agent.persisted_turn_receipt``); the pre-turn
-    prefix is unchanged when every history row kept its committed row id."""
-    from agent.persisted_turn_receipt import (
-        committed_row_id, persisted_turn_receipt, row_identity_lookup, verify_receipt_rows)
+    prefix is unchanged when every history row kept its committed row id. A store error while
+    proving or verifying it omits the receipt (``verified_persisted_turn_receipt``), never the turn."""
+    from agent.persisted_turn_receipt import committed_row_id, verified_persisted_turn_receipt
 
     messages = st.result.get("messages")
     if not isinstance(messages, list):
         return None  # no turn suffix to address (failed/preflight turns never staged history)
-    rows = row_identity_lookup(getattr(st.agent, "_session_db", None), getattr(st.agent, "session_id", None))
-    return verify_receipt_rows(persisted_turn_receipt(
+    return verified_persisted_turn_receipt(
+        getattr(st.agent, "_session_db", None), getattr(st.agent, "session_id", None),
         messages, getattr(st.agent, "_persist_user_message_idx", None), st.history,
         raw, status,
         compression_unchanged=type(st.compression_count) is int and st.compression_count == getattr(
@@ -899,8 +899,8 @@ def _persisted_turn_receipt(st: _TurnRun, raw: Any, status: str) -> dict | None:
         prefix_row_matches=lambda before, after: (
             committed_row_id(before) is not None and committed_row_id(before) == committed_row_id(after)),
         turn_message=getattr(st.agent, "_turn_user_message", None),
-        turn_override=getattr(st.agent, "_persist_user_message_override", None), row_identity=rows,
-    ), rows)
+        turn_override=getattr(st.agent, "_persist_user_message_override", None),
+    )
 
 
 def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None, cols: int):
