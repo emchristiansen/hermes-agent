@@ -27,6 +27,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from hermes_cli.kanban_db_active_pr import released_after
 from hermes_cli.kanban_db_retry_policy import CrashSweep as _CrashSweep, DeadWorker as _DeadWorker, KANBAN_OWNER_RESTART_EXIT_CODE
 from hermes_cli.kanban_db_retry_policy import first_failure_landing
 from hermes_cli.kanban_db_retry_policy import reclaim_transaction
@@ -1567,10 +1568,9 @@ def check_respawn_guard(
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
-    handoff or an unblock followed the comment: the named profile must work on
-    that PR, or an operator resumed the card with it). The review lane skips the
-    last two: they are the *inputs* to a review handoff. Stale / dead claim locks
-    are NOT a guard reason — the reclaim passes own those.
+    handoff, unblock or dependency release followed the comment: the named profile must work on
+    that PR, or the card was resumed with it). The review lane skips the last two (the *inputs* to
+    a review handoff). Stale / dead claim locks are NOT a guard reason — reclaim passes own those.
     """
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
@@ -1636,22 +1636,16 @@ def check_respawn_guard(
         return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #    Exception: a handoff AFTER the newest PR comment (operator reassign,
-    #    reviewer changes_requested, review reopen) names the profile that must
-    #    now work on THAT PR — a closer or the implementer finishing it, not a
-    #    duplicate implementation (#111910); so does an operator's ``unblock``. A
-    #    crash/reclaim is neither, so the PR's worker is not re-spawned against it.
+    #    Exception: a release AFTER the newest PR comment names who must now work on THAT PR, not a
+    #    duplicate implementation (#111910): a handoff (reassign, changes_requested, review reopen),
+    #    an operator ``unblock``/``promote`` (incl. a ready-card continuation), or a dependency
+    #    release (``promoted`` from ``todo``). Crash/reclaim, reprioritize and a breaker park's
+    #    auto-recovery are none; ``kanban_db_active_pr.is_release`` holds the provenance rules.
     pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
                                           cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
                 if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
-    if pr_times:
-        # Strictly after: a same-second tie stays guarded (fail closed).
-        if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
-                conn, "task_events", task_id, max(pr_times),
-                "AND kind IN ('assigned', 'changes_requested', 'review_reopened', 'unblocked')", cols=", kind, payload", strict=True)):
-            return None
+    if pr_times and not released_after(conn, task_id, max(pr_times)):
         return "active_pr"
-
     return None
 
 
@@ -1671,22 +1665,6 @@ def _rows_since(conn: sqlite3.Connection, table: str, task_id: str, since: int, 
         t = unreadable if t is None else t
         if t is not None and (t > since if strict else t >= since):
             yield t, row
-
-
-def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
-    """Only an ``assigned`` event that moves the card to a DIFFERENT profile is
-    a handoff. A no-op re-assign (dev→dev via CLI/dashboard/``reassign
-    --reclaim``), an unassign, or the dispatcher's own
-    ``kanban.default_assignee`` write would otherwise lift ``active_pr`` for
-    the very implementer that opened the PR. Events without ``from`` (written
-    before it was recorded) are not trusted as handoffs — fail closed."""
-    if kind != "assigned":
-        return True
-    data = _kb._json_or(payload, {})
-    if not isinstance(data, dict) or data.get("source") == "kanban.default_assignee":
-        return False
-    to = data.get("assignee")
-    return bool(to) and "from" in data and data["from"] != to
 
 
 def _profile_exists_fn() -> Optional[Callable[[str], bool]]:

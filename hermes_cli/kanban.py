@@ -1131,13 +1131,18 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     # Dedupe while preserving order; positional task_id always first.
     ids = list(dict.fromkeys(_bulk_ids(args)))
     dry_run = bool(args.dry_run)
+    # An exact-run continuation of a READY card (respawn guard ``active_pr``); one card per fence.
+    expected_run = getattr(args, "expected_terminal_run", None)
+    fence = {} if expected_run is None else {"expected_terminal_run": expected_run}
+    if fence and len(ids) != 1:
+        return _err("kanban promote: an exact terminal-run fence requires one task", 2)
 
     results: list[dict[str, object]] = []
     with kbc.connect_closing() as conn:
         for tid in ids:
-            ok, err = kb.promote_task(conn, tid, actor=author, reason=reason, dry_run=dry_run)
+            ok, err = kb.promote_task(conn, tid, actor=author, reason=reason, dry_run=dry_run, **fence)
             results.append({"task_id": tid, "promoted": ok, "dry_run": dry_run,
-                            "reason": reason, "error": err})
+                            "reason": reason, "error": err, **fence})
 
     failed = [r for r in results if not r["promoted"]]
     if getattr(args, "json", False):
@@ -1146,11 +1151,12 @@ def _cmd_promote(args: argparse.Namespace) -> int:
         return 0 if not failed else 1
 
     tag = " (dry)" if dry_run else ""
-    label = "Would promote" if dry_run else "Promoted"
+    label = ("Would continue" if dry_run else "Continued") if fence else ("Would promote" if dry_run else "Promoted")
+    target = f"ready after terminal run {expected_run}" if fence else "ready"
     suffix = f": {reason}" if reason else ""
     for r in results:
         if r["promoted"]:
-            print(f"{label} {r['task_id']} -> ready{tag}{suffix}")
+            print(f"{label} {r['task_id']} -> {target}{tag}{suffix}")
         else:
             print(f"cannot promote {r['task_id']}: {r['error']}", file=sys.stderr)
     return 0 if not failed else 1
