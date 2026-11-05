@@ -30,7 +30,8 @@ from gateway.restart import (
 )
 from gateway.run_common import _UNSET
 from gateway.run_runtime import interrupt_side_agents, managed_turn_count, stop_managed_turns
-from gateway.run_shutdown_budget import STOP_CLOSE_RESERVE_SECONDS, quiesce_reserve, stop_wait_budget
+from gateway.run_shutdown_budget import (
+    STOP_CLOSE_RESERVE_SECONDS, final_sweep_live, quiesce_reserve, start_daemon_call, stop_wait_budget)
 from gateway.run_shutdown_session_end import GatewaySessionEndMixin
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
 
@@ -1181,10 +1182,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                 session_id=getattr(agent, "session_id", None), platform="gateway", reason="shutdown",
                 session_key=session_key,
             )
-            try:  # adapters are still connected here (teardown runs after this loop)
-                await self._deliver_session_end_messages(messages, session_key=session_key)
-            except Exception:
-                logger.debug("Session-end plugin message delivery failed for %s", session_key, exc_info=True)
+            # Adapters are still connected here (teardown runs after this loop); bounded by the leash.
+            await self._deliver_session_end_messages_within_stop(messages, session_key=session_key)
             # Off-loop + bounded: a wedged memory provider here used to hang the whole shutdown so
             # SIGTERM never completed.
             await self._cleanup_agent_resources_off_loop(agent, context="shutdown finalize", session_key=session_key)
@@ -1772,22 +1771,12 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         return _marked_cron_jobs
 
     @staticmethod
-    async def _stop_kill_tool_subprocesses_off_loop(phase: str) -> list:
-        """Run _stop_kill_tool_subprocesses in a worker thread; returns cron job IDs marked interrupted.
-
-        ``kill_all`` fans out into per-target ``kill_process`` calls that do blocking work
-        (registry checkpoint disk I/O, ``subprocess.run`` for systemd scopes, sandbox exec),
-        so running the sweep inline would monopolize the gateway event loop (#116327).
-        Offloaded with ``asyncio.to_thread`` — the loop's default executor, deliberately NOT
-        the gateway-owned ``self._executor``, which ``_stop_quiesce_and_close_session_dbs``
-        drains right after this phase. Phase order is preserved: callers await this before
-        cron notices / adapter teardown. If the surrounding stop task is cancelled while the
-        worker runs, the thread is left to finish on its own; the thread-based shutdown
-        watchdog remains the hard backstop.
-        """
-        return await asyncio.to_thread(
-            GatewayShutdownMixin._stop_kill_tool_subprocesses, phase
-        )
+    def _stop_kill_tool_subprocesses_off_loop(phase: str) -> tuple[asyncio.Future, threading.Thread]:
+        """Start _stop_kill_tool_subprocesses (blocking: registry checkpoint I/O, systemd ``subprocess.run``,
+        sandbox exec — inline it monopolizes the loop, #116327) on its own daemon thread; returns the
+        awaitable cron job IDs marked interrupted, and the thread. Neither the gateway pools (the quiesce
+        drains them) nor the default executor (``asyncio.run`` joins it after the watchdog is disarmed)."""
+        return start_daemon_call(GatewayShutdownMixin._stop_kill_tool_subprocesses, phase, name=f"hermes-stop-{phase}")
 
     async def _stop_begin_teardown(self, ctx: GatewayShutdownMixin._StopContext) -> None:
         """Flag teardown, stop room worker/watchdog, notify sessions."""
@@ -1902,7 +1891,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             logger.debug("Re-signaled interrupt for work still live at settle-window exit")
         # Kill tool subprocesses NOW: deferring past adapter/DB teardown risks the systemd cgroup SIGKILL.
         # Off-loop: the sweep does blocking kills that must not monopolize the event loop (#116327).
-        _interrupted_cron_jobs = await GatewayRunner._stop_kill_tool_subprocesses_off_loop("post-interrupt")
+        _interrupted_cron_jobs = await GatewayRunner._stop_kill_tool_subprocesses_off_loop("post-interrupt")[0]
         logger.info("Shutdown phase: post-interrupt tool kill done at +%.2fs", ctx.elapsed())
         # Last window with the transport up (the cron worker's own notice arrives after teardown).
         with _log_suppressed(logging.DEBUG, "Cron interrupt notification failed: %s"):
@@ -1983,11 +1972,15 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         self._shutdown_event.set()
         # Global catch-all subprocess kill (safe to repeat) for the graceful path and late respawns.
         # Off-loop: same blocking sweep as the post-interrupt kill (#116327). Awaited only within the stop's
-        # leash left for the quiesce and the close: past it the sweep thread finishes on its own.
-        _kill = asyncio.ensure_future(GatewayRunner._stop_kill_tool_subprocesses_off_loop("final-cleanup"))
+        # leash left for the quiesce and the close: past it the daemon thread is left running, the quiesce
+        # keeps SessionDB open for it (final_sweep_live) and the process exit ends it.
+        _kill, self._stop_final_sweep_thread = GatewayRunner._stop_kill_tool_subprocesses_off_loop("final-cleanup")
         if not (await asyncio.wait({_kill}, timeout=stop_wait_budget(self, 3600.0, reserve=quiesce_reserve())))[0]:
             _kill.add_done_callback(consume_detached_task_result)
-        logger.info("Shutdown phase: final-cleanup tool kill done at +%.2fs", ctx.elapsed())
+            logger.warning("Shutdown phase: final-cleanup tool kill still running at +%.2fs; no longer awaited "
+                           "(the process exit ends it)", ctx.elapsed())
+        else:
+            logger.info("Shutdown phase: final-cleanup tool kill done at +%.2fs", ctx.elapsed())
         # Reap the auxiliary-client cache: clients bound to dead worker-thread loops leak httpx transports.
         def _reap_aux_clients() -> None:
             # Reap the process-global auxiliary-client cache once at the very end of teardown. Per-turn
@@ -2042,12 +2035,12 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         _cron_live = self._active_cron_job_count()
         _api_live = ctx.api_live
         _api_worker_live = self._active_api_worker_count()
-        _deferred_live = ctx.deferred_count() + managed_turn_count(self)  # + authority turns/mutations
+        _deferred_live = ctx.deferred_count() + managed_turn_count(self) + final_sweep_live(self)  # + authority, sweep
         if _cron_live or _api_live or _api_worker_live or _deferred_live:
             logger.warning(
                 "Shutdown phase: %d cron job(s) / %d API-server run(s) / %d API-server worker(s) / "
-                "%d deferred/authority worker(s) still running after the executor quiesce — skipping the SessionDB "
-                "close/checkpoint, leaving state.db open for the live writer (#102198, #116535)",
+                "%d deferred/authority/final-sweep worker(s) still running after the executor quiesce — skipping the "
+                "SessionDB close/checkpoint, leaving state.db open for the live writer (#102198, #116535)",
                 _cron_live, _api_live, _api_worker_live, _deferred_live,
             )
             return

@@ -9,20 +9,30 @@ a cleanup that could have finished at once. Production (2026-11-04/05): every SI
 timed out on live work could end in "Shutdown watchdog fired after 60s". The 03:17 dump shows the loop
 idle in select (not wedged) with an agent cleanup in flight on a housekeeping worker, a plausible
 contributor; which tail await held the stop is not proven. These tests pin the composed contract instead.
+Review t_f4ec2b56/run2438 added two holes: a finalize message's adapter send was awaited without any
+bound (BUDGET-02), and a final tool sweep the stop stopped waiting for sat on the default executor that
+``asyncio.run`` joins after the watchdog is disarmed (KILL-1). The process-exit tests run the stop and
+``asyncio.run`` in a child interpreter with the real (non-pytest) watchdogs armed, up to its ``os._exit``.
 """
 
 import asyncio
+import os
+import subprocess
+import sys
 import threading
 import time
 from collections import OrderedDict
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.config import Platform
+from gateway.platforms.base import SendResult
 from gateway.restart import LAUNCHD_WATCHDOG_DUMP_MARGIN_S
-from tests.gateway.restart_test_helpers import RestartTestAdapter, make_restart_runner
+from gateway.run_shutdown import GatewayShutdownMixin
+from tests.gateway.restart_test_helpers import RestartTestAdapter, make_restart_runner, make_restart_source
 
 
 def _slow_disconnect(seconds, done):
@@ -114,3 +124,222 @@ async def test_an_immediate_idle_cleanup_runs_even_when_the_leash_is_nearly_spen
     elapsed, finished, _ = await _stop(4.0, 0.0, {Platform.TELEGRAM: adapter})
     assert finished, "the idle agent's cleanup was skipped with time still on the leash"
     assert elapsed < 4.0
+
+
+def _leashed_runner(leash):
+    runner, adapter = make_restart_runner()
+    runner._restart_drain_timeout = 0.0
+    runner._stop_requested_by_signal = True
+    runner._launchd_exit_timeout_s = leash + LAUNCHD_WATCHDOG_DUMP_MARGIN_S
+    return runner, adapter
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("send_delay", [0.0, 9.0])
+async def test_finalize_message_delivery_is_bounded_by_the_leash(send_delay, caplog):
+    """BUDGET-02: a finalize hook's message is sent while the leash allows, then recorded as lost."""
+    runner, adapter = _leashed_runner(8.0)
+    key = "agent:main:telegram:dm:123456"
+    closed = threading.Event()
+    agent = SimpleNamespace(session_id=None, close=closed.set, shutdown_memory_provider=lambda *a, **k: None,
+                            _session_messages=None)
+    runner._drain_active_agents = AsyncMock(return_value=({key: agent}, False))  # a drained, completed agent
+    source = make_restart_source()
+    runner._shutdown_notification_target = AsyncMock(return_value=(source, "telegram", source.chat_id, None, None))
+    sent = []
+
+    async def send(chat_id, content, **kwargs):
+        arrived = asyncio.Event()
+        handle = asyncio.get_running_loop().call_later(send_delay, arrived.set)
+        try:
+            await arrived.wait()
+            sent.append(content)
+            return SendResult(success=True, message_id="m1")
+        finally:
+            handle.cancel()
+
+    adapter.send, adapter.disconnect = send, AsyncMock()
+    started = time.monotonic()
+    with patch("hermes_cli.lifecycle._plugin_hooks", return_value=["finalizer-result"]), \
+            patch("gateway.status.remove_pid_file"), patch("gateway.status.publish_runtime_status"):
+        await runner.stop()
+    elapsed = time.monotonic() - started
+    assert elapsed < 8.0, f"finalize delivery kept the stop {elapsed:.2f}s, past its 8s leash"
+    assert closed.is_set(), "the agent cleanup after the delivery did not run"
+    adapter.disconnect.assert_awaited_once()
+    assert _final_state(runner) == "stopped"
+    lost = [r.getMessage() for r in caplog.records if "session-end plugin message(s)" in r.getMessage()]
+    if send_delay == 0.0:
+        assert sent == ["finalizer-result"] and not lost
+    else:
+        assert sent == [] and len(lost) == 1 and "'finalizer-result'" in lost[0] and "remaining" in lost[0]
+
+
+@pytest.mark.asyncio
+async def test_a_completion_flush_that_ignores_its_cancel_cannot_hold_the_stop(caplog):
+    runner, adapter = _leashed_runner(8.0)
+    adapter.disconnect = AsyncMock()
+    release = asyncio.Event()
+
+    async def stubborn_flush():
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            handle = asyncio.get_running_loop().call_later(9.0, release.set)
+            try:
+                await release.wait()  # ignores the shutdown cancel for 9s
+            finally:
+                handle.cancel()
+
+    flush = asyncio.ensure_future(stubborn_flush())
+    await asyncio.sleep(0)  # health: allow HX013 -- one loop turn so the flush is inside its wait
+    runner._completion_notification_batch_flush_tasks = {flush}
+    started = time.monotonic()
+    try:
+        with patch("gateway.status.remove_pid_file"), patch("gateway.status.publish_runtime_status"):
+            await runner.stop()
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+        await flush
+    assert elapsed < 8.0, f"a cancel-resistant completion flush kept the stop {elapsed:.2f}s"
+    adapter.disconnect.assert_awaited_once()
+    assert any("completion-batch flush task(s) still running" in r.getMessage() for r in caplog.records)
+
+
+def _stop_under_asyncio_run(leash, sweep_seconds):
+    """KILL-1 boundary: the real stop inside ``asyncio.run``, whose return (not stop()'s) is what lets
+    the gateway reach its hard exit; the final tool sweep takes ``sweep_seconds``."""
+    observed, release, swept = {}, threading.Event(), threading.Event()
+
+    def sweep(phase):
+        assert phase == "final-cleanup"
+        release.wait(timeout=sweep_seconds)
+        swept.set()
+        return []
+
+    async def main():
+        runner, _ = _leashed_runner(leash)
+        runner._session_db = db = MagicMock()
+        await runner.stop()
+        observed.update(stop=time.monotonic() - started, watchdog_done=runner._shutdown_watchdog_done.is_set(),
+                        db_closed=db._db.close.called, swept_at_stop=swept.is_set())
+
+    started = time.monotonic()
+    try:
+        with patch.object(GatewayShutdownMixin, "_stop_kill_tool_subprocesses", side_effect=sweep), \
+                patch("gateway.status.remove_pid_file"), patch("gateway.status.publish_runtime_status"):
+            asyncio.run(main())
+        observed["asyncio_run"] = time.monotonic() - started
+    finally:
+        release.set()
+    return observed
+
+
+def test_a_final_sweep_past_its_wait_cannot_hold_the_exit_after_the_watchdog_is_disarmed():
+    observed = _stop_under_asyncio_run(4.0, 6.0)
+    assert observed["watchdog_done"] and not observed["swept_at_stop"], observed
+    assert observed["asyncio_run"] < 4.0, f"asyncio.run returned past the 4s leash: {observed}"
+    assert not observed["db_closed"], f"SessionDB was closed while the final sweep still ran: {observed}"
+
+
+def test_a_final_sweep_that_finishes_in_time_is_awaited_before_the_close():
+    observed = _stop_under_asyncio_run(4.0, 0.0)
+    assert observed["swept_at_stop"] and observed["db_closed"], observed
+    assert observed["asyncio_run"] < 4.0, observed
+
+
+REPO = Path(__file__).resolve().parents[2]
+
+# Child: the real stop as asyncio.run's main coroutine, its shutdown watchdog armed (no PYTEST_CURRENT_TEST),
+# a 6 s final sweep under a 4 s leash, then the entrypoint's hard exit.
+_SWEEP_CHILD = """
+import asyncio, os, threading, time
+from unittest.mock import patch
+from gateway.restart import LAUNCHD_WATCHDOG_DUMP_MARGIN_S
+from gateway.run_shutdown import GatewayShutdownMixin
+from tests.gateway.restart_test_helpers import make_restart_runner
+
+def sweep(phase):
+    threading.Event().wait(6.0)
+    return []
+
+async def lifecycle():
+    runner, _ = make_restart_runner()
+    runner._restart_drain_timeout = 0.0
+    runner._stop_requested_by_signal = True
+    runner._launchd_exit_timeout_s = 4.0 + LAUNCHD_WATCHDOG_DUMP_MARGIN_S
+    await runner.stop()
+    print("STOPPED", round(time.monotonic() - started, 3), flush=True)
+    return True
+
+started = time.monotonic()
+with patch.object(GatewayShutdownMixin, "_stop_kill_tool_subprocesses", side_effect=sweep), \\
+        patch("gateway.status.remove_pid_file"), patch("gateway.status.publish_runtime_status"):
+    ok = asyncio.run(lifecycle())
+print("EXITING", round(time.monotonic() - started, 3), flush=True)
+os._exit(0 if ok else 1)
+"""
+
+# Child: work the stop gave up on outlives the gateway lifecycle (a default-executor straggler and a task
+# that swallows every cancel), so asyncio.run's own teardown never ends; the exit backstop must end it.
+_STRAGGLER_CHILD = """
+import asyncio, os, sys, time
+from gateway.shutdown_watchdog import run_with_exit_backstop
+
+async def deaf():
+    while True:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            pass
+
+async def lifecycle():
+    asyncio.get_running_loop().run_in_executor(None, time.sleep, 60)
+    asyncio.ensure_future(deaf())
+    await asyncio.sleep(0)
+    print("LIFECYCLE_DONE", time.time(), flush=True)
+    if sys.argv[1] == "raise":
+        raise SystemExit(75)
+    return True
+
+try:
+    asyncio.run(run_with_exit_backstop(lifecycle, leash_s=1.0))
+except SystemExit as exc:
+    os._exit(exc.code)
+os._exit(0)
+"""
+
+
+def _child(tmp_path, code, *args, timeout=60):
+    home = tmp_path / "hermes"
+    home.mkdir(exist_ok=True)
+    env = {k: v for k, v in os.environ.items() if k != "PYTEST_CURRENT_TEST"}
+    env.update(HOME=str(tmp_path), HERMES_HOME=str(home), PYTHONPATH=str(REPO))
+    proc = subprocess.run([sys.executable, "-c", code, *args], cwd=str(REPO), env=env, capture_output=True,
+                          text=True, timeout=timeout, check=False)
+    return proc, home, time.time()
+
+
+def _marks(stdout):
+    return {line.split()[0]: float(line.split()[1]) for line in stdout.splitlines()
+            if line.split() and line.split()[0] in {"STOPPED", "EXITING", "LIFECYCLE_DONE"}}
+
+
+def test_the_process_exit_follows_the_stop_while_a_final_sweep_still_runs(tmp_path):
+    """KILL-1 at the process boundary: asyncio.run returns and the process exits on the stop's leash."""
+    proc, home, _ = _child(tmp_path, _SWEEP_CHILD)
+    marks = _marks(proc.stdout)
+    assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr[-4000:])
+    assert marks["STOPPED"] < 4.0 and marks["EXITING"] < 4.0, marks
+    assert not (home / "logs" / "gateway-shutdown-watchdog.log").exists(), "the stop's watchdog fired"
+
+
+@pytest.mark.parametrize("ending, exit_code", [("return", 0), ("raise", 75)])
+def test_asyncio_run_teardown_cannot_hold_the_exit_past_its_backstop(tmp_path, ending, exit_code):
+    proc, home, exited_at = _child(tmp_path, _STRAGGLER_CHILD, ending)
+    marks = _marks(proc.stdout)
+    assert proc.returncode == exit_code, (proc.returncode, proc.stdout, proc.stderr[-4000:])
+    assert exited_at - marks["LIFECYCLE_DONE"] < 10.0, "the exit waited on the stragglers"
+    dump = (home / "logs" / "gateway-shutdown-watchdog.log").read_text(encoding="utf-8")
+    assert "exit_teardown_watchdog_fired" in dump and '"phase": "asyncio.run teardown"' in dump

@@ -1392,8 +1392,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         }
         for task in tasks:
             task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        if tasks:  # during a stop, waited only within the leash the adapter teardown after it leaves
+            from gateway.run_shutdown_budget import agent_wait_reserve, stop_wait_timeout
+            timeout = stop_wait_timeout(self, reserve=agent_wait_reserve(self))
+            settled = asyncio.gather(*tasks, return_exceptions=True)
+            if not (await asyncio.wait({settled}, timeout=timeout))[0]:
+                logger.warning("Shutdown: %d completion-batch flush task(s) still running %.1fs after their "
+                               "cancel; settling their batches as undelivered", len(tasks), timeout)
         # Defensive cleanup for an orphaned queue with no live flush task.
         batches = getattr(self, "_completion_notification_batches", {})
         for entries in batches.values():

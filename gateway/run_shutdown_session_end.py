@@ -12,7 +12,7 @@ from contextlib import suppress
 from typing import Any, List, Optional
 
 from agent.async_utils import consume_detached_task_result
-from gateway.run_shutdown_budget import agent_wait_reserve, stop_wait_budget
+from gateway.run_shutdown_budget import agent_wait_reserve, stop_wait_budget, stop_wait_timeout
 
 logger = logging.getLogger("gateway.run")
 
@@ -22,9 +22,11 @@ class GatewaySessionEndMixin:
 
     async def _deliver_session_end_messages(
         self, messages: list[str], *, source: Any = None, session_key: Optional[str] = None,
+        delivered: Optional[list[int]] = None,
     ) -> None:
         """Send plugin ``on_session_finalize`` text to the chat that owns the session — a plain adapter send,
-        never an agent turn. No resolvable chat (or no adapter) → logged and dropped."""
+        never an agent turn. No resolvable chat (or no adapter) → logged and dropped. ``delivered`` collects
+        the indexes of the messages that went out."""
         if not messages:
             return
         if source is None and session_key:
@@ -35,10 +37,41 @@ class GatewaySessionEndMixin:
             logger.info("Session-end plugin message(s) dropped: no chat for session %s", session_key)
             return
         metadata = self._thread_metadata_for_source(source)
-        for message in messages:
-            await self._send_notice_logged(
+        for index, message in enumerate(messages):
+            if await self._send_notice_logged(
                 adapter, str(source.chat_id), message, source.platform.value if source.platform else "",
-                "Failed to send session-end plugin message to %s:%s: %s", metadata=metadata)
+                "Failed to send session-end plugin message to %s:%s: %s", metadata=metadata,
+            ) and delivered is not None:
+                delivered.append(index)
+
+    async def _deliver_session_end_messages_within_stop(
+        self, messages: list[str], *, session_key: Optional[str],
+    ) -> None:
+        """Shutdown delivery of finalize messages, waited for only within the leash the rest of the
+        teardown leaves (``agent_wait_reserve``, like the finalize itself). A send still in flight then is
+        cancelled, never awaited; every message that did not go out is logged as lost, with its text."""
+        if not messages:
+            return
+        delivered: list[int] = []
+        delivery = asyncio.ensure_future(
+            self._deliver_session_end_messages(messages, session_key=session_key, delivered=delivered))
+        timeout = stop_wait_timeout(self, reserve=agent_wait_reserve(self))
+        try:
+            finished = bool((await asyncio.wait({delivery}, timeout=timeout))[0])
+        finally:
+            if not delivery.done():  # timed out (or the stop was cancelled): it must not outlive the adapter
+                delivery.cancel()
+                delivery.add_done_callback(consume_detached_task_result)
+        if not finished:
+            why = f"not delivered within the stop's remaining {timeout:.1f}s"
+        elif delivery.exception() is not None:
+            why = f"delivery raised {delivery.exception()!r}"
+        else:
+            why = "send failed or no chat for the session"
+        lost = [message for index, message in enumerate(messages) if index not in delivered]
+        if lost:
+            logger.warning("Shutdown: %d of %d session-end plugin message(s) for %s lost (%s): %r",
+                           len(lost), len(messages), session_key, why, lost)
 
     async def _reset_session_off_loop(self, *, session_key: Optional[str] = None, **kwargs: Any) -> None:
         """Plugin ``on_session_reset`` off-loop under the profile owning ``session_key``, bounded like
