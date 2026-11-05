@@ -42,15 +42,12 @@ def is_message(authority, ref, row):
     return True
 
 
-def steered_text(row):
-    """How the running turn receives the message: the user's own text as theirs; local automation (a Bot
-    Chat delivery, a producer notice) framed with its sender, never as the user's (``turn_author`` is the
-    author the message's own turn would have had)."""
+def delivered_by(row):
+    """Who delivered the message, when it is not the user's own text: local automation (a Bot Chat
+    delivery, a producer notice) reaches the turn framed with the author its own turn would carry
+    (``turn_author``; ``{}`` for Hermes automation), never as the user's. None for the user's text."""
     descriptor = row['payload'].get('local_automation_v1')
-    if descriptor is None:
-        return row['payload']['text']
-    from agent.prompt_builder import format_delivered_message
-    return format_delivered_message(row['payload']['text'], descriptor.get('turn_author'))
+    return None if descriptor is None else dict(descriptor.get('turn_author') or {})
 
 
 def steer_soon(authority, ref):
@@ -91,7 +88,7 @@ async def _pass(authority, ref, live):
                 # queued waits for the next owner, as the drain makes it.
                 return
             try:
-                await transfer(authority, ref, row, generation, steered_text(row))
+                await transfer(authority, ref, row, generation, delivered_by(row))
             except RuntimeStoreError as exc:
                 if exc.reason == 'admission_started':
                     continue  # the drain claimed it first: it runs as its own turn

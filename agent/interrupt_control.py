@@ -102,6 +102,32 @@ def _set_steer_parts(agent, parts: list) -> None:
     agent._pending_steer = "\n".join(text for _, text in parts) or None
 
 
+class DrainedSteer(str):
+    """Drained steer text that holds a delivered message (``steer(..., delivered_by=...)``): ``segments``
+    are its parts in order as ``(sender, text)``, ``sender`` None for the user's own text. The renderer
+    frames each part by this record, never by what the text says (``prompt_builder.format_steer_marker``).
+    A drain of only the user's text stays a plain ``str``."""
+
+    segments: tuple = ()
+
+
+def _steer_senders(agent) -> dict:
+    """``{ticket: sender}`` for ticketed steers another principal delivered (a Bot Chat delivery, a
+    producer notice); ``sender`` is that author (``{}`` for Hermes automation). Kept until settlement."""
+    return vars(agent).setdefault("_steer_ticket_senders", {})
+
+
+def _drained_text(agent, parts: list):
+    text = "\n".join(part_text for _, part_text in parts) or None
+    senders = _steer_senders(agent)
+    if text is None or not any(ticket in senders for ticket, _ in parts if ticket is not None):
+        return text
+    drained = DrainedSteer(text)
+    drained.segments = tuple((senders.get(ticket) if ticket is not None else None, part_text)
+                             for ticket, part_text in parts)
+    return drained
+
+
 def _steer_fates(agent) -> dict:
     """``{ticket: consumed}`` for ticketed steers that left the buffer: True when a drain handed the text
     to the turn, False when it was dropped unread. ``withdraw_steer`` reads each one once."""
@@ -307,14 +333,18 @@ class InterruptControlMixin:
                 _set_steer_parts(self, [])
         return True
 
-    def steer(self, text: str, *, ticket=None) -> bool:
+    def steer(self, text: str, *, ticket=None, delivered_by=None) -> bool:
         """Queue user text for delivery as its own user row after the current tool batch finishes (no
         interrupt); multiple calls concatenate with newlines. Returns False for empty text. ``ticket``
-        names the submission, so ``withdraw_steer`` can settle exactly it, whatever text others carry."""
+        names the submission, so ``withdraw_steer`` can settle exactly it, whatever text others carry.
+        ``delivered_by`` (a ticketed steer only): the text is another principal's delivered message, not
+        the user's: that author dict, or ``{}`` for Hermes automation."""
         if not text or not text.strip():
             return False
         cleaned = text.strip()
         with _ic_lock(self, "_pending_steer_lock"):
+            if delivered_by is not None and ticket is not None:
+                _steer_senders(self)[ticket] = dict(delivered_by)
             _set_steer_parts(self, _steer_parts(self) + [(ticket, cleaned)])
         # The turn no longer ran on its own (first-task-done detection reads this off the result).
         self._turn_user_intervened = True
@@ -400,6 +430,7 @@ class InterruptControlMixin:
         with _ic_lock(self, "_pending_steer_lock"):
             text = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
             parts = _steer_parts(self)
+            text = _drained_text(self, parts) if text else text
             _set_steer_parts(self, [])
             for ticket, _ in parts:
                 if ticket is not None:
@@ -426,6 +457,7 @@ class InterruptControlMixin:
             parts = _steer_parts(self)
             kept = [part for part in parts if part[0] != ticket]
             consumed = _steer_fates(self).pop(ticket, True)
+            _steer_senders(self).pop(ticket, None)
             if len(kept) == len(parts):
                 return consumed is False
             _set_steer_parts(self, kept)
