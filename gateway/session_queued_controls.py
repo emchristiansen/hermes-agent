@@ -119,9 +119,10 @@ def _receiving_agent(authority, session_id, generation):
     return agent
 
 
-def _deliver(authority, session_id, generation, agent, admission_id, text):
+def _deliver(authority, session_id, generation, agent, admission_id, text, delivered_by=None):
     """Hand the committed text to the claim's agent; the caller holds the stream lock. False once the
-    claim stopped executing (its settlement then decides the row) or its agent refused the text."""
+    claim stopped executing (its settlement then decides the row) or its agent refused the text.
+    ``delivered_by``: the text is another principal's delivered message (``agent.steer``)."""
     entry = authority.steer_transfers.get(session_id)
     if (entry is None or entry[0] != generation or admission_id not in entry[1]
             or _receiving_agent(authority, session_id, generation) is not agent):
@@ -129,7 +130,11 @@ def _deliver(authority, session_id, generation, agent, admission_id, text):
     if not entry[1][admission_id]:
         # Ticketed by its admission id: settlement withdraws exactly it if no drain of the turn consumed it.
         ticketed = callable(getattr(agent, 'withdraw_steer', None))
-        entry[1][admission_id] = bool(agent.steer(text, ticket=admission_id) if ticketed else agent.steer(text))
+        if delivered_by is not None:
+            # Only a ticketed seam records the sender; without one the message runs as its own turn.
+            entry[1][admission_id] = ticketed and bool(agent.steer(text, ticket=admission_id, delivered_by=delivered_by))
+        else:
+            entry[1][admission_id] = bool(agent.steer(text, ticket=admission_id) if ticketed else agent.steer(text))
     return entry[1][admission_id]
 
 
@@ -155,13 +160,12 @@ async def steer_queued(connection, ref, params):
     return asdict(authority._receipt(await transfer(authority, ref, row, handle.execution_generation)))
 
 
-async def transfer(authority, ref, row, generation, text=None):
-    """Transfer the queued ``row`` to the running claim ``generation`` and hand its text (``text``: how the
-    turn receives it, its payload text by default) to that claim's agent; returns the committed row.
-    Refuses (``steer_unavailable``) with the row untouched while the claim has no agent, and queues it
-    again in its own place when the claim ended before delivery."""
-    admission_id, live = row['admission_id'], authority.sessions[ref.session_id]
-    text = row['payload']['text'] if text is None else text
+async def transfer(authority, ref, row, generation, delivered_by=None):
+    """Transfer the queued ``row`` to the running claim ``generation`` and hand its text to that claim's
+    agent (``delivered_by``: as another principal's delivered message, not the user's); returns the
+    committed row. Refuses (``steer_unavailable``) with the row untouched while the claim has no agent,
+    and queues it again in its own place when the claim ended before delivery."""
+    admission_id, text, live = row['admission_id'], row['payload']['text'], authority.sessions[ref.session_id]
     session_id = ref.session_id
     with live.event_stream.lock:
         agent = _receiving_agent(authority, session_id, generation)
@@ -183,7 +187,7 @@ async def transfer(authority, ref, row, generation, text=None):
         raise
     if fresh:
         with live.event_stream.lock:
-            delivered = _deliver(authority, session_id, generation, agent, admission_id, text)
+            delivered = _deliver(authority, session_id, generation, agent, admission_id, text, delivered_by)
         if not delivered:
             # The claim ended first: the text reached nobody, so the admission is queued again.
             await tracked_write(authority, partial(revert_steer_input, authority.db, epoch=authority.epoch,
