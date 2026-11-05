@@ -13,9 +13,11 @@ events.
 The fix: ``_handle_active_session_busy_message`` returns ``False`` early for any
 event with ``internal=True``, so the base adapter queues it silently (no
 interrupt, no ack) and it cascades as a new turn after the current one finishes.
-This preserves strict message-role alternation and the design invariant that a
-completion surfaces as a NEW turn only when idle, never spliced into a running
-turn.
+
+Every message steers (Eric, 2026-11-04): when the running agent has the steer seam
+that records a sender, the completion is steered into the running turn as Hermes
+automation's (a standalone user row after a tool result, so role alternation stays
+legal), still without an interrupt or an ack; only without that seam is it queued.
 """
 
 from __future__ import annotations
@@ -91,8 +93,10 @@ def _make_adapter() -> MagicMock:
     return adapter
 
 
-def _make_running_parent() -> MagicMock:
+def _make_running_parent(steer_seam: bool = False) -> MagicMock:
     parent = MagicMock()
+    if not steer_seam:
+        del parent.withdraw_steer  # an agent without the sender-recording steer seam
     parent._active_children = []  # no active subagents at completion time
     parent._active_children_lock = threading.Lock()
     parent.get_activity_summary.return_value = {
@@ -126,3 +130,26 @@ async def test_internal_event_does_not_interrupt_busy_session() -> None:
     adapter._send_with_retry.assert_not_called()
 
 
+
+
+@pytest.mark.asyncio
+async def test_internal_event_steers_into_a_running_agent_with_the_steer_seam() -> None:
+    """Every message steers: the completion reaches the running turn as Hermes automation's,
+    never interrupting it and never acknowledged as a user message."""
+    runner = _make_runner()
+    runner._busy_input_mode = "interrupt"
+    adapter = _make_adapter()
+    event = _make_internal_event()
+    sk = build_session_key(event.source)
+    parent = _make_running_parent(steer_seam=True)
+    parent.steer.return_value = True
+    runner._running_agents[sk] = parent
+    runner.adapters[event.source.platform] = adapter
+
+    handled = await runner._handle_active_session_busy_message(event, sk)
+
+    assert handled is True and event._gateway_accepted is True
+    parent.steer.assert_called_once_with("[async delegation completed]", delivered_by={})
+    parent.interrupt.assert_not_called()
+    adapter._send_with_retry.assert_not_called()
+    assert sk not in adapter._pending_messages

@@ -71,7 +71,32 @@ class CLIProcessNotificationsMixin:
                 from agent.notification_presentation import diagnostic_process_event
                 if diagnostic_process_event(event) and not isinstance(pending, TimelineNotification):
                     pending = TimelineNotification(text, text, "internal_notification", "diagnostic")
-            self._pending_input.put(pending)
+            if not self._steer_notification(pending):
+                self._pending_input.put(pending)
+
+    def _steer_notification(self, pending) -> bool:
+        """While a turn runs, hand a notification's text to it as Hermes automation's, never the user's
+        (every message steers, Eric 2026-11-04; the gateway's busy pass does the same for its admitted
+        notices). False leaves it for the next turn, as before: idle, or no running agent took it."""
+        agent = getattr(self, "agent", None)
+        if not getattr(self, "_agent_running", False) or not callable(getattr(agent, "withdraw_steer", None)):
+            return False  # only the seam that records a sender: never framed as the user's text
+        from tools.process_registry import process_registry
+        from tools.process_registry_notifications import ProcessNotificationBatch
+        if isinstance(pending, ProcessNotificationBatch):
+            text, display = pending.render(process_registry), pending.display_text(process_registry)
+        else:
+            text, display = str(pending), getattr(pending, "display_text", None) or str(pending)
+        try:
+            accepted = bool(text) and agent.steer(text, delivered_by={})
+        except Exception:  # health: allow BLE001 -- as the Enter path's steer: a failed steer leaves the notice for the next turn
+            accepted = False
+        if accepted:
+            from cli import _ACCENT, _RST, _cprint
+            from agent.i18n import t
+            preview = display[:80] + ("..." if len(display) > 80 else "")
+            _cprint(f"  {_ACCENT}{t('cli.tui.steered', preview=preview)}{_RST}")
+        return bool(accepted)
 
     def _tui_unwrap_input(self, user_input):
         """Unwrap ``_VoiceInputMessage`` / ``_SeededQueryMessage`` -> ``(text_or_tuple, is_voice_input, is_seeded_query)``."""

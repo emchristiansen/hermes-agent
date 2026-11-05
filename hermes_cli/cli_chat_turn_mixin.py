@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 
+from contextlib import suppress
 from pathlib import Path
 from rich import box as rich_box
 from rich.panel import Panel
@@ -405,6 +406,10 @@ class CLIChatTurnMixin:
             try:
                 interrupt_msg = self._interrupt_queue.get(timeout=0.1)
             except queue.Empty:
+                # Every message steers (Eric, 2026-11-04): a process notice or subagent result that
+                # lands while this turn runs reaches it now, not after the turn.
+                with suppress(Exception):  # as the idle tick's drain: never breaks the turn's monitor
+                    self._drain_process_notifications("cli-busy")
                 # Flush the StdoutProxy buffer: it otherwise only flushes on input-triggered
                 # renderer passes, so on macOS the CLI looks frozen until the user types.
                 # Force prompt_toolkit to flush any pending stdout output from the agent thread. (#1624)
