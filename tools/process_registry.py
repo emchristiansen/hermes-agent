@@ -35,7 +35,8 @@ from hermes_cli.config import get_hermes_home
 from tools.process_registry_notifications import (
     format_process_notification, heartbeat_output_tail, is_child_process_notification, should_surface_notification)
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
-from tools.process_registry_output_log import ProcessOutputLogMixin, open_output_log, record_exit_command, worker_output_log
+from tools.process_registry_output_log import (
+    ProcessOutputLogMixin, open_output_log, record_exit_command, worker_output_log, worker_spawn_outlives_unit)
 from tools.process_registry_termination import ProcessTerminationMixin
 from tools.process_registry_results import load_completed_results, save_completed_result
 from tools.process_registry_env_log import log_delta_command
@@ -1110,19 +1111,17 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         """Login-shell argv for *safe_command* (parity with LocalEnvironment: rc files
         sourced, user tools on PATH), wrapped in a transient systemd scope when we are
         the supervised gateway (own cgroup: an OOM kills only the worker, not the
-        gateway and its messaging control plane)."""
+        gateway and its messaging control plane) or a registered worker sharing a service
+        unit's cgroup (``worker_spawn_outlives_unit``: the unit's stop must not kill it)."""
         argv = [_find_shell(), "-lic", f"set +m; {safe_command}"]
         # This applies to both pipe mode and the PTY path above. See #70716.
-        in_supervised_gateway = _IS_LINUX and _is_supervised_gateway_process()
+        in_supervised_gateway = _IS_LINUX and (_is_supervised_gateway_process() or worker_spawn_outlives_unit())
         if in_supervised_gateway and _systemd_run_user_scope_available():
             session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
             return _build_systemd_scope_argv(argv, unit_suffix=unit_suffix)
-        if in_supervised_gateway:
-            # Under a supervisor but no private cgroup: a worker OOM can still take
-            # the whole gateway down.
-            logger.debug(
-                "%s background executor not isolated in a systemd scope "
-                "(systemd-run --user unavailable); worker shares the gateway cgroup.", label)
+        if in_supervised_gateway:  # no private cgroup: a worker OOM can still take the whole gateway down
+            logger.debug("%s background executor not isolated in a systemd scope "
+                         "(systemd-run --user unavailable); worker shares the gateway cgroup.", label)
         return argv
 
     @staticmethod
