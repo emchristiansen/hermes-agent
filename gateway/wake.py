@@ -117,7 +117,11 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
         if source is None:
             raise ValueError("deliver_wake: push-capable adapter requires a SessionSource")
         from gateway.platforms.event import MessageEvent, MessageType
-        runner = getattr(adapter, "gateway_runner", None)
+        # A LocalSessionAdapter belongs to its session authority and is never wired by the runner
+        # (no message handler, no gateway_runner): its handle_message discards every event, so
+        # its wakes must take the authority FIFO through the authority's runner.
+        runner = getattr(adapter, "gateway_runner", None) or getattr(
+            getattr(adapter, "authority", None), "runner", None)
         if runner is not None:
             from gateway.session_automation import admit_route_wake
             from hermes_state_runtime import RuntimeStoreError
