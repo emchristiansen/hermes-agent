@@ -21,6 +21,7 @@ from contextvars import Context
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from agent.async_utils import consume_detached_task_result
 from agent.i18n import t
 from gateway.config import Platform
 from gateway.restart import (
@@ -29,6 +30,7 @@ from gateway.restart import (
 )
 from gateway.run_common import _UNSET
 from gateway.run_runtime import interrupt_side_agents, managed_turn_count, stop_managed_turns
+from gateway.run_shutdown_budget import STOP_CLOSE_RESERVE_SECONDS, quiesce_reserve, stop_wait_budget
 from gateway.run_shutdown_session_end import GatewaySessionEndMixin
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
 
@@ -1980,8 +1982,11 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                 getattr(self, _attr).clear()
         self._shutdown_event.set()
         # Global catch-all subprocess kill (safe to repeat) for the graceful path and late respawns.
-        # Off-loop: same blocking sweep as the post-interrupt kill (#116327).
-        await GatewayRunner._stop_kill_tool_subprocesses_off_loop("final-cleanup")
+        # Off-loop: same blocking sweep as the post-interrupt kill (#116327). Awaited only within the stop's
+        # leash left for the quiesce and the close: past it the sweep thread finishes on its own.
+        _kill = asyncio.ensure_future(GatewayRunner._stop_kill_tool_subprocesses_off_loop("final-cleanup"))
+        if not (await asyncio.wait({_kill}, timeout=stop_wait_budget(self, 3600.0, reserve=quiesce_reserve())))[0]:
+            _kill.add_done_callback(consume_detached_task_result)
         logger.info("Shutdown phase: final-cleanup tool kill done at +%.2fs", ctx.elapsed())
         # Reap the auxiliary-client cache: clients bound to dead worker-thread loops leak httpx transports.
         def _reap_aux_clients() -> None:
@@ -2013,9 +2018,9 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         # #101064. The wait is bounded and clamped to what is left of the shutdown watchdog leash (minus a
         # second for the close itself), so a stuck worker can never cost us the post-close cleanup window
         # (#82161).
-        _exec_quiesce_budget = max(
+        _exec_quiesce_budget = stop_wait_budget(self, max(  # the stop's own deadline wins when it is shorter
             0.0, min(_EXECUTOR_QUIESCE_TIMEOUT, resolve_shutdown_watchdog_delay(timeout) - ctx.elapsed() - 1.0),
-        )
+        ), reserve=STOP_CLOSE_RESERVE_SECONDS)
         _exec_live = GatewayRunner._shutdown_executor(self, drain_timeout=_exec_quiesce_budget)
         if _exec_live:
             # A live worker may be mid-write (the #101093 corruption sequence): skip the close and let
@@ -2120,14 +2125,9 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             self._update_runtime_status("stopped", self._exit_reason)
         try:
             from gateway.status import flush_runtime_status_async
-            # Never outlive the launchd exit budget (``_launchd_exit_timeout_s`` is set by the
-            # supervised-restart path when it exists; a plain 2 s bound otherwise). The cap only
-            # applies to signal-driven stops — a programmatic stop is not racing the supervisor.
-            flush_timeout = 2.0
-            budget = getattr(self, "_launchd_exit_timeout_s", None)
-            signal_stop = getattr(self, "_stop_requested_by_signal", False)
-            if signal_stop and isinstance(budget, (int, float)) and budget > 0:
-                flush_timeout = max(0.0, min(flush_timeout, budget - ctx.elapsed()))
+            # A plain 2 s bound, never past the stop's deadline (the watchdog leash, itself capped under
+            # launchd's live exit budget for signal-driven stops, ``effective_stop_watchdog_delay``).
+            flush_timeout = stop_wait_budget(self, 2.0, reserve=0.0)
             if not await flush_runtime_status_async(timeout=flush_timeout):
                 logger.warning("Timed out flushing terminal gateway runtime status")
         except Exception:
