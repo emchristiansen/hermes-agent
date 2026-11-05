@@ -189,8 +189,8 @@ async def test_every_busy_preference_reads_steer(tmp_path, monkeypatch, asked):
 async def test_a_bot_chat_delivery_to_a_busy_bot_chat_steers_as_its_sender_reached_it(bot, monkeypatch):
     """The legacy Desktop relay's chain past its WS hop: ``session_bot.deliver`` with the server-derived
     bot author -> ``_admit`` -> ``admit_automation``. The second delivery reaches the running turn; its
-    sender's receipt reports what the ledger knows: no reply of its own (``ambiguous``), never a
-    second turn."""
+    sender's receipt reports what the ledger knows: delivered into a turn that completed, with no reply
+    of its own (``settled``, empty reply), never a second turn."""
     from gateway.session_bot import _result, deliver
     from tools.bot_live_delivery import read_delivery_result
     agent, ran, running, boundary, taken = BufferedAgent(), [], asyncio.Event(), asyncio.Event(), []
@@ -224,8 +224,8 @@ async def test_a_bot_chat_delivery_to_a_busy_bot_chat_steers_as_its_sender_reach
     assert 'Desktop relay' in content and 'relay:abc' in content, 'its sender, as its own turn would carry it'
     assert 'a direct message from the user' not in content, 'never promoted to the user'
     assert second['admission_id'] and second['status'] in {'queued', 'claimed'}, second
-    # The truthful limit of the existing receipt contract: no reply belongs to a steered delivery.
-    assert (receipt['status'], receipt['reply']) == ('ambiguous', ''), receipt
+    # Committed ``steered`` is proof of delivery, not an unknown outcome; no reply belongs to it.
+    assert (receipt['status'], receipt['reply']) == ('settled', ''), receipt
 
 
 @pytest.mark.asyncio
@@ -385,3 +385,84 @@ async def test_an_operator_replay_of_a_transferred_delivery_keeps_its_sender(bot
     assert content.count('peer-report') == 1 and 'Fixture peer' in content and 'bot:fixture-peer' in content
     assert 'a direct message from the user' not in content
     assert ran == ['running']
+
+
+def _held_bot_turn(monkeypatch, *, error=None):
+    """The bot fixture's first claim adopts a ``BufferedAgent`` and stays running until ``boundary``;
+    it then crosses one tool/result boundary and completes (or fails with ``error``)."""
+    agent, ran, running, boundary = BufferedAgent(), [], asyncio.Event(), asyncio.Event()
+
+    async def execute(authority, ref, row):
+        ran.append(row['payload']['text'])
+        if len(ran) > 1:
+            return 'own turn'
+        authority.adopt_agent(ref.session_id, row['generation'], agent)
+        running.set()
+        await asyncio.wait_for(boundary.wait(), 30)
+        _boundary(agent)
+        if error is not None:
+            authority.pending_results[row['admission_id']] = {
+                'result': {'final_response': '', 'messages': [], 'failed': True, 'error': error}, 'usage': {}}
+            return ''
+        return 'pong'
+    monkeypatch.setattr('gateway.session_finite.execute_finite_admission', execute)
+    return ran, running, boundary
+
+
+@pytest.mark.asyncio
+async def test_a_peer_run_steered_into_a_turn_that_completes_reports_delivered_not_ambiguous(bot, monkeypatch):
+    """t_674db54b: ``hermes peer run`` into a busy Bot Chat. The delivery is steered into the running
+    turn, which takes it and completes; the run's waiter (``await_peer_receipt``, as
+    ``_execute_run_via_live_owner`` drives it) stays pending while the transfer is in flight and then
+    reports the committed delivery (``settled``), not ``Bot Chat delivery ambiguous``."""
+    from gateway import session_bot
+    from gateway.platforms.api_server_bot_chat import await_peer_receipt
+    from gateway.session_bot import deliver
+    wait_admission, followed = session_bot.peer_wait_admission, []
+
+    def peer_wait_admission(authority, record):
+        followed.append(wait_admission(authority, record))
+        return followed[-1]
+    monkeypatch.setattr(session_bot, 'peer_wait_admission', peer_wait_admission)
+    ran, running, boundary = _held_bot_turn(monkeypatch)
+    first = asyncio.create_task(deliver(bot.connection, dict(id='a' * 32, profile='default', message='ping')))
+    await asyncio.wait_for(running.wait(), 30)
+    second = await deliver(bot.connection, dict(id=KEY, profile='default', message='report ready'))
+    await async_wait_until(lambda: any(r['request_id'] == 'bot:' + KEY and r['status'] == 'terminal'
+                                       for r in _admissions(bot)), timeout=10, what='the delivery to transfer')
+    waiting = asyncio.create_task(await_peer_receipt(bot.authority, second, None, should_stop=lambda: False))
+    # The waiter re-reads the in-flight transfer more than once: it follows the admission, never answers.
+    await async_wait_until(lambda: len(followed) >= 2 or waiting.done(), timeout=10, what='the waiter to poll')
+    assert not waiting.done(), ('in flight is pending, never the answer', waiting.result())
+    assert followed[-1] == (second['admission_id'], False), followed
+    boundary.set()
+    await first
+    receipt = await asyncio.wait_for(waiting, 10)
+    await _settle_quietly(bot)
+    rows = {r['request_id']: (r['status'], r['outcome']) for r in _admissions(bot)}
+    assert ran == ['ping'] and rows['bot:' + KEY] == ('terminal', 'steered'), (ran, rows)
+    assert (receipt['status'], receipt['reply']) == ('settled', ''), receipt
+    assert 'error' not in receipt and 'reason' not in receipt, receipt
+
+
+@pytest.mark.asyncio
+async def test_a_delivery_taken_by_a_turn_that_did_not_complete_stays_ambiguous(bot, monkeypatch):
+    """The genuinely unknown case keeps its answer: the text reached the turn, the turn failed, so
+    whether it was acted on is unknown (``interrupted``): ``ambiguous``, and never resent."""
+    from gateway.platforms.api_server_bot_chat import await_peer_receipt
+    from gateway.session_bot import deliver
+    ran, running, boundary = _held_bot_turn(monkeypatch, error='fixture: tool crashed')
+    first = asyncio.create_task(deliver(bot.connection, dict(id='a' * 32, profile='default', message='ping')))
+    await asyncio.wait_for(running.wait(), 30)
+    second = await deliver(bot.connection, dict(id=KEY, profile='default', message='report ready'))
+    await async_wait_until(lambda: any(r['request_id'] == 'bot:' + KEY and r['status'] == 'terminal'
+                                       for r in _admissions(bot)), timeout=10, what='the delivery to transfer')
+    waiting = asyncio.create_task(await_peer_receipt(bot.authority, second, None, should_stop=lambda: False))
+    boundary.set()
+    await first
+    receipt = await asyncio.wait_for(waiting, 10)
+    await _settle_quietly(bot)
+    rows = {r['request_id']: (r['status'], r['outcome']) for r in _admissions(bot)}
+    assert rows['bot:' + KEY] == ('terminal', 'interrupted'), rows
+    assert ran == ['ping'], 'never resent as its own turn'
+    assert receipt['status'] == 'ambiguous', receipt
