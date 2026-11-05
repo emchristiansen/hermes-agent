@@ -11,10 +11,12 @@ anything by itself: an explicit kill, ``kill_all`` (the gateway's shutdown sweep
 later recovery that finds the scope empty releases it.
 
 Every interpreter of a profile may recover the profile's checkpoint (each managed-worker admission
-does) while another is still finishing one of its commands, so the finish (scope check, receipt,
-checkpoint) and a recovery's decision about the same command (adopt, hold or stop) are each made
-under ``completion_fence``: a recovery acts on the completion that is durable when it acts, and a
-finish that comes after a recovery decided to stop the scope finds it stopped.
+does) while another is still finishing or closing one of its commands. So every transition that can
+retain a scope (a finish: scope check, receipt, checkpoint; the close of an adopted entry whose root
+is gone or recycled) and a recovery's decision about the same command (adopt, hold or stop) are each
+made under ``completion_fence``: a recovery acts on the custody that is durable when it acts, and a
+transition that comes after a recovery decided to stop the scope finds it stopped. A transition
+that cannot take the fence makes no durable change: it stays pending and is retried.
 """
 from contextlib import contextmanager
 import json
@@ -22,11 +24,14 @@ import logging
 from pathlib import Path
 import shutil
 import subprocess
+import time
 from typing import Optional
 
 logger = logging.getLogger("tools.process_registry")
 
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
+# A finish whose completion fence cannot be taken retries with this backoff (seconds).
+_FENCE_RETRY_FIRST_SECONDS, _FENCE_RETRY_MAX_SECONDS = 0.05, 2.0
 
 
 def scope_populated(unit: str) -> Optional[bool]:
@@ -69,7 +74,8 @@ def scope_populated(unit: str) -> Optional[bool]:
 def completion_fence():
     """The profile's lock ordering a command's durable finish against a recovery's decision about it,
     across interpreters (``flock``, so across threads too). Never taken while holding the checkpoint
-    lock or a registry lock. Yields False when it could not be taken: a caller then stops nothing."""
+    lock or a registry lock. Yields False when it could not be taken: the caller then makes no
+    custody transition and stops nothing (each caller defines its pending/retry path)."""
     from hermes_cli.active_sessions import _FileLock
     from tools.process_registry import _checkpoint_path
     path = _checkpoint_path()
@@ -77,7 +83,7 @@ def completion_fence():
     try:
         lock.__enter__()
     except (OSError, RuntimeError) as exc:  # cannot open the lock file / flock refused
-        logger.warning("Process completion fence %s unavailable: %s", lock.path, exc)
+        logger.debug("Process completion fence %s unavailable: %s", lock.path, exc)
         yield False
         return
     try:
@@ -87,7 +93,8 @@ def completion_fence():
 
 
 class ProcessScopeCustodyMixin:
-    """The subclass supplies ``_lock``, ``_finished``, ``_write_checkpoint``. See ProcessRegistry."""
+    """The subclass supplies ``_lock``, ``_finished``, ``_write_checkpoint``, ``_move_to_finished``,
+    ``_prune_uncollected_detached`` and ``_close_reused_detached``. See ProcessRegistry."""
 
     @staticmethod
     def _sweepable(session) -> bool:
@@ -103,14 +110,41 @@ class ProcessScopeCustodyMixin:
         if session.systemd_unit:
             session._scope_stop_pending = scope_populated(session.systemd_unit) is not False
 
-    def _finish_with_scope(self, session, mark_exited) -> None:
+    def _finish_with_scope(self, session, mark_exited, *, block: bool = True) -> bool:
         """A reader-observed exit: hold the scope if it is populated, record the exit (``mark_exited``,
-        under the session lock) and persist the outcome, as one step against a recovery's decision."""
-        with completion_fence():
+        under the session lock) and persist the outcome, as one step against a recovery's decision.
+        While the fence cannot be taken nothing is recorded: the session stays running with its output
+        and the finish is retried, here with backoff (``block``, a reader thread) until it lands or
+        another path (a kill) finalised the session, else by the caller's next poll. True: finished."""
+        delay = _FENCE_RETRY_FIRST_SECONDS
+        while True:
+            with completion_fence() as fenced:
+                if fenced:
+                    self._hold_scope_if_populated(session)
+                    with session._lock:
+                        mark_exited()
+                    self._move_to_finished(session)
+                    return True
+            if delay == _FENCE_RETRY_FIRST_SECONDS:
+                logger.log(logging.WARNING if block else logging.DEBUG, "Completion of %s is pending: the "
+                           "process completion fence is unavailable; retrying", session.id)
+            if not block or session._finish_claimed:
+                return False
+            time.sleep(delay)
+            delay = min(delay * 2, _FENCE_RETRY_MAX_SECONDS)
+
+    def _close_detached(self, session, fate: str):
+        """An adopted (Popen-less) entry whose root is ``gone`` or whose PID was ``reused``: hold the scope
+        if it is populated and close the entry with no collected exit (no receipt, no completion), under
+        ``completion_fence`` like a finish. Fence unavailable: unchanged, a later refresh retries."""
+        with completion_fence() as fenced:
+            if not fenced:
+                return session
             self._hold_scope_if_populated(session)
-            with session._lock:
-                mark_exited()
-            self._move_to_finished(session)
+            if fate == "gone":
+                return self._prune_uncollected_detached(session)
+            self._close_reused_detached(session)
+            return session
 
     def _stop_scope(self, session) -> bool:
         """Stop the session's systemd scope: True when it has none or the stop worked. Every kill

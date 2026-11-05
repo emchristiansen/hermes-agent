@@ -1008,13 +1008,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         if session is None or session.exited or not session.detached or session.pid_scope != "host" or session.output_log:
             return session  # a log-backed adoption's reader collects the recorded exit itself
         fate = self._detached_host_fate(session.pid, session.host_start_time)
-        if fate == "running":
-            return session
-        self._hold_scope_if_populated(session)
-        if fate == "gone":
-            return self._prune_uncollected_detached(session)
-        self._close_reused_detached(session)
-        return session
+        return session if fate == "running" else self._close_detached(session, fate)
 
     def _close_reused_detached(self, session: ProcessSession) -> None:
         """Close an entry whose PID was recycled onto another process.
@@ -1981,11 +1975,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             except Exception as e:
                 logger.debug("Non-blocking drain failed for %s: %s", session.id, e)
         # The descendant holding the pipe may be in the scope: held through the finish if populated.
-        self._finish_with_scope(session, lambda: session.mark_exited(rc))
-        logger.info(
-            "Reconciled session %s: direct child exited with code %s but reader "
-            "was still blocked (orphaned pipe). Flipped to exited.",
-            session.id, rc)
+        if self._finish_with_scope(session, lambda: session.mark_exited(rc), block=False):
+            logger.info(
+                "Reconciled session %s: direct child exited with code %s but reader "
+                "was still blocked (orphaned pipe). Flipped to exited.",
+                session.id, rc)
 
     @staticmethod
     def _status_head(session: ProcessSession) -> dict:
