@@ -5172,8 +5172,7 @@ def main():
         from hermes_cli.gateway_multiplex_mode import log_multiplex_decision, resolve_multiplex_mode
         log_multiplex_decision(resolve_multiplex_mode(config))
 
-    # start_gateway() completes teardown before returning/raising SystemExit; force-exit after so a
-    # wedged non-daemon worker can't block Py_FinalizeEx's join. SystemExit caught so EVERY path exits.
+    # start_gateway() completes teardown before returning/raising SystemExit; force-exit after (see below).
     try:
         # start_gateway() performs the full graceful teardown (adapters disconnected, sessions saved +
         # flushed, SQLite closed, cron/MCP stopped, PID file + runtime lock released) before it returns OR
@@ -5184,8 +5183,9 @@ def main():
         # SystemExit is caught explicitly: start_gateway raises it on the clean-fatal-config (#51228),
         # planned-restart, and service-restart paths, all of which complete teardown first. Routing those
         # codes through the same os._exit backstop means EVERY exit path is wedge-proof, not just the
-        # boolean-return ones.
-        success = asyncio.run(start_gateway(config))
+        # boolean-return ones. asyncio.run's own teardown runs after the stop disarmed its watchdog: backstopped.
+        from gateway.shutdown_watchdog import run_with_exit_backstop
+        success = asyncio.run(run_with_exit_backstop(lambda: start_gateway(config)))
         exit_code = 0 if success else 1
     except SystemExit as e:
         # e.code may be None (→ 0), an int, or a str (→ 1, like CPython).
