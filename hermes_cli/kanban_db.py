@@ -2085,10 +2085,9 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
                         "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
                         (resume_status, task_id),
                     )
+                # ``from``: todo is a dependency release, blocked a breaker park recovering (active_pr).
                 payload = {"status": resume_status} if resume_status != "ready" else {}
-                if cur_status == "blocked":  # breaker park auto-recovering: not a release (active_pr)
-                    payload["from"] = "blocked"
-                _append_event(conn, task_id, "promoted", payload or None)
+                _append_event(conn, task_id, "promoted", {**payload, "from": cur_status})
                 promoted += 1
     return promoted
 
@@ -3481,20 +3480,20 @@ def request_changes(
 
 def promote_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
-    dry_run: bool = False,
+    dry_run: bool = False, expected_terminal_run: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
-    """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
-    Refused while a parent is unfinished; ``dry_run`` only validates.
-    Returns ``(ok, reason)``."""
+    """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event. Refused while a parent
+    is unfinished; ``dry_run`` only validates. Returns ``(ok, reason)``. ``expected_terminal_run``
+    instead continues a ``ready`` card past ``active_pr`` (``kanban_db_active_pr.continue_ready``)."""
+    if expected_terminal_run is not None:
+        from hermes_cli.kanban_db_active_pr import continue_ready
+        return continue_ready(conn, task_id, expected_terminal_run, actor=actor, reason=reason, dry_run=dry_run)
     cur_status = _task_status(conn, task_id)
     if cur_status is None:
         return False, f"task {task_id} not found"
-
     if cur_status not in ("todo", "blocked"):
-        return False, (
-            f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
-        )
+        return False, (f"task {task_id} is {cur_status!r}; promote only applies to 'todo' or 'blocked' "
+                       f"(a 'ready' card held by active_pr: --expected-terminal-run <latest run>)")
 
     # No override: claim_task demotes ready -> todo on an undone parent whichever
     # writer set 'ready', so a forced promotion would only report a success the
