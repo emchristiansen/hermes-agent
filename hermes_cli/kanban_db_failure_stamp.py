@@ -25,6 +25,12 @@ RESPAWN_BLOCKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The guard's one total order over a card's ended runs, newest first. ``ended_at`` is
+# whole seconds, so a sweep and a spawn failure in one dispatch tick tie; the id breaks
+# it, since a card's runs open one at a time (``current_run_id``) under an ascending
+# AUTOINCREMENT id. Every "latest run" / "later run" decision of the guard uses it.
+LATEST_RUN_FIRST = "ended_at DESC, id DESC"
+
 
 def stamp_superseded(conn, task_id, err) -> bool:
     """True when the run that recorded ``err`` is no longer the card's newest attempt.
@@ -32,27 +38,30 @@ def stamp_superseded(conn, task_id, err) -> bool:
     Every writer that stamps ``tasks.last_failure_error`` for a run (the
     dead-worker sweep, ``_record_task_failure``) copies the same text, capped at
     500 chars, into that run's own ``task_runs.error``, so the newest ended run
-    whose error matches is the stamp's provenance. It is superseded when a later
-    run was actually spawned (``worker_pid``, ``spawned`` or ``worker_registered``)
-    and ended: had that attempt diagnosed a failure it would have re-stamped the
-    column and be the match itself. A stamp no run recorded (PR acceptance, a
+    whose error matches is the stamp's provenance (newest in ``LATEST_RUN_FIRST``
+    order). It is superseded when a run later in that order was actually spawned
+    (``worker_pid``, ``spawned`` or ``worker_registered``) and ended: had that
+    attempt diagnosed a failure it would have re-stamped the column and be the
+    match itself. A stamp no run recorded (PR acceptance, a
     legacy ``last_spawn_error``) is never superseded — the guard fails closed.
     """
     from hermes_cli.kanban_db import _lossy_text
     origin = None
     for run in conn.execute(
-        "SELECT id, error FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
-        "AND error IS NOT NULL ORDER BY id DESC",
+        "SELECT id, ended_at, error FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+        f"AND error IS NOT NULL ORDER BY {LATEST_RUN_FIRST}",
         (task_id,),
     ):
         if (_lossy_text(run["error"]) or "")[:500] == err:
-            origin = run["id"]
+            origin = run
             break
     if origin is None:
         return False
+    # "Later" in the same order: a later second, or the same second and a higher id.
     return conn.execute(
-        "SELECT 1 FROM task_runs r WHERE r.task_id = ? AND r.id > ? AND r.ended_at IS NOT NULL "
+        "SELECT 1 FROM task_runs r WHERE r.task_id = ? AND r.ended_at IS NOT NULL "
+        "AND (r.ended_at > ? OR (r.ended_at = ? AND r.id > ?)) "
         "AND (r.worker_pid IS NOT NULL OR EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = r.task_id "
         "AND e.run_id = r.id AND e.kind IN ('spawned', 'worker_registered'))) LIMIT 1",
-        (task_id, origin),
+        (task_id, origin["ended_at"], origin["ended_at"], origin["id"]),
     ).fetchone() is not None

@@ -198,3 +198,66 @@ def test_a_stamp_no_run_recorded_still_guards_after_an_owner_restart(conn, clock
     assert json.loads(conn.execute(
         "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'owner_restarted' ORDER BY id DESC LIMIT 1",
         (tid,)).fetchone()[0])["exit_code"] == 79
+
+
+# ---------------------------------------------------------------------------
+# Same-second ends (AUTH-PROV-01): ``ended_at`` is whole seconds, so one dispatch tick can
+# end two runs of a card in the same second (the sweep books a dead attempt, then the spawn
+# of the next one fails). "Latest" must follow run order, not whichever tied row SQLite
+# returns first.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def one_second(monkeypatch: pytest.MonkeyPatch):
+    """Freeze the clock: every run in the test ends in the same integer second."""
+    now = int(time.time())
+    monkeypatch.setattr(time, "time", lambda: now + 0.5)
+
+
+def _runs(conn, tid):
+    return [dict(r) for r in conn.execute(
+        "SELECT id, outcome, ended_at FROM task_runs WHERE task_id = ? ORDER BY id", (tid,))]
+
+
+@pytest.mark.parametrize("lane", ["ready", "review"])
+def test_an_auth_failure_ending_in_the_same_second_as_a_crash_still_guards(conn, one_second, lane):
+    tid = kb.create_task(conn, title="same tick auth", assignee="w")
+    _attempt(conn, tid)  # dies without a result: a counted crash
+
+    def spawn_rejected(task, workspace, board=None):
+        raise RuntimeError("401 Unauthorized: invalid API key")
+
+    # One tick: the sweep books the crash, then the next spawn is refused.
+    res = kbd.dispatch_once(conn, spawn_fn=spawn_rejected, failure_limit=5)
+    assert tid in res.crashed
+    runs = _runs(conn, tid)
+    assert [r["outcome"] for r in runs] == ["crashed", "spawn_failed"]
+    assert runs[0]["ended_at"] == runs[1]["ended_at"]
+    stamped = _history(conn, tid)
+    assert stamped[0] == "ready" and "401 Unauthorized" in stamped[1] and stamped[2] == 2
+
+    res = kbd.dispatch_once(conn, dry_run=True)
+    assert dict(res.respawn_guarded).get(tid) == "blocker_auth"
+    assert kbd.check_respawn_guard(conn, tid, lane=lane) == "blocker_auth"
+    assert _history(conn, tid) == stamped
+
+
+@pytest.mark.parametrize("older", ["crashed", "owner_restarted"])
+def test_a_quota_wall_ending_in_the_same_second_as_an_older_attempt_keeps_its_cooldown(conn, one_second, older):
+    tid = kb.create_task(conn, title="same second quota", assignee="w")
+    if older == "crashed":
+        _attempt(conn, tid)
+    else:
+        _owner_restarted_attempt(conn, tid)
+    kbd.dispatch_once(conn, dry_run=True)  # sweep books the older attempt
+
+    _rate_limited_attempt(conn, tid)
+    res = kbd.dispatch_once(conn, dry_run=True)
+    assert tid in res.rate_limited
+    runs = _runs(conn, tid)
+    assert [r["outcome"] for r in runs] == [older, "rate_limited"]
+    assert runs[0]["ended_at"] == runs[1]["ended_at"]
+    assert dict(res.respawn_guarded).get(tid) == "rate_limit_cooldown"
+    assert kbd.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+    assert _history(conn, tid)[2] == (1 if older == "crashed" else 0)
