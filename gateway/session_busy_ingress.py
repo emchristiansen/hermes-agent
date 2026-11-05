@@ -42,14 +42,6 @@ def is_message(authority, ref, row):
     return True
 
 
-def delivered_by(row):
-    """Who delivered the message, when it is not the user's own text: local automation (a Bot Chat
-    delivery, a producer notice) reaches the turn framed with the author its own turn would carry
-    (``turn_author``; ``{}`` for Hermes automation), never as the user's. None for the user's text."""
-    descriptor = row['payload'].get('local_automation_v1')
-    return None if descriptor is None else dict(descriptor.get('turn_author') or {})
-
-
 def steer_soon(authority, ref):
     """Run the pass for ``ref``'s session on the owner loop, one at a time: a request while a pass
     runs makes that pass read the queue again before it exits."""
@@ -88,7 +80,7 @@ async def _pass(authority, ref, live):
                 # queued waits for the next owner, as the drain makes it.
                 return
             try:
-                await transfer(authority, ref, row, generation, delivered_by(row))
+                await transfer(authority, ref, row, generation)
             except RuntimeStoreError as exc:
                 if exc.reason == 'admission_started':
                     continue  # the drain claimed it first: it runs as its own turn
