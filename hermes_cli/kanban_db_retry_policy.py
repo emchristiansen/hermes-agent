@@ -83,43 +83,53 @@ class DeadWorker:
 
 def terminal_run_matches(conn, task_id, expected_run):
     """A latest ended attempt with no live board claim and a known owner terminal."""
+    return terminal_run_refusal(conn, task_id, expected_run) is None
+
+
+def terminal_run_refusal(conn, task_id, expected_run):
+    """Why ``expected_run`` is not a releasable terminal attempt, or None when it is."""
     if type(expected_run) is not int:
-        return False
+        return 'no exact terminal run was named (--expected-terminal-run)'
     task = conn.execute(
         "SELECT claim_lock,worker_pid,current_run_id FROM tasks WHERE id=?", (task_id,),
     ).fetchone()
     latest = conn.execute(
         "SELECT id,ended_at FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
-    if (task is None or latest is None or latest['id'] != expected_run or latest['ended_at'] is None
-            or any(task[key] is not None for key in ('claim_lock', 'worker_pid', 'current_run_id'))):
-        return False
+    if task is None or latest is None:
+        return 'the task has no attempt to release'
+    if latest['id'] != expected_run:
+        return f'run {expected_run} is not the latest attempt (latest is {latest["id"]})'
+    if latest['ended_at'] is None:
+        return f'run {expected_run} has not ended'
+    if any(task[key] is not None for key in ('claim_lock', 'worker_pid', 'current_run_id')):
+        return 'the task still holds a live claim'
     hold = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='blocked' ORDER BY id DESC LIMIT 1",
                         (task_id, expected_run)).fetchone()
     try:
         pending_account = json.loads(hold['payload']).get('accounting_required', False) if hold else False
     except (ValueError, TypeError, AttributeError):
-        return False
+        return f'run {expected_run} has an unreadable hold record'
     if pending_account and conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind='gave_up'",
                                         (task_id, expected_run)).fetchone() is None:
-        return False
+        return f'run {expected_run} failure accounting is not recorded yet'
     # Unlike current-run reclaim, a stopped card requires the exact historical run's owner event.
     event = conn.execute(
         "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='owner_admitted' ORDER BY id DESC LIMIT 1",
         (task_id, expected_run),
     ).fetchone()
     if event is None:
-        return True  # A genuinely unmanaged/legacy attempt has no native admission to reconcile.
+        return None  # A genuinely unmanaged/legacy attempt has no native admission to reconcile.
     try:
         binding = json.loads(event['payload'])
-        with closing(sqlite3.connect(Path(binding['db']).as_uri() + '?mode=ro', uri=True)) as owner:
-            state = owner.execute(
-                "SELECT status FROM session_admissions WHERE target_session_id=? AND request_id=?",
-                (binding['session_id'], binding['request_id']),
-            ).fetchone()
-        return state is not None and state[0] == 'terminal'
-    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
-        return False
+    except (ValueError, TypeError):
+        binding = None
+    state = _owner_admission_state(binding) if isinstance(binding, dict) else None
+    if state is None:
+        return f'run {expected_run} owner admission is unreadable'
+    if state[0] != 'terminal':
+        return f'run {expected_run} owner admission is not terminal yet ({state[0]})'
+    return None
 
 
 def edit_retry_policy(conn, task_id, limit, expected_run, mixed_values, *,
@@ -146,14 +156,83 @@ def edit_retry_policy(conn, task_id, limit, expected_run, mixed_values, *,
     return True
 
 
+def own_scheduled_attempt(conn, task_id):
+    """The run a scheduled card's ordinary callback wake resumes, if the card cleanly yielded.
+
+    Only a claimed attempt that ended by scheduling its own card, whose bound worker then
+    recorded exit 0 and whose owner admission (if managed) settled ``completed``, qualifies:
+    that is a deliberate yield, not a failure whose effects need reconciling. Anything else
+    (no worker result yet, a nonzero exit, an interrupted or unknown admission, a run
+    synthesized by scheduling a held card) keeps the first-failure fence's exact-run release."""
+    task = conn.execute('SELECT status FROM tasks WHERE id=?', (task_id,)).fetchone()
+    latest = conn.execute(
+        "SELECT id,outcome FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if task is None or task['status'] != 'scheduled' or latest is None or latest['outcome'] != 'scheduled':
+        return None
+    run = latest['id']
+    if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed' LIMIT 1",
+                    (task_id, run)).fetchone() is None:
+        return None
+    result = _last_event_payload(conn, task_id, run, 'worker_result')
+    if not isinstance(result, dict) or result.get('exit_code') != 0:
+        return None
+    admitted = _last_event_payload(conn, task_id, run, 'owner_admitted')
+    if admitted is not None and _owner_admission_state(admitted, ('status', 'outcome')) != ('terminal', 'completed'):
+        return None
+    return run
+
+
+def _last_event_payload(conn, task_id, run_id, kind):
+    """The latest ``kind`` event's decoded payload for the run, None when absent; unreadable is {}."""
+    row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind=? ORDER BY id DESC LIMIT 1",
+                       (task_id, run_id, kind)).fetchone()
+    if row is None:
+        return None
+    try:
+        return json.loads(row['payload']) if row['payload'] else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def _owner_admission_state(binding, columns=('status',)):
+    """The ``columns`` of the owner admission an ``owner_admitted`` payload names: a tuple,
+    ('missing',) * n when absent, None when unreadable."""
+    try:
+        with closing(sqlite3.connect(Path(binding['db']).as_uri() + '?mode=ro', uri=True)) as owner:
+            row = owner.execute(
+                f"SELECT {','.join(columns)} FROM session_admissions WHERE target_session_id=? AND request_id=?",
+                (binding['session_id'], binding['request_id']),
+            ).fetchone()
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
+        return None
+    return ('missing',) * len(columns) if row is None else tuple(row)
+
+
 def release_is_fenced(conn, task_id, expected_run):
-    """Ordinary releases keep their old path; selected releases must match the exact attempt."""
+    """Ordinary releases keep their old path; selected releases must match the exact attempt.
+
+    A selected card that scheduled itself names its own attempt, so an ordinary callback wake
+    passes the same terminal-attempt and owner checks as an explicit exact-run release."""
+    return release_refusal(conn, task_id, expected_run) is None
+
+
+def release_refusal(conn, task_id, expected_run):
+    """Why a release of ``task_id`` is refused by this policy, or None when it may proceed."""
     row = conn.execute('SELECT max_retries FROM tasks WHERE id=?', (task_id,)).fetchone()
     if row is None:
-        return False
+        return 'no such task'
     if row['max_retries'] != 1 and expected_run is None:
-        return True
-    return terminal_run_matches(conn, task_id, expected_run) and not kanban_owner_recovery.owner_reclaim_blocked(conn, task_id)
+        return None
+    if expected_run is None:
+        expected_run = own_scheduled_attempt(conn, task_id)
+        if expected_run is None:
+            return ('max_retries=1 holds release until an exact terminal run is named (--expected-terminal-run); '
+                    'only a clean self-scheduled yield (worker exit 0, owner admission completed) wakes without it')
+    refusal = terminal_run_refusal(conn, task_id, expected_run)
+    if refusal is None and kanban_owner_recovery.owner_reclaim_blocked(conn, task_id):
+        refusal = 'its owner may still be executing the attempt'
+    return refusal
 
 
 def first_failure_landing(conn, task_id, phase):
@@ -195,3 +274,13 @@ def record_first_failure_hold(conn, task_id, run_id, phase, append_event, *, acc
         'kind': 'capability', 'retry_status': phase, 'accounting_required': accounting_required,
         'reason': 'selected first-failure hold; reconcile the exact attempt before explicit release',
     }, run_id=run_id)
+
+
+def unblock_refusal(conn, task_id, expected_run=None):
+    """A truthful reason ``unblock_task`` refused ``task_id``, read after the refusal."""
+    task = conn.execute('SELECT status FROM tasks WHERE id=?', (task_id,)).fetchone()
+    if task is None:
+        return 'no such task'
+    if task['status'] not in ('blocked', 'scheduled'):
+        return f'status is {task["status"]}, not blocked/scheduled'
+    return release_refusal(conn, task_id, expected_run) or 'it changed while being released; retry'
