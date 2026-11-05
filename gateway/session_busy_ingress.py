@@ -9,8 +9,10 @@ An idle session still runs the message as its own turn at once (the drain is unc
 The pass runs after each admission while a claim executes, and when the claim adopts its agent (a
 message admitted before that has no agent to reach yet). Messages are interactive plain text (what
 ``prompt.steer_queued`` already offers) and local automation text: Kanban and process notices, liveness
-ticks and Bot Chat deliveries, including the Desktop relay's. A row whose route no longer belongs to
-this session is left to the drain, which refuses it as before. Whole jobs keep their own turn:
+ticks and Bot Chat deliveries, including the Desktop relay's; these reach the turn framed with their
+sender, never as the user's text. A row whose route no longer belongs to this session is left to the
+drain, which refuses it as before, and nothing steers while the runtime drains (a restart's queued
+input waits for the next owner, as the drain makes it). Whole jobs keep their own turn:
 attachments, finite/cron/Kanban/API/A2A/hosted runs and hidden prompts, whose producers read that
 turn's own result. Messaging-platform text steers through the messaging busy path, before admission.
 """
@@ -38,6 +40,17 @@ def is_message(authority, ref, row):
     except RuntimeStoreError:
         return False
     return True
+
+
+def steered_text(row):
+    """How the running turn receives the message: the user's own text as theirs; local automation (a Bot
+    Chat delivery, a producer notice) framed with its sender, never as the user's (``turn_author`` is the
+    author the message's own turn would have had)."""
+    descriptor = row['payload'].get('local_automation_v1')
+    if descriptor is None:
+        return row['payload']['text']
+    from agent.prompt_builder import format_delivered_message
+    return format_delivered_message(row['payload']['text'], descriptor.get('turn_author'))
 
 
 def steer_soon(authority, ref):
@@ -68,12 +81,14 @@ async def _pass(authority, ref, live):
             agent = None if generation is None else _receiving_agent(authority, ref.session_id, generation)
         if agent is None or ref.session_id in getattr(authority, '_managed_workers', {}):
             return  # idle (the drain runs them), no agent yet (adoption runs this again), or a managed worker
+        if authority.runner._draining or authority.retiring:
+            return  # the drain's own gate: what is queued during a restart waits for the next owner
         rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=ref.session_id)
         for row in rows:
             if row['status'] != 'queued' or not is_message(authority, ref, row):
                 continue
             try:
-                await transfer(authority, ref, row, generation)
+                await transfer(authority, ref, row, generation, steered_text(row))
             except RuntimeStoreError as exc:
                 if exc.reason == 'admission_started':
                     continue  # the drain claimed it first: it runs as its own turn

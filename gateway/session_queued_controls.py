@@ -155,11 +155,13 @@ async def steer_queued(connection, ref, params):
     return asdict(authority._receipt(await transfer(authority, ref, row, handle.execution_generation)))
 
 
-async def transfer(authority, ref, row, generation):
-    """Transfer the queued ``row`` to the running claim ``generation`` and hand its text to that claim's
-    agent; returns the committed row. Refuses (``steer_unavailable``) with the row untouched while the
-    claim has no agent, and queues it again in its own place when the claim ended before delivery."""
-    admission_id, text, live = row['admission_id'], row['payload']['text'], authority.sessions[ref.session_id]
+async def transfer(authority, ref, row, generation, text=None):
+    """Transfer the queued ``row`` to the running claim ``generation`` and hand its text (``text``: how the
+    turn receives it, its payload text by default) to that claim's agent; returns the committed row.
+    Refuses (``steer_unavailable``) with the row untouched while the claim has no agent, and queues it
+    again in its own place when the claim ended before delivery."""
+    admission_id, live = row['admission_id'], authority.sessions[ref.session_id]
+    text = row['payload']['text'] if text is None else text
     session_id = ref.session_id
     with live.event_stream.lock:
         agent = _receiving_agent(authority, session_id, generation)

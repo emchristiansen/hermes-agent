@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 from collections import OrderedDict
@@ -554,9 +555,43 @@ CONTROL_FRAME_OPENERS = (
 )
 
 
+# A message another principal delivered into the running turn (a peer bot's Bot Chat delivery, a producer
+# notice): its own frame names who sent it and never carries the user's authority. Its body cannot contain
+# either frame's markers (``format_delivered_message`` neutralizes them), so a delivered segment ends
+# exactly at its own close marker.
+DELIVERED_MARKER_OPEN = "[DELIVERED MESSAGE"
+DELIVERED_MARKER_CLOSE = "[/DELIVERED MESSAGE]"
+_FRAME_MARKER = re.compile(r"\[(?=/?(?:DELIVERED MESSAGE|OUT-OF-BAND USER MESSAGE))")
+_DELIVERED_SEGMENT = re.compile(re.escape(DELIVERED_MARKER_OPEN) + r" — [^\n]*\]\n.*?\n" + re.escape(DELIVERED_MARKER_CLOSE), re.DOTALL)
+
+
+def format_delivered_message(text: str, author: Optional[dict[str, Any]] = None) -> str:
+    """Frame ``text`` that ``author`` (``{"id", "name", "is_bot"}``; None for Hermes automation) delivered
+    while a turn ran: steered into that turn, it keeps its sender and is never a message from the user."""
+    def label(value: Any) -> str:  # one header line, never a bracket that could end it
+        return re.sub(r"[\[\]\n]", "", str(value or ""))
+    if author:
+        sender = f"from {label(author.get('name') or author.get('id'))} ({label(author.get('id'))})"
+        sender += ", an agent" if author.get("is_bot") else ""
+    else:
+        sender = "from Hermes automation"
+    return (f"{DELIVERED_MARKER_OPEN} — {sender}, not from the user; delivered once at this position while you "
+            f"worked; not tool output and not a new delivery when replayed from conversation history]\n"
+            f"{_FRAME_MARKER.sub('(', text)}\n{DELIVERED_MARKER_CLOSE}")
+
+
 def format_steer_marker(steer_text: str) -> str:
-    """Wrap a mid-turn steer in the self-describing marker (see note above)."""
-    return f"\n\n{STEER_MARKER_OPEN}\n{steer_text}\n{STEER_MARKER_CLOSE}"
+    """Wrap a mid-turn steer in the self-describing marker (see note above). Delivered messages
+    (``format_delivered_message``) keep their own frame; only the user's text is wrapped."""
+    pieces, start = [], 0
+    for match in _DELIVERED_SEGMENT.finditer(steer_text):
+        pieces += [(False, steer_text[start:match.start()]), (True, match.group())]
+        start = match.end()
+    if not pieces:
+        return f"\n\n{STEER_MARKER_OPEN}\n{steer_text}\n{STEER_MARKER_CLOSE}"
+    pieces.append((False, steer_text[start:]))
+    return "\n\n" + "\n".join(text if delivered else f"{STEER_MARKER_OPEN}\n{text.strip(chr(10))}\n{STEER_MARKER_CLOSE}"
+                              for delivered, text in pieces if delivered or text.strip())
 
 
 STEER_DISPLAY_KIND = "steer"
