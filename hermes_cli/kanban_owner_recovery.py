@@ -91,6 +91,21 @@ def _owner_process_gone(receipt) -> bool:
     return birth is not None and current != birth
 
 
+def _owner_settled_admission(receipt) -> bool:
+    """True when the receipt's admission is ``terminal`` in the owner's own ledger.
+
+    A live owner settles an attempt it can no longer run (a lost managed worker, before or after
+    binding) ``terminal``/``interrupted`` and runs it no further; terminal says the owner is done
+    executing it, not what its effects were. An unreadable ledger is never proof."""
+    try:
+        with closing(sqlite3.connect(Path(receipt['db']).as_uri() + '?mode=ro', uri=True)) as owner:
+            row = owner.execute('SELECT status FROM session_admissions WHERE target_session_id=? AND request_id=?',
+                                (receipt['session_id'], receipt['request_id'])).fetchone()
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
+        return False
+    return row is not None and row[0] == 'terminal'
+
+
 def _run_worker_pids(conn, task_row, task_id):
     """Every worker pid recorded for the task's current run, with its spawn fingerprint."""
     recorded = [(task_row['worker_pid'], task_row['worker_started_at'])]
@@ -113,7 +128,8 @@ def owner_attempt_provably_over(conn, task_id) -> bool:
 
       * the claim is host-local and EXPIRED (a live claim is the owner still working);
       * no heartbeat inside ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS``;
-      * the receipt's own process is gone or recycled;
+      * the receipt's own process is gone or recycled, or that owner has settled the admission
+        ``terminal`` (a live owner fences a managed worker it lost before ``worker_bound``);
       * every worker pid recorded for the run (``tasks.worker_pid``, its ``spawned`` and
         ``worker_bound`` events) is dead or recycled.
 
@@ -136,7 +152,8 @@ def owner_attempt_provably_over(conn, task_id) -> bool:
     heartbeat = kb._to_epoch(row['last_heartbeat_at'])
     if heartbeat is not None and now - heartbeat <= kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS:
         return False
-    if not _owner_process_gone(_latest_run_event(conn, task_id, 'owner_admitted')):
+    receipt = _latest_run_event(conn, task_id, 'owner_admitted')
+    if not (_owner_process_gone(receipt) or _owner_settled_admission(receipt)):
         return False
     pids = _run_worker_pids(conn, row, task_id)
     if not pids:
