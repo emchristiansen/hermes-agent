@@ -1,17 +1,21 @@
 """Closing the app before onboarding finishes does not count: the next launch's ``onboarding.start``
-(``fresh_launch``) deletes the unfinished chat and starts over at the name beat, while a second window
-or a reconnect in the same launch (no flag) keeps the run."""
+(``fresh_launch``) ends the unfinished run as ``replaced`` and starts over at the name beat in a new
+chat, while the old chat stays in the history with every message. A second window or a reconnect in
+the same launch (no flag) keeps the run."""
 
 from __future__ import annotations
 
+import os
+import threading
 from pathlib import Path
 
 import pytest
 
 from agent import onboarding_record
-from agent.onboarding_flow import PENDING, Answered, Facts, Shown
+from agent.onboarding_flow import PENDING, Answered, Facts, Shown, is_active
+from agent.onboarding_text import CHAT_TITLE
 from hermes_cli.config import read_user_config_raw
-from tui_gateway import server
+from tui_gateway import server, server_requests
 
 FACTS = Facts(os="macos", arch="arm64", machine_kind="Mac", plugins=())
 
@@ -67,28 +71,48 @@ def _run_flag(root: Path) -> bool:
     return read_user_config_raw(root / "config.yaml")["onboarding"]["run"]
 
 
-def test_a_new_launch_deletes_the_unfinished_chat_and_starts_over_at_the_name_beat(root, client, ended):
+def _quit_mid_run(db, old: str) -> list[dict]:
+    """The user got past the name card and talked in the chat, then quit the app; returns its messages."""
+    onboarding_record.advance(db, old, Shown("name"))
+    onboarding_record.advance(db, old, Answered("name", {"name": "Sid"}))
+    db.append_message(old, "assistant", "Hi! What should I call you?")
+    db.append_message(old, "user", "Call me Sid.")
+    db.append_message(old, "assistant", "Nice to meet you, Sid. Want to pick a theme next?")
+    messages = db.get_messages(old)
+    assert len(messages) == 4  # the hidden opening the start stored, then the dialogue
+    return messages
+
+
+def test_a_new_launch_keeps_the_unfinished_chat_and_starts_over_at_the_name_beat(root, client, ended):
     first = _start({"fresh_launch": True})
     old = first["stored_session_id"]
     db = server._get_db()
     old_title = db.get_session(old)["title"]
-    # The user got past the name card, then quit the app.
-    onboarding_record.advance(db, old, Shown("name"))
-    onboarding_record.advance(db, old, Answered("name", {"name": "Sid"}))
+    messages = _quit_mid_run(db, old)
     assert onboarding_record.load(db, old)["beats"]["name"] != PENDING
 
     again = _start({"fresh_launch": True})
     new = again["stored_session_id"]
 
     assert new != old and again["resumed"] is False and again["run_id"] != first["run_id"]
-    assert db.get_session(old) is None
-    assert [(e["stored_session_id"], e["outcome"]) for e in ended] == [(old, "deleted")]
+    # The old chat and every message in it stay; its run ended as replaced, and every window was told.
+    assert db.get_session(old) is not None and db.get_messages(old) == messages
+    old_record = onboarding_record.load(db, old)
+    assert old_record["ended_by"] == "replaced" and not is_active(old_record)
+    assert [(e["run_id"], e["stored_session_id"], e["outcome"]) for e in ended] == [
+        (first["run_id"], old, "replaced")]
     record = onboarding_record.load(db, new)
-    assert onboarding_record.active_session_id(db) == new and record["beats"]["name"] == PENDING
-    # The fresh chat plays the opening again, under the title the deleted chat had.
+    assert onboarding_record.open_session_ids(db) == [new] and record["beats"]["name"] == PENDING
+    # The fresh chat plays the opening again; the kept chat keeps its title, the new one is next in the lineage.
     assert [kind for kind, _ in client] == ["resume", "submit", "resume", "submit"]
-    assert db.get_session(new)["title"] == old_title
+    assert old_title == CHAT_TITLE and db.get_session(old)["title"] == old_title
+    assert db.get_session(new)["title"] == f"{CHAT_TITLE} #2"
     assert _run_flag(root) is True
+    # The old run is never resumed: a second window or a reconnect gets the new one.
+    resumed = _start()
+    assert resumed["stored_session_id"] == new and resumed["resumed"] is True
+    assert server.handle_request({"jsonrpc": "2.0", "id": 8, "method": "onboarding.state",
+                                  "params": {}})["result"]["session_id"] == new
 
 
 def test_a_second_window_or_a_reconnect_keeps_the_run(root, client, ended):
@@ -100,14 +124,66 @@ def test_a_second_window_or_a_reconnect_keeps_the_run(root, client, ended):
     assert again["run_id"] == first["run_id"] and ended == []
 
 
-def test_a_new_launch_closes_the_unfinished_chat_still_live_here_before_deleting_it(root, client, ended, monkeypatch):
+def test_a_new_launch_closes_the_unfinished_chat_still_live_here_and_withdraws_its_card(root, client, ended,
+                                                                                       monkeypatch):
     old = _start({"fresh_launch": True})["stored_session_id"]
-    closed = []
+    db = server._get_db()
+    messages = _quit_mid_run(db, old)
+    closed, events = [], []
     monkeypatch.setitem(server._sessions, "rt-live", {"session_key": old})
     monkeypatch.setattr(server, "_close_session_by_id",
-                        lambda sid, **kw: closed.append((sid, server._get_db().get_session(old) is not None)))
+                        lambda sid, **kw: closed.append((sid, kw, server._get_db().get_session(old) is not None)))
+    monkeypatch.setattr(server_requests, "_answerable", lambda _sid: True)
+    monkeypatch.setattr(server_requests, "_write", lambda frame: None)
+    monkeypatch.setattr(server_requests, "_emit", lambda kind, sid, payload: events.append((kind, sid, payload)))
+    reply = []
+    waiter = threading.Thread(target=lambda: reply.append(server._setup_beat_request(
+        "rt-live", {"beat": "theme", "card": {"picker": "accent"}})), daemon=True)
+    waiter.start()
+    from tests.waiting import wait_until
+    wait_until(lambda: server_requests.pending_kind("rt-live") == "setup_beat")
 
     _start({"fresh_launch": True})
+    waiter.join(timeout=5)
 
-    assert closed == [("rt-live", True)]
-    assert server._get_db().get_session(old) is None
+    assert closed == [("rt-live", {"end_reason": "onboarding_restart"}, True)]
+    assert reply == [None] and [(kind, sid) for kind, sid, _ in events] == [("request.cancel", "rt-live")]
+    assert db.get_messages(old) == messages
+    assert onboarding_record.load(db, old)["ended_by"] == "replaced"
+    assert [e["outcome"] for e in ended] == ["replaced"]
+
+
+def test_a_new_launch_keeps_a_chat_a_turn_still_writes_and_ends_its_run_as_replaced(root, client, ended):
+    old = _start({"fresh_launch": True})["stored_session_id"]
+    db = server._get_db()
+    messages = _quit_mid_run(db, old)
+    holder = f"pid={os.getpid()}:turn=onboarding-test"
+    assert db.try_acquire_session_turn_lease(old, holder, ttl_seconds=300.0)
+    try:
+        new = _start({"fresh_launch": True})["stored_session_id"]
+    finally:
+        db.release_session_turn_lease(old, holder)
+
+    assert new != old and db.get_messages(old) == messages
+    assert onboarding_record.load(db, old)["ended_by"] == "replaced"
+    assert onboarding_record.open_session_ids(db) == [new]
+    assert [(e["stored_session_id"], e["outcome"]) for e in ended] == [(old, "replaced")]
+
+
+def test_deleting_a_kept_chat_or_the_new_run_by_hand_still_deletes(root, client, ended):
+    old = _start({"fresh_launch": True})["stored_session_id"]
+    db = server._get_db()
+    _quit_mid_run(db, old)
+    new = _start({"fresh_launch": True})["stored_session_id"]
+
+    # The kept chat is an ordinary chat now: the user can still delete it; its run already ended.
+    assert server.handle_request({"jsonrpc": "2.0", "id": 9, "method": "session.delete",
+                                  "params": {"session_id": old}})["result"] == {"deleted": old}
+    assert db.get_session(old) is None and db.get_messages(old) == []
+    assert [e["outcome"] for e in ended] == ["replaced"]
+    # Deleting the chat of the run in progress ends it (deleted) and tells every window, as before.
+    assert server.handle_request({"jsonrpc": "2.0", "id": 10, "method": "session.delete",
+                                  "params": {"session_id": new}})["result"] == {"deleted": new}
+    assert db.get_session(new) is None
+    assert [(e["stored_session_id"], e["outcome"]) for e in ended] == [(old, "replaced"), (new, "deleted")]
+    assert onboarding_record.active_session_id(db) is None and _run_flag(root) is False
