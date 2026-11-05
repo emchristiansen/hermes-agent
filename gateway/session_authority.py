@@ -21,7 +21,7 @@ from gateway.session_contract import (
 from gateway.session_events import SessionEvents
 from gateway.session_pending_controls import PendingControls
 from hermes_state_runtime import (
-    STEERING, RuntimeStoreError, admit_session_input, begin_runtime_epoch,
+    OWNER_RESTART, STEERING, RuntimeStoreError, admit_session_input, begin_runtime_epoch,
     cancel_session_input, claim_session_input, get_session_admission,
     list_session_admissions, recover_session_inputs, resolve_unknown_session_input,
 )
@@ -390,7 +390,10 @@ class SessionAuthority:
 
     def _receipt(self, row):
         status, outcome = row['status'], row['outcome']
-        if outcome == STEERING:  # handed to the running claim: it reads as that execution until settled
+        # Handed to the running claim, or a card attempt lost to its owner's end that still owes its
+        # board the restart result: it reads as that execution until settled (a submitter that read
+        # ``unknown`` would exit before the cause it waits for is published).
+        if outcome == STEERING or (status, outcome) == ('unknown', OWNER_RESTART):
             status, outcome = 'started', None
         return AdmissionReceipt(row['admission_id'], SessionRef(self.profile_id, row['target_session_id']),
                                 row['seq'], status, outcome, row['owner_epoch'] or self.epoch, row['generation'])
@@ -1392,11 +1395,10 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     db_key = await asyncio.to_thread(Path(db.db_path).resolve)
     epoch = await asyncio.to_thread(begin_runtime_epoch, db, instance_id=instance_id)
     # Hot-serve builds a profile while the loop serves the others: both writes stay off it.
-    from gateway.session_unattended_unknown import inflight_admissions, settle_recovered_unattended
-    inflight = await asyncio.to_thread(inflight_admissions, db)
     await asyncio.to_thread(recover_session_inputs, db, epoch=epoch)
     # A lost automation turn has nobody to resolve it: it settles interrupted before any FIFO runs.
-    await asyncio.to_thread(settle_recovered_unattended, db, epoch, inflight)
+    from gateway.session_unattended_unknown import settle_recovered_unattended
+    await asyncio.to_thread(settle_recovered_unattended, db, epoch)
     await asyncio.to_thread(backfill_legacy_session_owners, db)
     await asyncio.to_thread(backfill_compression_created_sources, db)
     authority = SessionAuthority(runner, profile_id=profile_id, instance_id=instance_id, db=db, epoch=epoch)

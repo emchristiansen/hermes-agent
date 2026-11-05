@@ -8,7 +8,7 @@ import secrets
 import subprocess
 
 from gateway.session_admission import admission_fingerprint
-from hermes_state_runtime import RuntimeStoreError, _admission, _epoch, _secret_digest, _session
+from hermes_state_runtime import OWE_OWNER_RESTART, RuntimeStoreError, _admission, _epoch, _secret_digest, _session
 
 # A venv launcher (uv's Windows python.exe, pip's exe shim) sits between the owner's
 # handle and the interpreter; the real worker is never further away than this.
@@ -95,11 +95,13 @@ def reserve_admission_worker(authority, *, admission_id, process, principal_id, 
     return authority.db._execute_write(write)
 
 
-def lose_admission_worker(authority, row, scope):
+def lose_admission_worker(authority, row, scope, owner_restart=False):
     """Revoke a private assignment and pause its FIFO; no inference replay.
 
     This also fences a result already in the pipe at loss/shutdown. Retention
     requires a still-started admission even when the generation has not changed.
+    ``owner_restart``: the owner was already ending when it found the worker lost, so a Kanban card
+    attempt's cause (``OWNER_RESTART``) commits with this fence.
     """
     def write(conn):
         _epoch(conn, scope['epoch'])
@@ -115,5 +117,7 @@ def lose_admission_worker(authority, row, scope):
         from hermes_state_runtime_workers import compact_terminal_receipts
         compact_terminal_receipts(conn, scope['execution_id'])
         conn.execute("UPDATE session_admissions SET status='unknown' WHERE admission_id=?", (row['admission_id'],))
+        if owner_restart:
+            conn.execute(OWE_OWNER_RESTART + ' AND admission_id=?', (row['admission_id'],))
         conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (current['target_session_id'],))
     authority.db._execute_write(write)

@@ -295,6 +295,14 @@ def cancel_session_input(db, *, epoch: int, admission_id: str) -> dict:
 # back to ``queued`` (its own FIFO place) when the text never reached the claim's agent.
 STEERING = 'steering'
 
+# An ``unknown`` Kanban card attempt lost because its owner itself ended (stopping, or a predecessor
+# that left it running): the cause it still owes its board (``session_unattended_unknown``), committed
+# in the same transaction as its loss fence so no cancellation or later owner loss can drop it. It
+# reads as in flight until it settles ``interrupted``, which replaces it.
+OWNER_RESTART = 'owner_restart'
+OWE_OWNER_RESTART = ("UPDATE session_admissions SET outcome='" + OWNER_RESTART + "' WHERE outcome IS NULL "
+                     "AND json_type(payload_json, '$.kanban_card_v1') IS NOT NULL")
+
 
 def steer_replayed(row) -> bool:
     """``row`` is a committed transfer (still in flight, or settled ``steered``): an exact retry of
@@ -457,6 +465,9 @@ def recover_session_inputs(db, *, epoch: int) -> int:
         # A steer handed to a lost claim may or may not have reached its agent: never replayed.
         conn.execute("UPDATE session_admissions SET outcome='interrupted' WHERE status='terminal' AND outcome=? "
                      "AND owner_epoch!=?", (STEERING, epoch))
+        # A card attempt a previous owner left running was lost to that owner's end: its cause
+        # commits with this fence (``OWNER_RESTART``).
+        conn.execute(OWE_OWNER_RESTART + " AND status='started' AND owner_epoch!=?", (epoch,))
         return conn.execute("UPDATE session_admissions SET status='unknown' WHERE status='started' AND owner_epoch!=?", (epoch,)).rowcount
     return db._execute_write(write)
 

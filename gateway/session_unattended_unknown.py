@@ -12,13 +12,25 @@ Such a row settles through the same fenced resolution a person's Discard uses
 Hermes transcript notice committed in the same transaction. No second recovery store.
 
 A Kanban card attempt lost because its owner itself ended (this owner already stopping or restarting
-when it fenced the lost worker, or a predecessor that left the turn in flight) also gets that cause
-recorded as the run's result before it settles (``record_owner_restart``), so the dispatcher requeues
-the card without counting a failure. A turn lost under a live, continuing owner keeps its crash booking.
+when it fenced the lost worker, or a predecessor that left the turn in flight) carries that cause
+durably: ``OWNER_RESTART``, committed in the same transaction as its ``unknown`` fence. Its terminal
+settlement first publishes the cause as the run's result (``publish_owed_restart``), so the
+dispatcher requeues the card without counting a failure. The states are:
+
+* ``unknown``/``OWNER_RESTART``: owed. The receipt reads as in flight. Boot tries once; the drain
+  retries a storage failure in place while its owner serves. An ending owner leaves it to the next
+  boot.
+* the result is recorded, or provably moot (a stale run or claim, a result the interpreter already
+  recorded, no board for the attempt): it settles ``terminal``/``interrupted``. That write replaces
+  the cause, and a repeat publication finds the result and records nothing.
+
+A turn lost under a live, continuing owner never carries the cause, so it keeps its crash booking.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import sqlite3
 
 from hermes_state_keys import CRON_PRINCIPAL_ID
 
@@ -52,15 +64,24 @@ def owner_ending(authority) -> bool:
                 or getattr(runner, '_restart_requested', False))
 
 
-def record_owner_restart(db, row) -> None:
-    """Record that this card attempt was lost because its owner ended, BEFORE its terminal settlement
-    is written, so a submitter that reads the terminal receipt also reads the cause. Callers decide
-    the cause where the loss is fenced: the managed-worker loss path (this owner already ending when
-    it found the worker lost) or boot recovery (a row its predecessor left running). Best effort: a
-    failure only leaves the attempt's ordinary crash booking."""
+# Transient board/store failures: the owed result stays owed and its terminal receipt waits.
+_STORAGE_ERRORS = (OSError, sqlite3.OperationalError)
+# Capped backoff for the drain's in-place retry of an owed publication.
+_OWED_RETRY_MIN_S, _OWED_RETRY_MAX_S = 0.5, 5.0
+
+
+def publish_owed_restart(db, row) -> bool:
+    """Publish the restart result ``row`` owes (``OWNER_RESTART``) before its terminal settlement, so
+    a submitter or dispatcher that reads the terminal receipt also reads the cause. True once the row
+    may settle: recorded now, nothing owed, or moot (``record_owner_restart_result`` refuses a stale
+    run or claim and never writes over an existing result; an attempt whose board policy is not this
+    one's has nowhere to record it). A store that cannot take the write now raises
+    (``_STORAGE_ERRORS``): the row stays owed. Any other failure is logged and settles without it,
+    leaving the ordinary crash booking."""
+    from hermes_state_runtime import OWNER_RESTART
     card = (row.get('payload') or {}).get('kanban_card_v1')
-    if card is None:
-        return
+    if row.get('outcome') != OWNER_RESTART or card is None:
+        return True
     from gateway.session_kanban import card_board_db, record_owner_restart_result
     try:
         with db._read_ctx() as conn:
@@ -68,22 +89,18 @@ def record_owner_restart(db, row) -> None:
         if board_db is not None and record_owner_restart_result(card, board_db):
             logger.info('Kanban attempt %s/%s run %s: owner restart recorded (not replayed)',
                         card.get('board'), card.get('task_id'), card.get('run_id'))
+    except _STORAGE_ERRORS:
+        raise
     except Exception:
-        logger.warning('Kanban attempt %r: owner restart not recorded', card, exc_info=True)
+        logger.warning('Kanban attempt %r: owner restart not recordable; settling without it', card, exc_info=True)
+    return True
 
 
-def inflight_admissions(db) -> frozenset:
-    """Admissions a previous owner left ``started``: read before ``recover_session_inputs`` fences them."""
-    with db._read_ctx() as conn:
-        return frozenset(r[0] for r in conn.execute(
-            "SELECT admission_id FROM session_admissions WHERE status='started'").fetchall())
-
-
-def settle_recovered_unattended(db, epoch, inflight=frozenset()) -> int:
+def settle_recovered_unattended(db, epoch) -> int:
     """Boot recovery, right after ``recover_session_inputs`` fenced lost turns ``unknown`` and before
-    any FIFO is scheduled: settle every unattended one. Synchronous; runs off the owner loop.
-    ``inflight``: admissions the previous owner left running (``inflight_admissions``), so lost because
-    that owner ended; a row it had already fenced ``unknown`` itself is not one of them."""
+    any FIFO is scheduled: settle every unattended one. Synchronous; runs off the owner loop. A row
+    whose owed restart result cannot be published now stays ``unknown`` for its drain to retry
+    (``recover_local_sessions`` schedules it)."""
     from agent.turn_failure_copy import AUTOMATION_INTERRUPTED_NOTICE
     from gateway.session_ingress_media import release_admission_media
     from gateway.session_results import close_discarded_turn
@@ -93,9 +110,12 @@ def settle_recovered_unattended(db, epoch, inflight=frozenset()) -> int:
             "SELECT * FROM session_admissions WHERE status='unknown' ORDER BY seq").fetchall()]
     settled = 0
     for row in _unattended_unknown(rows):
-        if row['admission_id'] in inflight:
-            # Before the terminal write: whoever reads the settled receipt also finds its cause.
-            record_owner_restart(db, row)
+        try:
+            publish_owed_restart(db, row)
+        except _STORAGE_ERRORS as exc:
+            logger.warning('Lost Kanban admission %s left owed: owner restart not published (%r)',
+                           row['admission_id'], exc)
+            continue
         try:
             resolve_unknown_session_input(
                 db, epoch=epoch, admission_id=row['admission_id'], generation=row['generation'],
@@ -110,17 +130,36 @@ def settle_recovered_unattended(db, epoch, inflight=frozenset()) -> int:
     return settled
 
 
+async def _published_in_drain(authority, row) -> bool:
+    """``publish_owed_restart`` from the owner's drain: while this owner serves, a storage failure is
+    retried in place (the session's FIFO is held behind the row anyway); an ending owner leaves the
+    durable cause to its successor's boot. False when the row must stay ``unknown``."""
+    delay = _OWED_RETRY_MIN_S
+    while True:
+        try:
+            return await asyncio.to_thread(publish_owed_restart, authority.db, row)
+        except _STORAGE_ERRORS as exc:
+            if owner_ending(authority):
+                logger.warning('Lost Kanban admission %s left owed for the next owner: owner restart not '
+                               'published (%r)', row['admission_id'], exc)
+                return False
+            logger.warning('Lost Kanban admission %s: owner restart not published (%r); retrying in %.1fs',
+                           row['admission_id'], exc, delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, _OWED_RETRY_MAX_S)
+
+
 async def settle_unattended_unknown(authority, ref) -> bool:
     """The drain found an ``unknown`` head (fenced in this owner, e.g. a lost managed worker):
     settle the unattended ones through the owner's resolution. True when any settled, so the
     drain re-reads its FIFO instead of pausing; a person's ``unknown`` row still pauses it."""
-    import asyncio
-
     from agent.turn_failure_copy import AUTOMATION_INTERRUPTED_NOTICE
     from hermes_state_runtime import RuntimeStoreError, list_session_admissions
     rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=ref.session_id)
     settled = False
     for row in _unattended_unknown(rows):
+        if not await _published_in_drain(authority, row):
+            continue
         try:
             await authority.resolve_unknown_as_owner(ref, row['admission_id'], row['generation'],
                                                      notice=AUTOMATION_INTERRUPTED_NOTICE)

@@ -45,15 +45,13 @@ def _describe_exit(returncode):
 
 async def _fence_lost_worker(authority, row, scope):
     """Fence a lost worker's admission ``unknown``. The loss's cause is bound here, where it is found:
-    an owner already stopping lost it to its own end, which is recorded before any terminal receipt.
-    A kill under a live owner stays a crash even if a stop begins afterwards."""
+    an owner already stopping lost it to its own end, and that cause commits with the fence itself,
+    so the settlement that follows (this drain's, or a later owner's boot) owes the card its restart
+    result. A kill under a live owner stays a crash even if a stop begins afterwards."""
     from gateway.session_runtime_workers import tracked_write
-    from gateway.session_unattended_unknown import owner_ending, record_owner_restart
+    from gateway.session_unattended_unknown import owner_ending
     from gateway.session_worker_reservation import lose_admission_worker
-    owner_ended = owner_ending(authority)
-    await tracked_write(authority, partial(lose_admission_worker, authority, row, scope))
-    if owner_ended:
-        await asyncio.to_thread(record_owner_restart, authority.db, row)
+    await tracked_write(authority, partial(lose_admission_worker, authority, row, scope, owner_ending(authority)))
 
 
 class ManagedExecutionUnknown(RuntimeError):
