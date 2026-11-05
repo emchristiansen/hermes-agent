@@ -215,9 +215,20 @@ class GatewayClient:
         self.pending[rid] = future
         self.events.moved.set()  # a reader waiting on the consumer reads on toward this answer
         try:
-            await self.websocket.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}))
+            from websockets.exceptions import ConnectionClosed
+            try:
+                await self.websocket.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}))
+            except ConnectionClosed as exc:
+                # The frame may already be on the wire (a send can fail while it waits to drain).
+                raise GatewayClientError("Gateway disconnected while the request was being sent; whether the "
+                                         "gateway received it is unknown.") from exc
             budget = DEFAULT_RPC_TIMEOUT if _timeout is None else _timeout
-            return await asyncio.wait_for(future, None if budget == float("inf") else budget)
+            try:
+                return await asyncio.wait_for(future, None if budget == float("inf") else budget)
+            except TimeoutError as exc:
+                # Unanswered, not unconnected: a bare TimeoutError reads as a failed connection
+                # (connect_gateway). The request was sent, so its outcome is unknown.
+                raise GatewayClientError(f"Gateway did not answer {method} within {budget:g} s") from exc
         finally:
             self.pending.pop(rid, None)
 
@@ -259,12 +270,14 @@ def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None, 
 
 
 @asynccontextmanager
-async def connect_gateway(endpoint=None, subject=None):
+async def connect_gateway(endpoint=None, subject=None, ready_timeout=None):
     """Attach to this home's owner. ``endpoint``: an already-discovered ready owner to dial as-is
     (maintenance that must never start a gateway); default ensures one, starting it if needed.
     ``subject``: mint the ticket for this principal (the caller's authenticated dashboard user)
-    rather than the socket identity; only a peer the owner already trusts may name one."""
+    rather than the socket identity; only a peer the owner already trusts may name one.
+    ``ready_timeout``: seconds the owner ensure may take (default: its own deadline)."""
     from websockets.asyncio.client import connect
+    from websockets.exceptions import InvalidMessage
     from hermes_constants import get_hermes_home
     from hermes_cli.gateway_runtime import attachable, ensure_gateway_runtime, gateway_profile_home
     from urllib.parse import urlsplit
@@ -285,7 +298,10 @@ async def connect_gateway(endpoint=None, subject=None):
         home = gateway_profile_home(get_hermes_home())
         # A client's own start: the daemon it may launch ends itself once idle (no client, adapter,
         # cron/kanban work or admission), and the next client starts a fresh one.
-        result = await asyncio.to_thread(ensure_gateway_runtime, home, idle_exit=True)
+        # ``ready_timeout`` bounds the ensure, which runs on in its thread even once this await is
+        # cancelled (and the process cannot exit before it ends); default: its own deadline.
+        bound = {} if ready_timeout is None else {"timeout": ready_timeout}
+        result = await asyncio.to_thread(ensure_gateway_runtime, home, idle_exit=True, **bound)
         if not attachable(result):
             detail = getattr(result, "detail", None)
             if result.reason_code == "runtime_exited" and detail:
@@ -301,13 +317,20 @@ async def connect_gateway(endpoint=None, subject=None):
         # The gateway is a loopback (or explicitly named) peer, never something to route through the
         # user's HTTP(S) proxy; websockets>=14 reads HTTP_PROXY/HTTPS_PROXY by default and a proxy that
         # cannot reach 127.0.0.1 turns every launch into a 10 s open timeout.
+        # No keepalive to a loopback owner, as its listener sends none (build_listener_server): the
+        # owner answers pongs on its event loop, so a GIL-starved loop would miss the 20 s pong
+        # deadline and the healthy socket would be dropped. A dead loopback owner closes the socket.
+        from hermes_cli.web_server_boundary import _LOOPBACK_HOST_VALUES
+        keepalive = {"ping_interval": None} if urlsplit(url).hostname in _LOOPBACK_HOST_VALUES else {}
         async with connect(url, subprotocols=protocols, open_timeout=10, max_size=8 * 1024 * 1024,
-                           proxy=None) as ws:
+                           proxy=None, **keepalive) as ws:
             if protocols and ws.subprotocol != GATEWAY_WS_PROTOCOL:
                 raise GatewayClientError("Gateway protocol mismatch; update/restart required")
             async with GatewayClient(ws) as client:
                 yield client
     except GatewayClientError:
         raise
-    except (OSError, TimeoutError) as exc:
+    except (OSError, TimeoutError, InvalidMessage) as exc:
+        # InvalidMessage: the upgrade response was cut off or garbled (a socket reset mid-handshake),
+        # a transport loss like the others; an owner's refusal (InvalidStatus) still propagates.
         raise GatewayClientError("Gateway connection failed; no local fallback") from exc

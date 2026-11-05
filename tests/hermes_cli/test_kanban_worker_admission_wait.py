@@ -13,7 +13,7 @@ import json
 import pytest
 
 from hermes_cli import kanban_worker_client
-from hermes_cli.gateway_client import GatewayClient
+from hermes_cli.gateway_client import GatewayClient, GatewayClientError
 
 
 class _Owner:
@@ -49,8 +49,8 @@ async def test_a_slow_admission_answer_is_awaited_not_failed(monkeypatch, tmp_pa
     owner = _Owner()
     params = {'board': 'b', 'task_id': 't1', 'run_id': 1, 'claim_lock': 'lock'}
     async with GatewayClient(owner) as client:
-        code = await kanban_worker_client._submit_claim(client, params, str(tmp_path / 'kanban.db'))
-    assert code == 0
+        admission = await kanban_worker_client._submit_claim(client, params, str(tmp_path / 'kanban.db'))
+        assert await kanban_worker_client._follow(admission, client, params, str(tmp_path / 'kanban.db')) == 0
     # One submission: the wait never resends the claim, and the budget never goes on the wire.
     assert [r['method'] for r in owner.sent] == ['kanban.run']
     assert all('_timeout' not in r['params'] for r in owner.sent)
@@ -82,7 +82,7 @@ async def test_an_owner_that_stalls_after_admitting_fails_the_wait_within_the_lo
     owner = _StalledOwner()
     params = {'board': 'b', 'task_id': 't1', 'run_id': 1, 'claim_lock': 'lock'}
     async with GatewayClient(owner) as client:
-        with pytest.raises(TimeoutError):
+        with pytest.raises(GatewayClientError, match='^Gateway did not answer kanban.run within '):
             # The outer 5 s guard only stops an unbounded wait from hanging the test.
             await real_wait_for(kanban_worker_client._submit_claim(client, params, str(tmp_path / 'kanban.db')), 5)
     assert budgets == [budget] and [r['method'] for r in owner.sent] == ['kanban.run']
