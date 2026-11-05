@@ -3,7 +3,9 @@
 (1) A messaging user's plain text admitted before the running turn adopted its agent steers into it at
 adoption: the busy path marks it in memory (``_hm_steer_at_adoption``) before the row is written, since
 the row cannot tell it from an explicit ``/queue`` or an A2A task, which keep their own turns (reviewer
-GW-F01/GW-F02). Without a live mark (a drain, a restart) it keeps its own next turn, as before.
+GW-F01/GW-F02). Without a live mark (a drain, a restart) it keeps its own next turn, as before. A
+post-admission hook that awaits while the turn adopts its agent leaves the text marked too, and the busy
+pass steers it at once (reviewer ADM-02); a hook that consumes it still consumes it.
 
 (2) A wake with NO session authority (legacy path): ``gateway.wake.deliver_wake`` falls back to the
 adapter's ``handle_message``. When the runner's session state holds a running agent with the steer
@@ -481,3 +483,78 @@ async def test_a_mark_recorded_while_an_older_queue_read_is_in_flight_survives_i
     assert executed == ['A'] and row_b()['outcome'] == 'steered'
     [content] = taken
     assert human in content and USER_MARKER in content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('hook_result', [None, {'action': 'handled'}], ids=['passes', 'consumes'])
+async def test_a_human_message_whose_admission_hook_spans_adoption_steers_into_the_turn(monkeypatch, hook_result):
+    """Reviewer ADM-02 schedule: B reaches the busy path while A has no agent (so ``_hm_busy_preempt``
+    declines), then awaits a registered ``post_gateway_admission`` hook while A adopts and promotes its
+    agent. A passing hook leaves B to steer into A at its next boundary; a consuming hook consumes B."""
+    from types import SimpleNamespace
+    from gateway.platforms.event import MessageEvent
+    from gateway.run import _AGENT_PENDING_SENTINEL
+    from gateway.session_busy_ingress import _pass
+    from gateway.session_contract import SessionRef
+    from gateway.session_results import execution_result
+    from hermes_cli.plugins import PluginContext, PluginManifest, get_plugin_manager
+
+    runner, adapter, authority, source, key = await _gateway(monkeypatch)
+    agent = BufferedAgent()
+    running, boundary, in_hook, resume_hook = (asyncio.Event() for _ in range(4))
+    executed, taken, calls, generations = [], [], [], []
+
+    async def turn(event, source, quick_key, run_generation):
+        executed.append(event.text)
+        if event.text == 'A':
+            generations.append(run_generation)
+            running.set()
+            await asyncio.wait_for(boundary.wait(), 30)
+            taken.append(_boundary(agent))
+        captured = execution_result.get()
+        if captured is not None:
+            captured['result'] = {'final_response': 'reply ' + event.text, 'messages': []}
+        return 'reply ' + event.text
+    monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
+
+    async def hook(text, **kwargs):
+        calls.append(text)
+        if text == 'B':
+            assert runner._peek_session_state(key).turn.agent is _AGENT_PENDING_SENTINEL, 'B saw no agent'
+            in_hook.set()
+            await asyncio.wait_for(resume_hook.wait(), 30)
+            return hook_result
+    manager = get_plugin_manager()
+    manager._discovered = True
+    PluginContext(PluginManifest(name='adm02', key='adm02', source='user'), manager).register_hook(
+        'post_gateway_admission', hook)
+
+    await adapter.handle_message(MessageEvent(text='A', source=source, message_id='A'))
+    await asyncio.wait_for(running.wait(), 30)
+    sending = asyncio.create_task(adapter.handle_message(MessageEvent(text='B', source=source, message_id='B')))
+    await asyncio.wait_for(in_hook.wait(), 30)
+    sid = runner.session_store.peek_session_id(key)
+    authority.adopt_agent(sid, authority.executing[sid], agent)
+    await runner._run_agent_track_agent(SimpleNamespace(
+        source=source, session_key=key, run_generation=generations[0], agent_holder=[agent]))
+    assert runner._peek_session_state(key).turn.agent is agent
+    resume_hook.set()
+    await asyncio.wait_for(sending, 30)
+    live = authority.sessions[sid]
+    await _pass(authority, SessionRef(authority.profile_id, sid), live)  # the adoption's own pass, settled
+    if live.steering:
+        await live.steering
+    boundary.set()
+    await async_wait_until(lambda: not runner._is_session_running(key)
+                           and all(r['status'] == 'terminal' for r in _rows(authority, runner, key)),
+                           timeout=15, what='every admitted row to settle')
+
+    assert calls == ['A', 'B'], 'the hook ran once per message, never again at execution'
+    assert executed == ['A'], 'B never ran as its own turn'
+    rows = _rows(authority, runner, key)
+    if hook_result is not None:
+        assert taken == [None] and [r['payload'].get('text') for r in rows] == ['A'], 'the hook consumed B'
+        return
+    [content] = taken
+    assert content is not None and '\n\nB\n' in content and USER_MARKER in content
+    assert next(r for r in rows if r['payload'].get('text') == 'B')['outcome'] == 'steered'

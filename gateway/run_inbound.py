@@ -683,13 +683,12 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
 
     def _hm_steer_at_adoption(self, event: MessageEvent, source, _quick_key: str) -> None:
         """Mark (in memory, never on the row) a messaging user's plain text that reached a running turn
-        before it built its agent, so the authority's adoption pass steers it as ``_hm_busy_preempt``
-        would have (every message steers, Eric 2026-11-04). An explicit ``/queue`` (``_fifo_only``), a
-        job producer's input, media, another busy mode or a drain keeps its own next turn."""
-        from gateway.run import _AGENT_PENDING_SENTINEL
-        state = self._peek_session_state(_quick_key)
-        agent = state.turn.agent if state else None
-        if (self._is_session_running(_quick_key) and (agent is None or agent is _AGENT_PENDING_SENTINEL)
+        and that ``_hm_busy_preempt`` did not steer, so the authority's busy pass steers it into that
+        turn's agent (every message steers, Eric 2026-11-04): at adoption when the turn had none yet, or
+        at once when it adopted one while this admission awaited (a post-admission hook). An explicit
+        ``/queue`` (``_fifo_only``), a job producer's input, media, another busy mode or a drain keeps
+        its own next turn."""
+        if (self._is_session_running(_quick_key)
                 and not getattr(event, "_fifo_only", False) and not self._draining
                 and self._hm_text_only(event) and (event.text or "").strip()
                 and source.platform.value not in _JOB_PRODUCER_PLATFORMS
