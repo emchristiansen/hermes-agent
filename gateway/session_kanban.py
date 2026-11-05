@@ -321,13 +321,31 @@ def _record_worker_result(context, code, last_output):
     import os
     from hermes_cli.kanban_db_connect import connect_closing
     from hermes_cli import kanban_db as kb
-    with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
-        if _bound_worker_matches(conn, context):
-            # Closing a run clears its claim/PID and replaces metadata; keep the
-            # result in the immutable attempt event stream instead.
-            kb._append_event(conn, context['task_id'], 'worker_result',
-                {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
-                 'last_output': last_output}, run_id=context['run_id'])
+    with connect_closing(Path(context['db'])) as conn:
+        with kb.write_txn(conn):
+            if _bound_worker_matches(conn, context):
+                # Closing a run clears its claim/PID and replaces metadata; keep the
+                # result in the immutable attempt event stream instead.
+                kb._append_event(conn, context['task_id'], 'worker_result',
+                    {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
+                     'last_output': last_output}, run_id=context['run_id'])
+        _remove_finished_workspace(conn, context)
+
+
+def _remove_finished_workspace(conn, context):
+    """Workspace cleanup never removes a directory while a live bound worker works at or under it
+    (``_workspace_in_use_by_other``), so a done or archived card's cleanup, and the parent sweep it
+    runs, was held back while this worker's turn went on. This worker's ``worker_result`` is
+    recorded now, so it no longer counts as live: step out of any directory the cleanup may
+    remove and run it again. Directories another live worker still uses stay until that worker's
+    own end runs this."""
+    import os
+    from hermes_cli import kanban_db as kb
+    task = kb.get_task(conn, context['task_id'])
+    if task is None or task.status not in ('done', 'archived'):
+        return
+    os.chdir(Path(context['db']).resolve().parent)  # the board directory, never removed by cleanup
+    kb._cleanup_workspace(conn, context['task_id'])
 
 
 def record_owner_restart_result(card, board_db) -> bool:
@@ -343,11 +361,17 @@ def record_owner_restart_result(card, board_db) -> bool:
     ``KANBAN_OWNER_RESTART_EXIT_CODE``: the submitter returns it and the dispatcher requeues without
     counting a failure. Only for the task's CURRENT run under its live claim, and never over a result
     the interpreter already recorded. ``board_db``: the board file the attempt's session policy names
-    (``card_board_db``). False when nothing was recorded."""
+    (``card_board_db``). False when nothing was recorded.
+
+    This is the attempt's accounting, not the end of the interpreter's use of its workspace: the
+    interpreter may still be running (a tool in flight outlives owner-pipe EOF by a grace period).
+    ``OWNER_RECORDED_RESULT_KEY`` marks the result as the owner's, so workspace cleanup keeps
+    honouring the binding until the interpreter records its own result or is gone."""
     import os
     from hermes_cli.kanban_db_connect import connect_closing
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_retry_policy import KANBAN_OWNER_RESTART_EXIT_CODE
+    from hermes_cli.kanban_db_workspace import OWNER_RECORDED_RESULT_KEY
     if not isinstance(card, dict) or not isinstance(card.get('task_id'), str) or type(card.get('run_id')) is not int:
         return False
     path = Path(board_db)
@@ -365,7 +389,7 @@ def record_owner_restart_result(card, board_db) -> bool:
             return False
         kb._append_event(conn, task_id, 'worker_result',
             {'pid': bound.get('pid'), 'claim_lock': bound['claim_lock'], 'exit_code': KANBAN_OWNER_RESTART_EXIT_CODE,
-             'last_output': '', 'recorded_by_owner_pid': os.getpid()}, run_id=run_id)
+             'last_output': '', OWNER_RECORDED_RESULT_KEY: os.getpid()}, run_id=run_id)
     return True
 
 
