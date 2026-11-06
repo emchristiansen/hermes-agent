@@ -3484,7 +3484,7 @@ def promote_task(
 ) -> tuple[bool, Optional[str]]:
     """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event. Refused while a parent
     is unfinished; ``dry_run`` only validates. Returns ``(ok, reason)``. ``expected_terminal_run`` instead continues
-    a guarded ``ready`` card or an interrupted ``triage`` loop (``kanban_db_active_pr.continue_ready``)."""
+    a guarded ``ready`` card or a ``triage`` loop whose input arrived (``kanban_db_active_pr.continue_ready``)."""
     if expected_terminal_run is not None:
         from hermes_cli.kanban_db_active_pr import continue_ready
         return continue_ready(conn, task_id, expected_terminal_run, actor=actor, reason=reason, dry_run=dry_run)
@@ -3493,7 +3493,7 @@ def promote_task(
         return False, f"task {task_id} not found"
     if cur_status not in ("todo", "blocked"):
         return False, (f"task {task_id} is {cur_status!r}; promote only applies to 'todo' or 'blocked' "
-                       f"(a guarded 'ready' card or an interrupted 'triage' loop: --expected-terminal-run <latest run>)")
+                       f"(a guarded 'ready' card or a 'triage' loop: --expected-terminal-run <latest run>)")
 
     # No override: claim_task demotes ready -> todo on an undone parent whichever
     # writer set 'ready', so a forced promotion would only report a success the

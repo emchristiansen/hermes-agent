@@ -1,6 +1,7 @@
 """Release provenance for the dispatcher's ``active_pr`` respawn guard, and the operator's
 exact-run continuation of a READY card that guard holds, or of a TRIAGE card whose loop run was
-interrupted before its worker recorded a result (the input it awaited has since arrived).
+interrupted before its worker recorded a result or finished with its own bound worker's result
+(either way the input it awaited has since arrived).
 
 A PR URL in a recent comment holds the ready lane (a re-spawned opener risks a duplicate PR)
 until a *release* is recorded strictly after the newest such comment. A release persists:
@@ -61,15 +62,15 @@ def is_release(conn, task_id, event_id, kind, payload) -> bool:
 
 
 def continuation_refusal(conn, task_id, expected_run, reason=None):
-    """Why the exact-run continuation of a READY (or interrupted TRIAGE) card is refused, else None."""
+    """Why the exact-run continuation of a READY (or loop-run TRIAGE) card is refused, else None."""
     task = conn.execute('SELECT status,claim_lock,worker_pid,current_run_id FROM tasks WHERE id=?', (task_id,)).fetchone()
     if task is None:
         return f'task {task_id} not found'
     if task['status'] == 'triage':
         return triage_continuation_refusal(conn, task_id, expected_run, reason)
     if task['status'] != 'ready':
-        return (f"task {task_id} is {task['status']!r}; a continuation applies only to 'ready' or an "
-                "interrupted 'triage' loop (promote todo/blocked without --expected-terminal-run)")
+        return (f"task {task_id} is {task['status']!r}; a continuation applies only to 'ready' or a "
+                "'triage' loop (promote todo/blocked without --expected-terminal-run)")
     latest = conn.execute('SELECT id,ended_at FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1',
                           (task_id,)).fetchone()
     if latest is None or type(expected_run) is not int or latest['id'] != expected_run:
@@ -180,12 +181,26 @@ def _origin_refusal(conn, task_id, run_id, loop):
     return None
 
 
-def triage_continuation_refusal(conn, task_id, expected_run, reason):
-    """Why a TRIAGE card may not continue to ``ready`` after its exact interrupted loop run, else None.
+def _finished_result(conn, task_id, run_id):
+    """``(event id, payload)`` of run ``run_id``'s worker_result when it is the run's own bound
+    worker's terminal result after its loop, else None. The check is settle-triage's own
+    (``kanban_db_graph._settlement_terminal_run``: bound < loop < result, same pid and claim, int
+    exit, verified start identity, run ended blocked with its claim released and no open run),
+    reused, not restated."""
+    from hermes_cli.kanban_db_graph import _settlement_terminal_run
+    if _settlement_terminal_run(conn, task_id, run_id) is None:
+        return None
+    return _run_event(conn, task_id, run_id, 'worker_result')
 
-    The shape ``settle-triage`` cannot take: the run tripped the loop breaker
-    (``block_loop_detected``) and was then interrupted, so its bound interpreter never wrote a
-    ``worker_result``. Continuing needs positive proof that nothing can still write for it: the
+
+def triage_continuation_refusal(conn, task_id, expected_run, reason):
+    """Why a TRIAGE card may not continue to ``ready`` after its exact loop run, else None.
+
+    The run tripped the loop breaker (``block_loop_detected``) and either was interrupted before
+    its bound interpreter wrote a ``worker_result`` (a shape ``settle-triage`` cannot take), or
+    finished with its own bound worker's terminal result (``_finished_result``); any other result
+    is refused. Either way the awaited input has arrived, so no missing-input wait is recorded.
+    Continuing needs positive proof that nothing can still write for it: the
     latest run, ended ``blocked``, from the implementation lane (``_origin_refusal``: a review-origin
     loop is refused), no open run or claim on the card, a ``worker_bound`` under the
     run's claim, that claim and every binding's issued by THIS host, EVERY worker pid recorded for the run dead or recycled by a successful reading of
@@ -216,9 +231,10 @@ def triage_continuation_refusal(conn, task_id, expected_run, reason):
     origin = _origin_refusal(conn, task_id, expected_run, loop[1])
     if origin is not None:
         return origin
-    if _run_event(conn, task_id, expected_run, 'worker_result') is not None:
-        return (f'run {expected_run} has a worker_result; its finished loop is settled with '
-                'settle-triage, not continued')
+    if _run_event(conn, task_id, expected_run, 'worker_result') is not None and _finished_result(conn, task_id, expected_run) is None:
+        return (f"run {expected_run}'s worker_result is not proven its own bound worker's terminal result "
+                "(settle-triage's check: run ended blocked with its claim released, bound < loop < result "
+                'order, matching pid and claim, int exit, verified bound identity)')
     writers = _writers_refusal(conn, task_id, latest)
     if writers is not None:
         return writers
@@ -234,14 +250,16 @@ def triage_continuation_refusal(conn, task_id, expected_run, reason):
 
 def continue_ready(conn, task_id, expected_run, *, actor, reason, dry_run):
     """Explicit operator continuation of a READY card held by ``active_pr``, or of a TRIAGE card
-    whose exact loop run was interrupted without a worker result (``triage_continuation_refusal``).
+    whose exact loop run was interrupted without a worker result or finished with its own bound
+    worker's result (``triage_continuation_refusal``).
 
     A ready card stays ``ready``; a ``promoted_manual`` event marked ``from: ready`` on run
     ``expected_run`` is the release the guard honours after the newest PR comment. A triage card
     moves to ``ready`` with the same assignee, title, body and counters (``block_kind``,
     ``block_recurrences`` and the failure counters are kept, so a same-cause re-block returns it
-    to triage); its ``promoted_manual`` (``from: triage``) records the interrupted run, that no
-    worker result was recorded, and the input that arrived. Fenced on the exact latest ended run,
+    to triage); its ``promoted_manual`` (``from: triage``) records the input that arrived and the
+    loop run: ``interrupted_run`` with ``worker_result_recorded: false``, or ``finished_run`` with
+    ``worker_result_recorded: true``, the result's event id and exit code. Fenced on the exact latest ended run,
     re-checked under the write lock; a refused or dry-run attempt writes nothing.
     Orchestrator-only, as unblock. Returns ``(ok, refusal)``."""
     from agent.swarm_capabilities import worker_board_management_enabled
@@ -255,10 +273,13 @@ def continue_ready(conn, task_id, expected_run, *, actor, reason, dry_run):
         refusal = continuation_refusal(conn, task_id, expected_run, reason)
         if refusal is None and kb._task_status(conn, task_id) == 'triage':
             conn.execute("UPDATE tasks SET status='ready' WHERE id=? AND status='triage'", (task_id,))
+            finished = _finished_result(conn, task_id, expected_run)
+            shape = ({'interrupted_run': expected_run, 'worker_result_recorded': False} if finished is None else
+                     {'finished_run': expected_run, 'worker_result_recorded': True,
+                      'worker_result_event': finished[0], 'worker_exit_code': finished[1]['exit_code']})
             kb._append_event(conn, task_id, 'promoted_manual', {
                 'actor': actor, 'reason': reason, 'from': 'triage', 'continuation': True,
-                'expected_terminal_run': expected_run, 'interrupted_run': expected_run,
-                'worker_result_recorded': False,
+                'expected_terminal_run': expected_run, **shape,
             }, run_id=expected_run)
         elif refusal is None:
             kb._append_event(conn, task_id, 'promoted_manual', {
