@@ -100,6 +100,9 @@ def _task_row(conn, tid) -> dict:
 def test_interrupted_triage_loop_continues_to_ready_with_honest_history(kanban_home: Path, tmp_path: Path) -> None:
     with kbc.connect() as conn:
         tid, run_id = _interrupted_loop(conn, tmp_path)
+        loop = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='block_loop_detected'",
+                            (tid,)).fetchone()[0]
+        assert json.loads(loop)["source_status"] == "ready"  # an implementation-lane loop
         # Local positive: the run's claim and binding were issued by this host.
         assert kb.latest_run(conn, tid).claim_lock.startswith(kb._host_prefix())
         kb.add_comment(conn, tid, author="operator", body=INPUT)
@@ -189,6 +192,8 @@ REFUSALS = {
     "foreign_binding": "was claimed on another host (elsewhere.example)",
     "hostless_claim": "the host of run",
     "missing_claim": "the host of run",
+    "loop_says_review": "is a review-origin loop (claimed from review)",
+    "loop_lane_unprovable": "cannot be proven (source_status=None)",
 }
 
 
@@ -241,6 +246,10 @@ def test_triage_continuation_refusals_write_nothing(
             "hostless_claim": [("UPDATE task_runs SET claim_lock='worker' WHERE id=?", (run_id,)),
                                ("UPDATE task_events SET payload=json_set(payload, '$.claim_lock', 'worker') "
                                 "WHERE task_id=? AND kind='worker_bound'", (tid,))],
+            "loop_says_review": [("UPDATE task_events SET payload=json_set(payload, '$.source_status', 'review') "
+                                  "WHERE task_id=? AND kind='block_loop_detected'", (tid,))],
+            "loop_lane_unprovable": [("UPDATE task_events SET payload=json_remove(payload, '$.source_status') "
+                                      "WHERE task_id=? AND kind='block_loop_detected'", (tid,))],
             "missing_claim": [("UPDATE task_runs SET claim_lock=NULL WHERE id=?", (run_id,)),
                               ("UPDATE task_events SET payload=json_remove(payload, '$.claim_lock') "
                                "WHERE task_id=? AND kind='worker_bound'", (tid,))],
@@ -307,6 +316,48 @@ def test_live_writer_with_unreadable_current_identity_is_refused(
     monkeypatch.setattr(status, "get_process_start_time", real)
     assert _cli("promote", tid, INPUT, "--expected-terminal-run", str(run_id)) == 1
     assert "may still be live" in capsys.readouterr().err
+
+
+def test_review_origin_loop_is_refused_without_writes(
+    kanban_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """A reviewer run's interrupted loop (review run 3747's sequence: request_review,
+    claim_review_task, block, unblock, claim_review_task, block) is refused: landing it in ready
+    would make dispatch claim it as an implementation run, dropping source_status=review and
+    sdlc-review, and request_changes would then fail ("active run was not claimed from review")."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="review loop", body="original body", assignee="worker")
+        assert kb.claim_task(conn, tid)
+        assert kb.request_review(conn, tid, reviewer="reviewer", expected_run_id=kb.get_task(conn, tid).current_run_id)
+        assert kb.claim_review_task(conn, tid)
+        assert kb.block_task(conn, tid, kind="transient", reason="waiting for credential")
+        assert kb.unblock_task(conn, tid)
+        assert kb.claim_review_task(conn, tid)
+        task = kb.get_task(conn, tid)
+        run_id = task.current_run_id
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "owner_admitted", _admission(tmp_path, "terminal"), run_id=run_id)
+            kb._append_event(conn, tid, "worker_bound", {
+                "pid": DEAD_PID, "claim_lock": task.claim_lock, "started_at": "boot-1|12345"}, run_id=run_id)
+        assert kb.block_task(conn, tid, kind="transient", reason="waiting for credential")
+        task = kb.get_task(conn, tid)
+        assert task.status == "triage" and task.assignee == "reviewer"
+        loop = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='block_loop_detected'",
+                            (tid,)).fetchone()[0]
+        assert json.loads(loop)["source_status"] == "review"
+        snapshot = list(conn.iterdump())
+
+    for dry in ([], ["--dry-run"]):
+        capsys.readouterr()
+        rc = _cli("promote", tid, INPUT, *dry, "--expected-terminal-run", str(run_id))
+        err = capsys.readouterr().err
+        with kbc.connect() as conn:  # r2 wrote Ready here: (0, 'ready', ['triage'])
+            outcome = (rc, kb.get_task(conn, tid).status, [e["from"] for e in _continuations(conn, tid)])
+        assert outcome == (1, "triage", []), (dry, outcome, err)
+        assert f"run {run_id} of {tid} is a review-origin loop (claimed from review)" in err, err
+        assert "would drop the review lane" in err
+    with kbc.connect() as conn:
+        assert list(conn.iterdump()) == snapshot  # zero writes
 
 
 def test_triage_continuation_is_orchestrator_only_and_one_card(
