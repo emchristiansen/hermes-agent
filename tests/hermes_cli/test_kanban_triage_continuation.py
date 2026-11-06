@@ -63,7 +63,7 @@ def _admission(tmp_path: Path, status: str) -> dict:
 def _claim(conn, tid):
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
-    assert kb.claim_task(conn, tid, claimer="worker") is not None
+    assert kb.claim_task(conn, tid) is not None  # this host's ``host:pid`` claim
     task = kb.get_task(conn, tid)
     return task.current_run_id, task.claim_lock
 
@@ -100,6 +100,8 @@ def _task_row(conn, tid) -> dict:
 def test_interrupted_triage_loop_continues_to_ready_with_honest_history(kanban_home: Path, tmp_path: Path) -> None:
     with kbc.connect() as conn:
         tid, run_id = _interrupted_loop(conn, tmp_path)
+        # Local positive: the run's claim and binding were issued by this host.
+        assert kb.latest_run(conn, tid).claim_lock.startswith(kb._host_prefix())
         kb.add_comment(conn, tid, author="operator", body=INPUT)
         before = _task_row(conn, tid)
         runs = [tuple(r) for r in conn.execute("SELECT * FROM task_runs ORDER BY id")]
@@ -179,6 +181,14 @@ REFUSALS = {
     "no_owner": "has no owner admission",
     "empty_reason": "must name the awaited input",
     "parent_open": "unsatisfied parent dependencies",
+    "earlier_live_binding": "may still be live",
+    "earlier_live_spawned": "may still be live",
+    "live_registered": "may still be live",
+    "unreadable_record": "unreadable worker record (spawned)",
+    "foreign_host": "was claimed on another host (elsewhere.example)",
+    "foreign_binding": "was claimed on another host (elsewhere.example)",
+    "hostless_claim": "the host of run",
+    "missing_claim": "the host of run",
 }
 
 
@@ -217,12 +227,41 @@ def test_triage_continuation_refusals_write_nothing(
             "no_owner": [("DELETE FROM task_events WHERE task_id=? AND kind='owner_admitted'", (tid,))],
             "empty_reason": [],
             "parent_open": [],
+            # Newest-only selection would see only the dead record appended last.
+            "earlier_live_binding": [("UPDATE task_events SET payload=json_set(payload, '$.pid', ?, '$.started_at', ?) "
+                                      "WHERE task_id=? AND kind='worker_bound'", (os.getpid(), live, tid))],
+            "earlier_live_spawned": [],
+            "live_registered": [],
+            "unreadable_record": [],
+            # Pid liveness is host-local: a foreign or unprovable claim's absent pid proves nothing.
+            "foreign_host": [("UPDATE task_runs SET claim_lock='elsewhere.example:4242' WHERE id=?", (run_id,)),
+                             ("UPDATE task_events SET payload=json_set(payload, '$.claim_lock', "
+                              "'elsewhere.example:4242') WHERE task_id=? AND kind='worker_bound'", (tid,))],
+            "foreign_binding": [],
+            "hostless_claim": [("UPDATE task_runs SET claim_lock='worker' WHERE id=?", (run_id,)),
+                               ("UPDATE task_events SET payload=json_set(payload, '$.claim_lock', 'worker') "
+                                "WHERE task_id=? AND kind='worker_bound'", (tid,))],
+            "missing_claim": [("UPDATE task_runs SET claim_lock=NULL WHERE id=?", (run_id,)),
+                              ("UPDATE task_events SET payload=json_remove(payload, '$.claim_lock') "
+                               "WHERE task_id=? AND kind='worker_bound'", (tid,))],
         }
+        later = {
+            "earlier_live_binding": [("worker_bound", {"pid": DEAD_PID, "started_at": "boot-1|1"})],
+            "earlier_live_spawned": [("spawned", {"pid": os.getpid(), "started_at": live}),
+                                     ("spawned", {"pid": DEAD_PID, "started_at": "boot-1|1"})],
+            "live_registered": [("worker_registered", {"pid": os.getpid(), "started_at": live})],
+            "unreadable_record": [("spawned", {"pid": None, "started_at": "boot-1|1"})],
+        }
+        foreign_binding = {"pid": DEAD_PID, "started_at": "boot-1|1", "claim_lock": "elsewhere.example:4242"}
         with kb.write_txn(conn):
             for sql, params in mutations[drift]:
                 conn.execute(sql, params)
+            claim = conn.execute("SELECT claim_lock FROM task_runs WHERE id=?", (run_id,)).fetchone()[0]
+            for kind, payload in later.get(drift, []):
+                kb._append_event(conn, tid, kind, dict(payload, claim_lock=claim), run_id=run_id)
+            if drift == "foreign_binding":  # the run's own claim and binding stay local
+                kb._append_event(conn, tid, "worker_bound", foreign_binding, run_id=run_id)
             if drift == "worker_result":
-                claim = conn.execute("SELECT claim_lock FROM task_runs WHERE id=?", (run_id,)).fetchone()[0]
                 kb._append_event(conn, tid, "worker_result", {"pid": DEAD_PID, "claim_lock": claim, "exit_code": 0},
                                  run_id=run_id)
         if drift == "parent_open":
@@ -238,6 +277,36 @@ def test_triage_continuation_refusals_write_nothing(
         assert REFUSALS[drift] in err, (drift, err)
     with kbc.connect() as conn:
         assert list(conn.iterdump()) == snapshot
+
+
+def test_live_writer_with_unreadable_current_identity_is_refused(
+    kanban_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+) -> None:
+    """A live pid whose start identity cannot be read now is not proven gone (``_worker_alive``
+    alone would call it recycled, i.e. dead)."""
+    from gateway import status
+    with kbc.connect() as conn:
+        tid, run_id = _interrupted_loop(conn, tmp_path)
+        live = _live_fingerprint()
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_events SET payload=json_set(payload, '$.pid', ?, '$.started_at', ?) "
+                         "WHERE task_id=? AND kind='worker_bound'", (os.getpid(), live, tid))
+        snapshot = list(conn.iterdump())
+    real = status.get_process_start_time
+    monkeypatch.setattr(status, "get_process_start_time",
+                        lambda pid: None if pid == os.getpid() else real(pid))
+    assert not kbd._worker_alive(os.getpid(), live)  # the signalling helper reads this as dead
+    for dry in ([], ["--dry-run"]):
+        capsys.readouterr()
+        assert _cli("promote", tid, INPUT, *dry, "--expected-terminal-run", str(run_id)) == 1
+        err = capsys.readouterr().err
+        assert f"the identity of live pid {os.getpid()} of run {run_id} cannot be read" in err, err
+    with kbc.connect() as conn:
+        assert list(conn.iterdump()) == snapshot
+    # Control: the same live writer with a readable identity is refused as live, not unreadable.
+    monkeypatch.setattr(status, "get_process_start_time", real)
+    assert _cli("promote", tid, INPUT, "--expected-terminal-run", str(run_id)) == 1
+    assert "may still be live" in capsys.readouterr().err
 
 
 def test_triage_continuation_is_orchestrator_only_and_one_card(

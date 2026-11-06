@@ -86,11 +86,81 @@ def continuation_refusal(conn, task_id, expected_run, reason=None):
 
 
 def _run_event(conn, task_id, run_id, kind):
-    """The newest ``kind`` event of run ``run_id`` as ``(id, payload dict)``, else None."""
+    """The newest ``kind`` event of run ``run_id`` as ``(id, payload dict)``, else None (an
+    existence test here; the writer proof reads every event, ``_run_writers``)."""
     from hermes_cli import kanban_db as kb
     row = conn.execute('SELECT id,payload FROM task_events WHERE task_id=? AND run_id=? AND kind=? '
                        'ORDER BY id DESC LIMIT 1', (task_id, run_id, kind)).fetchone()
     return None if row is None else (row['id'], kb._json_dict(row['payload']))
+
+
+def _run_writers(conn, task_id, run):
+    """Every ``(source, pid, recorded identity, payload)`` that may write for ``run``: ALL its
+    ``worker_bound``, ``spawned`` and ``worker_registered`` events (no append is unique per run:
+    ``session_kanban.bind_worker_context`` and ``kanban_db_dispatch._set_worker_pid`` append
+    unconditionally) and the run row's retained submitter."""
+    from hermes_cli import kanban_db as kb
+    writers = [(kind, kb._json_dict(payload)) for kind, payload in conn.execute(
+        "SELECT kind,payload FROM task_events WHERE task_id=? AND run_id=? AND kind IN ('worker_bound','spawned','worker_registered') "
+        'ORDER BY id', (task_id, run['id']))]
+    rows = [(kind, data.get('pid'), data.get('started_at'), data) for kind, data in writers]
+    if run['worker_pid'] is not None:
+        rows.append(('task_runs.worker_pid', run['worker_pid'], run['worker_started_at'], {}))
+    return rows
+
+
+def _writer_state(pid, recorded):
+    """``gone`` when ``pid`` is dead or its CURRENT identity was read and differs from ``recorded``
+    (recycled); ``unreadable`` when it is live and its current identity cannot be read; else
+    ``live``. Fails closed like ``kanban_db_workspace._binding_may_be_live``: an unreadable,
+    legacy (None) or ``unverified`` identity never proves the writer gone. (``_worker_alive``
+    reads an unreadable current identity as recycled, right for signalling, not for this proof.)"""
+    from gateway.status import get_process_start_time
+    from hermes_cli.kanban_db_dispatch import _pid_alive
+    from hermes_cli.kanban_db_workspace import _identity_differs
+    if not _pid_alive(pid):
+        return 'gone'
+    if get_process_start_time(pid) is None:
+        return 'unreadable'
+    return 'gone' if _identity_differs(pid, recorded) else 'live'
+
+
+def _host_refusal(run, writers):
+    """Why ``run``'s pids cannot be judged on this host, else None. Pid liveness is host-local
+    (``kanban_db_dispatch.adopt_worker_pid`` and ``_reap_terminal_worker_row`` gate on
+    ``_host_prefix`` too): a foreign or unprovable claim's absent pid proves nothing."""
+    from hermes_cli import kanban_db as kb
+    claims = [run['claim_lock']] + [data.get('claim_lock') for kind, _p, _r, data in writers if kind == 'worker_bound']
+    if any(not isinstance(claim, str) or ':' not in claim or not claim.split(':', 1)[0] for claim in claims):
+        return f"the host of run {run['id']} cannot be proven from its claim; its writers cannot be probed here"
+    foreign = sorted({claim.split(':', 1)[0] for claim in claims if not claim.startswith(kb._host_prefix())})
+    if foreign:
+        return (f"run {run['id']} was claimed on another host ({', '.join(foreign)}); "
+                'its writers cannot be proven gone from this host')
+    return None
+
+
+def _writers_refusal(conn, task_id, run):
+    """Why the writers of ``run`` are not all provably gone, else None."""
+    writers = _run_writers(conn, task_id, run)
+    if not any(kind == 'worker_bound' and data.get('claim_lock') == run['claim_lock']
+               for kind, _pid, _rec, data in writers):
+        return f"run {run['id']} has no bound worker under its claim; its writer cannot be proven gone"
+    host = _host_refusal(run, writers)
+    if host is not None:
+        return host
+    bad = [kind for kind, pid, _rec, _data in writers if type(pid) is not int or pid <= 0]
+    if bad:
+        return f"run {run['id']} has an unreadable worker record ({', '.join(bad)}); its writer cannot be proven gone"
+    states = [(pid, _writer_state(pid, rec)) for _kind, pid, rec, _data in writers]  # per record, not per pid
+    unreadable = sorted({pid for pid, state in states if state == 'unreadable'})
+    if unreadable:
+        return (f"the identity of live pid {', '.join(map(str, unreadable))} of run {run['id']} cannot be read; "
+                'it may still be the writer')
+    alive = sorted({pid for pid, state in states if state == 'live'})
+    if alive:
+        return f"a worker of run {run['id']} may still be live (pid {', '.join(map(str, alive))})"
+    return None
 
 
 def triage_continuation_refusal(conn, task_id, expected_run, reason):
@@ -99,12 +169,11 @@ def triage_continuation_refusal(conn, task_id, expected_run, reason):
     The shape ``settle-triage`` cannot take: the run tripped the loop breaker
     (``block_loop_detected``) and was then interrupted, so its bound interpreter never wrote a
     ``worker_result``. Continuing needs positive proof that nothing can still write for it: the
-    latest run, ended ``blocked``, no open run or claim on the card, every worker pid recorded
-    for the run (``worker_bound`` under the run's claim, the spawned submitter) dead or recycled
-    by its start identity, and the run's owner admission recorded and terminal. ``reason`` names
-    the awaited input that has now arrived (e.g. a comment id) and is required."""
+    latest run, ended ``blocked``, no open run or claim on the card, a ``worker_bound`` under the
+    run's claim, that claim and every binding's issued by THIS host, EVERY worker pid recorded for the run dead or recycled by a successful reading of
+    its start identity (``_writers_refusal``), and the run's owner admission recorded and
+    terminal. ``reason`` names the awaited input that has now arrived (e.g. a comment id)."""
     from hermes_cli import kanban_db as kb
-    from hermes_cli.kanban_db_dispatch import _worker_alive
     from hermes_cli.kanban_db_retry_policy import terminal_run_refusal
     if type(expected_run) is not int:
         return 'no exact terminal run was named (--expected-terminal-run)'
@@ -128,17 +197,9 @@ def triage_continuation_refusal(conn, task_id, expected_run, reason):
     if _run_event(conn, task_id, expected_run, 'worker_result') is not None:
         return (f'run {expected_run} has a worker_result; its finished loop is settled with '
                 'settle-triage, not continued')
-    bound = _run_event(conn, task_id, expected_run, 'worker_bound')
-    bound = bound[1] if bound else {}
-    if type(bound.get('pid')) is not int or bound['pid'] <= 0 or bound.get('claim_lock') != latest['claim_lock']:
-        return f'run {expected_run} has no bound worker under its claim; its writer cannot be proven gone'
-    spawned = _run_event(conn, task_id, expected_run, 'spawned')
-    spawned = spawned[1] if spawned else {}
-    pids = [(bound['pid'], bound.get('started_at')), (latest['worker_pid'], latest['worker_started_at']),
-            (spawned.get('pid'), spawned.get('started_at'))]
-    alive = sorted({int(pid) for pid, started in pids if pid and _worker_alive(int(pid), started)})
-    if alive:
-        return f"a worker of run {expected_run} may still be live (pid {', '.join(map(str, alive))})"
+    writers = _writers_refusal(conn, task_id, latest)
+    if writers is not None:
+        return writers
     if _run_event(conn, task_id, expected_run, 'owner_admitted') is None:
         return f'run {expected_run} has no owner admission; the owner cannot be proven terminal'
     owner = terminal_run_refusal(conn, task_id, expected_run)
