@@ -1,5 +1,6 @@
 """Release provenance for the dispatcher's ``active_pr`` respawn guard, and the operator's
-exact-run continuation of a READY card that guard holds.
+exact-run continuation of a READY card that guard holds, or of a TRIAGE card whose loop run was
+interrupted before its worker recorded a result (the input it awaited has since arrived).
 
 A PR URL in a recent comment holds the ready lane (a re-spawned opener risks a duplicate PR)
 until a *release* is recorded strictly after the newest such comment. A release persists:
@@ -59,14 +60,16 @@ def is_release(conn, task_id, event_id, kind, payload) -> bool:
     return before is not None and before['kind'] == 'dependency_wait'
 
 
-def continuation_refusal(conn, task_id, expected_run):
-    """Why the exact-run continuation of a READY card is refused, else None."""
+def continuation_refusal(conn, task_id, expected_run, reason=None):
+    """Why the exact-run continuation of a READY (or interrupted TRIAGE) card is refused, else None."""
     task = conn.execute('SELECT status,claim_lock,worker_pid,current_run_id FROM tasks WHERE id=?', (task_id,)).fetchone()
     if task is None:
         return f'task {task_id} not found'
+    if task['status'] == 'triage':
+        return triage_continuation_refusal(conn, task_id, expected_run, reason)
     if task['status'] != 'ready':
-        return (f"task {task_id} is {task['status']!r}; a continuation applies only to 'ready' "
-                "(promote todo/blocked without --expected-terminal-run)")
+        return (f"task {task_id} is {task['status']!r}; a continuation applies only to 'ready' or an "
+                "interrupted 'triage' loop (promote todo/blocked without --expected-terminal-run)")
     latest = conn.execute('SELECT id,ended_at FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1',
                           (task_id,)).fetchone()
     if latest is None or type(expected_run) is not int or latest['id'] != expected_run:
@@ -82,24 +85,99 @@ def continuation_refusal(conn, task_id, expected_run):
     return None
 
 
-def continue_ready(conn, task_id, expected_run, *, actor, reason, dry_run):
-    """Explicit operator continuation of a READY card held by ``active_pr``.
+def _run_event(conn, task_id, run_id, kind):
+    """The newest ``kind`` event of run ``run_id`` as ``(id, payload dict)``, else None."""
+    from hermes_cli import kanban_db as kb
+    row = conn.execute('SELECT id,payload FROM task_events WHERE task_id=? AND run_id=? AND kind=? '
+                       'ORDER BY id DESC LIMIT 1', (task_id, run_id, kind)).fetchone()
+    return None if row is None else (row['id'], kb._json_dict(row['payload']))
 
-    The card stays ``ready``; a ``promoted_manual`` event marked ``from: ready`` on run
-    ``expected_run`` is the release the guard honours after the newest PR comment. Fenced on the
-    exact latest ended run with no live claim and no owner still executing it, re-checked under
-    the write lock; a refused or dry-run attempt writes nothing. Orchestrator-only, as unblock.
-    Returns ``(ok, refusal)``."""
+
+def triage_continuation_refusal(conn, task_id, expected_run, reason):
+    """Why a TRIAGE card may not continue to ``ready`` after its exact interrupted loop run, else None.
+
+    The shape ``settle-triage`` cannot take: the run tripped the loop breaker
+    (``block_loop_detected``) and was then interrupted, so its bound interpreter never wrote a
+    ``worker_result``. Continuing needs positive proof that nothing can still write for it: the
+    latest run, ended ``blocked``, no open run or claim on the card, every worker pid recorded
+    for the run (``worker_bound`` under the run's claim, the spawned submitter) dead or recycled
+    by its start identity, and the run's owner admission recorded and terminal. ``reason`` names
+    the awaited input that has now arrived (e.g. a comment id) and is required."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_dispatch import _worker_alive
+    from hermes_cli.kanban_db_retry_policy import terminal_run_refusal
+    if type(expected_run) is not int:
+        return 'no exact terminal run was named (--expected-terminal-run)'
+    if not isinstance(reason, str) or not reason.strip():
+        return ('a triage continuation must name the awaited input that has arrived '
+                '(reason, e.g. the comment id carrying it)')
+    task = conn.execute('SELECT claim_lock,claim_expires,worker_pid,current_run_id FROM tasks WHERE id=?',
+                        (task_id,)).fetchone()
+    latest = conn.execute('SELECT * FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1', (task_id,)).fetchone()
+    if latest is None or latest['id'] != expected_run:
+        return f"run {expected_run} is not the latest run of {task_id} (latest: {latest['id'] if latest else 'none'})"
+    if conn.execute('SELECT 1 FROM task_runs WHERE task_id=? AND ended_at IS NULL', (task_id,)).fetchone():
+        return f'{task_id} has an open run'
+    live = [key for key in ('claim_lock', 'claim_expires', 'worker_pid', 'current_run_id') if task[key] is not None]
+    if live:
+        return f"{task_id} still has a live claim ({', '.join(live)})"
+    if latest['status'] != 'blocked' or latest['outcome'] != 'blocked':
+        return f"run {expected_run} did not end blocked ({latest['status']}/{latest['outcome']})"
+    if _run_event(conn, task_id, expected_run, 'block_loop_detected') is None:
+        return f'run {expected_run} did not route {task_id} to triage (no block_loop_detected on it)'
+    if _run_event(conn, task_id, expected_run, 'worker_result') is not None:
+        return (f'run {expected_run} has a worker_result; its finished loop is settled with '
+                'settle-triage, not continued')
+    bound = _run_event(conn, task_id, expected_run, 'worker_bound')
+    bound = bound[1] if bound else {}
+    if type(bound.get('pid')) is not int or bound['pid'] <= 0 or bound.get('claim_lock') != latest['claim_lock']:
+        return f'run {expected_run} has no bound worker under its claim; its writer cannot be proven gone'
+    spawned = _run_event(conn, task_id, expected_run, 'spawned')
+    spawned = spawned[1] if spawned else {}
+    pids = [(bound['pid'], bound.get('started_at')), (latest['worker_pid'], latest['worker_started_at']),
+            (spawned.get('pid'), spawned.get('started_at'))]
+    alive = sorted({int(pid) for pid, started in pids if pid and _worker_alive(int(pid), started)})
+    if alive:
+        return f"a worker of run {expected_run} may still be live (pid {', '.join(map(str, alive))})"
+    if _run_event(conn, task_id, expected_run, 'owner_admitted') is None:
+        return f'run {expected_run} has no owner admission; the owner cannot be proven terminal'
+    owner = terminal_run_refusal(conn, task_id, expected_run)
+    if owner is not None:
+        return f'the owner of run {expected_run} may still be executing it ({owner})'
+    if not kb._parents_satisfied(conn, task_id):
+        return (f'{task_id} has unsatisfied parent dependencies; a continuation lands only in ready')
+    return None
+
+
+def continue_ready(conn, task_id, expected_run, *, actor, reason, dry_run):
+    """Explicit operator continuation of a READY card held by ``active_pr``, or of a TRIAGE card
+    whose exact loop run was interrupted without a worker result (``triage_continuation_refusal``).
+
+    A ready card stays ``ready``; a ``promoted_manual`` event marked ``from: ready`` on run
+    ``expected_run`` is the release the guard honours after the newest PR comment. A triage card
+    moves to ``ready`` with the same assignee, title, body and counters (``block_kind``,
+    ``block_recurrences`` and the failure counters are kept, so a same-cause re-block returns it
+    to triage); its ``promoted_manual`` (``from: triage``) records the interrupted run, that no
+    worker result was recorded, and the input that arrived. Fenced on the exact latest ended run,
+    re-checked under the write lock; a refused or dry-run attempt writes nothing.
+    Orchestrator-only, as unblock. Returns ``(ok, refusal)``."""
     from agent.swarm_capabilities import worker_board_management_enabled
     from hermes_cli import kanban_db as kb
     if os.environ.get('HERMES_KANBAN_TASK') and not worker_board_management_enabled():
         return False, 'a ready-card continuation is orchestrator-only; workers must hand off their assigned task'
-    refusal = continuation_refusal(conn, task_id, expected_run)
+    refusal = continuation_refusal(conn, task_id, expected_run, reason)
     if refusal or dry_run:
         return refusal is None, refusal
     with kb.write_txn(conn):
-        refusal = continuation_refusal(conn, task_id, expected_run)
-        if refusal is None:
+        refusal = continuation_refusal(conn, task_id, expected_run, reason)
+        if refusal is None and kb._task_status(conn, task_id) == 'triage':
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=? AND status='triage'", (task_id,))
+            kb._append_event(conn, task_id, 'promoted_manual', {
+                'actor': actor, 'reason': reason, 'from': 'triage', 'continuation': True,
+                'expected_terminal_run': expected_run, 'interrupted_run': expected_run,
+                'worker_result_recorded': False,
+            }, run_id=expected_run)
+        elif refusal is None:
             kb._append_event(conn, task_id, 'promoted_manual', {
                 'actor': actor, 'reason': reason, 'from': 'ready', 'continuation': True,
                 'expected_terminal_run': expected_run,

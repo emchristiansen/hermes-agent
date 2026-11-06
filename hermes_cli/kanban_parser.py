@@ -366,8 +366,12 @@ _SPECS = [
         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
         _arg("--expected-terminal-run", type=int,
              help="Continue ONE ready card held by the active_pr respawn guard: its exact latest ended run "
-                  "(no live claim, owner terminal; orchestrator-only). The card stays ready and respawns"),
-    ], help="Manually move one or more todo/blocked tasks to ready, or continue a guarded ready task (recovery path)"),
+                  "(no live claim, owner terminal; orchestrator-only). The card stays ready and respawns. "
+                  "Also moves ONE triage card to ready when that run tripped the loop breaker and was "
+                  "interrupted with no worker result (workers provably dead, owner admission terminal); "
+                  "the reason must name the awaited input that has arrived"),
+    ], help="Manually move one or more todo/blocked tasks to ready, or continue a guarded ready task "
+            "or an interrupted triage loop (recovery path)"),
     _cmd("archive", [
         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
         _arg("--rm", dest="purge_ids", nargs="+",
