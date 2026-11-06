@@ -51,14 +51,15 @@ def _get_context_file_read_timeout() -> float:
 
 
 def _read_text_with_timeout(
-    path: Path, timeout: Optional[float] = None, encoding: str = "utf-8-sig"
+    path: Path, timeout: Optional[float] = None, encoding: str = "utf-8-sig", newline: Optional[str] = None,
 ) -> Optional[str]:
     """``path.read_text()`` on a daemon thread so a slow file can't stall startup.
 
     Returns the text, or ``None`` after *timeout* seconds (logged at WARNING;
     the orphaned reader thread finishes on its own). Read errors propagate to
     the caller exactly as a direct ``read_text`` would, so existing
-    ``try/except`` handling at each site is unchanged.
+    ``try/except`` handling at each site is unchanged. *newline* is ``open()``'s
+    (``""`` keeps the file's line endings); ``read_text`` takes it only from Python 3.13.
     """
     if timeout is None:
         timeout = _get_context_file_read_timeout()
@@ -66,7 +67,8 @@ def _read_text_with_timeout(
 
     def _reader() -> None:
         try:
-            result.put((True, path.read_text(encoding=encoding)))
+            with path.open(encoding=encoding, newline=newline) as handle:
+                result.put((True, handle.read()))
         except Exception as exc:  # re-raised on the caller thread
             result.put((False, exc))
 
@@ -1097,6 +1099,13 @@ _truncation_warnings: contextvars.ContextVar[Optional[list]] = contextvars.Conte
 )
 
 
+def queue_prompt_warning(msg: str) -> None:
+    """Queue *msg* for the chat status line; ``build_system_prompt`` drains it with the truncation warnings."""
+    if (warnings := _truncation_warnings.get()) is None:
+        _truncation_warnings.set(warnings := [])
+    warnings.append(msg)
+
+
 def drain_truncation_warnings() -> list:
     """Return and clear any truncation warnings accumulated in this context."""
     warnings = _truncation_warnings.get() or []
@@ -1531,9 +1540,7 @@ def _truncate_content(
     msg = f"⚠️  Context file {filename} TRUNCATED: {len(content)} chars exceeds limit of {max_chars} — {remedy}"
     logger.warning(msg)
     if queue_warning:
-        if (warnings := _truncation_warnings.get()) is None:
-            _truncation_warnings.set(warnings := [])
-        warnings.append(msg)
+        queue_prompt_warning(msg)
     head_chars = int(max_chars * CONTEXT_TRUNCATE_HEAD_RATIO)
     tail_chars = int(max_chars * CONTEXT_TRUNCATE_TAIL_RATIO)
     omitted = _omitted_headings(content, head_chars, len(content) - tail_chars)
@@ -1562,6 +1569,11 @@ def _omitted_headings(content: str, start: int, end: int, limit: int = 15) -> li
     return headings[:limit] + (["..."] if len(headings) > limit else [])
 
 
+def soul_md_path(home_override: Path | None = None) -> Path:
+    """The SOUL.md that ``load_soul_md`` reads for *home_override* (else the ambient home)."""
+    return (Path(home_override) if home_override is not None else get_hermes_home()) / "SOUL.md"
+
+
 def load_soul_md(context_length: Optional[int] = None, home_override: Path | None = None) -> Optional[str]:
     """SOUL.md from HERMES_HOME (identity slot #1), or None.
 
@@ -1582,7 +1594,7 @@ def load_soul_md(context_length: Optional[int] = None, home_override: Path | Non
         ensure_hermes_home()
     except Exception as e:
         logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
-    soul_path = (Path(home_override) if home_override is not None else get_hermes_home()) / "SOUL.md"
+    soul_path = soul_md_path(home_override)
     if not soul_path.exists():
         return None
     try:

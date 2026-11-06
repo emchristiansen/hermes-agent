@@ -837,6 +837,8 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 agent.session_id, exc,
             )
 
+    from agent.home_guidance import restore_home_guidance
+    restore_home_guidance(agent, stored_prompt)  # a resumed session keeps its edition through every rebuild
     if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
         # NULL/empty rows never reach this probe: they already rebuild below.
         if _bot_chat_prompt_stale(agent, stored_prompt):

@@ -243,6 +243,9 @@ class SlashCommandsMixin:
             reset_session_state = getattr(state.agent, "reset_session_state", None)
             if callable(reset_session_state):
                 reset_session_state()
+                # The row keeps the session, not the ended conversation's prompt (and its home-guidance decision).
+                from agent.home_guidance import forget_stored_prompt
+                forget_stored_prompt(state.agent, state.session_id)
         except Exception:
             logger.warning("ACP session state reset failed for %s", state.session_id, exc_info=True)
             return "Conversation history cleared. Agent session state reset failed; see logs."

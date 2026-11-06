@@ -35,6 +35,9 @@ def _sync_agent_to_session(cli, session_id: str, *, parent_session_id: str, reas
             cli.agent._todo_store = TodoStore()
     if hasattr(cli.agent, "_invalidate_system_prompt"):
         cli.agent._invalidate_system_prompt()
+    # The target's stored prompt carries its home-guidance decision: adopt it before a pre-turn command can build.
+    from agent.home_guidance import adopt_stored_prompt
+    adopt_stored_prompt(cli.agent)
     with suppress(Exception):
         _mm = getattr(cli.agent, "_memory_manager", None)
         # reset=False: provider state follows the new id; parent_session_id keeps lineage (#6672).
