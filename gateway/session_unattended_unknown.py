@@ -75,9 +75,9 @@ def publish_owed_restart(db, row) -> bool:
     a submitter or dispatcher that reads the terminal receipt also reads the cause. True once the row
     may settle: recorded now, nothing owed, or moot (``record_owner_restart_result`` refuses a stale
     run or claim and never writes over an existing result; an attempt whose board policy is not this
-    one's has nowhere to record it). A store that cannot take the write now raises
-    (``_STORAGE_ERRORS``): the row stays owed. Any other failure is logged and settles without it,
-    leaving the ordinary crash booking."""
+    one's has nowhere to record it). The row's session fences an attempt whose interpreter never
+    bound. A store that cannot take the write now raises (``_STORAGE_ERRORS``): the row stays owed.
+    Any other failure is logged and settles without it, leaving the ordinary crash booking."""
     from hermes_state_runtime import OWNER_RESTART
     card = (row.get('payload') or {}).get('kanban_card_v1')
     if row.get('outcome') != OWNER_RESTART or card is None:
@@ -86,7 +86,7 @@ def publish_owed_restart(db, row) -> bool:
     try:
         with db._read_ctx() as conn:
             board_db = card_board_db(conn, row)
-        if board_db is not None and record_owner_restart_result(card, board_db):
+        if board_db is not None and record_owner_restart_result(card, board_db, row.get('target_session_id')):
             logger.info('Kanban attempt %s/%s run %s: owner restart recorded (not replayed)',
                         card.get('board'), card.get('task_id'), card.get('run_id'))
     except _STORAGE_ERRORS:

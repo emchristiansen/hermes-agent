@@ -348,7 +348,26 @@ def _remove_finished_workspace(conn, context):
     kb._cleanup_workspace(conn, context['task_id'])
 
 
-def record_owner_restart_result(card, board_db) -> bool:
+def _unbound_attempt_claim(conn, task_id, run_id, session_id):
+    """The claim of run ``run_id`` when it is still the task's running attempt and was admitted to
+    ``session_id`` (its ``owner_admitted`` marker), else None. For an attempt whose interpreter
+    never bound: no ``worker_bound`` claim exists to fence by, so the run's own claim and admission
+    marker fence it instead."""
+    if not isinstance(session_id, str):
+        return None
+    run = conn.execute("SELECT r.claim_lock FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
+                       "WHERE t.id=? AND t.current_run_id=? AND t.status='running' AND r.status='running' "
+                       "AND r.claim_lock = t.claim_lock", (task_id, run_id)).fetchone()
+    marker = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='owner_admitted' "
+                          "ORDER BY id DESC LIMIT 1", (task_id, run_id)).fetchone()
+    try:
+        admitted = json.loads(marker[0]).get('session_id') if marker else None
+    except (ValueError, TypeError, AttributeError):
+        admitted = None
+    return run[0] if run and run[0] and admitted == session_id else None
+
+
+def record_owner_restart_result(card, board_db, session_id=None) -> bool:
     """The profile owner ended under a card attempt: record that as the run's result.
 
     Called only where the owner itself settles the attempt's lost turn ``interrupted`` because it
@@ -362,6 +381,15 @@ def record_owner_restart_result(card, board_db) -> bool:
     counting a failure. Only for the task's CURRENT run under its live claim, and never over a result
     the interpreter already recorded. ``board_db``: the board file the attempt's session policy names
     (``card_board_db``). False when nothing was recorded.
+
+    An attempt the owner admitted but whose interpreter never bound (the owner ended between its
+    ``owner_admitted`` marker and ``worker_bound``) was lost to the same restart. With
+    ``session_id``, the admission's session, it is recorded under the run's own claim and the
+    dispatcher's spawned worker pid, fenced by the run's marker naming that session
+    (``_unbound_attempt_claim``); the crash sweep books it as it books a bound one
+    (``kanban_owner_recovery.owner_restart_accounted``). The dispatcher registers that pid after
+    the spawn, so it can still be NULL here: the record then carries no pid and speaks for the pid
+    the run registers later (``kanban_owner_recovery.managed_run_exit_code``).
 
     This is the attempt's accounting, not the end of the interpreter's use of its workspace: the
     interpreter may still be running (a tool in flight outlives owner-pipe EOF by a grace period).
@@ -382,13 +410,17 @@ def record_owner_restart_result(card, board_db) -> bool:
         row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_bound' "
                            "ORDER BY id DESC LIMIT 1", (task_id, run_id)).fetchone()
         bound = json.loads(row[0]) if row else {}
-        task = conn.execute('SELECT current_run_id, claim_lock FROM tasks WHERE id=?', (task_id,)).fetchone()
-        if (not bound.get('claim_lock') or task is None or task[0] != run_id or task[1] != bound['claim_lock']
+        task = conn.execute('SELECT current_run_id, claim_lock, worker_pid FROM tasks WHERE id=?', (task_id,)).fetchone()
+        if row is not None:
+            claim, pid = bound.get('claim_lock'), bound.get('pid')
+        else:
+            claim, pid = _unbound_attempt_claim(conn, task_id, run_id, session_id), task[2] if task else None
+        if (not claim or task is None or task[0] != run_id or task[1] != claim
                 or conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_result'",
                                 (task_id, run_id)).fetchone()):
             return False
         kb._append_event(conn, task_id, 'worker_result',
-            {'pid': bound.get('pid'), 'claim_lock': bound['claim_lock'], 'exit_code': KANBAN_OWNER_RESTART_EXIT_CODE,
+            {'pid': pid, 'claim_lock': claim, 'exit_code': KANBAN_OWNER_RESTART_EXIT_CODE,
              'last_output': '', OWNER_RECORDED_RESULT_KEY: os.getpid()}, run_id=run_id)
     return True
 

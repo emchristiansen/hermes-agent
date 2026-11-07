@@ -31,7 +31,7 @@ from gateway.restart import (
 from gateway.run_common import _UNSET
 from gateway.run_runtime import interrupt_side_agents, managed_turn_count, stop_managed_turns
 from gateway.run_shutdown_budget import (
-    STOP_CLOSE_RESERVE_SECONDS, final_sweep_live, quiesce_reserve, start_daemon_call, stop_wait_budget)
+    STOP_CLOSE_RESERVE_SECONDS, final_sweep_live, join_settled_final_sweep, quiesce_reserve, start_daemon_call, stop_wait_budget)
 from gateway.run_shutdown_session_end import GatewaySessionEndMixin
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
 
@@ -1979,7 +1979,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             _kill.add_done_callback(consume_detached_task_result)
             logger.warning("Shutdown phase: final-cleanup tool kill still running at +%.2fs; no longer awaited "
                            "(the process exit ends it)", ctx.elapsed())
-        else:
+        elif join_settled_final_sweep(self, self._stop_final_sweep_thread, ctx.elapsed):  # else it logs why not
             logger.info("Shutdown phase: final-cleanup tool kill done at +%.2fs", ctx.elapsed())
         # Reap the auxiliary-client cache: clients bound to dead worker-thread loops leak httpx transports.
         def _reap_aux_clients() -> None:

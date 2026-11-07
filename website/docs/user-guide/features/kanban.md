@@ -666,6 +666,16 @@ hermes kanban create "audit auth flow" \
 
 The dispatcher emits one `--skills <name>` flag per skill listed, so the worker spawns with all of them loaded on top of the auto-injected kanban guidance. The skill names must match skills that are actually installed on the assignee's profile (run `hermes skills list` to see what's available); there's no runtime install.
 
+A binding naming a skill the assignee lacks fails every attempt before the conversation starts. Change it on the existing card between attempts (the id, history, comments and every other field stay as they are):
+
+```bash
+hermes kanban set-skills t_abcd translation github-code-review   # replace
+hermes kanban set-skills t_abcd --clear                          # back to no forced skills
+hermes kanban set-skills t_abcd --clear --expected '["github-code-review"]' --reason "skill not installed"
+```
+
+The next claimed attempt reads the new binding. It is refused while an attempt holds the card (live claim or open run), since that attempt already loaded its skills, and it is orchestrator-only like `unblock`. `--expected` makes it compare-and-set, and every change is recorded as a `skills_set` event.
+
 ### Per-task model override
 
 Pin a task's worker to a specific model (and optionally provider), independent of the assignee profile's default:

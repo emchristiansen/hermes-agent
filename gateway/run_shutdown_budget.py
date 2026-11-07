@@ -16,6 +16,7 @@ default executor after ``stop()`` has disarmed the watchdog, so such work runs o
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 from contextlib import suppress
@@ -23,6 +24,10 @@ from typing import Any, Callable, Optional
 
 # SessionDB close and the exit-state writes, after the executor quiesce (the quiesce kept 1s for them).
 STOP_CLOSE_RESERVE_SECONDS = 1.0
+# How long the stop waits, once the final sweep's future has settled, for its daemon thread to exit: the
+# sweep has returned by then and the thread only has its settlement post (``call_soon_threadsafe``) left,
+# but the loop can resume on the settled future before the thread is gone (QUIESCE-COMPOSITION-I1).
+STOP_SETTLED_SWEEP_EXIT_SECONDS = 0.5
 # The share of its 2s bound the executor quiesce is guaranteed after the adapters and the final tool
 # kill: it waits for a live writer as long as the deadline allows, and a writer still live when it
 # gives up keeps SessionDB open (#101093), so a shorter quiesce is safe where a cut close is not.
@@ -76,6 +81,20 @@ def final_sweep_live(runner) -> int:
     quiesce conservatively treats it as a live writer and keeps SessionDB open (#101093)."""
     thread = getattr(runner, "_stop_final_sweep_thread", None)
     return int(thread is not None and thread.is_alive())
+
+
+def join_settled_final_sweep(runner, thread: threading.Thread, elapsed: Callable[[], float]) -> bool:
+    """Wait for the final sweep's thread, whose future has settled, to exit within its exit bound (clamped
+    to the stop's leash after the quiesce and the close). Until it has exited ``final_sweep_live`` counts
+    it as a live writer and the close is skipped, though the sweep finished in time. Returns whether it
+    exited; one still alive past the bound is logged, stays a live writer and SessionDB stays open for it."""
+    thread.join(stop_wait_budget(runner, STOP_SETTLED_SWEEP_EXIT_SECONDS, reserve=quiesce_reserve()))
+    if not thread.is_alive():
+        return True
+    logging.getLogger("gateway.run").warning(
+        "Shutdown phase: final-cleanup tool kill done at +%.2fs but its thread has not exited; the quiesce "
+        "keeps SessionDB open for it", elapsed())
+    return False
 
 
 def quiesce_reserve() -> float:

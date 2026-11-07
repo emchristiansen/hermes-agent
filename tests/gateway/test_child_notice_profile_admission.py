@@ -5,6 +5,7 @@ owning profile's settings, a handoff to the parent, and the stale child pin.
 """
 
 import asyncio
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -297,10 +298,9 @@ async def test_batched_completions_follow_the_owning_profile(
         pair = [("PROCESS_RESULT", evt), ("COMPANION_RESULT", companion)]
         if path in {"batch_foreground_first", "batch_boundary_first"}:
             pair.reverse()
-        outcomes = await asyncio.gather(*(
-            runner._enqueue_process_completion_notification(text, event)
-            for text, event in pair
-        ))
+        # Coalescing premise, made real: the window opens only once every eligible entry is IN the batch
+        # (``gather`` alone does not ensure that: scope hydration runs before the append, INT-R2-F1).
+        outcomes = await _enqueue_all_then_flush(runner, monkeypatch, pair)
         assert outcomes[pair.index(("PROCESS_RESULT", evt))] is (True if leg.surfaced else None)
         assert outcomes[pair.index(("COMPANION_RESULT", companion))] is (None if boundary else True)
         texts = "\n".join(event.text for event, _sid, _home in rig.admitted)
@@ -309,3 +309,78 @@ async def test_batched_completions_follow_the_owning_profile(
         assert len(rig.admitted) == (int(leg.surfaced) if boundary else 1)
 
     await _for_each_leg(rig, owner, surface_a, path, consume)
+
+
+async def _enqueue_all_then_flush(runner, monkeypatch, pair):
+    """Enqueue *pair* concurrently. The batch window (the flush's own sleep, recognised by its caller, never
+    another await) waits until each call has either returned (filtered by policy before batching) or has its
+    entry in a batch; it then elapses exactly as configured (0.01 s, as before)."""
+    real_sleep = asyncio.sleep
+    all_in = asyncio.Event()
+
+    async def window(delay, *args, **kwargs):
+        if sys._getframe(1).f_code.co_name == "_flush_process_completion_batch":
+            await all_in.wait()
+        return await real_sleep(delay, *args, **kwargs)
+    monkeypatch.setattr(asyncio, "sleep", window)
+    tasks = [asyncio.ensure_future(runner._enqueue_process_completion_notification(text, event))
+             for text, event in pair]
+
+    def in_batch(event):
+        return any(e is event for entries in runner._completion_notification_batches.values()
+                   for _t, e, _f in entries)
+    try:
+        while not all(task.done() or in_batch(event) for task, (_text, event) in zip(tasks, pair)):
+            await real_sleep(0)
+        all_in.set()
+        return list(await asyncio.gather(*tasks))
+    finally:
+        all_in.set()
+        monkeypatch.setattr(asyncio, "sleep", real_sleep)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface_a", [True, False])
+async def test_a_completion_arriving_after_the_batch_detached_gets_its_own_batch(
+    monkeypatch, tmp_path, request, surface_a, private_db_probe_cleanup,
+):
+    """Late-arrival control. The second completion arrives while the first batch, already detached, is
+    being delivered. It forms its own batch: two admissions, each result exactly once, nothing lost, nothing
+    settled on the other's acceptance, and every owner/route/pin check of ``_for_each_leg`` intact."""
+    rig = _build_rig(monkeypatch, tmp_path, request, surface_a, "all")
+    runner = rig.runner
+    accept = rig.adapter.handle_message
+
+    async def consume(leg):
+        runner._completion_notification_batch_window = 0.01
+        leg.proc.output_buffer = "FIRST_RESULT"
+        first = {**runner._build_process_completion_event(leg.watcher, leg.proc, leg.proc.id),
+                 "owner_task_id": "parent-owner", "session_id": f"first-{leg.name}-{leg.index}",
+                 "output": "FIRST_RESULT"}
+        late = {**first, "session_id": f"late-{leg.name}-{leg.index}", "output": "LATE_RESULT"}
+        delivering, late_queued = asyncio.Event(), asyncio.Event()
+
+        async def held_accept(event):
+            if not delivering.is_set():  # the first batch's admission: held until the late one is queued
+                delivering.set()
+                await late_queued.wait()
+            return await accept(event)
+        rig.adapter.handle_message = held_accept
+        try:
+            one = asyncio.ensure_future(runner._enqueue_process_completion_notification("FIRST_RESULT", first))
+            await asyncio.wait_for(delivering.wait(), 30)
+            assert runner._completion_notification_batches == {}  # the first batch has been detached
+            two = asyncio.ensure_future(runner._enqueue_process_completion_notification("LATE_RESULT", late))
+            while not any(e is late for v in runner._completion_notification_batches.values() for _t, e, _f in v):
+                await asyncio.sleep(0)
+            late_queued.set()
+            assert await asyncio.gather(one, two) == [True, True]
+        finally:
+            late_queued.set()
+            rig.adapter.handle_message = accept
+        texts = [event.text for event, _sid, _home in rig.admitted]
+        assert len(texts) == 2, texts
+        assert sum("FIRST_RESULT" in t for t in texts) == 1 and sum("LATE_RESULT" in t for t in texts) == 1
+        assert runner._completion_notification_batches == {}
+
+    await _for_each_leg(rig, "foreground", surface_a, "batch_child_first", consume)

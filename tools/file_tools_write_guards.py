@@ -193,15 +193,20 @@ _PROTECTED_INSTRUCTION_BASENAMES = frozenset({
 def _protected_instruction_config() -> tuple[bool, list[str]]:
     """Return ``(enabled, extra_patterns)`` from ``security.protected_instruction_files`` /
     ``security.protected_instruction_extra_patterns`` (fnmatch on basename). Config read
-    failures keep the gate ON — fail-safe for a security boundary."""
+    failures keep the gate ON — fail-safe for a security boundary. ``load_config`` does not raise on
+    a broken config.yaml (it serves defaults or the last good config as a ``FailedConfigRead``):
+    that fallback is a read failure here too, so it cannot turn the gate off. Its extra patterns
+    (last good user config and the current managed overlay) only add protection, so they still apply."""
     try:
         from hermes_cli.config import load_config, cfg_get
+        from hermes_cli.config_read_errors import FailedConfigRead
         cfg = load_config()
+        failed_read = isinstance(cfg, FailedConfigRead)
         enabled = cfg_get(cfg, "security", "protected_instruction_files", default=True)
         extra = cfg_get(cfg, "security", "protected_instruction_extra_patterns", default=[])
     except Exception:
         return True, []
-    if not isinstance(enabled, bool):
+    if failed_read or not isinstance(enabled, bool):
         enabled = True
     if not isinstance(extra, list):
         extra = []

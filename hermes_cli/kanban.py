@@ -211,7 +211,7 @@ def _audit_author(requested: str | None = None) -> str:
 
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
-    "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
+    "init", "create", "swarm", "assign", "set-skills", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "settle-triage", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
@@ -600,6 +600,38 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         print(f"Set model override on {args.task_id}: {label} (applies on next dispatch)")
     else:
         print(f"Cleared model override on {args.task_id} (worker uses its profile default)")
+    return 0
+
+
+def _cmd_set_skills(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_db_skills import UNSET, set_task_skills
+    names = list(args.skills or [])
+    if (bool(names) + bool(args.clear) + bool(args.explicit_none)) != 1:
+        return _err("kanban set-skills: pass skill names, --clear or --none (exactly one)", 2)
+    skills = names if names else (None if args.clear else [])
+    expected = UNSET
+    if args.expected is not None:
+        try:
+            expected = json.loads(args.expected)
+        except json.JSONDecodeError as exc:
+            return _err(f"kanban set-skills: --expected: {exc}", 2)
+        if expected is not None and not (isinstance(expected, list) and all(isinstance(s, str) for s in expected)):
+            return _err('kanban set-skills: --expected must be null, [] or a JSON list of names', 2)
+    reason = _stripped_or_none(getattr(args, "reason", None))
+    try:
+        with kbc.connect_closing() as conn:
+            ok, refusal = set_task_skills(conn, args.task_id, skills, expected=expected,
+                                          actor=_audit_author(), reason=reason)
+            task = kb.get_task(conn, args.task_id)
+    except ValueError as exc:
+        return _err(f"kanban set-skills: {exc}", 2)
+    result = {"task_id": args.task_id, "ok": ok, "skills": task.skills if task else None, "error": refusal}
+    if _json_out(args, result):
+        return 0 if ok else 1
+    if not ok:
+        return _err(f"cannot set skills on {args.task_id}: {refusal}")
+    shown = ", ".join(task.skills) if task.skills else ("(none, explicit)" if task.skills == [] else "(default: none)")
+    print(f"Skills on {args.task_id}: {shown} (applies on the next claimed attempt)")
     return 0
 
 
@@ -1363,7 +1395,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
-    "assign": _cmd_assign, "set-model": _cmd_set_model,
+    "assign": _cmd_assign, "set-model": _cmd_set_model, "set-skills": _cmd_set_skills,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,

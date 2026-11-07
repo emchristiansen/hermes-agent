@@ -257,6 +257,20 @@ _SPECS = [
              help="Provider the model belongs to (worker is spawned with "
                   "--provider <name>). Cleared together with the model."),
     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
+    _cmd("set-skills", [
+        _TASK_ID,
+        _arg("skills", nargs="*", metavar="SKILL",
+             help="Skill names that replace the binding (separate words, no commas)"),
+        _arg("--clear", action="store_true",
+             help="Reset to the create-time default: no forced skills (stored NULL)"),
+        _arg("--none", dest="explicit_none", action="store_true",
+             help="Store an explicit empty list (also loads no forced skills)"),
+        _arg("--expected", metavar="JSON",
+             help='Compare-and-set: the current binding as JSON (null, [] or ["a","b"]); refused when it differs'),
+        _reason("Audit reason recorded on the skills_set event"),
+        _json_flag(help="Emit JSON output"),
+    ], help="Replace or clear a task's force-loaded skills (takes effect on the next claimed attempt; "
+            "refused while an attempt holds the task; orchestrator-only)"),
     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
     _cmd("reassign", [
         _TASK_ID,

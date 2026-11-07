@@ -7,11 +7,13 @@ from copy import deepcopy
 from datetime import UTC, datetime
 import json
 import logging
+import re
 
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session_contract import SessionRef
 from hermes_state_runtime import RuntimeStoreError, admit_session_input, list_session_admissions
+from gateway.run_notifications_offload import owned_offload
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +25,24 @@ def producer_identity(runner, event):
     return json.dumps(identity, separators=(',', ':'))
 
 
+# Characters every JSON encoder stores verbatim inside a string (``_json`` and ``json.dumps``
+# escape only quotes, backslashes, control and, with ``ensure_ascii``, non-ASCII characters).
+_VERBATIM_JSON_RUN = re.compile(r'[A-Za-z0-9_.:,\[\]{}-]+')
+
+
+def _identity_needle(identity):
+    """The longest run of *identity* a stored payload carrying it must contain verbatim: a
+    necessary condition, never a match (``''`` when there is none: every row is a candidate)."""
+    return max(_VERBATIM_JSON_RUN.findall(identity), key=len, default='')
+
+
 def completion_admission(runner, event):
+    """The route's earliest admission (by ``seq``) carrying *event*'s producer identity, as its
+    own or as a coalesced sibling's (``identities``); None is "not admitted", never a success.
+
+    Blocking (state DB reads): event-loop callers run it off-loop. Only rows whose payload JSON
+    contains the identity's verbatim run are read and decoded; the identity match itself is the
+    parsed descriptor comparison it always was."""
     from gateway.session_authorities import active_authority
     authority = active_authority(runner)
     if authority is None:
@@ -31,9 +50,10 @@ def completion_admission(runner, event):
     entry = runner.session_store.lookup_by_session_key(str(event.get('session_key') or ''))
     if entry is None:
         return None
-    from hermes_state_runtime import list_session_admissions
+    from hermes_state_runtime import list_session_admissions_containing
     identity = producer_identity(runner, event)
-    for row in list_session_admissions(authority.db, session_id=_route_owner(authority, entry), pending_only=False):
+    for row in list_session_admissions_containing(
+            authority.db, session_id=_route_owner(authority, entry), needle=_identity_needle(identity)):
         descriptor = row['payload'].get('local_automation_v1') or row['payload'].get('native_text_v1', {}).get('automation', {})
         if identity in descriptor.get('identities', [descriptor.get('identity')]):
             return row
@@ -115,15 +135,15 @@ async def prepare_heartbeat(runner, event):
     if entry is None:
         return event
     owner, process = _route_owner(authority, entry), str(event.get('session_id') or '')
-    if await asyncio.to_thread(_process_completed, runner, authority, owner, event):
+    if await owned_offload(runner, _process_completed, runner, authority, owner, event):
         logger.debug("Dropped heartbeat %s of process %s: its completion is already admitted",
                      event.get('event_id'), process)
         return None
     from hermes_state_runtime import find_session_admission
-    if await asyncio.to_thread(find_session_admission, authority.db, principal_id='automation:' + entry.session_key,
+    if await owned_offload(runner, find_session_admission, authority.db, principal_id='automation:' + entry.session_key,
                                session_id=owner, request_id=producer_identity(runner, event)):
         return None  # a retry of a tick already admitted (its acknowledgement lost)
-    pending = await asyncio.to_thread(list_session_admissions, authority.db, session_id=owner)
+    pending = await owned_offload(runner, list_session_admissions, authority.db, session_id=owner)
     waiting = next((row for row in pending if _queued_tick(row, process, entry.session_key)), None)
     earlier = waiting and _descriptor(waiting['payload']).get('tick')
     if not isinstance(earlier, dict):
@@ -177,7 +197,7 @@ async def withdraw_process_ticks(runner, event):
         finished = {identity[1] for identity in _identities(
             [producer_identity(runner, event), *(event.get('_automation_identities') or ())])
             if identity[0] == 'completion' and len(identity) > 1}
-        pending = await asyncio.to_thread(
+        pending = await owned_offload(runner,
             list_session_admissions, authority.db, session_id=_route_owner(authority, entry))
         for row in pending:
             if any(_queued_tick(row, process, entry.session_key) for process in finished):
@@ -513,7 +533,7 @@ async def move_route_wakes(runner, session_key, old_session_id):
     new = SessionRef(authority.profile_id, authority.logical_owner(entry.session_id))
     if old.session_id not in authority.sessions or old == new:
         return
-    rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=old.session_id)
+    rows = await owned_offload(runner, list_session_admissions, authority.db, session_id=old.session_id)
     if any(row['status'] == 'unknown' for row in rows):
         return
     actor = Principal('messaging-control', authority.profile_id, frozenset({'session:submit', 'session:control'}), 'reset')
@@ -681,7 +701,7 @@ async def _fold_queued_kanban_wakes(authority, entry, identity, text, category):
     session keeps at most one queued wake and loses none: a refused fold cancels nothing and the
     notifier retries."""
     import asyncio
-    pending = await asyncio.to_thread(list_session_admissions, authority.db,
+    pending = await owned_offload(authority.runner, list_session_admissions, authority.db,
                                       session_id=_route_owner(authority, entry))
     waiting = [row for row in pending if _queued_kanban_wake(row, entry.session_key, category)]
     if not waiting:

@@ -65,16 +65,45 @@ async def run(params, board_db):
         raise GatewayClientError('Kanban requires the assigned local profile owner')
     deadline = time.monotonic() + OWNER_WAIT_S
     admission = None
+    # The owner incarnation live when this attempt started, for ``_owner_restart_grace``.
+    from hermes_cli.kanban_presubmit_grace import baseline
+    owner = await asyncio.to_thread(baseline)
+    # Set once ``connect_gateway`` yields a connection, the only way ``kanban.run`` can be sent. From
+    # then on whether the owner received the claim is unknown, so nothing here retries the submit or
+    # spends the grace: only failures in the ensure phase, before any connection, are retried.
+    connected = False
     while True:
         try:
             async with _receipts() as client:
+                connected = True
                 admission = await _submit_claim(client, params, board_db)
                 return await _follow(admission, client, params, board_db)
         except GatewayUnavailableError as exc:
-            # Only before admission: an admitted claim is never submitted again.
-            if admission is not None or exc.state not in _TRANSIENT_OWNER_STATES or time.monotonic() >= deadline:
+            # Only before any connection: a claim that may have reached the owner is never resubmitted.
+            if connected or admission is not None or exc.state not in _TRANSIENT_OWNER_STATES:
+                raise
+            if time.monotonic() >= deadline:
+                if await asyncio.to_thread(_owner_restart_grace, owner, params, board_db):
+                    from hermes_cli.kanban_db_retry_policy import KANBAN_OWNER_RESTART_EXIT_CODE
+                    return KANBAN_OWNER_RESTART_EXIT_CODE
                 raise
         await asyncio.sleep(1)
+
+
+def _owner_restart_grace(owner, params, board_db):
+    """The owner never became ready within the wait and nothing was submitted: True when the owner
+    incarnation live at this attempt's start was replaced by another, and the card's one grace before
+    an actual admission was still unspent and is now spent on this exact run
+    (``kanban_presubmit_grace``). Otherwise False, and the wait's ordinary counted exit follows."""
+    from hermes_cli.kanban_presubmit_grace import record_grace, replacement
+    home, old = owner
+    new = replacement(old, home)
+    if new is None or not record_grace(board_db, params, old, new, home):
+        return False
+    print(f'Kanban attempt not submitted: its owner {old[0]} was replaced by {new[0]} and never became ready '
+          f'within {OWNER_WAIT_S:g} s; owner restart recorded (the card\'s one grace before an admission)',
+          file=sys.stderr)
+    return True
 
 
 @contextlib.asynccontextmanager

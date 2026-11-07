@@ -197,6 +197,20 @@ def list_session_admissions(db, *, session_id: str, pending_only: bool = True) -
         return [_row(row) for row in conn.execute(sql, (session_id,))]
 
 
+def list_session_admissions_containing(db, *, session_id: str, needle: str) -> list[dict]:
+    """The session's admissions, any status, whose stored payload JSON contains *needle*, in
+    ``seq`` order. A prefilter, never an identity: callers verify the parsed payload exactly.
+
+    The (target, status, seq) index bounds the scan to the session and ``instr`` runs inside
+    SQLite, so only matching rows are returned and decoded; they are ordered here, so no temp
+    B-tree sorts (and on a large session spills) the session's whole history."""
+    with db._read_ctx() as conn:
+        rows = [_row(row) for row in conn.execute(
+            'SELECT * FROM session_admissions WHERE target_session_id=? AND instr(payload_json, ?) > 0',
+            (session_id, needle))]
+    return sorted(rows, key=lambda row: row['seq'])
+
+
 _ANY_HEAD = object()
 
 
