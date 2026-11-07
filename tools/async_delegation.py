@@ -1049,7 +1049,12 @@ def _finalize(delegation_id: str, result: Any, status: str) -> None:
     ``result`` is a dict or a callable receiving the record snapshot (stall path). The record
     stays active ("finalizing") until durable persistence and queue publication finish; otherwise
     process shutdown can kill this daemon worker after status flips but before SQLite commits.
-    A second call for the same id (late runner return after a forced stall) is a no-op."""
+    A second call for the same id (late runner return after a forced stall) is a no-op.
+
+    The claiming actor is a physical writer until persistence and publication finish (V3-ASYNC-01): the claim
+    admits it in ``_worker_futures`` (the same accounting ``join_workers`` gives the close gate), so a stale
+    monitor that finalizes a record whose worker has already returned and settled its own admission still keeps
+    SessionDB open, or is waited for within the quiesce's bound, until its completion write is done."""
     with _records_lock:
         record = _records.get(delegation_id)
         if record is None or record.get("status") not in _ACTIVE_STATES:
@@ -1059,11 +1064,15 @@ def _finalize(delegation_id: str, result: Any, status: str) -> None:
         record["interrupt_fn"] = None  # drop the closure; child is done
         record["progress_fn"] = None  # stop stale-monitor sampling
         snapshot = dict(record)
-    _push_completion_event(snapshot, result(snapshot) if callable(result) else result, status)
-    with _records_lock:
-        if delegation_id in _records:
-            _records[delegation_id]["status"] = status
-        _prune_completed_locked()
+        finalizer = _admit_worker_locked()
+    try:
+        _push_completion_event(snapshot, result(snapshot) if callable(result) else result, status)
+        with _records_lock:
+            if delegation_id in _records:
+                _records[delegation_id]["status"] = status
+            _prune_completed_locked()
+    finally:
+        _settle_admission(finalizer)
 
 
 def _push_completion_event(record: dict[str, Any], result: dict[str, Any], status: str) -> None:

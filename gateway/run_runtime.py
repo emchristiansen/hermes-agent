@@ -404,11 +404,15 @@ async def _retire_profile_authority(authority, timeout=None):
     # Every turn here has retired (joined above) and registered its upgrade before retiring, so this read sees
     # them all. Only upgrades writing a store under this home count, so another profile still releases on its own.
     # A zero read also fences the home: an upgrade handed over later (by a turn not joined here) is refused.
-    from gateway.run_shutdown_budget import title_upgrades_live_under
+    from gateway.run_shutdown_budget import title_fence_generation, title_upgrades_live_under
     db_path = getattr(getattr(authority, 'db', None), 'db_path', None)
     home = Path(db_path).parent if db_path is not None else Path(str(authority.profile_id))
     budget = min(TITLE_SETTLE_SECONDS, max(0.0, deadline - time.monotonic()))
-    titles = await asyncio.to_thread(functools.partial(title_upgrades_live_under, home, budget, fence=True))
+    # Bind the fence to this generation before the handoff (TITLE-CANCEL-01): cancelling this coroutine does not stop
+    # the read's thread, and a re-serve meanwhile starts a generation that thread must never fence, however late it runs.
+    generation = title_fence_generation(home)
+    titles = await asyncio.to_thread(functools.partial(title_upgrades_live_under, home, budget, fence=True,
+                                                       generation=generation))
     if titles:
         logger.error('Profile %s title writer (%d) still live; ownership retained', authority.profile_id, titles)
         return False

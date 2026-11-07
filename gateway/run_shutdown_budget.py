@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import os
 import threading
 import time
 from contextlib import suppress
@@ -150,27 +151,57 @@ def title_upgrades_live(timeout: float) -> int:
     return join(max(0.0, timeout)) if callable(join) else 0
 
 
-def title_upgrades_live_under(home, timeout: float, *, fence: bool = False) -> int:
+def title_upgrades_live_under(home, timeout: float, *, fence: bool = False, generation: Optional[int] = None) -> int:
     """Per-home form of ``title_upgrades_live`` (A3-SH-TITLE-02). It returns the auto-title upgrades that write a
     store under *home* and are still running after a wait of up to ``timeout``. Profile retirement reads it before
     the home's stores close and its reservation is released, so another profile's title upgrade never holds this one.
-    With ``fence``, a zero read also refuses later upgrades for the home (``join_title_upgrades_under``).
+    With ``fence``, a zero read also refuses later upgrades for the home (``join_title_upgrades_under``), but only
+    while the home's serve generation is still the one the read is bound to (TITLE-CANCEL-01): ``generation`` when
+    the caller bound it before a thread handoff (``title_fence_generation``), else the generation at this call.
     It fails closed: a read that raises counts as one live writer, which keeps the profile retained."""
     import sys
+    bound = title_fence_generation(home) if generation is None else generation
     join = getattr(sys.modules.get("agent.title_generator"), "join_title_upgrades_under", None)
     if not callable(join):
         return 0  # a process that never imported the title generator started no upgrade
     try:
-        return join(home, max(0.0, timeout), fence=fence)
+        if not fence:
+            return join(home, max(0.0, timeout))
+        return join(home, max(0.0, timeout), fence=True,
+                    still_current=lambda: title_fence_generation(home) == bound)
     except Exception:  # health: allow BLE001 -- fail closed: an unread writer keeps the profile
         logger.error("Title-writer read for %s failed; treated as live", home, exc_info=True)
         return 1
 
 
+# Serve generation of each home's title fence (TITLE-CANCEL-01), kept here so that it exists whether or not the
+# title generator was ever imported (a stop never imports it). ``unfence_title_home`` (every serve) advances it. A
+# fencing read publishes its fence only while the generation is still the one it was bound to, so a retirement whose
+# read outlives a re-serve (its coroutine was cancelled; its ``to_thread`` read was not) cannot fence the successor,
+# however late that read starts, resumes or first finds the generator imported. Retirement binds the generation on
+# the event loop BEFORE the thread handoff; a synchronous read binds it at the call.
+_title_fence_lock = threading.Lock()
+_title_fence_generation: dict = {}
+
+
+def _title_home_key(home) -> str:
+    return os.path.normcase(os.path.realpath(os.fspath(home)))
+
+
+def title_fence_generation(home) -> int:
+    """The current title-fence serve generation of *home* (0 before any serve advanced it)."""
+    with _title_fence_lock:
+        return _title_fence_generation.get(_title_home_key(home), 0)
+
+
 def unfence_title_home(home) -> None:
-    """The home is served again: lift its title-upgrade fence (``title_upgrades_live_under``). A no-op where the
-    generator was never imported (nothing fenced it)."""
+    """The home is served again: begin a new title-fence generation (an obsolete fencing read of an earlier one can no
+    longer publish) and lift its title-upgrade fence (``title_upgrades_live_under``). The fence itself is a no-op where
+    the generator was never imported (nothing fenced it)."""
     import sys
+    key = _title_home_key(home)
+    with _title_fence_lock:
+        _title_fence_generation[key] = _title_fence_generation.get(key, 0) + 1
     unfence = getattr(sys.modules.get("agent.title_generator"), "unfence_title_home", None)
     if callable(unfence):
         unfence(home)

@@ -92,7 +92,7 @@ def _holds(thread, root: str) -> bool:
     return store is None or _is_under(store, root)
 
 
-def join_title_upgrades_under(home, timeout: float, *, fence: bool = False) -> int:
+def join_title_upgrades_under(home, timeout: float, *, fence: bool = False, still_current: Optional[Callable[[], bool]] = None) -> int:
     """Per-home form of ``join_title_upgrades`` (A3-SH-TITLE-02): a bounded join of the registered upgrades that
     write a store under *home*. Returns how many are STILL live.
 
@@ -105,7 +105,7 @@ def join_title_upgrades_under(home, timeout: float, *, fence: bool = False) -> i
     The turn that hands an upgrade over registers it before the turn retires, so a read made after the home's
     turns retired sees every upgrade they started. With ``fence``, a read of zero also fences the home, under the
     registration lock, after re-reading there: from then on ``start_title_upgrade`` refuses an upgrade writing under it
-    (one handed over by a turn the caller did not join), until ``unfence_title_home``."""
+    (one handed over by a turn the caller did not join), until ``unfence_title_home``; a False ``still_current()`` withholds it."""
     root = os.path.normcase(os.path.realpath(os.fspath(home)))
     deadline = time.monotonic() + max(0.0, timeout)
     live = 0
@@ -125,7 +125,8 @@ def join_title_upgrades_under(home, timeout: float, *, fence: bool = False) -> i
             pending = [t for t in _registered_upgrades() if _holds(t, root) and (t.ident is None or t.is_alive())]
             if pending:
                 return len(pending)
-            _FENCED_HOMES.add(root)
+            if still_current is None or still_current():  # else a serve began a new generation meanwhile
+                _FENCED_HOMES.add(root)
     return live
 
 
