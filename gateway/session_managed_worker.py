@@ -346,8 +346,21 @@ class ManagedWorker:
             stopper.cancel()
             arrived.cancel()
 
-    def interrupt(self):
-        self.control({'type': 'stop'})
+    def interrupt(self, message=None, **kwargs):
+        """The Stop control, under the explicit-stop ABI (``agent.interrupt_compat``): the profile
+        stop and ``adopt_agent`` reach an adopted worker through ``request_hard_interrupt``, which
+        passes a message and may pass ``tool_reason``. The stop frame carries neither; a gateway
+        stop's cause is recorded by ``stop_authority_turns``. The execution's ``finally`` drops the
+        worker from ``_managed_workers`` and closes it while ``adopted`` still names it, so a closed
+        worker has nothing left to stop. A full control queue is not an error either: ``control``
+        latched ``stop`` first and the owner's read loop escalates on that latch."""
+        try:
+            self.control({'type': 'stop'})
+        except RuntimeStoreError as exc:
+            if exc.reason not in {'managed_worker_lost', 'worker_control_backpressure'}:
+                raise
+            import logging
+            logging.getLogger(__name__).debug('Managed Stop not queued (%s)', exc.reason)
 
     def respond(self, kind, prompt_id, value):
         self.control({'type': kind, 'prompt_id': prompt_id, 'value': value})
