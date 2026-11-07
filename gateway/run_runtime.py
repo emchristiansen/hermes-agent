@@ -224,7 +224,11 @@ def release_profile_home(runner, home):
                      "process exit", ", ".join(unfinished), home)
         return False
     from gateway.run_shutdown_budget import title_upgrades_live_under
-    if title_upgrades_live_under(home, 0.0):  # second check (A3-SH-TITLE-02): retirement waited for them first
+    # Second check (A3-SH-TITLE-02): retirement waited for them first. The read fences the home when it finds none
+    # (A3-SH-TITLE-03): a failed serve lifted the fence and never retired an authority, so without it an old deferred
+    # upgrade handed over after this release would reopen the store under the next owner's lock. From the zero read on,
+    # registration under the home is refused, through the release and until a later serve lifts it again.
+    if title_upgrades_live_under(home, 0.0, fence=True):
         logger.error("[MULTIPLEX] A title writer of %s is still live: ownership retained until process exit", home)
         return False
     process_ownership.release(home)
@@ -448,9 +452,16 @@ async def serve_profile_runtime(runner, name, home):
         registry.remove(home)
     elif existing is not None:
         return existing
-    from gateway.run_shutdown_budget import unfence_title_home
+    from gateway.run_shutdown_budget import title_upgrades_live_under, unfence_title_home
     unfence_title_home(home)  # served again: its new turns' title upgrades start (A3-SH-TITLE-02 fence)
-    authority = await _build_profile_authority(runner, name, home, register=False)
+    try:
+        authority = await _build_profile_authority(runner, name, home, register=False)
+    except BaseException:
+        # A failed initialization must not leave the home unfenced (A3-SH-TITLE-03): restore the fence unless an upgrade
+        # started meanwhile, which is a live writer that keeps the reservation (``release_profile_home`` reads it). The
+        # read does not wait (timeout 0), so it runs inline even when the serve was cancelled.
+        title_upgrades_live_under(home, 0.0, fence=True)
+        raise
     try:
         with owner_scope(authority):
             _drop_retired_local_adapter(authority)

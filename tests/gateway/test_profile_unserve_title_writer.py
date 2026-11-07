@@ -21,7 +21,11 @@ retired and released. This is a turn the retirement did not join, and the fence 
 
 The remaining cases pin the per-home scope, the registration-before-read ordering inside the retirement, the fence and its
 lifting, the failed-start and unstarted bounds, and the fail-closed reader (A4 review r6264 A4-SH-TITLE-UNSERVE-01 is the
-same defect)."""
+same defect).
+
+The A3-SH-TITLE-03 cases at the end (review6390) cover a re-serve whose initialization fails: the home stays fenced through
+the release's zero read and the release itself, an upgrade started while the failed attempt still owned the home keeps the
+reservation, beta releases independently, and a later serve titles the new generation and finally releases."""
 import json
 import os
 import sys
@@ -414,5 +418,205 @@ def test_the_fence_refuses_only_its_home_until_it_is_lifted(tmp_path):
         tg._UPGRADE_STORES[allowed] = str(alpha / 'state.db')
         tg.start_title_upgrade(allowed); allowed.join(10)
         assert allowed.ident is not None
+    finally:
+        budget.unfence_title_home(alpha)
+
+
+# A3-SH-TITLE-03 (review6390, t_60889c77): a failed re-serve lifted the fence, its initialization failed, and the release
+# read the home's titles without fencing it. An old deferred upgrade handed over afterwards then reopened alpha's store and
+# wrote it while an independent contender held alpha's lock. The cases below follow the review's
+# test_review_q07_lifetime_extra.py and test_review_q07_failed_reserve_live_title.py shapes: production unserve/serve/release,
+# real deferred upgrade and real deferred-start consumer, separate contender processes. Only the model answer, the authority
+# initialization failure and the unrelated MCP/memory/log teardown are substituted.
+
+
+def _failing_initialize(monkeypatch, home, before_failure=None):
+    from gateway import session_authority
+    real = session_authority.initialize_session_authority
+
+    async def initialize(*args, **kwargs):
+        if kwargs.get('profile_id') == str(home):
+            if before_failure is not None:
+                before_failure()
+            raise RuntimeError('injected authority initialization failure')
+        return await real(*args, **kwargs)
+    monkeypatch.setattr(session_authority, 'initialize_session_authority', initialize)
+    return lambda: monkeypatch.setattr(session_authority, 'initialize_session_authority', real)
+
+
+@pytest.mark.parametrize('fail_build', [True, False], ids=['failed-reserve', 'served-then-unserved'])
+def test_a_deferred_title_stays_refused_after_a_reserve_attempt_releases_the_home(tmp_path, monkeypatch, fail_build):
+    from agent import title_generator as tg
+    from agent.turn_context import start_deferred_title_upgrade
+    from gateway.run import _profile_runtime_scope
+    from gateway.runtime_ownership import process_ownership
+    modelled = []; writes = []; contenders = []; obs = {}
+    monkeypatch.setattr(tg, 'title_upgrade_must_wait_for_turn', lambda runtime: True)   # the self-hosted (deferred) branch
+    monkeypatch.setattr(tg, 'generate_title', lambda *a, **k: modelled.append(1) or 'Late deferred title after reserve')
+    with _gateway(tmp_path, monkeypatch, served=('alpha', 'beta')) as (runner, homes, call):
+        home = homes['alpha']; db = runner.session_authorities.for_home(home).db
+        child, child_db = _make_agent(monkeypatch, home)
+        assert child_db is db
+        db.create_session('deferred-reserve', source='test')
+        with _profile_runtime_scope(home):
+            upgrade = tg.maybe_auto_title(db, 'deferred-reserve', 'Investigate the title fence across a failed reserve')
+        assert upgrade is not None and upgrade.ident is None
+        child._deferred_title_upgrade = upgrade      # the turn's finalizer hands it over later
+        with _external_teardown():
+            assert call(runner._unserve_profile('alpha', home)) is True
+        if fail_build:
+            _failing_initialize(monkeypatch, home)
+        obs['serve_error'] = call(runner._serve_profile_runtime('alpha', home))
+        if fail_build:
+            assert 'injected authority initialization failure' in obs['serve_error'], obs
+        else:
+            assert obs['serve_error'] is None, obs
+            with _external_teardown():
+                assert call(runner._unserve_profile('alpha', home)) is True
+        contenders.append(_contender(home))
+        obs['before_late_start'] = {'owned': process_ownership.owns(home), 'contender': _read(contenders[-1]),
+                                    'authority': runner.session_authorities.for_home(home) is not None,
+                                    'fenced': _root(home) in tg._FENCED_HOMES}
+        real_write = db._execute_write
+
+        def write(fn, *a, **kw):
+            writes.append({'thread': threading.current_thread().name, 'owned': process_ownership.owns(home)})
+            return real_write(fn, *a, **kw)
+        monkeypatch.setattr(db, '_execute_write', write)
+        try:
+            start_deferred_title_upgrade(child)
+            if upgrade.ident is not None:
+                upgrade.join(20)
+            with _external_teardown():
+                obs['beta_unserve'] = call(runner._unserve_profile('beta', homes['beta']))
+            contenders.append(_contender(homes['beta'])); obs['beta_contender'] = _read(contenders[-1])
+            obs.update(started=upgrade.ident is not None, registered=upgrade in tg._UPGRADE_THREADS,
+                       modelled=len(modelled), writes=writes)
+            (tmp_path / 'observation.json').write_text(json.dumps(obs, indent=2, default=str))
+            assert obs['before_late_start'] == {'owned': False, 'contender': 'ACQUIRED', 'authority': False, 'fenced': True}, obs
+            assert not obs['started'] and not obs['registered'] and obs['modelled'] == 0 and writes == [], obs
+            assert obs['beta_unserve'] is True and obs['beta_contender'] == 'ACQUIRED', obs
+        finally:
+            for contender in contenders:
+                _let_go(contender)
+            db.close()
+
+
+@pytest.mark.platforms('linux')
+def test_a_failed_reserve_keeps_an_already_started_title_owned_then_releases_and_titles_again(tmp_path, monkeypatch):
+    """The live-writer side of TITLE-03: an old deferred upgrade that started while the failed serve still owned alpha is a
+    live writer. The failure keeps alpha's lock (contender refused) and every write stays owned; beta releases on its own.
+    Once the title retired, a later serve and unserve titles the new generation and finally releases alpha."""
+    from agent import title_generator as tg
+    from agent.turn_context import start_deferred_title_upgrade
+    from gateway.run import _profile_runtime_scope
+    from gateway.runtime_ownership import process_ownership
+    gate = threading.Event(); entered = threading.Event(); writes = []; contenders = []; obs = {}
+    titles = iter(['Old generation live title', 'New generation title'])
+
+    def model(*args, **kwargs):
+        entered.set(); assert gate.wait(60)
+        return next(titles)
+    monkeypatch.setattr(tg, 'title_upgrade_must_wait_for_turn', lambda runtime: True)
+    monkeypatch.setattr(tg, 'generate_title', model)
+    with _gateway(tmp_path, monkeypatch, served=('alpha', 'beta')) as (runner, homes, call):
+        home = homes['alpha']; db = runner.session_authorities.for_home(home).db
+        child, child_db = _make_agent(monkeypatch, home)
+        assert child_db is db
+        db.create_session('live-old', source='test')
+        with _profile_runtime_scope(home):
+            upgrade = tg.maybe_auto_title(db, 'live-old', 'Investigate a title started during a failed reserve')
+        assert upgrade is not None and upgrade.ident is None
+        child._deferred_title_upgrade = upgrade
+        with _external_teardown():
+            assert call(runner._unserve_profile('alpha', home)) is True
+
+        def started_during_build():
+            start_deferred_title_upgrade(child)
+            assert entered.wait(10)
+            obs['during_build'] = {'owned': process_ownership.owns(home), 'writer_alive': upgrade.is_alive()}
+        restore = _failing_initialize(monkeypatch, home, started_during_build)
+        real_write = db._execute_write
+
+        def write(fn, *a, **kw):
+            writes.append({'thread': threading.current_thread().name, 'owned': process_ownership.owns(home)})
+            return real_write(fn, *a, **kw)
+        monkeypatch.setattr(db, '_execute_write', write)
+        try:
+            obs['serve_error'] = call(runner._serve_profile_runtime('alpha', home))
+            contenders.append(_contender(home))
+            obs['after_failed_build'] = {'owned': process_ownership.owns(home), 'writer_alive': upgrade.is_alive(),
+                                         'contender': _read(contenders[-1]), 'fenced': _root(home) in tg._FENCED_HOMES,
+                                         'authority': runner.session_authorities.for_home(home) is not None}
+            with _external_teardown():
+                obs['beta_unserve'] = call(runner._unserve_profile('beta', homes['beta']))
+            contenders.append(_contender(homes['beta'])); obs['beta_contender'] = _read(contenders[-1])
+            gate.set(); upgrade.join(20)
+            obs['old_title'] = db.get_session_title('live-old')
+            obs['writer_alive_after_join'] = upgrade.is_alive()
+            restore()
+            monkeypatch.setattr(tg, 'title_upgrade_must_wait_for_turn', lambda runtime: False)
+            obs['reserve_again'] = call(runner._serve_profile_runtime('alpha', home))
+            fresh = runner.session_authorities.for_home(home).db
+            fresh.create_session('live-new', source='test')
+            with _profile_runtime_scope(home):
+                new = tg.maybe_auto_title(fresh, 'live-new', 'Investigate the next generation title')
+            assert new is not None
+            new.join(20)
+            obs['new_title'] = fresh.get_session_title('live-new')
+            with _external_teardown():
+                obs['last_unserve'] = call(runner._unserve_profile('alpha', home))
+            contenders.append(_contender(home)); obs['last_contender'] = _read(contenders[-1])
+            obs['writes'] = writes
+            (tmp_path / 'observation.json').write_text(json.dumps(obs, indent=2, default=str))
+            assert obs['during_build'] == {'owned': True, 'writer_alive': True}, obs
+            assert 'injected authority initialization failure' in obs['serve_error'], obs
+            assert obs['after_failed_build'] == {'owned': True, 'writer_alive': True, 'contender': 'REFUSED',
+                                                 'fenced': False, 'authority': False}, obs
+            assert obs['beta_unserve'] is True and obs['beta_contender'] == 'ACQUIRED', obs
+            assert not obs['writer_alive_after_join'] and obs['old_title'] == 'Old generation live title', obs
+            assert writes and all(w['owned'] for w in writes), obs
+            assert obs['reserve_again'] is None and obs['new_title'] == 'New generation title', obs
+            assert obs['last_unserve'] is True and obs['last_contender'] == 'ACQUIRED', obs
+        finally:
+            gate.set()
+            if upgrade.ident is not None:
+                upgrade.join(20)
+            for contender in contenders:
+                _let_go(contender)
+            db.close()
+
+
+def test_a_failed_initialization_restores_the_fence_unless_a_writer_started(tmp_path, monkeypatch):
+    """``serve_profile_runtime`` lifts the fence before it builds; a build that raises puts it back at once (before any
+    release runs), and leaves the home unfenced only for an upgrade that started meanwhile (a live writer it must keep)."""
+    import asyncio
+    from types import SimpleNamespace
+    from agent import title_generator as tg
+    from gateway import run_runtime
+    from gateway import run_shutdown_budget as budget
+    alpha = (tmp_path / 'alpha'); alpha.mkdir()
+    runner = SimpleNamespace(session_authorities=SimpleNamespace(for_home=lambda home: None))
+    started = []
+
+    async def build(runner, name, home, *, register):
+        assert _root(home) not in tg._FENCED_HOMES      # lifted for the attempt
+        if started:
+            gate, thread = _held(tg, alpha / 'state.db'); started.append((gate, thread))
+        raise RuntimeError('injected build failure')
+    monkeypatch.setattr(run_runtime, '_build_profile_authority', build)
+    assert budget.title_upgrades_live_under(alpha, 0.0, fence=True) == 0     # a retired alpha
+    try:
+        with pytest.raises(RuntimeError, match='injected build failure'):
+            asyncio.run(run_runtime.serve_profile_runtime(runner, 'alpha', alpha))
+        assert _root(alpha) in tg._FENCED_HOMES
+        started.append(None)
+        with pytest.raises(RuntimeError, match='injected build failure'):
+            asyncio.run(run_runtime.serve_profile_runtime(runner, 'alpha', alpha))
+        gate, thread = started[-1]
+        try:
+            assert thread.is_alive() and _root(alpha) not in tg._FENCED_HOMES
+        finally:
+            gate.set(); thread.join(10)
     finally:
         budget.unfence_title_home(alpha)
