@@ -157,10 +157,11 @@ def _write_dump_record(record: dict[str, Any]) -> None:
     )
 
 
-def _log_quietly(level: str, msg: str, *args) -> None:
-    """Log at *level*; never raises (the wedged main thread may hold the logging lock)."""
+def _log_quietly(level: str, msg: str, *args, exc_info: bool = False) -> None:
+    """Log at *level*; never raises (the wedged main thread may hold the logging lock, and a
+    failing handler must never fail the startup step being diagnosed)."""
     try:
-        getattr(logger, level)(msg, *args)
+        getattr(logger, level)(msg, *args, exc_info=exc_info)
     except Exception:
         pass
 
@@ -663,7 +664,7 @@ def begin_startup_phase(phase: str, *, expected_s: float = 0.0, detail: str = ""
             return None
         return _PhaseToken(handle, handle.begin_phase(expected_s, phase, detail))
     except Exception:
-        logger.debug("Failed to begin startup phase", exc_info=True)
+        _log_quietly("debug", "Failed to begin startup phase", exc_info=True)
         return None
 
 
@@ -674,18 +675,19 @@ def end_startup_phase(token: Optional[_PhaseToken]) -> None:
     try:
         token.handle.end_phase(token.key)
     except Exception:
-        logger.debug("Failed to end startup phase", exc_info=True)
+        _log_quietly("debug", "Failed to end startup phase", exc_info=True)
 
 
 def _resolve_detail(detail: Any) -> str:
     """The phase detail text; a callable is evaluated here. Attribution must never fail the step it
-    describes, so an exception while building it yields an empty detail (logged at DEBUG)."""
+    describes: an exception while building it yields an empty detail, noted at DEBUG through the
+    never-raising ``_log_quietly`` (a failing log handler cannot escape either)."""
     if not callable(detail):
         return str(detail or "")
     try:
         return str(detail() or "")
     except Exception:
-        logger.debug("Failed to build startup phase detail", exc_info=True)
+        _log_quietly("debug", "Failed to build startup phase detail", exc_info=True)
         return ""
 
 
