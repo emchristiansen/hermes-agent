@@ -142,6 +142,10 @@ class ProfileOwnership:
     def __init__(self):
         self._handles: dict[Path, object] = {}
         self._writers: list[threading.Thread] = []
+        # Why shutdown left a store open for a live writer it does not own as a thread (the stop's
+        # DB gate skipped the close); while set, ``close`` releases nothing. Cleared only once an
+        # explicit ``release`` dropped every reservation.
+        self._retained_for: str | None = None
         self._mutex = threading.RLock()
 
     @property
@@ -195,6 +199,8 @@ class ProfileOwnership:
             if handle is not None:
                 _release_file_lock(handle)
                 handle.close()
+            if not self._handles:
+                self._retained_for = None  # nothing left to retain: a later reservation starts clean
 
     def start_writer(self, thread: threading.Thread) -> None:
         """Register before starting so partial startup cannot forget a live writer."""
@@ -202,11 +208,25 @@ class ProfileOwnership:
             self._writers.append(thread)
             thread.start()
 
+    def retain_until_exit(self, reason: str) -> None:
+        """A stop may leave a store open for a live writer (from its start until it closes the stores,
+        and for good when its DB gate skips the close): keep every reservation, as for a live
+        ``start_writer`` thread, until :meth:`stores_closed` or process exit releases the locks."""
+        with self._mutex:
+            self._retained_for = reason
+
+    def stores_closed(self) -> None:
+        """The stop closed every store: nothing it retained is left open for a writer."""
+        with self._mutex:
+            self._retained_for = None
+
     def close(self) -> None:
         with self._mutex:
             # A timed-out daemon can still write during finally/atexit. Keep the
             # handles alive; process exit releases them atomically in the OS.
             if any(thread.is_alive() for thread in self._writers):
+                return
+            if self._retained_for is not None:
                 return
             self._writers.clear()
             for home in reversed(self.homes):

@@ -131,16 +131,17 @@ def build_profile_terminal_scope(
     scope = default_terminal_scope()
     default_image = scope.get("TERMINAL_DOCKER_IMAGE")
     env_path = home / ".env"
-    if env_path.exists():
-        # load_env_file swallows OSError by design (secret scope fails soft); an unreadable
-        # profile .env must fail closed here.
-        try:
-            env_path.read_bytes()
-        except Exception as exc:
-            raise TerminalPolicyUnavailable(f"cannot read {env_path}: {exc}") from exc
-        from agent.secret_scope import load_env_file
+    from agent.secret_scope import read_env_file
 
-        profile_env = load_env_file(env_path)
+    # ONE open/read: absent -> no .env policy; present but unreadable -> fail closed (load_env_file
+    # swallows OSError by design, the secret scope fails soft).
+    try:
+        profile_env: Optional[dict[str, str]] = read_env_file(env_path)
+    except (FileNotFoundError, NotADirectoryError):
+        profile_env = None
+    except OSError as exc:
+        raise TerminalPolicyUnavailable(f"cannot read {env_path}: {exc}") from exc
+    if profile_env is not None:
         scope.update((k, str(v)) for k, v in profile_env.items() if k.startswith("TERMINAL_"))
         # Provenance, not value: an image WRITTEN in the profile's .env is the user's choice even when
         # it spells the default (same rule apply_terminal_config_to_env applies to a set env var).

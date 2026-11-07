@@ -161,6 +161,10 @@ def managed_dotenv_keys() -> frozenset[str]:
 
 def get_secret_source_values(hermes_home: str | os.PathLike) -> dict[str, str]:
     """Return the external-secret value snapshot for ``hermes_home``."""
+    if not _SECRET_SOURCE_VALUES_BY_HOME:
+        # No home has a snapshot: skip the resolve() walk (one lstat per path component) that every
+        # profile scope entry would otherwise pay on the gateway's event loop for a guaranteed miss.
+        return {}
     return dict(_SECRET_SOURCE_VALUES_BY_HOME.get(str(Path(hermes_home).resolve()), {}))
 
 

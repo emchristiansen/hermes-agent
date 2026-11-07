@@ -21,7 +21,6 @@ from contextvars import Context
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-from agent.async_utils import consume_detached_task_result
 from agent.i18n import t
 from gateway.config import Platform
 from gateway.restart import (
@@ -31,8 +30,10 @@ from gateway.restart import (
 from gateway.run_common import _UNSET
 from gateway.run_runtime import interrupt_side_agents, managed_turn_count, stop_managed_turns
 from gateway.run_shutdown_budget import (
-    STOP_CLOSE_RESERVE_SECONDS, final_sweep_live, quiesce_reserve, start_daemon_call, stop_wait_budget)
+    STOP_CLOSE_RESERVE_SECONDS, close_step, gate_only_live, join_descendants_after_starters, quiesce_writers,
+    retain_open_stores, start_daemon_call, stop_wait_budget, stores_closed)
 from gateway.run_shutdown_session_end import GatewaySessionEndMixin
+from gateway.run_shutdown_teardown import GatewayTeardownMixin
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
 
 # Log-record parity with the origin module.
@@ -173,7 +174,7 @@ def _effective_watchdog_leash(runner: object) -> float:
     return effective_stop_watchdog_delay(runner, resolve_shutdown_watchdog_delay(effective_stop_drain_timeout(runner)))
 
 
-class GatewayShutdownMixin(GatewaySessionEndMixin):
+class GatewayShutdownMixin(GatewaySessionEndMixin, GatewayTeardownMixin):
     """Stop/drain/restart, scale-to-zero and active-work accounting methods for GatewayRunner."""
 
     @dataclasses.dataclass
@@ -1749,7 +1750,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             return _interrupted
 
         def _interrupt_delegations() -> None:
-            from tools.async_delegation import interrupt_all as _interrupt_async
+            from tools.async_delegation import shutdown_all as _interrupt_async  # fences new dispatches first
             _count_step(
                 "Shutdown (%s): interrupted %d background delegation(s)",
                 lambda: _interrupt_async(reason=f"gateway shutdown ({phase})"),
@@ -1934,65 +1935,6 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         _profile_adapters.clear()
         logger.info("Shutdown phase: all adapters disconnected at +%.2fs", ctx.elapsed())
 
-    async def _stop_release_runtime_state(self, ctx: GatewayShutdownMixin._StopContext) -> None:
-        """Cancel background tasks, flush pending messages, clear per-session state, final tool kill."""
-        from gateway.run import GatewayRunner
-        for _task in list(self._background_tasks):
-            # _restart_task awaits _stop_task: cancelling it would tunnel into _stop_impl and skip _shutdown_event.set().
-            if _task is self._stop_task or _task is self._restart_task:
-                continue
-            _task.cancel()
-        # The restart orchestration task is awaiting _stop_task right now; cancelling it would propagate
-        # CancelledError into this _stop_impl and skip _shutdown_event.set() / _exit_code = 75 (#12875). It
-        # self-terminates anyway.
-        self._background_tasks.clear()
-        ctx.api_live = self._active_api_run_count()
-        self.adapters.clear()
-        for _session_key in list(self._running_agents):
-            self._release_running_agent_state(_session_key)
-        # Flush pending messages before clearing: under FTS5 corruption they are the only surviving copy.
-        with suppress(Exception):
-            from gateway.shutdown_flush import flush_pending_to_file
-            flush_pending_to_file(dict(self._pending_messages), reason="shutdown")
-        # The overflow FIFO tail lives in SessionState.conversation.queued_events — flush it too.
-        with suppress(Exception):
-            from gateway.shutdown_flush import flush_overflow_to_file
-            flush_overflow_to_file(
-                {_k: list(_v) for _k, _v in dict(getattr(self, "_queued_events", None) or {}).items() if _v},
-                reason="shutdown",
-            )
-        # Live SessionState views: clear() resets one field per session (never a wholesale dict swap).
-        self._running_agents.clear()
-        self._running_agents_ts.clear()
-        self._pending_messages.clear()
-        self._pending_approvals.clear()
-        for _attr in ("_active_session_leases", "_busy_ack_ts"):  # absent on bare shutdown-path doubles
-            if hasattr(self, _attr):
-                getattr(self, _attr).clear()
-        self._shutdown_event.set()
-        # Global catch-all subprocess kill (safe to repeat) for the graceful path and late respawns.
-        # Off-loop: same blocking sweep as the post-interrupt kill (#116327). Awaited only within the stop's
-        # leash left for the quiesce and the close: past it the daemon thread is left running, the quiesce
-        # keeps SessionDB open for it (final_sweep_live) and the process exit ends it.
-        _kill, self._stop_final_sweep_thread = GatewayRunner._stop_kill_tool_subprocesses_off_loop("final-cleanup")
-        if not (await asyncio.wait({_kill}, timeout=stop_wait_budget(self, 3600.0, reserve=quiesce_reserve())))[0]:
-            _kill.add_done_callback(consume_detached_task_result)
-            logger.warning("Shutdown phase: final-cleanup tool kill still running at +%.2fs; no longer awaited "
-                           "(the process exit ends it)", ctx.elapsed())
-        else:
-            logger.info("Shutdown phase: final-cleanup tool kill done at +%.2fs", ctx.elapsed())
-        # Reap the auxiliary-client cache: clients bound to dead worker-thread loops leak httpx transports.
-        def _reap_aux_clients() -> None:
-            # Reap the process-global auxiliary-client cache once at the very end of teardown. Per-turn
-            # cleanup runs in _cleanup_agent_resources for each active agent, but clients bound to
-            # worker-thread loops that died with their ThreadPoolExecutor (notably cron ticks) only get
-            # swept here. Without this, long-running gateways accumulate async httpx transports until they
-            # hit EMFILE on macOS's default RLIMIT_NOFILE=256. See #14210.
-            from agent.auxiliary_client import shutdown_cached_clients
-            shutdown_cached_clients()
-
-        GatewayShutdownMixin._quiet_step("shutdown_cached_clients error", _reap_aux_clients)
-
     def _stop_quiesce_and_close_session_dbs(self, timeout: float, ctx: GatewayShutdownMixin._StopContext) -> None:
         """Quiesce the executor, then close SessionDB handles only if no worker is still live."""
         from gateway.run import GatewayRunner, _EXECUTOR_QUIESCE_TIMEOUT
@@ -2014,7 +1956,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         _exec_quiesce_budget = stop_wait_budget(self, max(  # the stop's own deadline wins when it is shorter
             0.0, min(_EXECUTOR_QUIESCE_TIMEOUT, resolve_shutdown_watchdog_delay(timeout) - ctx.elapsed() - 1.0),
         ), reserve=STOP_CLOSE_RESERVE_SECONDS)
-        _exec_live = GatewayRunner._shutdown_executor(self, drain_timeout=_exec_quiesce_budget)
+        _quiesce_deadline = time.monotonic() + _exec_quiesce_budget
+        _exec_live, _async_live = quiesce_writers(self, _exec_quiesce_budget)  # + async-delegation, maintenance
         if _exec_live:
             # A live worker may be mid-write (the #101093 corruption sequence): skip the close and let
             # SQLite recover from its WAL on next open (at worst a transient "database is locked").
@@ -2023,7 +1966,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                 "SessionDB close/checkpoint to avoid racing a live write (#101093); handles are left "
                 "open for SQLite to recover on next open", _exec_live, _exec_quiesce_budget,
             )
-            return
+            return retain_open_stores("executor worker live at the SessionDB close")
         logger.info("Shutdown phase: executor quiesced at +%.2fs", ctx.elapsed())
         # Cron jobs (scheduler pool), API-server runs and deferred hygiene workers (both on the loop's
         # default executor) never touch self._executor, so the join above cannot see them. A writer that
@@ -2035,16 +1978,29 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         _cron_live = self._active_cron_job_count()
         _api_live = ctx.api_live
         _api_worker_live = self._active_api_worker_count()
-        _deferred_live = ctx.deferred_count() + managed_turn_count(self) + final_sweep_live(self)  # + authority, sweep
+        _deferred_live = ctx.deferred_count() + managed_turn_count(self) + gate_only_live(self) + _async_live  # + rooms
         if _cron_live or _api_live or _api_worker_live or _deferred_live:
             logger.warning(
-                "Shutdown phase: %d cron job(s) / %d API-server run(s) / %d API-server worker(s) / "
-                "%d deferred/authority/final-sweep worker(s) still running after the executor quiesce — skipping the "
-                "SessionDB close/checkpoint, leaving state.db open for the live writer (#102198, #116535)",
+                "Shutdown phase: %d cron job(s) / %d API-server run(s) / %d API-server worker(s) / %d deferred/"
+                "authority/final-sweep/hosted-room/async-delegation/auto-title/maintenance worker(s) still running after the quiesce — "
+                "skipping the SessionDB close/checkpoint, leaving state.db open for the live writer (#102198, #116535)",
                 _cron_live, _api_live, _api_worker_live, _deferred_live,
             )
-            return
-        _step = GatewayShutdownMixin._quiet_step
+            return retain_open_stores("live writer at the SessionDB close")
+        # The quiesce read the detached registry before the starters above were sampled: one of them may
+        # have handed a writer over after that read (an API worker's timed-out nested conversation and its
+        # deferred close) and retired since, leaving a stale zero (A4-E5-04). Every starter registers what it
+        # hands over before it retires, so with all of them at zero this read sees it. It draws on what is
+        # left of the quiesce budget; a writer still live keeps the handles open as above.
+        _descendants_live = join_descendants_after_starters(max(0.0, _quiesce_deadline - time.monotonic()))
+        if _descendants_live:
+            logger.warning(
+                "Shutdown phase: %d async-delegation/detached/auto-title writer(s) handed over by a retired starter still "
+                "running after the quiesce — skipping the SessionDB close/checkpoint, leaving state.db open for "
+                "the live writer (#101093)", _descendants_live,
+            )
+            return retain_open_stores("handed-over descendant writer live at the SessionDB close")  # SH-01 E5 port
+        _step = close_step(_close_failed := [])  # a close that raised did not close its store
         # Close SQLite session DBs so --replace's new gateway does not hit 'database is locked'.
         # ``_session_db`` is an AsyncSessionDB facade — unwrap; ``session_store`` holds ``_db``.
         _self_db = getattr(self, "_session_db", None)
@@ -2057,8 +2013,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         _sweep = getattr(store, "close_all_db_handles", None)
         if _sweep is not None:
             _step("SessionDB handle sweep error", _sweep)
-        # Same sweep for the runner's own per-profile session_search handles.
-        _step("Runner SessionDB handle sweep error", lambda: GatewayRunner.close_all_session_db_handles(self))
+        if getattr(self, "_session_db_handle_cache", None) is not None:  # absent: this runner opened no handle
+            _step("Runner SessionDB handle sweep error", lambda: GatewayRunner.close_all_session_db_handles(self))
 
         def _close_shared() -> None:
             # Shared SessionDB instances still held by the process-wide registry (tools, cron, mirror).
@@ -2070,7 +2026,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                 logger.debug("Closed %d shared SessionDB instance(s) at shutdown", closed)
 
         _step("Shared SessionDB close error", _close_shared)
-        logger.info("Shutdown phase: SessionDB close done at +%.2fs", ctx.elapsed())
+        stores_closed(ctx.elapsed(), _close_failed)
 
     async def _stop_persist_exit_state(self, ctx: GatewayShutdownMixin._StopContext) -> None:
         """Clean-shutdown marker, restart markers, terminal runtime status; process bootstrap
@@ -2153,8 +2109,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         # Arm a plain OS thread at the start of stop(); if teardown never finishes within drain+grace it
         # dumps faulthandler stacks and os._exit so KeepAlive/systemd can revive. Skip under pytest so
         # stop()-driving unit tests don't get a delayed hard-exit in the worker. See #66892.
-        _watchdog_done = threading.Event()
-        self._shutdown_watchdog_done = _watchdog_done
+        self._shutdown_watchdog_done = _watchdog_done = threading.Event()
         # Shutdown-path doubles may lack the deferred-worker counter.
         ctx = GatewayShutdownMixin._StopContext(
             deferred_count=getattr(self, "_active_deferred_agent_worker_count", lambda: 0)
@@ -2204,6 +2159,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         if self._stop_task is not None:
             await self._stop_task
             return
+        retain_open_stores("the stop has not closed the stores")  # fail closed before the task can be cancelled
         self._stop_task = asyncio.create_task(GatewayRunner._stop_impl(self))
         await self._stop_task
 

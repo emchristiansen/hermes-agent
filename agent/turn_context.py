@@ -25,7 +25,10 @@ from agent.message_content import flatten_message_text
 from agent.lsp.deferred import forward_to_agent as forward_lsp_verdicts
 from agent.plugin_live_notes import pop_plugin_notices
 from agent.skills_index_delta import stage_skills_index_note
-from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS, append_message, stamp_message_timestamp
+from agent.message_metadata import (
+    MERGED_TURN_PREFIX, PERSISTENCE_ONLY_MESSAGE_FIELDS, append_message, stamp_message_timestamp,
+)
+from agent.prompt_builder import STEER_DISPLAY_KIND
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_native_anthropic_request_tokens_rough,
@@ -279,12 +282,22 @@ def start_deferred_title_upgrade(agent: Any) -> None:
     start_title_upgrade(upgrade)
 
 
+def holds_merged_turn(msg: Any, user_message: Any) -> bool:
+    """True when the alternation repair folded this turn's text into ``msg``, an unanswered user
+    row before it (``_merge_consecutive_users`` records the absorbed row's text as the prefix)."""
+    prefix = msg.get(MERGED_TURN_PREFIX) if isinstance(msg, dict) else None
+    return (
+        isinstance(prefix, str) and isinstance(user_message, str) and bool(user_message)
+        and msg.get("content") == prefix + "\n\n" + user_message
+    )
+
+
 def reanchor_current_turn_user_idx(messages: list[Any], user_message: Any) -> int:
     """Locate this turn's user message after compaction rebuilt ``messages``.
 
-    Prefers the LAST user message whose content exactly matches this turn's text, else
-    the last user-originated turn; compaction handoffs are never the fallback.
-    Returns -1 when there is no user-originated message.
+    Prefers the LAST user message whose content exactly matches this turn's text (or that the
+    alternation repair folded it into), else the last user-originated turn; compaction handoffs and
+    /steer rows are never the anchor. Returns -1 when there is no user-originated message.
 
     Compression replaces list entries with fresh copies (and may append a todo-snapshot user message or a
     restored user turn AFTER the surviving copy of the current turn's message), so a pre-compression index
@@ -300,11 +313,13 @@ def reanchor_current_turn_user_idx(messages: list[Any], user_message: Any) -> in
     fallback = -1
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
-        if not (isinstance(msg, dict) and msg.get("role") == "user"):
+        # A /steer row is mid-turn input with its own text, never this turn's row: anchoring it
+        # would write the turn's persist override (text, timestamp) over the steer's own bytes.
+        if not (isinstance(msg, dict) and msg.get("role") == "user") or msg.get("display_kind") == STEER_DISPLAY_KIND:
             continue
         # Typed synthetic current events keep their persistence anchor when raw
         # content is unchanged; not eligible for the human-only fallback below.
-        if msg.get("content") == user_message:
+        if msg.get("content") == user_message or holds_merged_turn(msg, user_message):
             return i
         live_view = user_originated_turn_view(msg)
         if live_view is None:
@@ -578,6 +593,7 @@ def _bind_turn_identity(
     ids. Returns ``(effective_task_id, turn_id)``."""
     agent._stream_callback = stream_callback  # picked up by _interruptible_api_call
     agent._persist_user_message_idx = None
+    agent._turn_user_message = None
     agent._persist_user_message_override = persist_user_message
     agent._persist_user_message_timestamp = persist_user_timestamp
     agent._persist_user_message_platform_id = persist_user_platform_id
@@ -1121,6 +1137,8 @@ def build_turn_context(
     append_message(messages, user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
+    # The turn's own dict: its uid/row id prove the prompt row after a repair folds it (persisted_turn_receipt).
+    agent._turn_user_message = user_msg
 
     agent._user_turn_count += 1
     # Copilot x-initiator: the first API call of this user turn is user-initiated;

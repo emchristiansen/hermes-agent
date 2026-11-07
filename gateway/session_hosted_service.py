@@ -274,11 +274,31 @@ def start_ready_hosted_services(runner):
 
 
 async def stop_hosted_service(runner, timeout=5):
+    """Stop every authority's room service in order, under one deadline. False unless each confirmed
+    its threads stopped: a service whose Stop raised counts as not stopped (logged), and the others
+    are still stopped. Cancellation propagates."""
     loop = asyncio.get_running_loop()
     deadline, stopped = loop.time() + max(0, timeout), True
     for authority in all_authorities(runner):
         service = getattr(authority, 'hosted_room_service', None)
         if service is not None:
-            result = await asyncio.to_thread(service.stop, timeout=max(0, deadline - loop.time()))
+            try:
+                result = await asyncio.to_thread(service.stop, timeout=max(0, deadline - loop.time()))
+            except Exception:
+                import logging
+                logging.getLogger(__name__).error('Hosted room service of %s failed to stop',
+                                                  getattr(authority, 'profile_id', '?'), exc_info=True)
+                result = False
             stopped = result and stopped
     return stopped
+
+
+def live_hosted_room_threads(runner):
+    """Room threads still alive across every authority (read-only; see
+    ``HostedRoomRuntime.live_threads``). A service without the accessor reports none."""
+    threads = []
+    for authority in all_authorities(runner):
+        live = getattr(getattr(authority, 'hosted_room_service', None), 'live_threads', None)
+        if live is not None:
+            threads.extend(live())
+    return threads

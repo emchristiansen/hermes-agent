@@ -920,6 +920,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     finally:
         try:
             if runner is not None:
+                if getattr(runner, "_stop_task", None) is None:
+                    # SH-01 STARTUP-01: no stop has taken the stores' retention yet. Take it before this
+                    # cleanup's first await, so a drain that is cancelled or raises (skipping the stop
+                    # below) cannot reach the release with a writer of startup still live.
+                    from gateway.run_shutdown_budget import retain_open_stores
+                    retain_open_stores("startup cleanup has not closed the stores")
                 from gateway.run_runtime import drain_gateway_runtime
                 await drain_gateway_runtime(runner)
                 # Startup may have opened adapters before an exception or an early exit verdict. The

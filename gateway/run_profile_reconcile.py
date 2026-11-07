@@ -452,7 +452,7 @@ class GatewayProfileReconcileMixin:
             except Exception:
                 logger.warning("MCP tool discovery failed for profile '%s'", profile_name, exc_info=True)
 
-    async def _unserve_profile(self, name: str, home: Path) -> None:
+    async def _unserve_profile(self, name: str, home: Path) -> bool:
         """Stop and unroute one profile: cancel its reconnects, tear down its adapters, drop its
         bookkeeping and release this process's handles into its home so the deleter's rmtree succeeds.
         The releasing process is not always the deleter (#130244): under multiplexing THIS gateway
@@ -465,6 +465,10 @@ class GatewayProfileReconcileMixin:
         reconcile task with no profile bound — unscoped they resolved against the LAUNCH home, so a
         teardown hook needing this profile's credential failed closed (or, worse, borrowed the launch
         profile's). Secrets are not re-hydrated: teardown must not block the loop on a source fetch.
+
+        True once its ownership is released. False when retirement could not prove its turns stopped (the
+        reservation stays until this process exits), and also False when a store close under the home did
+        not finish (``release_profile_home``): the reservation stays.
         """
         from gateway.run import _profile_runtime_scope, _write_runtime_status_quiet
         from gateway.run_runtime import release_profile_home, unserve_profile_runtime
@@ -501,8 +505,9 @@ class GatewayProfileReconcileMixin:
                 # A writer outlived its Stop and may still write this home: the profile leaves the
                 # served set (ingress is gone above) but keeps its reservation and store handles until
                 # this process exits. Raising here aborted the reconcile for every other profile.
-                logger.error("[MULTIPLEX] Profile '%s' unrouted, but a turn outlived its Stop; ownership retained", name)
-                return
+                logger.error("[MULTIPLEX] Profile '%s' unrouted, but a turn or its title writer outlived its Stop; "
+                             "ownership retained", name)
+                return False
             # The reservation (gateway.lock) is released LAST: a deleter waiting on it may rmtree the
             # home as soon as it goes, so every handle this process holds there must close first.
             try:
@@ -530,8 +535,29 @@ class GatewayProfileReconcileMixin:
                     from hermes_logging import release_profile_log_handlers
                     await asyncio.to_thread(release_profile_log_handlers, home)
             finally:
-                release_profile_home(self, home)
+                released = release_profile_home(self, home)
+            if not released:  # a store close under it did not finish: unrouted, ownership retained
+                return False
             logger.info("[MULTIPLEX] Profile '%s' unserved — %d adapter(s) stopped and unrouted", name, len(adapters))
+            return True
+
+
+async def _unserve_retained_error(runner, name, home):
+    """The control answer for an unserve whose ``_unserve_profile`` kept the profile's ownership. Its cause:
+    retirement that could not prove the turns stopped keeps the retiring authority registered for the home;
+    otherwise the release was refused because a store close under the home did not finish
+    (``release_profile_home``). Neither retries on its own: ownership stays with this process until a later
+    action on the profile (a serve that finishes the retirement, or a finished store close then its release)
+    or this process exits."""
+    registry = getattr(runner, "session_authorities", None)
+    resolved = await asyncio.to_thread(Path(home).resolve)
+    if registry is not None and registry.for_home(resolved) is not None:
+        cause = ("its turns are not proven stopped (a turn, hosted room or completed turn's title writer outlived "
+                 "its Stop deadline)")
+    else:
+        cause = "a store close under its home did not finish (a writer of that store is still live)"
+    return (f"profile '{name}' was unrouted and is no longer served, but {cause}: ownership is retained "
+            "(its gateway.lock stays held) and is not released automatically; see the gateway log")
 
 
 def _profile_lifecycle_verb(runner, *, serve: bool):
@@ -550,8 +576,14 @@ def _profile_lifecycle_verb(runner, *, serve: bool):
             if not serve:
                 if name not in known:
                     return {"error": f"profile '{name}' is not served"}
-                await runner._unserve_profile(name, known.pop(name))
+                home = known.pop(name)
+                released = await runner._unserve_profile(name, home)
                 runner._record_served_profiles(active, list(known.items()))
+                if not released:
+                    # Unrouted and no longer served, but its ownership was kept: never answered as stopped (the CLI
+                    # would report it stopped and, for a restart, serve it again over its live writer).
+                    return {"error": await _unserve_retained_error(runner, name, home),
+                            "served_profiles": runner.served_profile_names()}
                 return {"unserved": name, "served_profiles": runner.served_profile_names()}
             installed = dict(profiles_to_serve(True, include_parked=True))
             if name not in installed:

@@ -434,3 +434,142 @@ async def test_default_executor_worker_is_seen_by_the_close_guard():
         f"SessionDB was closed/checkpointed while the detached hygiene worker was still alive: {events}"
     )
     assert gw._active_deferred_agent_worker_count() == 0, "finished worker left registered"
+
+
+class _SettledSweepThread(threading.Thread):
+    """The final sweep's daemon thread, held between posting its settlement and exiting.
+
+    It runs the REAL ``start_daemon_call._run`` first: the real sweep, then the
+    ``call_soon_threadsafe`` that settles the stop's future. Only then does it wait on
+    ``exit_gate``. That is the window QUIESCE-COMPOSITION-I1 hit naturally: the loop resumed
+    on the settled future while the thread was still alive inside ``call_soon_threadsafe``, so
+    ``final_sweep_live`` counted a sweep that had already finished.
+
+    ``exit_on_join`` models what the real thread does once it is scheduled: it exits as soon as
+    someone waits for it. Without it, the thread stays alive until the test releases it.
+    """
+
+    def __init__(self, target, *, exit_on_join, name):
+        self.posted = threading.Event()
+        self.exit_gate = threading.Event()
+        self.exit_on_join = exit_on_join
+        self.gate_timed_out = False
+
+        def _run():
+            target()  # the real _run: sweep, then post the settlement
+            self.posted.set()
+            if not self.exit_gate.wait(10.0):
+                self.gate_timed_out = True
+
+        super().__init__(target=_run, name=name, daemon=True)
+
+    def join(self, timeout=None):
+        if self.exit_on_join:
+            self.exit_gate.set()
+        super().join(timeout)
+
+    def release(self):
+        self.exit_gate.set()
+        super().join(5.0)
+
+
+def _hold_final_sweep_thread(monkeypatch, *, exit_on_join):
+    """Route only the stop's final-cleanup daemon thread through ``_SettledSweepThread``.
+
+    ``start_daemon_call`` resolves ``spawn_context_thread`` at call time, so this is the same
+    seam the thread is really created through; the sweep, the future, the guard, the executor
+    and the close decision all stay real.
+    """
+    import agent.memory_provider as memory
+
+    original = memory.spawn_context_thread
+    threads = []
+
+    def spawn(target, *, name, **kwargs):
+        if name != "hermes-stop-final-cleanup":
+            return original(target, name=name, **kwargs)
+        thread = _SettledSweepThread(memory.ctx_bound(target), exit_on_join=exit_on_join, name=name)
+        threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(memory, "spawn_context_thread", spawn)
+    return threads
+
+
+def _refuses_new_work(gw):
+    try:
+        gw_mod.GatewayRunner._get_executor(gw)
+    except RuntimeError:
+        return True
+    return False
+
+
+def _probe_close(gw, events, threads):
+    real_close = gw._session_db.close
+
+    def _close_and_probe():
+        events.append(f"closing_flag:{gw._executor_closing}")
+        events.append(f"sweep_thread_alive:{any(t.is_alive() for t in threads)}")
+        real_close()
+
+    gw._session_db.close = _close_and_probe
+
+
+@pytest.mark.asyncio
+async def test_a_settled_final_sweep_whose_thread_has_not_exited_does_not_hold_the_close(
+    monkeypatch, caplog
+):
+    """QUIESCE-COMPOSITION-I1 / SCOPE-COMPOSE-OBS-01: the final sweep finished in time and settled
+    its future, but its daemon thread is still alive (between its settlement post and its exit)
+    when the stop reaches the close guard. Counting that thread as a live writer skipped the
+    SessionDB close for a sweep that was done.
+
+    ``start_daemon_call._run`` posts the settlement only after ``fn`` has returned or unwound, so
+    the thread can no longer write: the close follows the awaited result, not the thread's unwind
+    (A3 sweep a3294b45, t_e5a23a28/run2885). Nothing waits for the thread; the executor is sealed
+    before the close and refuses new work after it, and the stop logs the sweep as done, not as a
+    live final-sweep worker. The thread here exits only when the test releases it, after the stop.
+    The real sweep's last step (its ``finally``) records ``sweep_final_write``: the close must follow
+    that write, which happens before the settlement is posted, while the post-publication tail
+    (the settlement post has returned; only the thread's own unwind is left) runs concurrently.
+    """
+    from gateway.run_shutdown import GatewayShutdownMixin
+
+    events = []
+    gw = _FakeGateway(events)
+    real_sweep = GatewayShutdownMixin._stop_kill_tool_subprocesses
+
+    def sweep_with_final_write(phase):
+        try:
+            return real_sweep(phase)
+        finally:
+            if phase == "final-cleanup":
+                events.append("sweep_final_write")
+
+    monkeypatch.setattr(GatewayShutdownMixin, "_stop_kill_tool_subprocesses", staticmethod(sweep_with_final_write))
+    threads = _hold_final_sweep_thread(monkeypatch, exit_on_join=False)
+    _probe_close(gw, events, threads)
+    caplog.set_level("INFO", logger="gateway.run")
+    try:
+        await gw_mod.GatewayRunner.stop(gw)
+        state = {
+            "events": list(events),
+            "posted": [t.posted.is_set() for t in threads],
+            "sweep_thread_alive_at_return": [t.is_alive() for t in threads],
+            "executor_closing": gw._executor_closing,
+            "refuses_new_work": _refuses_new_work(gw),
+        }
+    finally:
+        for thread in threads:
+            thread.release()
+
+    assert len(threads) == 1 and state["posted"] == [True], state
+    assert state["sweep_thread_alive_at_return"] == [True], state
+    assert state["events"] == [
+        "sweep_final_write", "closing_flag:True", "sweep_thread_alive:True", "close:session_db"
+    ], state
+    assert state["refuses_new_work"] is True, state
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("final-cleanup tool kill done" in m for m in messages), messages
+    assert not any("still running after the quiesce" in m for m in messages), messages
+    assert not threads[0].is_alive() and not threads[0].gate_timed_out

@@ -26,6 +26,15 @@ logger = logging.getLogger(__name__)
 # so a process that reads the ledger right before exit (``-z --usage-file``) must be able to join
 # them (bounded) instead of racing the write (#112848).
 _UPGRADE_THREADS: weakref.WeakSet[threading.Thread] = weakref.WeakSet()
+# The store (SessionDB file) each upgrade writes, recorded when ``maybe_auto_title`` builds it: a profile that
+# unserves waits for the upgrades writing a store under ITS home, and only for those (A3-SH-TITLE-02).
+_UPGRADE_STORES: "weakref.WeakKeyDictionary[threading.Thread, str]" = weakref.WeakKeyDictionary()
+# Homes a profile retirement closed to new upgrades (A3-SH-TITLE-02). The retirement fences a home once it found no live upgrade
+# writing under it, then closes that home's stores and releases it. A deferred upgrade handed over afterwards (its turn was not
+# one the retirement joined) is then refused instead of started. Registration and the fence take the same lock, so an upgrade
+# is either seen by the retirement's read or refused.
+_FENCED_HOMES: set = set()
+_REGISTRATION_LOCK = threading.Lock()
 
 
 def wait_for_title_upgrades(timeout: float = 10.0) -> None:
@@ -33,6 +42,98 @@ def wait_for_title_upgrades(timeout: float = 10.0) -> None:
     deadline = time.monotonic() + timeout
     for thread in list(_UPGRADE_THREADS):
         thread.join(max(0.0, deadline - time.monotonic()))
+
+
+def join_title_upgrades(timeout: float) -> int:
+    """Bounded join of the started upgrade threads; returns how many are STILL alive (never raises).
+
+    A completed turn hands its model-title upgrade to one of these threads, which keeps that turn's
+    SessionDB and persists the title when its model call returns, after the turn itself retired. The
+    gateway's shutdown close gate counts the survivors as live writers (A3-SH-TITLE-01): closing the
+    store and releasing its profile under one lets the late title write reopen a store another process
+    owns. A registered thread not started yet (``start_title_upgrade`` adds before it starts) counts
+    as live and is not joined."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    live = 0
+    for thread in list(_UPGRADE_THREADS):
+        if thread.ident is not None:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        if thread.ident is None or thread.is_alive():
+            live += 1
+    return live
+
+
+def _registered_upgrades() -> list:
+    """Copy of ``_UPGRADE_THREADS``. A registration on another thread can change the set during the copy
+    (RuntimeError), so the copy is retried."""
+    for _ in range(50):
+        try:
+            return list(_UPGRADE_THREADS)
+        except RuntimeError:
+            time.sleep(0.001)
+    return list(_UPGRADE_THREADS)
+
+
+def _store_path(session_db) -> Optional[str]:
+    """The file *session_db* writes, or None: the registry hands out a handle that wraps its SessionDB as ``_db``."""
+    path = getattr(getattr(session_db, "_db", session_db), "db_path", None)
+    return None if path is None else os.fspath(path)
+
+
+def _is_under(path: str, root: str) -> bool:
+    """True when *path* is *root* or lives inside it. Both are resolved and normcased, as ``close_all_under`` does."""
+    key = os.path.normcase(os.path.realpath(path))
+    return key == root or key.startswith(root + os.sep)
+
+
+def _holds(thread, root: str) -> bool:
+    """True when *thread* may write a store under *root*: its recorded store lives there, or none was recorded."""
+    store = _UPGRADE_STORES.get(thread)
+    return store is None or _is_under(store, root)
+
+
+def join_title_upgrades_under(home, timeout: float, *, fence: bool = False) -> int:
+    """Per-home form of ``join_title_upgrades`` (A3-SH-TITLE-02): a bounded join of the registered upgrades that
+    write a store under *home*. Returns how many are STILL live.
+
+    A profile that unserves closes every store under its home (``close_all_under``) and releases its reservation.
+    An upgrade still writing one of those stores would then reopen it and write it under the next owner's lock, so
+    while it is live the profile keeps both. An upgrade writing another profile's store does not hold this home.
+    A registered upgrade whose store was not recorded cannot be excluded from any home, so it counts here too.
+    ``start_title_upgrade`` registers an upgrade just before starting it. Within the deadline, an upgrade that is
+    still unstarted is waited for until it starts and is then joined; if it does not start in time it counts as live.
+    The turn that hands an upgrade over registers it before the turn retires, so a read made after the home's
+    turns retired sees every upgrade they started. With ``fence``, a read of zero also fences the home, under the
+    registration lock, after re-reading there: from then on ``start_title_upgrade`` refuses an upgrade writing under it
+    (one handed over by a turn the caller did not join), until ``unfence_title_home``."""
+    root = os.path.normcase(os.path.realpath(os.fspath(home)))
+    deadline = time.monotonic() + max(0.0, timeout)
+    live = 0
+    for thread in _registered_upgrades():
+        if not _holds(thread, root):
+            continue
+        while thread.ident is None and thread in _UPGRADE_THREADS and time.monotonic() < deadline:
+            time.sleep(0.005)
+        if thread not in _UPGRADE_THREADS and thread.ident is None:
+            continue  # its start failed and unregistered it: it never runs
+        if thread.ident is not None:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        if thread.ident is None or thread.is_alive():
+            live += 1
+    if fence and live == 0:
+        with _REGISTRATION_LOCK:  # no registration runs meanwhile: this re-read is exact
+            pending = [t for t in _registered_upgrades() if _holds(t, root) and (t.ident is None or t.is_alive())]
+            if pending:
+                return len(pending)
+            _FENCED_HOMES.add(root)
+    return live
+
+
+def unfence_title_home(home) -> None:
+    """Lift the registration fence of *home* (it is served again): its new turns' upgrades start normally."""
+    root = os.path.normcase(os.path.realpath(os.fspath(home)))
+    with _REGISTRATION_LOCK:
+        _FENCED_HOMES.discard(root)
 
 # (task_name, exception) -> None; surfaces auxiliary failures so silent drops don't pile up as NULL titles.
 FailureCallback = Callable[[str, BaseException], None]
@@ -240,8 +341,18 @@ def start_title_upgrade(upgrade: Optional[threading.Thread]) -> None:
     """Start a (deferred) title upgrade thread; joinable via ``wait_for_title_upgrades`` only once started."""
     if upgrade is None or upgrade.ident is not None:
         return
-    _UPGRADE_THREADS.add(upgrade)
-    upgrade.start()
+    store = _UPGRADE_STORES.get(upgrade)
+    with _REGISTRATION_LOCK:
+        if store is not None and any(_is_under(store, root) for root in _FENCED_HOMES):
+            # Its profile retired and is closing or has released its store (A3-SH-TITLE-02): the instant title stands.
+            logger.debug("Auto-title upgrade not started: the profile of %s was retired", store)
+            return
+        _UPGRADE_THREADS.add(upgrade)
+    try:
+        upgrade.start()
+    except BaseException:
+        _UPGRADE_THREADS.discard(upgrade)  # it never runs, so it is no writer to wait for
+        raise
 
 
 def strip_control_wrappers(text: str) -> str:
@@ -793,6 +904,9 @@ def maybe_auto_title(
         args=(session_db, session_id, user_message),
         kwargs=upgrade_kwargs,
     )
+    store = _store_path(session_db)
+    if store is not None:
+        _UPGRADE_STORES[upgrade] = store  # before any registration, deferred or not
     if title_upgrade_must_wait_for_turn(main_runtime):
         logger.debug("Auto-title upgrade deferred past the turn: shares the self-hosted endpoint with the main request")
         return upgrade

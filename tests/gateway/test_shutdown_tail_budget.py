@@ -249,6 +249,66 @@ def test_a_final_sweep_that_finishes_in_time_is_awaited_before_the_close():
     assert observed["asyncio_run"] < 4.0, observed
 
 
+def test_an_awaited_final_sweep_whose_thread_has_not_unwound_yet_does_not_hold_the_close():
+    """The sweep's daemon thread settles its result, then still has to unwind. The close follows the
+    awaited result, not that unwind: a thread-liveness check left SessionDB open whenever it lost the race."""
+    from agent import memory_provider
+    real_spawn, unwind = memory_provider.spawn_context_thread, threading.Event()
+
+    def spawn_unwinding_slowly(target, *, name, **kwargs):
+        def run(*args, **kw):
+            try:
+                return target(*args, **kw)  # settles the awaited result (call_soon_threadsafe)
+            finally:
+                if name == "hermes-stop-final-cleanup":
+                    unwind.wait(timeout=5.0)  # the thread's own unwind, after its result is in
+        return real_spawn(run, name=name, **kwargs)
+
+    try:
+        with patch.object(memory_provider, "spawn_context_thread", spawn_unwinding_slowly):
+            observed = _stop_under_asyncio_run(4.0, 0.0)
+    finally:
+        unwind.set()
+    assert observed["swept_at_stop"] and observed["db_closed"], observed
+
+
+
+def test_a_final_sweep_still_in_its_final_write_when_its_wait_runs_out_keeps_the_close_open():
+    """The other side of the settled-sweep rule (QUIESCE-COMPOSITION-I1): ``start_daemon_call`` posts the
+    settlement only after the sweep function has returned, so a sweep that already has its result but is
+    still inside its last durable write (its ``finally``) when the stop's wait runs out has published
+    nothing. It is still a writer: the stop keeps its thread as a live final sweep and SessionDB is not
+    closed under that write."""
+    observed, in_final, release, wrote = {}, threading.Event(), threading.Event(), threading.Event()
+
+    def sweep(phase):
+        assert phase == "final-cleanup"
+        try:
+            return []
+        finally:
+            in_final.set()
+            release.wait(timeout=6.0)  # the sweep's final durable write, still running past the wait
+            wrote.set()
+
+    async def main():
+        runner, _ = _leashed_runner(4.0)
+        runner._session_db = db = MagicMock()
+        await runner.stop()
+        thread = runner._stop_final_sweep_thread
+        observed.update(in_final=in_final.is_set(), wrote_at_stop=wrote.is_set(), db_closed=db._db.close.called,
+                        sweep_tracked_live=thread is not None and thread.is_alive())
+
+    try:
+        with patch.object(GatewayShutdownMixin, "_stop_kill_tool_subprocesses", side_effect=sweep), \
+                patch("gateway.status.remove_pid_file"), patch("gateway.status.publish_runtime_status"):
+            asyncio.run(main())
+    finally:
+        release.set()
+    assert observed["in_final"] and not observed["wrote_at_stop"], observed
+    assert observed["sweep_tracked_live"], observed
+    assert not observed["db_closed"], f"SessionDB was closed under the sweep's unfinished final write: {observed}"
+
+
 REPO = Path(__file__).resolve().parents[2]
 
 # Child: the real stop as asyncio.run's main coroutine, its shutdown watchdog armed (no PYTEST_CURRENT_TEST),
