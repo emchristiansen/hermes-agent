@@ -494,12 +494,28 @@ async def recover_bot_mailbox(authority):
         logger.warning('Bot Chat recovery skipped for %s: %s', authority.db.db_path, exc)
 
 
+def _startup_profile_detail(runner, authority) -> str:
+    """``profile=<name|launch> db=<path>`` for startup-phase attribution; never raises."""
+    try:
+        registry = getattr(runner, 'session_authorities', None)
+        name = None if registry is None else registry.profile_name(authority)
+        db = getattr(getattr(authority, 'db', None), 'db_path', None)
+        return f"profile={name or 'launch'} db={db}"
+    except Exception:  # health: allow BLE001 -- a label lookup failure must never abort startup; attribution only
+        return f"profile_id={getattr(authority, 'profile_id', '?')}"
+
+
 async def start_gateway_runtime_api(runner):
+    # Attribution only (expected_s=0, no lease): each step logs begin/end while the startup watchdog is
+    # armed, and an over-deadline warning names the steps still open.
     from gateway.run_api import start_gateway_api
-    runner.session_api = await start_gateway_api(runner)
+    from hermes_startup_watchdog import startup_phase
+    with startup_phase("gateway_runtime_api_start"):
+        runner.session_api = await start_gateway_api(runner)
     runner.session_runtime_descriptor['api_origin'] = runner.session_api.api_origin
     for authority in _authorities(runner):
-        await _recover_profile_bot_mailbox(runner, authority)
+        with startup_phase("bot_mailbox_recovery", detail=_startup_profile_detail(runner, authority)):
+            await _recover_profile_bot_mailbox(runner, authority)
 
 
 async def _recover_profile_bot_mailbox(runner, authority):

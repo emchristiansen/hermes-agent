@@ -873,7 +873,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             # sentinel for this life. After the PID-file claim so a --replace loser can't clobber it.
             # The store scan that report used to run here is deferred: see below.
             from gateway.lifecycle_ledger import record_startup
-            return record_startup()
+            from hermes_startup_watchdog import startup_phase
+            with startup_phase("lifecycle_record_startup"):  # attribution only, no lease
+                return record_startup()
 
         def _start_keepalive() -> None:
             from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
