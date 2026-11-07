@@ -161,8 +161,7 @@ class TestScopedLeaseRelease:
 
 class TestRuntimeApiAttribution:
     def test_runtime_api_steps_log_begin_end_per_profile(self, monkeypatch, caplog):
-        import gateway.run_api as run_api
-        import gateway.run_runtime as run_runtime
+        from gateway import run_api, run_runtime
 
         async def fake_start_gateway_api(runner):
             return SimpleNamespace(api_origin="http://127.0.0.1:0")

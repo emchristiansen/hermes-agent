@@ -6,6 +6,7 @@ Must never import hermes_state (cycle); shared constants live in hermes_state_co
 
 import contextlib
 import datetime
+import functools
 import hashlib
 import logging
 import json
@@ -181,6 +182,20 @@ def schema_read_probe_statements() -> tuple:
             for table, cols in sorted(tables.items())
         )
     return _READ_PROBE_STATEMENTS
+
+
+def _scoped_startup_phase(phase: str, extra=None):
+    """Run a ``SessionDB`` step as a scoped startup phase: a 600 s lease released when the step returns
+    or raises, and begin/end lines naming the DB/profile (``extra(*args)`` appends step detail). Both
+    happen only while the startup watchdog is armed."""
+    def decorate(step):
+        @functools.wraps(step)
+        def run(self, *args, **kwargs):
+            detail = self._startup_phase_detail(extra(*args, **kwargs) if extra else "")
+            with startup_phase(phase, expected_s=600.0, detail=detail):
+                return step(self, *args, **kwargs)
+        return run
+    return decorate
 
 
 class SessionSchemaMixin:
@@ -948,20 +963,17 @@ class SessionSchemaMixin:
                 detail += f" profile={parts[idx + 1]}"
         return f"{detail} {extra}".strip()
 
+    # Startup-watchdog lease: on multi-GB state.db files the reconciliation + version-gated data
+    # migrations are legitimately slow and can be I/O-bound (near-zero CPU), which the watchdog's CPU
+    # fallback would misread as a parked deadlock (OOF-298 / PR #89750). Clamped to _MAX_LEASE_S=900.
+    # The lease is scoped: it is released when this DB's init ends, so a later, unrelated startup step
+    # is never covered (or mislabelled) by this DB's claim. The begin/end lines name the DB/profile.
+    # Honest worst case (unchanged): a genuinely wedged DB init delays supervisor respawn by up to the lease.
+    @_scoped_startup_phase("state_db_init_schema")
     def _init_schema(self):
         """Create tables and FTS if missing, reconcile columns, run data migrations. Column
         additions are declarative via _reconcile_columns(), so reordered migrations can
         never skip a column; schema_version remains for data migrations only."""
-        # Startup-watchdog lease: on multi-GB state.db files the reconciliation + version-gated data
-        # migrations are legitimately slow and can be I/O-bound (near-zero CPU), which the watchdog's CPU
-        # fallback would misread as a parked deadlock (OOF-298 / PR #89750). Clamped to _MAX_LEASE_S=900.
-        # The lease is scoped: it is released when this DB's init ends, so a later, unrelated startup step
-        # is never covered (or mislabelled) by this DB's claim. The begin/end lines name the DB/profile.
-        # Honest worst case (unchanged): a genuinely wedged DB init delays supervisor respawn by up to the lease.
-        with startup_phase("state_db_init_schema", expected_s=600.0, detail=self._startup_phase_detail()):
-            self._init_schema_steps()
-
-    def _init_schema_steps(self):
         cursor = self._conn.cursor()
         cursor.executescript(SCHEMA_SQL)
 
@@ -1057,16 +1069,14 @@ class SessionSchemaMixin:
         ).fetchone() is None:
             cursor.execute(_STATE_META_UPSERT_SQL, ("fts_storage_version", str(FTS_STORAGE_VERSION)))
 
+    # Renew the lease, scoped to this chain (it can rewrite whole tables on large DBs); released when it returns.
+    @_scoped_startup_phase(
+        "state_db_data_migrations",
+        lambda _cursor, current_version, _fts5_available: f"from_version={current_version} to_version={SCHEMA_VERSION}",
+    )
     def _run_data_migrations(self, cursor: sqlite3.Cursor, current_version: int, fts5_available: bool) -> None:
         """Version-gated chain for DATA migrations only (row backfills); column additions never
         belong here. Advances schema_version at the end unless FTS5 is unavailable."""
-        # Renew the lease, scoped to this chain: it can rewrite whole tables on large DBs, and it is
-        # released when the chain returns (see _init_schema).
-        detail = self._startup_phase_detail(f"from_version={current_version} to_version={SCHEMA_VERSION}")
-        with startup_phase("state_db_data_migrations", expected_s=600.0, detail=detail):
-            self._run_data_migrations_steps(cursor, current_version, fts5_available)
-
-    def _run_data_migrations_steps(self, cursor: sqlite3.Cursor, current_version: int, fts5_available: bool) -> None:
         # (v10 trigram backfill and v11 inline FTS re-index were superseded by v23 and removed.)
         # v11 (SUPERSEDED by v23): re-index FTS5 tables to cover tool_name + tool_calls in inline mode
         # (#16751). v23 drops and rebuilds both FTS tables in external-content form, so running the v11

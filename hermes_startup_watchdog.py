@@ -178,6 +178,14 @@ def _mark_lifecycle_exit(exit_code: int) -> None:
         pass
 
 
+def _format_open_phases(values, now: float) -> list[str]:
+    """``phase (detail) open Ns`` for each open phase, oldest first."""
+    return [
+        f"{label or 'unknown'}{f' ({info})' if info else ''} open {now - started:.0f}s"
+        for label, info, started in sorted(values, key=lambda v: v[2])
+    ]
+
+
 class StartupWatchdogHandle:
     """Disarm/inspect handle for the armed startup watchdog thread."""
 
@@ -197,13 +205,13 @@ class StartupWatchdogHandle:
         # it; unscoped lease() claims still lapse only by time. _lease_phase keeps
         # the last phase that *claimed* (dump-record forensics), which is not
         # necessarily the phase holding the lease now.
-        self._leases: Dict[Any, tuple[float, Optional[str], str]] = {}
+        self._leases: dict[Any, tuple[float, Optional[str], str]] = {}
         self._lease_phase: Optional[str] = None
         self._lease_count = 0
         self._lease_release_count = 0
         # Startup phases currently in progress (begin_phase()/startup_phase()),
         # leased or not: key -> (phase, detail, monotonic start).
-        self._open_phases: Dict[Any, tuple[Optional[str], str, float]] = {}
+        self._open_phases: dict[Any, tuple[Optional[str], str, float]] = {}
         # Key of the scoped lease whose honoring set the current deadline (released
         # by end_phase), and a request for _run to restart its CPU window.
         self._deadline_lease_key: Any = None
@@ -307,10 +315,7 @@ class StartupWatchdogHandle:
 
     def _open_phases_locked(self, now: float) -> list[str]:
         """Open phases, oldest first, as ``phase (detail) open Ns``. Caller holds the lock."""
-        return [
-            f"{label or 'unknown'}{f' ({info})' if info else ''} open {now - started:.0f}s"
-            for label, info, started in sorted(self._open_phases.values(), key=lambda v: v[2])
-        ]
+        return _format_open_phases(self._open_phases.values(), now)
 
     def _active_lease_locked(self, now: float) -> Optional[tuple[Any, tuple[float, Optional[str], str]]]:
         """The longest unexpired lease as (key, (deadline, phase, detail)); prunes lapsed ones. Caller holds the lock."""
@@ -412,16 +417,8 @@ class StartupWatchdogHandle:
         self._exit(self.exit_code)
 
     def _open_phases_snapshot(self) -> list[str]:
-        """Lock-free best-effort copy for the fire path (the state lock is not taken there)."""
-        try:
-            now = time.monotonic()
-            values = sorted(list(self._open_phases.values()), key=lambda v: v[2])
-            return [
-                f"{label or 'unknown'}{f' ({info})' if info else ''} open {now - started:.0f}s"
-                for label, info, started in values
-            ]
-        except Exception:
-            return []
+        """Lock-free copy for the fire path, which takes no lock (``dict.copy`` is atomic under the GIL)."""
+        return _format_open_phases(self._open_phases.copy().values(), time.monotonic())
 
     def _exit_escort(self) -> None:
         """Hard-exit if the forensic fire path wedges (bounded-exit seam).
@@ -525,9 +522,16 @@ class StartupWatchdogHandle:
                 continue
             # No progress: claim the fire transition atomically so a disarm
             # racing this exact moment can still win if it gets there first.
+            # Compare-and-fire: the expired deadline and the empty lease set were
+            # read earlier, outside this lock; a phase release (fresh window) or
+            # kick may have moved the deadline, or a phase may have claimed a
+            # lease, since. Re-evaluate instead of firing on the stale reading.
             with self._state_lock:
                 if self._state != _ARMED:
                     return
+                now = time.monotonic()
+                if self._deadline > now or self._active_lease_locked(now) is not None:
+                    continue
                 self._state = _FIRING
             self._fire()
             return

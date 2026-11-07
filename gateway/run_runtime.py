@@ -501,7 +501,7 @@ def _startup_profile_detail(runner, authority) -> str:
         name = None if registry is None else registry.profile_name(authority)
         db = getattr(getattr(authority, 'db', None), 'db_path', None)
         return f"profile={name or 'launch'} db={db}"
-    except Exception:  # health: allow BLE001 -- attribution only
+    except Exception:  # health: allow BLE001 -- a label lookup failure must never abort startup; attribution only
         return f"profile_id={getattr(authority, 'profile_id', '?')}"
 
 
