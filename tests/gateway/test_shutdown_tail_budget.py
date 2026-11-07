@@ -249,27 +249,79 @@ def test_a_final_sweep_that_finishes_in_time_is_awaited_before_the_close():
     assert observed["asyncio_run"] < 4.0, observed
 
 
-def test_an_awaited_final_sweep_whose_thread_has_not_unwound_yet_does_not_hold_the_close():
-    """The sweep's daemon thread settles its result, then still has to unwind. The close follows the
-    awaited result, not that unwind: a thread-liveness check left SessionDB open whenever it lost the race."""
+def _stop_with_final_sweep_unwind(leash, hold_unwind):
+    """The real stop inside ``asyncio.run`` with an immediate final sweep whose daemon thread, after it has
+    settled the awaited result, holds its own unwind until released (``hold_unwind``) or exits at once."""
     from agent import memory_provider
-    real_spawn, unwind = memory_provider.spawn_context_thread, threading.Event()
+    from gateway.run_shutdown import _resolve_gateway_exit_verdict
+    real_spawn, unwind, threads, observed = memory_provider.spawn_context_thread, threading.Event(), [], {}
 
-    def spawn_unwinding_slowly(target, *, name, **kwargs):
+    def spawn_unwinding(target, *, name, **kwargs):
         def run(*args, **kw):
             try:
                 return target(*args, **kw)  # settles the awaited result (call_soon_threadsafe)
             finally:
-                if name == "hermes-stop-final-cleanup":
+                if name == "hermes-stop-final-cleanup" and hold_unwind:
                     unwind.wait(timeout=5.0)  # the thread's own unwind, after its result is in
-        return real_spawn(run, name=name, **kwargs)
+        thread = real_spawn(run, name=name, **kwargs)
+        if name == "hermes-stop-final-cleanup":
+            threads.append(thread)
+        return thread
 
+    async def main():
+        runner, _ = _leashed_runner(leash)
+        runner._exit_with_failure = False  # GatewayRunner.__init__'s default; the bare test runner skips __init__
+        runner._session_db = db = MagicMock()
+        await runner.stop()
+        observed.update(stop=time.monotonic() - started, db_closed=db._db.close.called,
+                        sweep_thread_alive_at_return=[t.is_alive() for t in threads],
+                        should_exit_with_failure=runner.should_exit_with_failure, exit_code=runner.exit_code,
+                        verdict=(_resolve_gateway_exit_verdict(runner, signal_initiated_shutdown=False),
+                                 _resolve_gateway_exit_verdict(runner, signal_initiated_shutdown=True)))
+
+    started = time.monotonic()
     try:
-        with patch.object(memory_provider, "spawn_context_thread", spawn_unwinding_slowly):
-            observed = _stop_under_asyncio_run(4.0, 0.0)
+        with patch.object(memory_provider, "spawn_context_thread", spawn_unwinding), \
+                patch.object(GatewayShutdownMixin, "_stop_kill_tool_subprocesses", return_value=[]), \
+                patch("gateway.status.remove_pid_file"), patch("gateway.status.publish_runtime_status"):
+            asyncio.run(main())
+        observed["asyncio_run"] = time.monotonic() - started
     finally:
         unwind.set()
-    assert observed["swept_at_stop"] and observed["db_closed"], observed
+        for thread in threads:
+            thread.join(timeout=10.0)
+    observed["sweep_thread_exited_after_release"] = [not t.is_alive() for t in threads]
+    return observed
+
+
+def test_an_awaited_final_sweep_whose_thread_outlives_its_exit_bound_keeps_the_db_open_and_reports_it(caplog):
+    """QUIESCE-COMPOSITION-I1, bounded-join contract. The sweep's daemon thread settles its result, then still
+    has to unwind; a thread that has not exited can still run its thread-local finalizers, so it stays a writer.
+    The stop waits for that unwind only within STOP_SETTLED_SWEEP_EXIT_SECONDS (never past its leash), leaves
+    SessionDB open while the thread lives, reports the skipped close as such (not as a clean "done"), and the
+    exit verdict stays the one an unobstructed stop reaches. (This replaces A3's
+    ``..._has_not_unwound_yet_does_not_hold_the_close``, whose close-anyway expectation contradicts the contract.)"""
+    caplog.set_level("INFO", logger="gateway.run")
+    held = _stop_with_final_sweep_unwind(4.0, hold_unwind=True)
+    messages = [r.getMessage() for r in caplog.records]
+    caplog.clear()
+    clean = _stop_with_final_sweep_unwind(4.0, hold_unwind=False)
+
+    # Bounded: the stop returned while the thread was still unwinding, inside the leash.
+    assert held["sweep_thread_alive_at_return"] == [True], held
+    assert held["asyncio_run"] < 4.0, held
+    # The DB stays open while the thread lives.
+    assert not held["db_closed"], f"SessionDB was closed under a live final-sweep thread: {held}"
+    # Truthful close-skip report.
+    assert any("final-cleanup tool kill done" in m and "its thread has not exited" in m for m in messages), messages
+    assert any("deferred/authority/final-sweep worker(s) still running" in m for m in messages), messages
+    assert not any(m.startswith("Shutdown phase: final-cleanup tool kill done") and "has not exited" not in m
+                   for m in messages), messages
+    # Independent exit verdict: the same as the unobstructed stop, which does close.
+    assert clean["db_closed"] and clean["sweep_thread_alive_at_return"] in ([False], [True]), clean
+    assert held["should_exit_with_failure"] is False and held["exit_code"] is None, held
+    assert held["verdict"] == clean["verdict"] == (True, False), (held, clean)
+    assert held["sweep_thread_exited_after_release"] == [True], held
 
 
 
