@@ -541,15 +541,18 @@ def auth_list_command(args) -> None:
             print()
             continue
         print(f"{provider} ({len(entries)} credentials):")
+        from agent.credential_display_names import display_name, listing_notes
         for idx, entry in enumerate(entries, start=1):
             marker = "← " if current is not None and entry.id == current.id else "  "
             status = _format_exhausted_status(entry)
             source = _display_source(entry.source)
             row = (
-                f"  #{idx}  {entry.label:<20} {entry.auth_type:<7} "
+                f"  #{idx}  {display_name(entry, entry.label):<20} {entry.auth_type:<7} "
                 f"id={entry.id} priority={entry.priority} {source}{status} {marker}"
             )
             print(row.rstrip())
+        for note in listing_notes(provider, (e.id for e in entries)):
+            print(f"  {note}")
         print()
     if not provider_filter or provider_filter in EXTERNAL_LOGIN_PROVIDERS:
         _print_external_login_notice()
