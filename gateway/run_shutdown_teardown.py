@@ -13,7 +13,7 @@ from contextlib import suppress
 from typing import TYPE_CHECKING
 
 from agent.async_utils import consume_detached_task_result
-from gateway.run_shutdown_budget import quiesce_reserve, stop_wait_budget
+from gateway.run_shutdown_budget import join_settled_final_sweep, quiesce_reserve, stop_wait_budget
 
 if TYPE_CHECKING:
     from gateway.run_shutdown import GatewayShutdownMixin
@@ -64,14 +64,13 @@ class GatewayTeardownMixin:
         self._shutdown_event.set()
         # Global catch-all subprocess kill (safe to repeat) for the graceful path and late respawns, off-loop (#116327).
         # Awaited only within the leash left for the quiesce and the close; past it the live thread keeps SessionDB open
-        # (final_sweep_live) until the process exit. Once awaited its work is done: a still-unwinding thread is cleared.
+        # (final_sweep_live) until the process exit. Once settled, its thread is joined within a bound (QUIESCE-COMPOSITION-I1).
         _kill, self._stop_final_sweep_thread = GatewayRunner._stop_kill_tool_subprocesses_off_loop("final-cleanup")
         if not (await asyncio.wait({_kill}, timeout=stop_wait_budget(self, 3600.0, reserve=quiesce_reserve())))[0]:
             _kill.add_done_callback(consume_detached_task_result)
             logger.warning("Shutdown phase: final-cleanup tool kill still running at +%.2fs; no longer awaited "
                            "(the process exit ends it)", ctx.elapsed())
-        else:
-            self._stop_final_sweep_thread = None
+        elif join_settled_final_sweep(self, self._stop_final_sweep_thread, ctx.elapsed):  # else it logs why not
             logger.info("Shutdown phase: final-cleanup tool kill done at +%.2fs", ctx.elapsed())
         # Reap the auxiliary-client cache: clients bound to dead worker-thread loops leak httpx transports.
         def _reap_aux_clients() -> None:
