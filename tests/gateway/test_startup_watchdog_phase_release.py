@@ -192,3 +192,41 @@ class TestRuntimeApiAttribution:
         for detail in ("profile=launch db=/h/state.db", "profile=b db=/h/profiles/b/state.db"):
             assert any(m.startswith("Startup phase bot_mailbox_recovery begin") and detail in m for m in messages)
             assert any(m.startswith("Startup phase bot_mailbox_recovery end after") and detail in m for m in messages)
+
+
+class TestScopedNonFiniteDuration:
+    """LEASE-6157-1 on the scoped path: NaN claims nothing (the phase is still recorded as open);
+    +inf clamps to the maximum lease, like the unscoped path."""
+
+    def test_nan_scoped_duration_claims_no_lease(self, exit_capture):
+        handle = arm_startup_watchdog(timeout_s=0.3)
+        token = begin_startup_phase("bad-duration", expected_s=float("nan"))
+        assert handle._lease_until == 0.0 and not handle._leases
+        assert token.key in handle._open_phases
+        assert exit_capture.fired.wait(timeout=10), "a NaN scoped duration must not mute the watchdog"
+        end_startup_phase(token)
+
+    def test_infinite_scoped_duration_is_clamped(self):
+        handle = arm_startup_watchdog(timeout_s=30.0)
+        token = begin_startup_phase("unbounded", expected_s=float("inf"))
+        remaining = handle._lease_until - time.monotonic()
+        assert sw._MAX_LEASE_S - 5 < remaining <= sw._MAX_LEASE_S
+        end_startup_phase(token)
+        assert handle._lease_until == 0.0
+
+    def test_detail_callable_is_lazy_and_failure_safe(self, caplog):
+        calls = []
+
+        def detail():
+            calls.append(1)
+            raise RuntimeError("attribution broke")
+
+        with startup_phase("unarmed_step", expected_s=60.0, detail=detail):
+            pass
+        assert calls == [], "the detail must not be built while no watchdog is armed"
+        caplog.set_level(logging.INFO, logger="hermes_startup_watchdog")
+        handle = arm_startup_watchdog(timeout_s=30.0)
+        with startup_phase("armed_step", expected_s=60.0, detail=detail):
+            assert handle._lease_until > time.monotonic()
+        assert calls == [1] and handle._lease_until == 0.0
+        assert any(m == "Startup phase armed_step begin" for m in _messages(caplog))

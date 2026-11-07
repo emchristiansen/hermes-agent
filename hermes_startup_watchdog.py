@@ -35,6 +35,7 @@ import contextlib
 import faulthandler
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -178,6 +179,22 @@ def _mark_lifecycle_exit(exit_code: int) -> None:
         pass
 
 
+def _lease_duration(expected_s: Any) -> Optional[float]:
+    """A claimable lease duration in seconds, or ``None`` for no claim.
+
+    Garbage, NaN and non-positive values claim nothing (NaN would otherwise become a deadline
+    that never compares as expired); ``+inf`` and anything above it clamp to ``_MAX_LEASE_S``,
+    as before.
+    """
+    try:
+        expected = float(expected_s)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(expected) or expected <= 0:
+        return None
+    return min(expected, _MAX_LEASE_S)
+
+
 def _format_open_phases(values, now: float) -> list[str]:
     """``phase (detail) open Ns`` for each open phase, oldest first."""
     return [
@@ -252,13 +269,9 @@ class StartupWatchdogHandle:
         threads. Clamped to ``_MAX_LEASE_S`` per call so one buggy caller cannot
         silence the watchdog indefinitely; long phases renew. Never raises.
         """
-        try:
-            expected = float(expected_s)
-        except (TypeError, ValueError):
+        expected = _lease_duration(expected_s)
+        if expected is None:
             return
-        if expected <= 0:
-            return
-        expected = min(expected, _MAX_LEASE_S)
         label = str(phase) if phase else None
         key = ("unscoped", label)
         with self._state_lock:
@@ -279,18 +292,15 @@ class StartupWatchdogHandle:
         lease only for a positive ``expected_s`` (same clamp as :meth:`lease`);
         zero means "attribute, do not protect". Never raises.
         """
-        try:
-            expected = float(expected_s)
-        except (TypeError, ValueError):
-            expected = 0.0
+        expected = _lease_duration(expected_s)
         label = str(phase) if phase else None
         info = str(detail or "")
         key = object()
         with self._state_lock:
             now = time.monotonic()
             self._open_phases[key] = (label, info, now)
-            if expected > 0:
-                self._leases[key] = (now + min(expected, _MAX_LEASE_S), label, info)
+            if expected is not None:
+                self._leases[key] = (now + expected, label, info)
                 if label:
                     self._lease_phase = label
                 self._lease_count += 1
@@ -667,14 +677,33 @@ def end_startup_phase(token: Optional[_PhaseToken]) -> None:
         logger.debug("Failed to end startup phase", exc_info=True)
 
 
+def _resolve_detail(detail: Any) -> str:
+    """The phase detail text; a callable is evaluated here. Attribution must never fail the step it
+    describes, so an exception while building it yields an empty detail (logged at DEBUG)."""
+    if not callable(detail):
+        return str(detail or "")
+    try:
+        return str(detail() or "")
+    except Exception:
+        logger.debug("Failed to build startup phase detail", exc_info=True)
+        return ""
+
+
 @contextlib.contextmanager
-def startup_phase(phase: str, *, expected_s: float = 0.0, detail: str = ""):
+def startup_phase(phase: str, *, expected_s: float = 0.0, detail: Any = ""):
     """Bracket one startup step: begin/end INFO lines naming *detail* (DB path, profile) and,
     for a positive ``expected_s``, a lease released when the block exits (normally or not).
 
-    Silent and free when no watchdog is armed, so the same code path (e.g. every
-    ``SessionDB`` open after startup) logs nothing outside gateway startup.
+    *detail* may be a string or a zero-argument callable; a callable is evaluated only while a
+    watchdog is armed. Silent and free when no watchdog is armed, so the same code path (e.g.
+    every ``SessionDB`` open after startup) logs nothing and computes nothing outside startup.
     """
+    with _handle_lock:
+        armed = _handle is not None
+    if not armed:
+        yield
+        return
+    detail = _resolve_detail(detail)
     token = begin_startup_phase(phase, expected_s=expected_s, detail=detail)
     started = time.monotonic()
     if token is not None:

@@ -8,6 +8,7 @@ import contextlib
 import datetime
 import functools
 import hashlib
+import inspect
 import logging
 import json
 import os
@@ -18,7 +19,7 @@ import uuid
 from typing import Dict, List, Optional, Sequence
 
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, profile_name_for_home
 from hermes_startup_watchdog import startup_phase
 from utils import safe_json_loads
 from hermes_state_common import (
@@ -186,12 +187,24 @@ def schema_read_probe_statements() -> tuple:
 
 def _scoped_startup_phase(phase: str, extra=None):
     """Run a ``SessionDB`` step as a scoped startup phase: a 600 s lease released when the step returns
-    or raises, and begin/end lines naming the DB/profile (``extra(*args)`` appends step detail). Both
-    happen only while the startup watchdog is armed."""
+    or raises, and begin/end lines naming the DB/profile. ``extra`` maps the step's bound arguments
+    (by parameter name) to extra detail text. Both happen only while the startup watchdog is armed;
+    the detail is built lazily and can never reject or fail a call the step itself accepts — the
+    step receives exactly the caller's arguments."""
     def decorate(step):
+        signature = inspect.signature(step)
+
         @functools.wraps(step)
         def run(self, *args, **kwargs):
-            detail = self._startup_phase_detail(extra(*args, **kwargs) if extra else "")
+            def detail() -> str:
+                text = ""
+                if extra is not None:
+                    try:
+                        text = extra(signature.bind(self, *args, **kwargs).arguments)
+                    except TypeError:
+                        text = ""  # the step raises its own TypeError for a call it rejects
+                return self._startup_phase_detail(text)
+
             with startup_phase(phase, expected_s=600.0, detail=detail):
                 return step(self, *args, **kwargs)
         return run
@@ -953,14 +966,16 @@ class SessionSchemaMixin:
     # ── _init_schema ───────────────────────────────────────────────────────
 
     def _startup_phase_detail(self, extra: str = "") -> str:
-        """``db=<path> [profile=<name>]`` for startup-phase logs and watchdog warnings."""
+        """``db=<path> [profile=<id>]`` for startup-phase logs and watchdog warnings.
+
+        The profile is the canonical owner of the DB's home (``hermes_constants.profile_name_for_home``:
+        ``default``, a named profile — including one legally named ``profiles`` — or none for a custom
+        home), never a guess from path components."""
         path = getattr(self, "db_path", None)
-        parts = tuple(p for p in str(path).split(os.sep) if p) if path is not None else ()
         detail = f"db={path}"
-        if "profiles" in parts[:-1]:
-            idx = len(parts) - 1 - parts[::-1].index("profiles")
-            if idx + 1 < len(parts) - 1:
-                detail += f" profile={parts[idx + 1]}"
+        profile = profile_name_for_home(os.path.dirname(os.fspath(path))) if path is not None else None
+        if profile:
+            detail += f" profile={profile}"
         return f"{detail} {extra}".strip()
 
     # Startup-watchdog lease: on multi-GB state.db files the reconciliation + version-gated data
@@ -1072,7 +1087,7 @@ class SessionSchemaMixin:
     # Renew the lease, scoped to this chain (it can rewrite whole tables on large DBs); released when it returns.
     @_scoped_startup_phase(
         "state_db_data_migrations",
-        lambda _cursor, current_version, _fts5_available: f"from_version={current_version} to_version={SCHEMA_VERSION}",
+        lambda bound: f"from_version={bound.get('current_version')} to_version={SCHEMA_VERSION}",
     )
     def _run_data_migrations(self, cursor: sqlite3.Cursor, current_version: int, fts5_available: bool) -> None:
         """Version-gated chain for DATA migrations only (row backfills); column additions never
