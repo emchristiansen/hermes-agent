@@ -241,13 +241,77 @@ def test_configured_failures_are_explicit_and_never_partial(home, case):
         agent.close()
 
 
-def test_over_the_context_file_limit_is_unavailable_never_truncated(home):
-    _config(home.hermes, agent__home_guidance_file=SOURCE, context_file_max_chars=20)
+def _fill(core, chars):
+    """Rewrite the core as exactly *chars* characters (ASCII, so characters are bytes)."""
+    head = "# Home core A\n\nFixture rule A: cite the original artifact.\n"
+    core.write_text(head + "a" * (chars - len(head)), encoding="utf-8")
+
+
+@pytest.mark.parametrize("over", [False, True], ids=["at the limit", "one character over"])
+def test_the_whole_file_limit_is_a_quarter_of_the_window_and_never_truncates(home, over):
+    """The trusted file is bounded by the model's window, not by the project context-file cap: up to a quarter of the
+    window (the runtime's 4 characters per token) it loads whole even under a 20-character context-file cap; one
+    character more and it is Unavailable, never truncated."""
+    from agent.model_metadata import CHARS_PER_TOKEN
+    _config(home.hermes, agent__home_guidance_file=SOURCE, context_file_max_chars=20, model__context_length=80_000)
     agent = _agent()
     try:
+        window = agent.context_compressor.context_length
+        assert window == 80_000 and CHARS_PER_TOKEN == 4
+        limit = window * CHARS_PER_TOKEN // 4
+        _fill(home.core, limit + over)
         prompt = _prompt(agent)
-        assert "over the context-file limit of 20; it is never truncated" in prompt
-        assert "Fixture rule A" not in prompt and "TRUNCATED" not in prompt
+        if over:
+            assert (f"has {limit + 1} characters, over the home-guidance limit of {limit} (the larger of the "
+                    f"context-file limit 20 and a quarter of the model's {window * 4}-character window); it is never "
+                    "truncated") in prompt
+            assert "Fixture rule A" not in prompt and "TRUNCATED" not in prompt
+        else:
+            assert prompt.count(_expected_block(home.core)) == 1
+    finally:
+        agent.close()
+
+
+def test_a_larger_context_file_limit_still_admits_a_larger_file(home):
+    """A profile's explicit context-file limit (the role floors) keeps working when it exceeds a quarter window."""
+    _config(home.hermes, agent__home_guidance_file=SOURCE, context_file_max_chars=100_000, model__context_length=64_000)
+    agent = _agent()
+    try:
+        assert agent.context_compressor.context_length == 64_000  # Hermes's minimum window; a quarter is 64000 chars
+        _fill(home.core, 100_000)
+        assert _prompt(agent).count(_expected_block(home.core)) == 1
+        _fill(home.core, 100_001)
+        assert hg.load_file(SOURCE, 64_000).reason.endswith(
+            "has 100001 characters, over the home-guidance limit of 100000 (the larger of the context-file limit "
+            "100000 and a quarter of the model's 256000-character window); it is never truncated")
+    finally:
+        agent.close()
+
+
+def test_an_unknown_window_falls_back_to_the_context_file_limit(home):
+    _config(home.hermes, agent__home_guidance_file=SOURCE)
+    _fill(home.core, 20_001)
+    result = hg.load_file(SOURCE, None)
+    assert isinstance(result, hg.Unavailable) and result.reason.endswith(
+        "has 20001 characters, over the home-guidance limit of 20000 (the context-file limit; the model's window is "
+        "unknown); it is never truncated")
+    _fill(home.core, 20_000)
+    assert isinstance(hg.load_file(SOURCE, None), hg.Carried)
+
+
+@pytest.mark.parametrize("window, loads", [(272_000, True), (256_000, True), (128_000, True), (64_000, False)])
+def test_a_plain_profile_loads_a_106083_character_edition_without_a_cap(home, window, loads):
+    """A new plain profile writes no context_file_max_chars (hermes_cli/profiles.py create_profile seeds only the
+    model): an edition of approved A's size loads on 272K (the default route), 256K (the unknown-model fallback) and
+    128K windows, and is refused whole, with the reason, on a 64K one."""
+    _config(home.hermes, agent__home_guidance_file=SOURCE, model__context_length=window)
+    agent = _agent()
+    try:
+        assert agent.context_compressor.context_length == window
+        _fill(home.core, 106_083)
+        prompt = _prompt(agent)
+        assert (prompt.count(_expected_block(home.core)) == 1) is loads
+        assert ("over the home-guidance limit of 64000" in prompt) is not loads
     finally:
         agent.close()
 
@@ -285,13 +349,25 @@ def test_the_timed_reader_keeps_or_translates_line_endings_on_every_supported_py
     assert pb._read_context_file(path) == "# Core\n\nRule."
 
 
-def test_ignore_rules_constructor_gets_none_but_a_soul_identity_constructor_does(home):
+def test_an_ignore_rules_constructor_still_gets_the_file_but_not_soul_or_project_rules(home, tmp_path, monkeypatch):
+    """--ignore-rules suppresses AGENTS.md, SOUL.md, .cursorrules, memory and preloaded skills; the configured home
+    guidance is none of those, so the ignore-rules and cron-like constructors carry it once — and still no persona
+    or project rules."""
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "AGENTS.md").write_text("PROJECT RULE SENTINEL\n", encoding="utf-8")
+    monkeypatch.setenv("TERMINAL_CWD", str(project))
+    (home.hermes / "SOUL.md").write_text("PERSONA SENTINEL\n", encoding="utf-8")
     _config(home.hermes, agent__home_guidance_file=SOURCE)
     ignore = _agent(skip_context_files=True, load_soul_identity=False)
     cron_like = _agent(skip_context_files=True, load_soul_identity=True)
     try:
-        assert "workstation_guidance" not in _prompt(ignore)
-        assert _prompt(cron_like).count(_expected_block(home.core)) == 1
+        ignored = _prompt(ignore)
+        assert ignored.count(_expected_block(home.core)) == 1
+        assert "PERSONA SENTINEL" not in ignored and "PROJECT RULE SENTINEL" not in ignored
+        cron = _prompt(cron_like)
+        assert cron.count(_expected_block(home.core)) == 1 and "PERSONA SENTINEL" in cron
+        assert "PROJECT RULE SENTINEL" not in cron
     finally:
         ignore.close()
         cron_like.close()
@@ -303,9 +379,24 @@ def _bind(monkeypatch, *, safe, cfg):
         os.getpid(), safe, safe, json.dumps(cfg)))
 
 
-def test_safe_mode_gets_none_even_when_its_frozen_config_names_the_file(home, monkeypatch):
-    cfg = _config(home.hermes, agent__home_guidance_file=SOURCE)
-    _bind(monkeypatch, safe=True, cfg=cfg)
+def test_safe_mode_renders_the_file_its_frozen_config_names_and_nothing_of_the_profile(home, monkeypatch):
+    """A safe worker reads only its frozen config (the bypass producer puts nothing of the profile there, only the
+    administrator's pin): the file it names loads once, while the SOUL persona and every other customization stay off."""
+    (home.hermes / "SOUL.md").write_text("PERSONA SENTINEL\n", encoding="utf-8")
+    _config(home.hermes)  # the live profile names nothing
+    _bind(monkeypatch, safe=True, cfg={"agent": {"home_guidance_file": SOURCE}})
+    agent = _agent()
+    try:
+        prompt = _prompt(agent)
+        assert prompt.count(_expected_block(home.core)) == 1 and "PERSONA SENTINEL" not in prompt
+        assert agent.skip_context_files and not agent.load_soul_identity  # safe mode's own restrictions are unchanged
+    finally:
+        agent.close()
+
+
+def test_safe_mode_without_a_captured_setting_renders_none(home, monkeypatch):
+    _config(home.hermes, agent__home_guidance_file=SOURCE)  # the live profile names it; the worker never reads it
+    _bind(monkeypatch, safe=True, cfg={})
     agent = _agent()
     try:
         assert "workstation_guidance" not in _prompt(agent)
@@ -596,9 +687,9 @@ def _soul_carrying_home(home):
 @pytest.mark.parametrize("source", ["file", "soul"])
 @pytest.mark.parametrize("restriction", ["safe", "ignore"])
 @pytest.mark.parametrize("rebuild", ["model mismatch", "compression"])
-def test_a_restricted_rebuild_drops_the_recorded_edition(home, monkeypatch, source, restriction, rebuild):
-    """A resumed session keeps its edition, but only as far as this agent may render it: safe mode and ignore-rules
-    constructors get none on rebuild, exactly as they get none on a first build (baseline does the same for SOUL)."""
+def test_a_restricted_rebuild_keeps_the_recorded_edition(home, monkeypatch, source, restriction, rebuild):
+    """A resumed session keeps its recorded edition through every rebuild: safe mode and ignore-rules constructors drop
+    the SOUL persona (as on baseline) but not the conversation's home guidance, which they render exactly once."""
     cfg = _config(home.hermes, **({"agent__home_guidance_file": SOURCE} if source == "file" else {}))
     block = _expected_block(home.core) if source == "file" else _soul_carrying_home(home)
     first = _agent(session_id="policy")
@@ -619,8 +710,9 @@ def test_a_restricted_rebuild_drops_the_recorded_edition(home, monkeypatch, sour
             resumed._invalidate_system_prompt()
             _prompt(resumed)
         rebuilt = resumed._cached_system_prompt
-        assert rebuilt != stored and "USER CORE SENTINEL" not in rebuilt and "Fixture rule A" not in rebuilt
-        assert "workstation_guidance" not in rebuilt
+        assert rebuilt != stored and rebuilt.count(block) == 1 and rebuilt.count("<workstation_guidance") == 1
+        assert "Fixture identity" not in rebuilt  # the persona stays suppressed
+        assert hg.frozen(resumed) == hg.Carried(block, source)
     finally:
         resumed.close()
 
@@ -784,8 +876,8 @@ def test_a_state_record_quoted_in_project_context_is_ignored(home, tmp_path, mon
 
 
 def test_a_record_that_does_not_match_its_prompt_is_not_trusted(home, caplog):
-    """A stored prompt whose recorded block bytes were altered yields no recorded decision (logged); the next build
-    decides afresh, as for a prompt from before this feature."""
+    """A stored prompt whose recorded block bytes were altered yields no edition (logged): the continuing conversation
+    carries an explicit unavailable notice rather than deciding afresh mid-way."""
     _config(home.hermes, agent__home_guidance_file=SOURCE)
     first = _agent(session_id="tampered")
     try:
@@ -795,8 +887,19 @@ def test_a_record_that_does_not_match_its_prompt_is_not_trusted(home, caplog):
     tampered = stored.replace("Fixture rule A", "Fixture rule X", 1)
     assert hg.persisted_state(stored) == hg.Carried(_expected_block(home.core), "file")
     with caplog.at_level("WARNING"):
-        assert hg.persisted_state(tampered) is hg._UNSET
+        state = hg.persisted_state(tampered)
+    assert isinstance(state, hg.Unavailable) and state.source == "agent.home_guidance_file"
+    assert state.reason.startswith("this conversation's stored home-guidance record is unusable (")
     assert "home-guidance record is unusable" in caplog.text
+    resumed = _agent(session_id="tampered")
+    try:
+        _restore(resumed, tampered)
+        resumed._invalidate_system_prompt()
+        rebuilt = _prompt(resumed)
+        assert "<workstation_guidance_unavailable " in rebuilt and "Fixture rule A" not in rebuilt.split("-->")[-1]
+        assert _guidance(rebuilt) == [_guidance(state.notice())[0]]
+    finally:
+        resumed.close()
 
 
 def test_a_live_model_switch_keeps_the_frozen_edition(home):
@@ -1105,6 +1208,12 @@ def _turn(agent, history):
                       restore_or_build_system_prompt=_restore_or_build_system_prompt).active_system_prompt
 
 
+def _child_expectation(home, decision, recorded):
+    """A delegate child inherits a carried or unavailable parent decision exactly; a parent that carries none hands
+    nothing over, and the child, a new conversation, decides from the current inputs (here the readable file B)."""
+    return [_expected_block(home.core)] if decision == "none" else recorded
+
+
 def _child_guidance(agent):
     from tests.tools.test_delegate_home_guidance import _child, _child_prompt
     child = _child(agent)
@@ -1182,7 +1291,7 @@ def test_a_cold_acp_restore_keeps_its_recorded_decision_through_a_pre_turn_compr
                 assert len(state.history) == 2  # no progress
                 assert hg.frozen(state.agent) == _stored_decision(db, "acp-stored")
             sent = _turn(state.agent, state.history)
-            assert _guidance(sent) == recorded and _child_guidance(state.agent) == recorded
+            assert _guidance(sent) == recorded and _child_guidance(state.agent) == _child_expectation(home, decision, recorded)
         finally:
             state.agent.close()
     finally:
@@ -1205,7 +1314,7 @@ def test_a_runtime_mismatch_rebuild_after_a_pre_turn_compress_keeps_the_recorded
             SlashCommandsMixin._cmd_compress(host, "", state)
             sent = _turn(state.agent, state.history)
             assert sent != stored and "Model: anthropic/claude-opus-4.6" in sent
-            assert _guidance(sent) == recorded and _child_guidance(state.agent) == recorded
+            assert _guidance(sent) == recorded and _child_guidance(state.agent) == _child_expectation(home, decision, recorded)
         finally:
             state.agent.close()
     finally:
@@ -1269,7 +1378,7 @@ def test_a_cli_switch_adopts_the_target_decision_before_a_pre_turn_compress(home
             compress_now(agent, history, parse_compress_args(""), task_id=target)
             assert hg.frozen(agent) == _stored_decision(db, target)
             sent = _turn(agent, history)
-            assert _guidance(sent) == recorded and _child_guidance(agent) == recorded
+            assert _guidance(sent) == recorded and _child_guidance(agent) == _child_expectation(home, decision, recorded)
         finally:
             agent.close()
     finally:
@@ -1298,7 +1407,7 @@ def test_adopting_the_stored_prompt_replaces_a_decision_made_before_it(home, tmp
             assert decision == "none" or "Fixture rule B" in repr(hg.frozen(agent))  # decided before adoption
             sent = _turn(agent, state.history)
             assert hg.frozen(agent) == _stored_decision(db, "acp-stored")
-            assert _guidance(sent) == recorded and _child_guidance(agent) == recorded
+            assert _guidance(sent) == recorded and _child_guidance(agent) == _child_expectation(home, decision, recorded)
         finally:
             agent.close()
     finally:
@@ -1444,10 +1553,10 @@ def test_undoing_every_turn_keeps_the_conversation_and_its_decision(home, tmp_pa
         model_history, _display = db.get_resume_conversations(agent.session_id)
         assert model_history == []
         sent = _guidance(_turn(agent, model_history))
-        assert sent == recorded and _child_guidance(agent) == recorded
+        assert sent == recorded and _child_guidance(agent) == _child_expectation(home, decision, recorded)
         home.core.write_text("# Home core C\n\nFixture rule C.\n", encoding="utf-8")
         agent._invalidate_system_prompt()
-        assert _guidance(_prompt(agent)) == recorded and _child_guidance(agent) == recorded
+        assert _guidance(_prompt(agent)) == recorded and _child_guidance(agent) == _child_expectation(home, decision, recorded)
     finally:
         agent.close()
         db.close()
@@ -1466,12 +1575,12 @@ def test_acp_reset_reports_a_failed_clear_of_the_ended_prompt(home, tmp_path, no
         stored = db.get_session("acp-stored")["system_prompt"]
         host, state = _acp_restore(db, "acp-stored")
         try:
-            def refuse(session_id, system_prompt):
+            def refuse(session_id):
                 raise RuntimeError("database is locked")
-            monkeypatch.setattr(db, "update_system_prompt", refuse)
+            monkeypatch.setattr(db, "end_conversation_in_place", refuse)
             with caplog.at_level(logging.WARNING, logger="acp_adapter.server"):
                 result = SlashCommandsMixin._cmd_reset(host, "", state)
-            assert result == "Conversation history cleared. Agent session state reset failed; see logs."
+            assert result == "Conversation history was not cleared: agent session state reset failed; see logs."
             assert "ACP session state reset failed for acp-stored" in caplog.text and "database is locked" in caplog.text
             assert db.get_session("acp-stored")["system_prompt"] == stored
         finally:

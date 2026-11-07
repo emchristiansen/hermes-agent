@@ -124,27 +124,35 @@ def test_unprofiled_child_of_a_soul_carrying_parent_gets_that_soul_block_only(en
         parent.close()
 
 
-def test_a_parent_without_home_guidance_passes_none_on(env):
-    launch, _core = env
+def test_a_parent_carrying_none_hands_nothing_over_and_its_child_decides_afresh(env):
+    """A parent whose conversation began before the file was configured carries none and keeps none; its child is a
+    new conversation, so it takes up the file configured now instead of inheriting the stale none."""
+    launch, core = env
     _config(launch)
     parent = _parent()
     _config(launch, home_guidance_file=SOURCE)  # configured only after the parent started
     child = _child(parent)
     try:
-        assert "workstation_guidance" not in _child_prompt(child)
+        assert child._home_guidance_inherited is None
+        assert "workstation_guidance" not in parent._build_system_prompt()  # the parent's decision stays frozen
+        prompt = _child_prompt(child)
+        assert prompt.count("<workstation_guidance") == 1 and prompt.count(_block(core)) == 1
     finally:
         child.close()
         parent.close()
 
 
-def test_an_ignore_rules_parent_passes_none_on(env):
-    launch, _core = env
+def test_an_ignore_rules_parent_carries_the_file_and_hands_its_exact_edition_on(env):
+    launch, core = env
     _config(launch, home_guidance_file=SOURCE)
     parent = _parent(skip_context_files=True, load_soul_identity=False)
-    assert "workstation_guidance" not in parent._cached_system_prompt
+    block_a = _block(core)
+    assert parent._cached_system_prompt.count(block_a) == 1
+    core.write_text(CORE_B, encoding="utf-8")
     child = _child(parent)
     try:
-        assert "workstation_guidance" not in _child_prompt(child)
+        prompt = _child_prompt(child)
+        assert prompt.count("<workstation_guidance") == 1 and prompt.count(block_a) == 1 and "Fixture rule B" not in prompt
     finally:
         child.close()
         parent.close()
@@ -166,9 +174,9 @@ def test_a_parents_unavailable_result_is_inherited_not_retried(env):
         parent.close()
 
 
-def test_a_safe_mode_child_gets_no_inherited_block(env, monkeypatch):
-    """Safe mode suppresses home guidance from every source, the parent's frozen edition included: the bound policy's
-    own config names the file, and the child still gets neither the parent's block nor a fresh read."""
+def test_a_safe_mode_child_gets_its_parents_exact_block(env, monkeypatch):
+    """Safe mode suppresses the persona, project rules, memory and plugins, not home guidance: a child built under a
+    bound safe policy carries its parent's exact edition, not a fresh read of the file its frozen config names."""
     from agent import safe_worker_policy
     launch, _core = env
     _config(launch, home_guidance_file=SOURCE)
@@ -178,10 +186,13 @@ def test_a_safe_mode_child_gets_no_inherited_block(env, monkeypatch):
     monkeypatch.setattr(safe_worker_policy, "_policy", safe_worker_policy._SafeWorkerPolicy(
         os.getpid(), True, True, json.dumps(frozen_cfg)))
     assert safe_worker_policy.safe_worker_enabled()
+    block_a = _block(_core)
+    _core.write_text(CORE_B, encoding="utf-8")
     child = _child(parent)
     try:
-        assert child._home_guidance_inherited is not None  # the parent's block was handed over; safe mode drops it
-        assert "workstation_guidance" not in _child_prompt(child)
+        assert child._home_guidance_inherited is not None
+        prompt = _child_prompt(child)
+        assert prompt.count("<workstation_guidance") == 1 and prompt.count(block_a) == 1 and "Fixture rule B" not in prompt
     finally:
         child.close()
         parent.close()
@@ -292,8 +303,8 @@ def test_an_over_cap_soul_parent_without_a_file_passes_none_on(env):
 
 @pytest.mark.parametrize("parent_kind", ["ordinary", "ignore-rules"])
 def test_a_resumed_parents_child_gets_what_the_parent_may_render(env, parent_kind):
-    """A resumed parent that reuses its stored prompt hands children the recorded edition; a resumed ignore-rules
-    parent hands them none, as it would on a first build."""
+    """A resumed parent that reuses its stored prompt hands children the recorded edition, whether or not it is an
+    ignore-rules constructor."""
     from unittest.mock import MagicMock
     from agent.conversation_loop import _restore_or_build_system_prompt
     launch, core = env
@@ -317,7 +328,7 @@ def test_a_resumed_parents_child_gets_what_the_parent_may_render(env, parent_kin
     try:
         prompt = _child_prompt(child)
         assert "Fixture rule B" not in prompt
-        assert prompt.count(block_a) == (1 if parent_kind == "ordinary" else 0)
+        assert prompt.count(block_a) == 1
     finally:
         child.close()
         resumed.close()
@@ -325,8 +336,8 @@ def test_a_resumed_parents_child_gets_what_the_parent_may_render(env, parent_kin
 
 def test_a_child_reset_to_a_new_session_does_not_keep_its_parents_edition(env):
     """Inheritance belongs to the delegated conversation: after a session reset the agent decides from its own inputs
-    (an unprofiled child loads none), so the parent's edition is not resurrected from the inherited, recorded or
-    still-cached state."""
+    (an unprofiled child reads the configured file afresh), so the parent's edition is not resurrected from the
+    inherited, recorded or still-cached state."""
     launch, core = env
     _config(launch, home_guidance_file=SOURCE)
     parent = _parent()
@@ -335,10 +346,12 @@ def test_a_child_reset_to_a_new_session_does_not_keep_its_parents_edition(env):
     try:
         child._cached_system_prompt = _child_prompt(child)
         assert child._cached_system_prompt.count(block_a) == 1
+        core.write_text(CORE_B, encoding="utf-8")  # the new conversation's own read must see this edition
         child.session_id = "child-new"
         child.reset_session_state()
         child._invalidate_system_prompt()
-        assert "workstation_guidance" not in _child_prompt(child)
+        prompt = _child_prompt(child)
+        assert block_a not in prompt and prompt.count(_block(core)) == 1
     finally:
         child.close()
         parent.close()

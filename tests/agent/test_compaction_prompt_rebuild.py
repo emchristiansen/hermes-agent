@@ -270,7 +270,9 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
 
             with patch("agent.prompt_builder.load_soul_md", return_value=""), env(repo), \
                  patch("agent.system_prompt.resolve_context_cwd", return_value=repo):
-                stored = build_system_prompt(self._pin_agent())
+                # A new conversation's first build: no cached prompt, which would otherwise be the stored prompt of a
+                # conversation from before home-guidance decisions were recorded (agent.home_guidance).
+                stored = build_system_prompt(self._pin_agent(_cached_system_prompt=None))
                 self.assertIn("Status: clean", stored)
                 (repo / "untracked.txt").write_text("wip\n")
                 db = SimpleNamespace(get_session=lambda sid: {"system_prompt": stored})
