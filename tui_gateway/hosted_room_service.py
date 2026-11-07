@@ -173,6 +173,10 @@ class HostedRoomService:
     def stop(self, *, timeout: float = 5.0) -> bool:
         return self.runtime.stop(timeout=timeout)
 
+    def live_threads(self):
+        """This service's room threads still alive (``HostedRoomRuntime.live_threads``)."""
+        return self.runtime.live_threads()
+
     def wakeup(self) -> None:
         self.runtime.wakeup()
 

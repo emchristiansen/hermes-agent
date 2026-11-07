@@ -46,6 +46,7 @@ from agent.session_activity import ActivityProvenance, AwakeIdleMeter
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import pre_agent_fallback_notice
 from gateway.turn_executor import _UnboundedThreadExecutor
+from gateway.run_shutdown_budget import counted_maintenance_pass
 
 # Per-session AIAgent cache bounds (agents are heavy); see _enforce_agent_cache_cap/_session_housekeeping_watcher.
 _AGENT_CACHE_MAX_SIZE = 128
@@ -4407,17 +4408,16 @@ def _profile_sessions_dir(launch: Optional[tuple[Path, Path]]) -> Path:
     return home / "sessions"
 
 
+@counted_maintenance_pass  # a writer the shutdown close waits for (and fences); see run_shutdown_budget
 def _housekeeping_state_db_maintenance(launch: Optional[tuple[Path, Path]] = None) -> None:
-    """Stale-session auto-archive plus auto-prune/VACUUM for ONE profile's state.db; both are gated
-    by sessions.min_interval_hours (VACUUM additionally by its own throttles). Opens its own
-    SessionDB — SQLite connections are thread-bound.
-
-    Profile-scoped by its caller: ``acquire()``, ``get_hermes_home()`` and ``load_config()`` all
-    resolve through the active scope, so an unscoped run swept only the LAUNCH profile's store with
-    the LAUNCH profile's retention settings and a multiplexed secondary was never archived, pruned
-    or vacuumed by anyone — the dashboard/serve trigger defers to the gateway for every profile a
-    gateway owns (``web_server_sessions``). *launch* carries the launch home's configured transcript
-    dir (:func:`_launch_sessions_dir`) so its override still governs its own profile."""
+    """Stale-session auto-archive plus auto-prune/VACUUM for ONE profile's state.db; both are gated by
+    sessions.min_interval_hours (VACUUM additionally by its own throttles). Opens its own SessionDB.
+    Profile-scoped by its caller: ``acquire()``, ``get_hermes_home()`` and ``load_config()`` all resolve
+    through the active scope, so an unscoped run swept only the LAUNCH profile's store with the LAUNCH
+    profile's retention settings and a multiplexed secondary was never archived, pruned or vacuumed by
+    anyone — the dashboard/serve trigger defers to the gateway for every profile a gateway owns
+    (``web_server_sessions``). *launch* carries the launch home's configured transcript dir
+    (:func:`_launch_sessions_dir`) so its override still governs its own profile."""
     from hermes_cli.config import load_config as _load_full_config
     from hermes_state_registry import acquire, release_or_close
     _sess_cfg = (_load_full_config().get("sessions") or {})
