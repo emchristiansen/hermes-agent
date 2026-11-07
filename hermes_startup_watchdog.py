@@ -12,7 +12,10 @@ leases (:func:`report_startup_progress`) — authoritative, prove the *startup p
 is alive, work for I/O-bound phases (schema migration, corruption repair in
 ``SessionDB.__init__``) with ~zero CPU; (2) process-wide CPU progress, capped at
 ``_MAX_CPU_EXTENSIONS`` since an unrelated thread burning CPU must not hide a parked
-startup thread forever. Known limitation: a *spinning* startup deadlock earns the capped
+startup thread forever. Scoped phases (:func:`startup_phase`) release their lease when
+they end, so a finished phase's claim is never honored afterwards, and name the step
+(DB path, profile) in begin/end INFO lines and in the warnings; bare
+:func:`report_startup_progress` claims still lapse only by time. Known limitation: a *spinning* startup deadlock earns the capped
 extensions before firing; the observed class is parked-thread deadlocks. Idle-by-design
 waits call :func:`kick_startup_watchdog` (respawn-storm backoff, up to 300s); MCP
 discovery's 120s wait sits inside the 300s default.
@@ -28,6 +31,7 @@ Everything is best-effort: a watchdog failure must never affect the startup it o
 
 from __future__ import annotations
 
+import contextlib
 import faulthandler
 import json
 import logging
@@ -187,11 +191,23 @@ class StartupWatchdogHandle:
         self._disarmed_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._extensions = 0
-        # Phase-owned progress lease (see lease()): monotonic deadline the
-        # current startup phase has claimed for legitimately long sync work.
-        self._lease_until = 0.0
+        # Phase-owned progress leases, keyed by claim: key -> (monotonic deadline,
+        # phase, detail). Scoped claims (begin_phase()/startup_phase()) are dropped
+        # when their phase ends, so a finished phase's claim is never honored after
+        # it; unscoped lease() claims still lapse only by time. _lease_phase keeps
+        # the last phase that *claimed* (dump-record forensics), which is not
+        # necessarily the phase holding the lease now.
+        self._leases: Dict[Any, tuple[float, Optional[str], str]] = {}
         self._lease_phase: Optional[str] = None
         self._lease_count = 0
+        self._lease_release_count = 0
+        # Startup phases currently in progress (begin_phase()/startup_phase()),
+        # leased or not: key -> (phase, detail, monotonic start).
+        self._open_phases: Dict[Any, tuple[Optional[str], str, float]] = {}
+        # Key of the scoped lease whose honoring set the current deadline (released
+        # by end_phase), and a request for _run to restart its CPU window.
+        self._deadline_lease_key: Any = None
+        self._rebaseline_cpu = False
         # Set by _fire() once forensics complete so the exit escort stands down.
         self._fire_done = threading.Event()
 
@@ -218,6 +234,7 @@ class StartupWatchdogHandle:
             extra = 0.0
         with self._state_lock:
             self._deadline = time.monotonic() + self.timeout_s + extra
+            self._deadline_lease_key = None
 
     def lease(self, expected_s: float, phase: str = "") -> None:
         """Claim a progress lease: this phase expects up to ``expected_s`` more seconds of work.
@@ -234,11 +251,80 @@ class StartupWatchdogHandle:
         if expected <= 0:
             return
         expected = min(expected, _MAX_LEASE_S)
+        label = str(phase) if phase else None
+        key = ("unscoped", label)
         with self._state_lock:
-            self._lease_until = max(self._lease_until, time.monotonic() + expected)
-            if phase:
-                self._lease_phase = str(phase)
+            until = time.monotonic() + expected
+            prior = self._leases.get(key)
+            if prior is not None:
+                until = max(prior[0], until)
+            self._leases[key] = (until, label, "")
+            if label:
+                self._lease_phase = label
             self._lease_count += 1
+
+    def begin_phase(self, expected_s: float, phase: str, detail: str = "") -> object:
+        """Open one phase instance; return its key for :meth:`end_phase`.
+
+        The phase is recorded as open (named in the fire record and the
+        lease-honoring warning) whether or not it claims a lease. It claims a
+        lease only for a positive ``expected_s`` (same clamp as :meth:`lease`);
+        zero means "attribute, do not protect". Never raises.
+        """
+        try:
+            expected = float(expected_s)
+        except (TypeError, ValueError):
+            expected = 0.0
+        label = str(phase) if phase else None
+        info = str(detail or "")
+        key = object()
+        with self._state_lock:
+            now = time.monotonic()
+            self._open_phases[key] = (label, info, now)
+            if expected > 0:
+                self._leases[key] = (now + min(expected, _MAX_LEASE_S), label, info)
+                if label:
+                    self._lease_phase = label
+                self._lease_count += 1
+        return key
+
+    def end_phase(self, key: Optional[object]) -> None:
+        """Close the phase opened by :meth:`begin_phase` and release its lease. Idempotent; never raises."""
+        if key is None:
+            return
+        with self._state_lock:
+            self._open_phases.pop(key, None)
+            if self._leases.pop(key, None) is not None:
+                self._lease_release_count += 1
+            if key is self._deadline_lease_key:
+                # The current deadline was granted by this lease. Do not keep
+                # honoring it after the phase ended: the work that follows gets
+                # one ordinary window, judged on its own CPU activity.
+                self._deadline_lease_key = None
+                if self._state == _ARMED:
+                    self._deadline = time.monotonic() + self.timeout_s
+                    self._rebaseline_cpu = True
+
+    def _open_phases_locked(self, now: float) -> list[str]:
+        """Open phases, oldest first, as ``phase (detail) open Ns``. Caller holds the lock."""
+        return [
+            f"{label or 'unknown'}{f' ({info})' if info else ''} open {now - started:.0f}s"
+            for label, info, started in sorted(self._open_phases.values(), key=lambda v: v[2])
+        ]
+
+    def _active_lease_locked(self, now: float) -> Optional[tuple[Any, tuple[float, Optional[str], str]]]:
+        """The longest unexpired lease as (key, (deadline, phase, detail)); prunes lapsed ones. Caller holds the lock."""
+        for key in [k for k, v in self._leases.items() if v[0] <= now]:
+            del self._leases[key]
+        if not self._leases:
+            return None
+        return max(self._leases.items(), key=lambda kv: kv[1][0])
+
+    @property
+    def _lease_until(self) -> float:
+        """Latest unexpired lease deadline, or 0.0 when no lease is held (inspection only)."""
+        values = list(self._leases.values())
+        return max((v[0] for v in values), default=0.0)
 
     @property
     def disarmed(self) -> bool:
@@ -294,7 +380,9 @@ class StartupWatchdogHandle:
                 "elapsed_s": round(elapsed, 3),
                 "extensions": self._extensions,
                 "lease_count": self._lease_count,
+                "lease_release_count": self._lease_release_count,
                 "last_lease_phase": self._lease_phase,
+                "open_phases": self._open_phases_snapshot(),
                 "exit_code": self.exit_code,
             }
         )
@@ -323,6 +411,18 @@ class StartupWatchdogHandle:
         self._fire_done.set()
         self._exit(self.exit_code)
 
+    def _open_phases_snapshot(self) -> list[str]:
+        """Lock-free best-effort copy for the fire path (the state lock is not taken there)."""
+        try:
+            now = time.monotonic()
+            values = sorted(list(self._open_phases.values()), key=lambda v: v[2])
+            return [
+                f"{label or 'unknown'}{f' ({info})' if info else ''} open {now - started:.0f}s"
+                for label, info, started in values
+            ]
+        except Exception:
+            return []
+
     def _exit_escort(self) -> None:
         """Hard-exit if the forensic fire path wedges (bounded-exit seam).
 
@@ -350,7 +450,24 @@ class StartupWatchdogHandle:
             if self._state != _ARMED:
                 return False
             self._deadline = deadline
+            self._deadline_lease_key = None
             return True
+
+    def _extend_for_lease_if_armed(self, now: float) -> Optional[tuple[float, Optional[str], str, list[str]]]:
+        """Honor the longest live lease atomically: pick it, extend to it and remember its key under one
+        lock hold, so an end_phase() racing this check can never leave a released lease's deadline in
+        force. Returns (deadline, phase, detail, open phases), or None when no lease is held or the
+        handle is no longer armed (the caller distinguishes via ``_state``)."""
+        with self._state_lock:
+            if self._state != _ARMED:
+                return None
+            active = self._active_lease_locked(now)
+            if active is None:
+                return None
+            key, (until, phase, detail) = active
+            self._deadline = max(until, now + min(_POLL_SLICE_S, self.timeout_s))
+            self._deadline_lease_key = key
+            return until, phase, detail, self._open_phases_locked(now)
 
     def _run(self) -> None:
         last_cpu = self._process_cpu_seconds()
@@ -359,6 +476,9 @@ class StartupWatchdogHandle:
                 if self._state != _ARMED:
                     return
                 deadline = self._deadline
+                rebaseline, self._rebaseline_cpu = self._rebaseline_cpu, False
+            if rebaseline:
+                last_cpu = self._process_cpu_seconds()
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 if self._disarmed_event.wait(timeout=min(remaining, _POLL_SLICE_S)):
@@ -368,17 +488,18 @@ class StartupWatchdogHandle:
             # outright; (2) CPU progress extends at most _MAX_CPU_EXTENSIONS
             # times (process-wide CPU proves activity, not startup progress).
             now = time.monotonic()
-            with self._state_lock:
-                lease_until = self._lease_until
-                lease_phase = self._lease_phase
-            if lease_until > now:
-                if not self._extend_if_armed(max(lease_until, now + min(_POLL_SLICE_S, self.timeout_s))):
-                    return
+            honored = self._extend_for_lease_if_armed(now)
+            if honored is None and self._state != _ARMED:
+                return
+            if honored is not None:
+                lease_until, lease_phase, lease_detail, open_phases = honored
                 _log_quietly(
                     "warning",
-                    "Gateway startup exceeded %.0fs but phase %r holds a "
-                    "progress lease for another %.0fs — honoring it.",
-                    self.timeout_s, lease_phase or "unknown", lease_until - now,
+                    "Gateway startup exceeded %.0fs but phase %r%s holds a "
+                    "progress lease for another %.0fs — honoring it (open startup phases: %s).",
+                    self.timeout_s, lease_phase or "unknown",
+                    f" ({lease_detail})" if lease_detail else "", lease_until - now,
+                    "; ".join(open_phases) or "none",
                 )
                 # Leased work may be I/O-bound; reset the CPU baseline so the
                 # post-lease window is judged on its own activity.
@@ -397,8 +518,9 @@ class StartupWatchdogHandle:
                     "(%.1fs this window); extending the startup watchdog "
                     "deadline (CPU-fallback extension %d of %d — phases "
                     "doing long legitimate work should call "
-                    "report_startup_progress instead).",
+                    "report_startup_progress instead; open startup phases: %s).",
                     self.timeout_s, window_delta, self._extensions, _MAX_CPU_EXTENSIONS,
+                    "; ".join(self._open_phases_snapshot()) or "none",
                 )
                 continue
             # No progress: claim the fire transition atomically so a disarm
@@ -501,6 +623,71 @@ def report_startup_progress(expected_s: float, phase: str = "") -> None:
     raises — safe to call unconditionally from application code.
     """
     _with_armed_handle("lease", "Failed to report startup progress", expected_s, phase)
+
+
+class _PhaseToken:
+    """Pairs a begin_phase() key with the handle that issued it, so the end goes to the same handle."""
+
+    __slots__ = ("handle", "key")
+
+    def __init__(self, handle: StartupWatchdogHandle, key: object):
+        self.handle = handle
+        self.key = key
+
+
+def begin_startup_phase(phase: str, *, expected_s: float = 0.0, detail: str = "") -> Optional[_PhaseToken]:
+    """Open a named startup phase on the armed watchdog; pair with :func:`end_startup_phase`.
+
+    A positive ``expected_s`` also claims a lease that :func:`end_startup_phase`
+    releases (so it is never honored after the phase ends); ``0`` only records
+    the phase as open for attribution. Returns ``None`` when not armed. Never raises.
+    """
+    try:
+        with _handle_lock:
+            handle = _handle
+        if handle is None:
+            return None
+        return _PhaseToken(handle, handle.begin_phase(expected_s, phase, detail))
+    except Exception:
+        logger.debug("Failed to begin startup phase", exc_info=True)
+        return None
+
+
+def end_startup_phase(token: Optional[_PhaseToken]) -> None:
+    """Close a phase opened by :func:`begin_startup_phase` and release its lease. Never raises."""
+    if token is None:
+        return
+    try:
+        token.handle.end_phase(token.key)
+    except Exception:
+        logger.debug("Failed to end startup phase", exc_info=True)
+
+
+@contextlib.contextmanager
+def startup_phase(phase: str, *, expected_s: float = 0.0, detail: str = ""):
+    """Bracket one startup step: begin/end INFO lines naming *detail* (DB path, profile) and,
+    for a positive ``expected_s``, a lease released when the block exits (normally or not).
+
+    Silent and free when no watchdog is armed, so the same code path (e.g. every
+    ``SessionDB`` open after startup) logs nothing outside gateway startup.
+    """
+    token = begin_startup_phase(phase, expected_s=expected_s, detail=detail)
+    started = time.monotonic()
+    if token is not None:
+        _log_quietly("info", "Startup phase %s begin%s", phase, f" ({detail})" if detail else "")
+    outcome = "end"
+    try:
+        yield
+    except BaseException:
+        outcome = "failed"
+        raise
+    finally:
+        if token is not None:
+            end_startup_phase(token)
+            _log_quietly(
+                "info", "Startup phase %s %s after %.1fs%s",
+                phase, outcome, time.monotonic() - started, f" ({detail})" if detail else "",
+            )
 
 
 def _reset_for_tests() -> None:
