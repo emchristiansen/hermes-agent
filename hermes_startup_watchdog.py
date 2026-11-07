@@ -663,7 +663,7 @@ def begin_startup_phase(phase: str, *, expected_s: float = 0.0, detail: str = ""
         if handle is None:
             return None
         return _PhaseToken(handle, handle.begin_phase(expected_s, phase, detail))
-    except Exception:
+    except Exception:  # health: allow BLE001 -- never-raise attribution boundary; traceback logged at DEBUG (exc_info=True) via _log_quietly, which cannot raise
         _log_quietly("debug", "Failed to begin startup phase", exc_info=True)
         return None
 
@@ -674,7 +674,7 @@ def end_startup_phase(token: Optional[_PhaseToken]) -> None:
         return
     try:
         token.handle.end_phase(token.key)
-    except Exception:
+    except Exception:  # health: allow BLE001 -- never-raise lease release boundary; traceback logged at DEBUG (exc_info=True) via _log_quietly, which cannot raise
         _log_quietly("debug", "Failed to end startup phase", exc_info=True)
 
 
@@ -686,7 +686,7 @@ def _resolve_detail(detail: Any) -> str:
         return str(detail or "")
     try:
         return str(detail() or "")
-    except Exception:
+    except Exception:  # health: allow BLE001 -- a caller-supplied detail callable may raise anything; traceback logged at DEBUG (exc_info=True) via _log_quietly, which cannot raise
         _log_quietly("debug", "Failed to build startup phase detail", exc_info=True)
         return ""
 
