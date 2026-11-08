@@ -795,6 +795,13 @@ def _handle_complete(args: dict, **kw) -> str:
                 raise _Reject(
                     f"could not complete {tid}: unsatisfied parent dependencies: "
                     f"{detail}; complete the parents first (done or archived)")
+            # A state/run refusal is not the card's last_failure_error, which may be an earlier
+            # attempt's (t_234158d0 showed run 6474's quota wall for run 6493's refused completion).
+            own = _worker_run_id(tid)
+            if task and (task.status not in ("running", "ready", "blocked", "review")
+                         or (own is not None and task.current_run_id != own)):
+                raise _Reject(f"could not complete {tid}: status is {task.status}, current run "
+                              f"{task.current_run_id}, this worker's run {own}")
             _check(False, (task.last_failure_error if task else None) or
                    f"could not complete {tid} (unknown id, stale run, or already terminal)")
         run = kb.latest_run(conn, tid)

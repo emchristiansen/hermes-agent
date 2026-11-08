@@ -213,7 +213,7 @@ def _audit_author(requested: str | None = None) -> str:
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "set-skills", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
-    "schedule", "unblock", "settle-triage", "promote", "archive", "dispatch", "daemon", "repair",
+    "schedule", "unblock", "settle-triage", "settle-delivered", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
     "gc",
@@ -1080,6 +1080,29 @@ def _cmd_settle_triage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_settle_delivered(args: argparse.Namespace) -> int:
+    from agent.swarm_capabilities import worker_board_management_enabled
+    if os.environ.get("HERMES_KANBAN_TASK") and not worker_board_management_enabled():
+        return _err("kanban settle-delivered is orchestrator-only; workers must hand off their assigned task")
+    metadata, rc = _parse_metadata_flag(getattr(args, "metadata", None))
+    if rc:
+        return rc
+    from hermes_cli.kanban_db_settle import settle_delivered_assessment
+    try:
+        with kbc.connect_closing() as conn:
+            ok, reason = settle_delivered_assessment(
+                conn, args.task_id, expected_terminal_run=args.expected_terminal_run, verdict=args.verdict,
+                result=args.result, author=_audit_author(), metadata=metadata)
+    except ValueError as exc:
+        return _err(f"kanban settle-delivered: {exc}", 2)
+    except kb.ArtifactPreservationError as exc:
+        return _err(f"cannot settle {args.task_id}: {exc} (nothing changed)")
+    if not ok:
+        return _err(f"cannot settle {args.task_id}: {reason} (nothing changed)")
+    print(f"Settled {args.task_id}: {reason}")
+    return 0
+
+
 def _cmd_unblock(args: argparse.Namespace) -> int:
     from agent.swarm_capabilities import worker_board_management_enabled
     from hermes_cli.kanban_db_retry_policy import unblock_refusal
@@ -1403,6 +1426,7 @@ _HANDLERS = {
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock, "settle-triage": _cmd_settle_triage,
+    "settle-delivered": _cmd_settle_delivered,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,

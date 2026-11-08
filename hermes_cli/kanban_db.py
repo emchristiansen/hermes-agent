@@ -2988,9 +2988,9 @@ def _persist_scratch_completion_artifacts(
 
     if changed:
         metadata["artifacts"] = persisted
-        metadata["_staged_artifacts"] = [
-            path for path in persisted if path.startswith(str(attachment_dir.resolve()))
-        ]
+        # Only this call's own new copies: a registered attachment passed through is not ours to discard.
+        copied = {str(dest.resolve()) for dest in used_destinations}
+        metadata["_staged_artifacts"] = [path for path in persisted if path in copied]
 
 
 def _discard_staged_copies(copies: Iterable[Path], attachment_dir: Path) -> None:
@@ -3086,17 +3086,16 @@ def edit_task(
             changed_fields.append("summary")
             if metadata is not None:
                 changed_fields.append("metadata")
-            run = conn.execute(
-            """
-            SELECT id FROM task_runs
-             WHERE task_id = ?
-               AND outcome = 'completed'
-             ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC
-             LIMIT 1
-            """,
-            (task_id,),
-        ).fetchone()
-            if run is None:
+            from hermes_cli.kanban_db_settle import settlement_correction
+            # SI-06: a settled assessment is corrected on its own record; no run is rewritten or synthesized.
+            correction = settlement_correction(conn, task_id, handoff_summary, metadata)
+            run = None if correction is not None else conn.execute(
+                "SELECT id FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+                "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1", (task_id,),
+            ).fetchone()
+            if correction is not None:
+                run_id = None
+            elif run is None:
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="completed", summary=handoff_summary, metadata=metadata,
                 )
@@ -3114,6 +3113,7 @@ def edit_task(
                     "fields": ["result", "summary"] + (["metadata"] if metadata is not None else []),
                     "result_len": len(result) if result else 0,
                     "summary": _first_line(handoff_summary, 400) or None,
+                    **({"settlement_correction": correction} if correction is not None else {}),
                 },
                 run_id=run_id,
             )
@@ -4143,42 +4143,6 @@ def latest_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
     return Run.from_row(row) if row else None
 
 
-def latest_summary(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    """Newest non-empty run summary, or None. Workers hand off via ``summary`` and
-    leave ``tasks.result`` NULL, so views need this or a done task looks empty."""
-    row = conn.execute(
-        "SELECT summary FROM task_runs "
-        "WHERE task_id = ? AND summary IS NOT NULL AND summary != '' "
-        "ORDER BY COALESCE(ended_at, started_at) DESC, id DESC LIMIT 1", (task_id,),
-    ).fetchone()
-    return row["summary"] if row else None
-
-
-def latest_summaries(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, str]:
-    """``{task_id: newest non-empty run summary}`` in one query (window function,
-    SQLite >= 3.25); tasks without a summary are omitted."""
-    ids = list(task_ids)
-    if not ids:
-        return {}
-    placeholders = ",".join("?" for _ in ids)
-    rows = conn.execute(
-        f"""
-        SELECT task_id, summary FROM (
-            SELECT task_id, summary,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY task_id
-                       ORDER BY COALESCE(ended_at, started_at) DESC, id DESC
-                   ) AS rn
-              FROM task_runs
-             WHERE task_id IN ({placeholders})
-               AND summary IS NOT NULL AND summary != ''
-        ) WHERE rn = 1
-        """,
-        ids,
-    ).fetchall()
-    return {r["task_id"]: r["summary"] for r in rows}
-
-
 def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, int]:
     """``{task_id: started_at of the run ``tasks.current_run_id`` points at}``
     in one query; tasks with no active run (NULL or dangling pointer) are omitted."""
@@ -4216,6 +4180,10 @@ from hermes_cli.kanban_db_workspace import (
     _is_managed_scratch_path,
     _managed_scratch_path_info,
     _scratch_workspace,
+)
+from hermes_cli.kanban_db_summaries import (
+    latest_summaries,
+    latest_summary,
 )
 from hermes_cli.kanban_db_dispatch import (
     DEFAULT_FAILURE_LIMIT,
