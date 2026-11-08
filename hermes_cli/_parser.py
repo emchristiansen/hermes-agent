@@ -80,6 +80,109 @@ def command_argv(argv: list[str]) -> list[str]:
     return []
 
 
+def is_no_init_command(argv: list[str], *, profile_flag_consumed: bool = False) -> bool:
+    """``hermes auth principals`` whose top-level options leave it unchanged; see ``no_init_command_args``."""
+    return no_init_command_args(argv, profile_flag_consumed=profile_flag_consumed) is not None
+
+
+class _NotInert(Exception):
+    pass
+
+
+def no_init_command_args(argv: list[str], *, profile_flag_consumed: bool = False) -> list[str] | None:
+    """The arguments after ``auth principals`` when *argv* is that command with top-level options that
+    leave it unchanged (``--cli``, ``--yolo``, ``--reas high`` …); otherwise None.
+
+    The command promises no home initialization or writes, so ``hermes_bootstrap`` skips its scratch
+    setup and ``hermes_cli.main`` dispatches it before the profile scratch export and the
+    config/logging imports, all of which create files in the home. Options that change what the
+    full CLI does instead (help, ``--version``, a non-empty ``-z``) or that it rejects are not this command:
+    they take the normal path, which answers them exactly as for every other command.
+
+    *argv* is parsed with the real top-level flags (``_add_top_level_flags``) and a command
+    positional with the full parser's subcommand arity, so which token is the command (abbreviated,
+    ``=``-joined or attached option values, ``--``) is argparse's own decision, not a token scan's.
+    There is no command dispatch: a stray word is never looked up (the "not a command" hints load
+    config, which writes). Before parsing, the first ``-p``/``--profile`` NAME is removed, as
+    ``main._apply_profile_override`` does before argparse; that scanner also skips other options'
+    values and invalid names, so for ``hermes_bootstrap`` this is an approximation. The decisive call
+    (``_startup_fast``) runs on the override's actual result with *profile_flag_consumed* (a remaining
+    ``-p`` is then the parser's error). Multi-word session names are then joined exactly as main
+    does before its parse."""
+    if not profile_flag_consumed:
+        argv = _without_profile_flag(argv)
+    argv = _coalesce_session_name_args(argv)  # as main's parse does: ``-c my session auth principals``
+    parser = argparse.ArgumentParser(prog="hermes")
+    _add_top_level_flags(parser)
+    parser.add_argument("command", nargs=argparse.PARSER)
+
+    def refuse(*_args, **_kwargs):
+        raise _NotInert
+
+    # Help prints then exits, and every parse error calls error(): refuse both before any output.
+    parser.print_help = parser.print_usage = parser.error = parser.exit = refuse
+    try:
+        args = parser.parse_args(argv)
+    except _NotInert:
+        return None
+    # ``main`` runs ``-z`` only for a non-empty prompt: ``--oneshot= auth principals`` is the command.
+    if args.command[:2] != ["auth", "principals"] or args.version or args.oneshot:
+        return None
+    return args.command[2:]
+
+
+def _coalesce_session_name_args(argv: list) -> list:
+    """Join unquoted multi-word session names after -c/--continue and -r/--resume.
+
+    ``hermes -c Pokemon Agent Dev`` → ``['-c', 'Pokemon Agent Dev']``; tokens
+    are collected until the next flag (``-*``) or known top-level subcommand.
+    """
+    _SUBCOMMANDS = {
+        "chat", "model", "gateway", "setup", "whatsapp", "whatsapp-cloud", "login", "logout",
+        "auth", "status", "cron", "doctor", "config", "pairing", "skills", "tools", "mcp",
+        "sessions", "insights", "update", "uninstall", "profile", "dashboard", "serve",
+        "desktop", "gui", "honcho", "claw", "plugins", "security", "acp", "webhook", "peer",
+        "memory", "dump", "debug", "backup", "import", "completion", "logs", "usage",
+    }
+    _SESSION_FLAGS = {"-c", "--continue", "-r", "--resume"}
+
+    result = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token in _SESSION_FLAGS:
+            result.append(token)
+            i += 1
+            # Collect subsequent non-flag, non-subcommand tokens as one name
+            parts: list = []
+            while (
+                i < len(argv)
+                and not argv[i].startswith("-")
+                and argv[i] not in _SUBCOMMANDS
+            ):
+                parts.append(argv[i])
+                i += 1
+            if parts:
+                result.append(" ".join(parts))
+        else:
+            result.append(token)
+            i += 1
+    return result
+
+
+def _without_profile_flag(argv: list[str]) -> list[str]:
+    """*argv* without its first ``-p NAME`` / ``--profile NAME`` / ``--profile=NAME`` (before ``--``)."""
+    flags = {flag for flag, _takes_value in PRE_ARGPARSE_INHERITED_FLAGS}
+    for i, token in enumerate(argv):
+        if token == "--":
+            break
+        if token.startswith("--") and token.partition("=")[0] in flags and "=" in token:
+            return argv[:i] + argv[i + 1:]
+        if token in flags and i + 1 < len(argv):
+            return argv[:i] + argv[i + 2:]
+    return list(argv)
+
+
 def _inherited_flag(parser, *args, **kwargs):
     """``parser.add_argument`` + tag the Action ``inherit_on_relaunch`` for ``hermes_cli.relaunch``."""
     action = parser.add_argument(*args, **kwargs)

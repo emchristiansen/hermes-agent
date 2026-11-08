@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import json
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from hermes_cli.version_info import get_version_info
@@ -92,7 +93,6 @@ STEPFUN_STEP_PLAN_INTL_BASE_URL = "https://api.stepfun.ai/step_plan/v1"
 STEPFUN_STEP_PLAN_CN_BASE_URL = "https://api.stepfun.com/step_plan/v1"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
-CODEX_OAUTH_USER_AGENT = f"hermes-cli/{get_version_info().base_version}"
 CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
 XAI_OAUTH_ISSUER = "https://auth.x.ai"
 XAI_OAUTH_DISCOVERY_URL = f"{XAI_OAUTH_ISSUER}/.well-known/openid-configuration"
@@ -121,6 +121,40 @@ ACTUAL_LOCAL_NOAUTH_PLACEHOLDER = "dummy-actual-local-api-key"
 # Upstream rate-limit / usage-quota exhaustion (HTTP 429): transient, re-authenticating cannot resolve
 # it, so it must stay distinct from missing/expired-credential errors.
 CODEX_RATE_LIMITED_CODE = "codex_rate_limited"
+
+
+def __getattr__(name: str) -> Any:
+    # ``CODEX_OAUTH_USER_AGENT`` needs the version, which can run ``git``: resolve it on first use, not
+    # at import, so importing these constants (the read-only principal projection does) starts nothing.
+    if name == "CODEX_OAUTH_USER_AGENT":
+        value = globals()[name] = f"hermes-cli/{get_version_info().base_version}"  # cache: later reads skip this
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+class DuplicateJsonMember(ValueError):
+    """A JSON object names one member twice: which value counts is a parser accident, so the document
+    is ambiguous. Carries no member name or value."""
+
+
+def unique_json_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """``json.loads(..., object_pairs_hook=unique_json_members)``: raise ``DuplicateJsonMember``
+    instead of silently keeping the last of a repeated member."""
+    obj: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in obj:
+            raise DuplicateJsonMember("a JSON object repeats a member name")
+        obj[key] = value
+    return obj
+
+
+class AuthStoreUnreadable(RuntimeError):
+    """A strict (read-only) auth-store read could not use the store at ``path``. The message names
+    the file and the failure kind only, never its contents."""
+
+    def __init__(self, path: Path, problem: str) -> None:
+        super().__init__(f"{path} {problem}")
+        self.path = path
 
 
 class AuthError(RuntimeError):
@@ -157,14 +191,19 @@ _minimax_err = _provider_error_factory("minimax-oauth")
 _openrouter_err = _provider_error_factory("openrouter")
 
 
-def _decode_jwt_claims(token: Any) -> dict[str, Any]:
+def _decode_jwt_claims(token: Any, *, unique_members: bool = False) -> dict[str, Any]:
+    """The token's claims, or ``{}`` when it is not a readable JWT. With *unique_members* a repeated
+    member name anywhere in the claims raises ``DuplicateJsonMember`` (strict callers must not bind
+    an identity the token states two ways)."""
     if not isinstance(token, str) or token.count(".") != 2:
         return {}
     payload = token.split(".")[1]
     payload += "=" * ((4 - len(payload) % 4) % 4)
     try:
         raw = base64.urlsafe_b64decode(payload.encode("utf-8"))
-        claims = json.loads(raw.decode("utf-8"))
+        claims = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_json_members if unique_members else None)
+    except DuplicateJsonMember:
+        raise
     except Exception:
         return {}
     return claims if isinstance(claims, dict) else {}

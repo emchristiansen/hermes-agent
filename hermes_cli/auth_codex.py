@@ -19,10 +19,11 @@ import time
 from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple
+from hermes_cli import auth_constants
 from hermes_cli.auth_constants import (
     _decode_jwt_claims, AUTH_LOCK_TIMEOUT_SECONDS, AuthError,
     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS, CODEX_OAUTH_CLIENT_ID, CODEX_OAUTH_TOKEN_URL,
-    CODEX_OAUTH_USER_AGENT, CODEX_RATE_LIMITED_CODE, DEFAULT_CODEX_BASE_URL, _codex_err, httpx)
+    CODEX_RATE_LIMITED_CODE, DEFAULT_CODEX_BASE_URL, _codex_err, httpx)
 from utils import env_float, normalize_proxy_env_vars
 
 if TYPE_CHECKING:  # annotation-only; the runtime import would be a cycle
@@ -489,7 +490,8 @@ def refresh_codex_oauth_pure(
                          "codex_auth_missing_refresh_token", relogin=True)
     with _codex_http_client(
         timeout=httpx.Timeout(max(5.0, float(timeout_seconds))),
-        headers={"Accept": "application/json", "User-Agent": CODEX_OAUTH_USER_AGENT}) as client:
+        # Read on use: the agent string resolves the version (possibly via git) on first access.
+        headers={"Accept": "application/json", "User-Agent": auth_constants.CODEX_OAUTH_USER_AGENT}) as client:
         response = client.post(
             CODEX_OAUTH_TOKEN_URL, headers={"Content-Type": "application/x-www-form-urlencoded"},
             data={
