@@ -157,7 +157,10 @@ def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str
 def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
     """Done-parent handoffs: newest ``completed`` run's summary+metadata,
     falling back to ``task.result`` for pre-runs-table data. Stamped with a
-    relative age so the worker re-verifies stale upstream results."""
+    relative age so the worker re-verifies stale upstream results. A parent whose newest completion
+    is a delivered-assessment settlement hands off that settled result (or its corrected handoff
+    summary) and its provenance instead."""
+    from hermes_cli.kanban_db_settle import settled_handoff
     parent_rows = conn.execute(
         "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id", (task_id,),
     ).fetchall()
@@ -166,7 +169,8 @@ def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str
         pt = _kb.get_task(conn, pid)
         if not pt or pt.status != "done":
             continue
-        runs = [r for r in _kb.list_runs(conn, pid) if r.outcome == "completed"]
+        settled = settled_handoff(conn, pid)
+        runs = [] if settled else [r for r in _kb.list_runs(conn, pid) if r.outcome == "completed"]
         runs.sort(key=lambda r: r.started_at, reverse=True)
         run = runs[0] if runs else None
         if not wrote_header:
@@ -179,16 +183,22 @@ def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str
                 "source before acting on it as current._"
             )
             wrote_header = True
-        done_ts = run.ended_at if run is not None and run.ended_at else (pt.completed_at or None)
+        done_ts = run.ended_at if run is not None and run.ended_at else (
+            settled[2] if settled else pt.completed_at or None)
         age = _relative_age(done_ts, now)
         lines.append(f"### {pid}" + (f" (completed {age})" if age else ""))
-        if run is not None and run.summary and run.summary.strip():
-            lines.append(_ctx_cap(run.summary))
+        # A settlement correction's handoff summary stands where an ordinary edit's run summary does (SI-10).
+        handoff = run.summary if run is not None else settled[1].get("summary") if settled else None
+        if handoff and handoff.strip():
+            lines.append(_ctx_cap(handoff))
         elif pt.result:
             lines.append(_ctx_cap(pt.result))
         else:
             lines.append("(no result recorded)")
-        meta_line = _ctx_metadata_line(run.metadata) if run is not None else None
+        if settled:
+            lines.append(f"_settled by {settled[1].get('actor')} from run {settled[1].get('expected_terminal_run')} "
+                         f"as a delivered {settled[1].get('verdict')} assessment_")
+        meta_line = _ctx_metadata_line(run.metadata if run is not None else settled[1].get("metadata") if settled else None)
         if meta_line:
             lines.append(meta_line)
         lines.append("")

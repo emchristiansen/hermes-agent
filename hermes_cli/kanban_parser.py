@@ -347,6 +347,17 @@ _SPECS = [
         _arg("--required-input", required=True, help="Concrete missing input"),
         _arg("--event", required=True, help="Substantive owner event needed before guarded unblock"),
     ], help="Orchestrator-only: settle terminal loop triage into a sticky external-event wait"),
+    _cmd("settle-delivered", [
+        _TASK_ID,
+        _arg("--expected-terminal-run", type=int, required=True,
+             help="Exact latest run, ended by a schedule, whose own worker then delivered (exit 0)"),
+        _arg("--verdict", choices=["changes_required", "rejected"], required=True,
+             help="The delivered negative verdict (there is no passing verdict here)"),
+        _arg("--result", required=True, help="The delivered assessment: verdict, report path and digest"),
+        _arg("--metadata", help="JSON object of structured facts stored on the settlement record and "
+                                "handed to dependents; scratch artifacts it or --result names are preserved"),
+    ], help="Orchestrator-only: settle a local-only Scheduled card whose ended run's worker already "
+            "delivered a negative assessment; never readies or dispatches it"),
     _cmd("schedule", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
