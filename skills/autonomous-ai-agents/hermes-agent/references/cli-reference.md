@@ -19,8 +19,8 @@ hermes [flags] [command]        (no subcommand = interactive chat)
   --profile, -p NAME        Use a named profile
   --yolo                    Skip dangerous command approval
   --tui / --cli             Force the Ink TUI / classic REPL
-  --ignore-rules            Skip AGENTS.md/SOUL.md/memory/skill injection
-  --safe-mode               Disable ALL customizations (troubleshooting)
+  --ignore-rules            Skip AGENTS.md/SOUL.md/memory/skill injection (home guidance file still loads)
+  --safe-mode               Disable customizations (troubleshooting; managed home guidance still loads)
   --pass-session-id         Include session ID in system prompt
 ```
 

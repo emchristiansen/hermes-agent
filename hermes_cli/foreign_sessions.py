@@ -254,8 +254,8 @@ def import_foreign_session(source: str, path, db=None) -> str:
         session_id = new_session_id()
         origin = {"imported_from": {"tool": tool, "path": str(path), "foreign_session_id": parsed.get("session_id")}}
         db.create_session(session_id, source=tool, cwd=parsed.get("cwd"), origin_json=json.dumps(origin))
-        for turn in turns:
-            db.append_message(session_id, turn["role"], turn["content"])
+        rows = [db.append_message(session_id, turn["role"], turn["content"]) for turn in turns]
+        db.record_foreign_import(session_id, origin["imported_from"], rows)  # where the imported transcript ends
         with contextlib.suppress(Exception):  # title is cosmetic; the import itself succeeded
             db.set_session_title(session_id, f"Imported from {_SOURCE_LABELS[source]}: {first_user}")
         return session_id

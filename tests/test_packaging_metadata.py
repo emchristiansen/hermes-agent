@@ -19,6 +19,23 @@ def test_test_dependencies_are_group_only_in_manifest_and_lock():
     assert "dev" not in hermes.get("optional-dependencies", {})
 
 
+
+def test_every_build_requirement_is_locked_at_its_pinned_version():
+    """A bundle ships its uv cache pruned to the packages uv.lock names (pm/uv_cache_prune.py), and every PM
+    generation rebuilds this project offline from that cache: a build requirement the lock does not carry at the
+    pinned version is pruned, and the offline rebuild fails."""
+    manifest = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text(encoding="utf-8"))
+    locked = {}
+    for row in lock["package"]:
+        locked.setdefault(row["name"], set()).add(Version(row["version"]))
+    requires = [Requirement(spec) for spec in manifest["build-system"]["requires"]]
+    assert {requirement.name for requirement in requires} == {"setuptools", "wheel"}
+    for requirement in requires:
+        pins = list(requirement.specifier)
+        assert len(pins) == 1 and pins[0].operator == "==", requirement
+        assert locked.get(requirement.name) == {Version(pins[0].version)}, (requirement, locked.get(requirement.name))
+
 def test_core_and_optional_speech_dependencies():
     project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     core = {Requirement(dep).name for dep in project["dependencies"]}

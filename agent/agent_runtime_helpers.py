@@ -491,10 +491,9 @@ def _remember_absorbed_row(survivor: dict[str, Any], dropped: dict[str, Any], *,
     if dropped.get(RETIRED_DURABLE_ROWS):
         survivor.setdefault(RETIRED_DURABLE_ROWS, []).extend(
             {k: v for k, v in row.items() if k != OWN_ROW} for row in dropped[RETIRED_DURABLE_ROWS])
-    # The uid witness claims the dropped dict's TEXT lives on in the survivor: only a fold earns it. A
-    # superseded row (``folded=False``) is retired like any absorbed row but its content is discarded.
-    if folded:
-        record_absorbed_message(survivor, dropped)
+    # The uid witness claims the dropped dict's TEXT lives on in the survivor: only a fold earns it. A superseded
+    # row (``folded=False``) is retired like any absorbed row, provenance included, but its content is discarded.
+    record_absorbed_message(survivor, dropped, text_kept=folded)
 
 
 def _count_unnamed_row(survivor: dict[str, Any], retired: dict[str, Any]) -> None:
