@@ -184,19 +184,22 @@ def continue_interrupted(conn, task_id, *, dry_run):
     Re-checked under the write lock, where a release another dispatcher recorded first is honoured
     rather than duplicated. So is this run's own ``continued`` when no comment is strictly newer:
     a same-second tie, which ``released_after`` keeps reported as ``active_pr`` (strict, fail
-    closed); a strictly newer comment gets a fresh proof and record. The ``continued`` event (on
-    the interrupted run) is a release ``released_after`` honours only while every later run of the
-    card provably never launched (``is_release``, ``never_launched``): unlike an operator
-    continuation it never covers a later attempt that may have run, which is proved afresh; a
-    newer PR comment guards again."""
+    closed); a strictly newer comment gets a fresh proof and record. That tie still stands once the
+    run is followed only by runs refused before launch (``_tied_release_over_refusals``). The
+    ``continued`` event (on the interrupted run) is a release ``released_after`` honours only while
+    every later run of the card provably never launched (``is_release``, ``never_launched``): unlike
+    an operator continuation it never covers a later attempt that may have run, which is proved
+    afresh; a newer PR comment guards again."""
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_dispatch import check_respawn_guard
-    if interrupted_owner_refusal(conn, task_id) is not None:
+    if interrupted_owner_refusal(conn, task_id) is not None and not _tied_release_over_refusals(conn, task_id):
         return False
     if dry_run:
         return True
     with kb.write_txn(conn):
         reason = check_respawn_guard(conn, task_id)
+        if reason == 'active_pr' and _tied_release_over_refusals(conn, task_id):
+            return True  # the tie below, its run since followed only by runs refused before launch
         if reason != 'active_pr' or interrupted_owner_refusal(conn, task_id) is not None:
             return reason is None
         latest = conn.execute('SELECT id,outcome FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1',
@@ -210,6 +213,23 @@ def continue_interrupted(conn, task_id, *, dry_run):
             'from': 'ready', 'continuation': True, 'interrupted_run': latest['id'], 'outcome': latest['outcome'],
         }, run_id=latest['id'])
     return True
+
+
+def _tied_release_over_refusals(conn, task_id) -> bool:
+    """Whether the newest ``continued`` is one ``released_after`` holds only for a same-second tie (no comment
+    strictly newer) and its interrupted run is followed only by runs the host refused before launch: then
+    nothing has run since that proof, exactly as when ``continue_interrupted`` honoured the tie for its own run,
+    and ``is_release`` would release it outright were it strictly newer. Any other later run is proved afresh."""
+    from hermes_cli import kanban_db as kb
+    prior = conn.execute("SELECT id, payload, created_at FROM task_events WHERE task_id=? AND kind='continued' "
+                         'ORDER BY id DESC LIMIT 1', (task_id,)).fetchone()
+    if prior is None:
+        return False
+    run = kb._json_dict(prior['payload']).get('interrupted_run')
+    return (type(run) is int and conn.execute('SELECT 1 FROM task_runs WHERE task_id=? AND id>?', (task_id, run)).fetchone()
+            is not None and is_release(conn, task_id, prior['id'], 'continued', prior['payload'])
+            and conn.execute('SELECT 1 FROM task_comments WHERE task_id=? AND created_at>?',
+                             (task_id, prior['created_at'])).fetchone() is None)
 
 
 def dispatch_guard(conn, task_id, *, lane, dry_run):

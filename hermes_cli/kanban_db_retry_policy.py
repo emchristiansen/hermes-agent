@@ -46,6 +46,36 @@ class CrashSweep:
 
 
 
+@dataclass(frozen=True)
+class SpawnClaim:
+    """The exact claim a dispatcher's spawn-failure transition belongs to (``_record_task_failure``).
+
+    The dispatcher can stall between its claim and that commit (claim TTL expires); the card may then
+    have been reclaimed and claimed again by another dispatcher, whose worker may be running. The commit
+    therefore changes nothing unless the card is still exactly this claim (``holds``): it never ends
+    another run, clears another claim or pid, charges another attempt or moves another phase.
+    ``refused_before_launch`` comes only from the launch-boundary producer's tag for this very run
+    (``_restart_safe_worker_argv`` raises before ``Popen``); under ``holds`` it marks the run it ends."""
+
+    run_id: int
+    claim_lock: Optional[str]
+    refused_before_launch: bool = False
+
+    @classmethod
+    def of(cls, claimed, exc: Optional[BaseException] = None) -> "SpawnClaim":
+        refused = exc is not None and getattr(exc, "kanban_refused_run", None) == claimed.current_run_id
+        return cls(claimed.current_run_id, claimed.claim_lock, refused)
+
+    def holds(self, task_row) -> bool:
+        """Whether the card (``tasks`` row read in the failure commit) is still this running claim."""
+        return (task_row["status"] == "running" and task_row["current_run_id"] == self.run_id
+                and task_row["claim_lock"] == self.claim_lock)
+
+    def launch_detail(self) -> dict:
+        """The run detail a host refusal records for the run it ends (only under ``holds``)."""
+        return {"launch": "refused_before_launch"} if self.refused_before_launch else {}
+
+
 # Worker result "the attempt's owner ended under it" (``session_kanban.record_owner_restart_result``):
 # requeued WITHOUT counting a failure, as the host's restart is not the card's.
 KANBAN_OWNER_RESTART_EXIT_CODE = 79

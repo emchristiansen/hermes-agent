@@ -32,7 +32,7 @@ from hermes_cli.kanban_db_failure_stamp import LATEST_RUN_FIRST, RESPAWN_BLOCKER
 from hermes_cli.kanban_db_retry_policy import CrashSweep as _CrashSweep, DeadWorker as _DeadWorker, KANBAN_OWNER_RESTART_EXIT_CODE
 from hermes_cli.kanban_db_retry_policy import first_failure_landing
 from hermes_cli.kanban_db_retry_policy import reclaim_transaction
-from hermes_cli.kanban_db_retry_policy import record_first_failure_hold, settle_failure_accounting
+from hermes_cli.kanban_db_retry_policy import SpawnClaim, record_first_failure_hold, settle_failure_accounting
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -1361,7 +1361,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
-    infrastructure: bool = False, run_id: Optional[int] = None, launch_refused: bool = False,
+    infrastructure: bool = False, run_id: Optional[int] = None, spawn_claim: Optional[SpawnClaim] = None,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every non-success path funnels
     through here so ``consecutive_failures`` stays consistent. Returns True when the task was auto-blocked.
@@ -1376,17 +1376,18 @@ def _record_task_failure(
     ``infrastructure=True``: the host refused the spawn (no restart-safe scope, #114720) — nothing about the
     card ran, so the run and event are recorded with ``infrastructure: true`` but ``consecutive_failures``
     is left alone and the breaker never trips; the card stays retryable and :func:`check_respawn_guard` spaces the retries.
-    ``launch_refused``: that refusal proved this exact run never launched, recorded ``launch: refused_before_launch``.
+    ``spawn_claim`` (the dispatcher's spawn path; implies both flags): applied only while the card is still exactly
+    that claim (``SpawnClaim.holds``), else nothing is written; its producer-proved ``launch`` joins the run detail.
     """
-    if failure_limit is None:
-        failure_limit = DEFAULT_FAILURE_LIMIT
+    failure_limit = DEFAULT_FAILURE_LIMIT if failure_limit is None else failure_limit
+    release_claim, end_run = (True, True) if spawn_claim is not None else (release_claim, end_run)
     error = error[:500]
     with _kb.write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, current_run_id "
+            "SELECT consecutive_failures, status, max_retries, current_run_id, claim_lock "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
-        if row is None:
+        if row is None or (spawn_claim is not None and not spawn_claim.holds(row)):
             return False
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
@@ -1425,7 +1426,7 @@ def _record_task_failure(
             if end_run:
                 detail = {"failures": failures, "retry_status": retry_status}
                 if infrastructure:
-                    detail.update(infrastructure=True, **({"launch": "refused_before_launch"} if launch_refused else {}))
+                    detail.update(infrastructure=True, **(spawn_claim.launch_detail() if spawn_claim else {}))
                 run_id = _kb._end_run(
                     conn, task_id, outcome=outcome, status=outcome, error=error, metadata=detail,
                 )
@@ -2099,7 +2100,7 @@ def _dispatch_lane_task(
     except Exception as exc:
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            outcome="spawn_failed", failure_limit=failure_limit, spawn_claim=SpawnClaim.of(claimed),
         ):
             result.auto_blocked.append(claimed.id)
         return False
@@ -2132,9 +2133,8 @@ def _dispatch_lane_task(
             _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
         if _record_task_failure(
             conn, claimed.id, str(exc),
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
-            infrastructure=infrastructure, launch_refused=infrastructure
-            and getattr(exc, "kanban_refused_run", None) == claimed.current_run_id,
+            outcome="spawn_failed", failure_limit=failure_limit, spawn_claim=SpawnClaim.of(claimed, exc),
+            infrastructure=infrastructure,
         ):
             result.auto_blocked.append(claimed.id)
         return False

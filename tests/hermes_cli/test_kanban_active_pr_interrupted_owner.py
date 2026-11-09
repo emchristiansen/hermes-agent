@@ -21,6 +21,9 @@ interrupted run, a same-second second dispatcher writes no second ``continued`` 
 c4 (review t_eccfd63f C3-RETRY-01): a later run the host refused before launch, proved by the
 argv producer that runs before ``Popen``, does not end that release: the owner is retried after the
 infrastructure cooldown; anything that may have run still ends it.
+c5 (review t_cf892b2a C4-TIE-01, C4-FENCE-01): a same-second ``continued`` (held by the strict tie)
+followed only by refused-before-launch runs is honoured as when it was written; and a dispatcher whose
+claim was reclaimed and re-claimed before its spawn failure returns writes nothing over the newer claim.
 """
 
 from __future__ import annotations
@@ -668,3 +671,132 @@ def test_an_ordinary_spawn_failure_ends_the_continuation(conn, tmp_path: Path, m
     assert kb.get_task(conn, tid).consecutive_failures == 1
     _after_cooldown(monkeypatch, 1)
     assert _held(conn, tid) and kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def _tie_with_the_pr_comment(conn, tid) -> int:
+    """Stamp the card's PR comments in the very second of its ``continued`` (the strict tie)."""
+    with kb.write_txn(conn):
+        stamp = conn.execute("SELECT created_at FROM task_events WHERE task_id=? AND kind='continued'", (tid,)).fetchone()[0]
+        conn.execute("UPDATE task_comments SET created_at=? WHERE task_id=?", (stamp, tid))
+    return stamp
+
+
+def test_a_same_second_continuation_survives_a_host_refusal(conn, tmp_path: Path, monkeypatch) -> None:
+    """C4-TIE-01: run 1's ``continued`` ties the newest PR comment, so ``released_after`` keeps reporting
+    ``active_pr`` and only the tie handling let run 2 be claimed. The host refuses run 2 before launch;
+    after the cooldown run 2 (``spawn_failed``) is no interruption to prove, yet nothing has run since
+    run 1's proof: the owner is retried now (c4 held it until another release or until the PR comment
+    left the guard window), and no second ``continued`` is written."""
+    tid, first = _restarted_owner(conn, tmp_path)
+    second = _refused_by_the_host(conn, monkeypatch, tid, tick=0)
+    _tie_with_the_pr_comment(conn, tid)
+    _after_cooldown(monkeypatch, 1)
+    assert kbd.check_respawn_guard(conn, tid) == "active_pr"  # the tie stays reported
+    assert kap.interrupted_owner_refusal(conn, tid) is not None  # run 2 is no interruption
+    assert _spawned(conn) == [tid]
+    assert [e["interrupted_run"] for e in _continued(conn, tid)] == [first]
+    assert kb.latest_run(conn, tid).id == second + 1
+
+
+@pytest.mark.parametrize("later", ["newer_pr_comment", "run_admitted", "run_bound"])
+def test_a_same_second_continuation_is_not_stretched(conn, tmp_path: Path, monkeypatch, later: str) -> None:
+    """The tie handling covers only runs refused before launch, and only while no comment is newer."""
+    tid, first = _restarted_owner(conn, tmp_path)
+    second = _refused_by_the_host(conn, monkeypatch, tid, tick=0)
+    stamp = _tie_with_the_pr_comment(conn, tid)
+    if later == "run_admitted":
+        _admitted(conn, tid, second)
+    elif later == "run_bound":
+        _bound(conn, tid, second)
+    else:
+        kb.add_comment(conn, tid, author="operator", body="Same PR: https://github.com/example/repo/pull/597")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_comments SET created_at=? WHERE task_id=? AND author='operator'", (stamp + 1, tid))
+    _after_cooldown(monkeypatch, 1)
+    assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+    assert _spawned(conn) == []
+    assert [e["interrupted_run"] for e in _continued(conn, tid)] == [first]
+
+
+def _card_state(conn, tid) -> tuple:
+    task = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
+    runs = [dict(r) for r in conn.execute("SELECT * FROM task_runs WHERE task_id=? ORDER BY id", (tid,))]
+    events = [dict(r) for r in conn.execute("SELECT * FROM task_events WHERE task_id=? ORDER BY id", (tid,))]
+    return task, runs, events
+
+
+@pytest.mark.parametrize("failure", ["host_refusal", "workspace"])
+def test_a_stale_spawn_failure_never_touches_the_newer_claim(conn, tmp_path: Path, monkeypatch, failure: str) -> None:
+    """C4-FENCE-01, normal path: dispatcher A claims run 1 and stalls past its claim TTL before its spawn
+    fails; meanwhile the independent supported routes run (not a second dispatch tick, which the board
+    lock serializes): the stale-claim sweep ``release_stale_claims`` reclaims run 1 and claimer B takes
+    run 2 with ``claim_task``. A's failure (a real host refusal from the argv producer, tagged run 1; or
+    a workspace failure) must change nothing: B's task row, runs, events and accounting stay exactly as
+    B left them (c4 ended run 2, cleared B's claim and restored the phase), and B's spawn still lands."""
+    from tools import process_registry
+    tid = kb.create_task(conn, title="re-claimed while A stalled", assignee="theseus-implementer")
+    host = kb._claimer_id().split(":", 1)[0]
+    seen: dict = {}
+
+    def b_takes_over() -> None:
+        a_run = kb.get_task(conn, tid).current_run_id
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET claim_expires=? WHERE id=?", (int(time.time()) - 1, tid))
+        assert kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None) == 1
+        b = kb.claim_task(conn, tid, claimer=f"{host}:dispatcher-b")
+        assert b is not None and b.current_run_id != a_run
+        seen.update(a_run=a_run, b=b, before=_card_state(conn, tid))
+
+    if failure == "host_refusal":
+        _host_cannot_place_workers(monkeypatch)
+        real = process_registry.restart_safe_gateway_child_argv
+
+        def stalled(*args, **kwargs):
+            b_takes_over()
+            return real(*args, **kwargs)  # the host refuses: RestartSafeScopeUnavailable, tagged run 1
+        monkeypatch.setattr(process_registry, "restart_safe_gateway_child_argv", stalled)
+        result = kbd.dispatch_once(conn)
+    else:
+        def stalled_workspace(claimed, board=None):
+            b_takes_over()
+            raise OSError("workspace unavailable")
+        monkeypatch.setattr(kbd._kbw, "resolve_workspace", stalled_workspace)
+        result = kbd.dispatch_once(conn, spawn_fn=lambda task, workspace: None)
+    assert tid not in [s[0] for s in result.spawned] and tid not in result.auto_blocked
+    assert _card_state(conn, tid) == seen["before"]
+    b = seen["b"]
+    assert kb.get_task(conn, tid).status == "running" and kb.get_task(conn, tid).claim_lock == b.claim_lock
+    kbd._set_worker_pid(conn, tid, os.getpid(), run_id=b.current_run_id, claim_lock=b.claim_lock)
+    assert kb.get_task(conn, tid).worker_pid == os.getpid()
+    assert conn.execute("SELECT worker_pid FROM task_runs WHERE id=?", (b.current_run_id,)).fetchone()[0] == os.getpid()
+
+
+def test_a_current_host_refusal_is_still_recorded_and_retried(conn, tmp_path: Path, monkeypatch) -> None:
+    """The fence keeps the ordinary path: a refusal for the claim still current ends that run uncharged,
+    tagged, back to ``ready`` (``_refused_by_the_host`` asserts each), and a healthy host then spawns."""
+    tid = kb.create_task(conn, title="plain refusal", assignee="theseus-implementer")
+    first = _refused_by_the_host(conn, monkeypatch, tid, tick=0)
+    assert kap.never_launched(conn, tid, conn.execute("SELECT * FROM task_runs WHERE id=?", (first,)).fetchone())
+    _after_cooldown(monkeypatch, 1)
+    assert _spawned(conn) == [tid]
+
+
+def test_a_spawn_claim_tag_for_another_run_marks_nothing() -> None:
+    """``SpawnClaim`` carries the producer's proof only for the exact claimed run."""
+    from hermes_cli.kanban_db_retry_policy import SpawnClaim
+    from tools.process_registry import RestartSafeScopeUnavailable
+
+    class Claimed:
+        current_run_id, claim_lock = 7, "host:1"
+    tagged = RestartSafeScopeUnavailable("no restart-safe scope")
+    tagged.kanban_refused_run = 6
+    assert SpawnClaim.of(Claimed, tagged).launch_detail() == {}
+    tagged.kanban_refused_run = 7
+    assert SpawnClaim.of(Claimed, tagged).launch_detail() == {"launch": "refused_before_launch"}
+    assert SpawnClaim.of(Claimed, RuntimeError("untagged")).launch_detail() == {}
+    claim = SpawnClaim.of(Claimed)
+    assert claim.holds({"status": "running", "current_run_id": 7, "claim_lock": "host:1"})
+    for row in ({"status": "ready", "current_run_id": 7, "claim_lock": "host:1"},
+                {"status": "running", "current_run_id": 8, "claim_lock": "host:1"},
+                {"status": "running", "current_run_id": 7, "claim_lock": "host:2"}):
+        assert not claim.holds(row)
