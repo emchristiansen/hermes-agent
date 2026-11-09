@@ -32,7 +32,7 @@ from hermes_cli.kanban_db_failure_stamp import LATEST_RUN_FIRST, RESPAWN_BLOCKER
 from hermes_cli.kanban_db_retry_policy import CrashSweep as _CrashSweep, DeadWorker as _DeadWorker, KANBAN_OWNER_RESTART_EXIT_CODE
 from hermes_cli.kanban_db_retry_policy import first_failure_landing
 from hermes_cli.kanban_db_retry_policy import reclaim_transaction
-from hermes_cli.kanban_db_retry_policy import record_first_failure_hold
+from hermes_cli.kanban_db_retry_policy import record_failure_counted, record_first_failure_hold
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -735,7 +735,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 error=error,
                 outcome="timed_out",
                 release_claim=False,
-                end_run=False,
+                end_run=False, run_id=run_id,
                 event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
             )
     return timed_out
@@ -1214,7 +1214,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 sweep.owner_restarted.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
-                sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
+                sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead, run_id))
     return sweep
 
 
@@ -1229,10 +1229,10 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     """
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
-    for _, _, _, dead in crash_details:
+    for _, _, _, dead, _ in crash_details:
         fp = _error_fingerprint(dead.error_text)
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
-    for tid, pid, claimer, dead in crash_details:
+    for tid, pid, claimer, dead, run_id in crash_details:
         error_text = dead.error_text
         if dead.protocol_violation:
             streak = _protocol_violation_streak(conn, tid)
@@ -1256,7 +1256,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 failure_limit=violation_limit,
                 force_trip=True,
                 release_claim=False,
-                end_run=False,
+                end_run=False, run_id=run_id,
                 event_payload_extra={
                     "pid": pid,
                     "claimer": claimer,
@@ -1275,7 +1275,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 outcome="crashed",
                 force_trip=True,
                 release_claim=False,
-                end_run=False,
+                end_run=False, run_id=run_id,
                 event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
             )
         else:
@@ -1290,7 +1290,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 outcome="crashed",
                 failure_limit=1 if is_systemic else None,
                 release_claim=False,
-                end_run=False,
+                end_run=False, run_id=run_id,
                 event_payload_extra=extra,
             )
         if tripped:
@@ -1359,25 +1359,24 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
-    infrastructure: bool = False,
+    infrastructure: bool = False, run_id: Optional[int] = None,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
     consistent. Returns True when the task was auto-blocked.
 
-    ``release_claim=True, end_run=True``: spawn-failure path (task still
-    running with an open run — restore source phase or ``blocked``, release
-    claim, close run). Both False: timeout/crash path (caller already restored
-    the phase and closed the run; only the counter moves, a trip flips to
-    ``blocked`` + ``gave_up``). Threshold: per-task ``max_retries`` >
-    ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``. ``force_trip`` trips
-    unconditionally (caller applied its own bounded-retry policy).
+    ``release_claim=True, end_run=True``: spawn-failure path (task still running with an open
+    run — restore source phase or ``blocked``, release claim, close run). Both False:
+    timeout/crash path (caller already restored the phase and closed the run; only the counter moves, a trip flips to
+    ``blocked`` + ``gave_up``). Threshold: per-task ``max_retries`` > ``failure_limit`` >
+    ``DEFAULT_FAILURE_LIMIT``. ``force_trip`` trips unconditionally (caller applied its own
+    bounded-retry policy). ``run_id``, the run a timeout/crash/reclaim caller already ended, gets
+    ``failure_counted`` in this transaction (``kanban_db_retry_policy.record_failure_counted``).
 
-    ``infrastructure=True``: the host refused the spawn (no restart-safe scope,
-    #114720) — nothing about the card ran, so the run and event are recorded
-    with ``infrastructure: true`` but ``consecutive_failures`` is left alone and
-    the breaker never trips; the card stays retryable and
-    :func:`check_respawn_guard` spaces the retries.
+    ``infrastructure=True``: the host refused the spawn (no restart-safe scope, #114720) —
+    nothing about the card ran, so the run and event are recorded with ``infrastructure: true``
+    but ``consecutive_failures`` is left alone and the breaker never trips; the card stays
+    retryable and :func:`check_respawn_guard` spaces the retries.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -1397,6 +1396,7 @@ def _record_task_failure(
         if row["max_retries"] == 1 and row["status"] == "blocked" and not release_claim:
             retry_status = _kb._resume_status_from_events(conn, task_id)
         failures = int(row["consecutive_failures"]) + (0 if infrastructure else 1)
+        record_failure_counted(conn, task_id, run_id, failures, outcome, _kb._append_event)
 
         # Per-task override wins over caller-supplied and default thresholds.
         task_override = _kb._row_get(row, "max_retries")

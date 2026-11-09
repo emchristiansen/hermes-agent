@@ -40,7 +40,8 @@ class CrashSweep:
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
     owner_restarted: list[str] = field(default_factory=list)
-    crash_details: list[tuple[str, int, str, object]] = field(default_factory=list)
+    crash_details: list[tuple[str, int, str, object, int]] = field(default_factory=list)
+    """``(task_id, pid, claim_lock, DeadWorker, ended run id)`` per counted crash."""
     exited_hook_payloads: list[dict] = field(default_factory=list)
 
 
@@ -154,6 +155,22 @@ def edit_retry_policy(conn, task_id, limit, expected_run, mixed_values, *,
         }, run_id=expected_run)
     notify_updated(conn, task_id, ['max_retries'], board=board)
     return True
+
+
+def record_failure_counted(conn, task_id, run_id, failures, outcome, append_event):
+    """Inside the failure-counting transaction: record that ``run_id``'s failure was counted.
+
+    The run is ended and its card re-queued in one commit and the failure counted in a later
+    one (``_reclaim_dead_workers`` / ``_account_crashes``, timeout and stale-claim reclaim); a
+    dispatcher lost between them leaves a retryable card whose failure no counter holds. Only
+    this event proves the count happened (``failure_counted``)."""
+    if run_id is not None:
+        append_event(conn, task_id, 'failure_counted', {'failures': failures, 'outcome': outcome}, run_id=run_id)
+
+
+def failure_counted(conn, task_id, run_id):
+    """Whether ``run_id``'s failure was counted (``record_failure_counted``)."""
+    return _last_event_payload(conn, task_id, run_id, 'failure_counted') is not None
 
 
 def own_scheduled_attempt(conn, task_id):

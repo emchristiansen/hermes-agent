@@ -13,7 +13,7 @@ release itself (``continue_interrupted``). Nothing here infers intent from a mis
 """
 import os
 
-from hermes_cli.kanban_db_retry_policy import terminal_run_matches
+from hermes_cli.kanban_db_retry_policy import failure_counted, terminal_run_matches
 from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked
 
 RELEASE_KINDS = ('assigned', 'changes_requested', 'review_reopened', 'unblocked', 'promoted', 'promoted_manual',
@@ -97,6 +97,8 @@ def continuation_refusal(conn, task_id, expected_run, reason=None):
 # ``scheduled`` and the review outcomes are the owner's own decisions; ``rate_limited`` and
 # ``spawn_failed`` have their own cooldowns in ``check_respawn_guard``.
 INTERRUPTED_OUTCOMES = ('crashed', 'timed_out', 'reclaimed', 'owner_restarted')
+# Of those, the outcomes that count against the breaker; ``owner_restarted`` is the host's, uncounted.
+COUNTED_OUTCOMES = ('crashed', 'timed_out', 'reclaimed')
 
 
 def interrupted_owner_refusal(conn, task_id):
@@ -105,10 +107,13 @@ def interrupted_owner_refusal(conn, task_id):
     The operator continuation (``continuation_refusal``) leaves "is the PR's owner really gone?"
     to the operator. Without one, every answer must be positive proof on the exact latest run:
     it ended in an ``INTERRUPTED_OUTCOMES`` outcome; the operator continuation's checks hold (the
-    card is ``ready``, no live claim, the owner admission terminal, no failure accounting pending);
-    no other run is open; the run came from the implementation lane; its owner admission was
-    RECORDED (an unmanaged run has nothing to prove the owner gone); and every worker recorded
-    for it is dead or recycled on this host (``_writers_refusal``). The continued owner then
+    card is ``ready``, no live claim, the owner admission terminal, no selected first-failure
+    accounting pending); a counted outcome's failure was itself counted (``failure_counted``:
+    the ordinary policy has no pending marker, and a dispatcher lost between ending the run and
+    counting it would otherwise let the retry budget be exceeded); no other run is open; the run
+    came from the implementation lane; its owner admission was RECORDED (an unmanaged run has
+    nothing to prove the owner gone); and every worker recorded for it is dead or recycled on
+    this host (``_writers_refusal``). The continued owner then
     sees the PR and every later comment on its card, exactly as an unguarded crashed card's
     retry does."""
     from hermes_cli import kanban_db as kb
@@ -121,6 +126,8 @@ def interrupted_owner_refusal(conn, task_id):
     refusal = continuation_refusal(conn, task_id, run)
     if refusal is not None:
         return refusal
+    if latest['outcome'] in COUNTED_OUTCOMES and not failure_counted(conn, task_id, run):
+        return f"run {run}'s {latest['outcome']} failure is not recorded as counted; its accounting may have been lost"
     if conn.execute('SELECT 1 FROM task_runs WHERE task_id=? AND ended_at IS NULL', (task_id,)).fetchone():
         return f'{task_id} has an open run'
     if kb._retry_status_for_run(conn, task_id, run) != 'ready':
@@ -135,7 +142,8 @@ def continue_interrupted(conn, task_id, *, dry_run):
     owner's latest run interrupted with nothing left to write for it. True when the card may be
     claimed; a refusal or dry run writes nothing.
 
-    Re-checked under the write lock, where a release another dispatcher recorded first is
+    Re-checked under the write lock, where a release another dispatcher recorded first, or any
+    ``continued`` already on this run (a same-second tie keeps ``active_pr`` reported), is
     honoured rather than duplicated. The ``continued`` event (on the interrupted run) is the
     persistent release ``released_after`` honours, as an operator continuation is: later
     crash/reclaim retries stay breaker-bounded, and a newer PR comment guards again."""
@@ -151,6 +159,8 @@ def continue_interrupted(conn, task_id, *, dry_run):
             return reason is None
         latest = conn.execute('SELECT id,outcome FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1',
                               (task_id,)).fetchone()
+        if _run_event(conn, task_id, latest['id'], 'continued') is not None:
+            return True
         kb._append_event(conn, task_id, 'continued', {
             'from': 'ready', 'continuation': True, 'interrupted_run': latest['id'], 'outcome': latest['outcome'],
         }, run_id=latest['id'])

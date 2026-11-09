@@ -11,6 +11,10 @@ still write for the exact interrupted run; every other shape stays held, as befo
 Real board SQLite and the real producers: ``claim_task``, ``_set_worker_pid``, the owner's
 ``owner_admitted``/``worker_bound`` events, ``record_owner_restart_result`` and the dead-worker
 sweep ``detect_crashed_workers``; the selection path is ``dispatch_once`` with a ``spawn_fn``.
+
+c2 (review t_878eb1fc SAFETY-C1-01): a counted crash is continued only once its failure is
+recorded as counted (``failure_counted``), so a dispatcher lost between the sweep's two commits
+cannot let the continuation exceed the retry budget; one ``continued`` per interrupted run.
 """
 
 from __future__ import annotations
@@ -265,3 +269,76 @@ def test_repeated_crashes_stay_bounded_by_the_breaker(conn, tmp_path: Path, monk
     task = kb.get_task(conn, tid)
     assert task.status == "blocked" and task.consecutive_failures == 2  # the breaker parks it
     assert tid not in _spawned(conn)
+
+
+def _reopened(conn):
+    """A fresh connection to the same board: nothing in memory survives a dispatcher's loss."""
+    fresh = sqlite3.connect(conn.execute("PRAGMA database_list").fetchone()[2], isolation_level=None)
+    fresh.row_factory = sqlite3.Row
+    return fresh
+
+
+@pytest.mark.parametrize("prior_failures", [0, 1])
+def test_crash_whose_count_was_lost_stays_held_until_counted_once(conn, tmp_path: Path, prior_failures: int) -> None:
+    """SAFETY-C1-01: the dead-worker sweep ends the run and re-queues the card in one commit and
+    counts the failure in the next. A dispatcher lost between them leaves no ordinary-policy
+    marker, so without proof of the count a continuation could exceed the retry budget."""
+    tid = kb.create_task(conn, title="lost count", assignee="theseus-implementer", max_retries=prior_failures + 2)
+    if prior_failures:
+        _owner_run(conn, tmp_path, tid)
+        assert kbd.detect_crashed_workers(conn) == [tid]
+        assert tid in _spawned(conn)  # the first, fully counted crash is continued
+        with kb.write_txn(conn):  # second-granularity stamps: that release < the next PR comment
+            conn.execute("UPDATE task_events SET created_at = created_at - 120 WHERE task_id = ?", (tid,))
+    run_id, _claim, _binding = _owner_run(conn, tmp_path, tid)  # posts a newer PR comment
+    sweep = kbd._reclaim_dead_workers(conn)  # ...and the dispatcher dies before _account_crashes
+    assert sweep.crashed == [tid] and kb.latest_run(conn, tid).outcome == "crashed"
+    fresh = _reopened(conn)
+    try:
+        before = len(_continued(fresh, tid))
+        assert _held(fresh, tid) and _held(fresh, tid)
+        assert len(_continued(fresh, tid)) == before
+        assert kb.latest_run(fresh, tid).id == run_id
+        assert kb.get_task(fresh, tid).consecutive_failures == prior_failures
+        assert "not recorded as counted" in kap.interrupted_owner_refusal(fresh, tid)
+    finally:
+        fresh.close()
+
+    # The lost count recovered (here the same accounting call with the sweep's own record): counted
+    # exactly once, and only then is the run continued.
+    assert kbd._account_crashes(conn, sweep.crash_details) == []
+    assert kb.get_task(conn, tid).consecutive_failures == prior_failures + 1
+    assert tid in _spawned(conn)
+    assert [e["interrupted_run"] for e in _continued(conn, tid)][-1] == run_id
+    assert kb.get_task(conn, tid).consecutive_failures == prior_failures + 1
+
+
+def test_lost_count_at_the_limit_never_starts_another_attempt(conn, tmp_path: Path) -> None:
+    tid, _first, _binding = _crashed_owner(conn, tmp_path, max_retries=2)
+    assert tid in _spawned(conn)
+    with kb.write_txn(conn):  # second-granularity stamps: that release < the next PR comment
+        conn.execute("UPDATE task_events SET created_at = created_at - 120 WHERE task_id = ?", (tid,))
+    _owner_run(conn, tmp_path, tid)  # posts a newer PR comment
+    sweep = kbd._reclaim_dead_workers(conn)
+    fresh = _reopened(conn)
+    try:
+        assert _held(fresh, tid)  # second failure uncounted: no third attempt
+    finally:
+        fresh.close()
+    assert kbd._account_crashes(conn, sweep.crash_details) == [tid]  # counting it parks the card
+    assert kb.get_task(conn, tid).status == "blocked"
+    assert tid not in _spawned(conn)
+
+
+def test_same_second_release_is_written_once(conn, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``continued`` in the same second as the newest PR comment does not lift the guard
+    (strict-after tie, fail closed); a second dispatcher must not append another for the run."""
+    tid, run_id, _binding = _crashed_owner(conn, tmp_path)
+    stamp = int(kbd.time.time())
+    with kb.write_txn(conn):
+        conn.execute("UPDATE task_comments SET created_at=? WHERE task_id=?", (stamp, tid))
+    monkeypatch.setattr(kbd.time, "time", lambda: stamp)
+    assert kap.continue_interrupted(conn, tid, dry_run=False)
+    assert kbd.check_respawn_guard(conn, tid) == "active_pr"  # the tie stays reported
+    assert kap.continue_interrupted(conn, tid, dry_run=False)
+    assert [e["interrupted_run"] for e in _continued(conn, tid)] == [run_id]
