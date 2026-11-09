@@ -1148,6 +1148,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
         ).fetchall()
         host_prefix = _kb._host_prefix()
         from hermes_cli.kanban_owner_recovery import managed_run_exit_code, owner_reclaim_blocked, presubmit_restart_fence as fence
+        from hermes_cli.kanban_db_provider_wall import attach_wall
         for row in rows:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
@@ -1168,6 +1169,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             # A managed run's authority-recorded exit (its bound interpreter's, under this claim).
             exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
             dead = fence(conn, row, exit_code, _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board))
+            if dead.rate_limited:
+                attach_wall(conn, row, dead.event_payload)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             landing = first_failure_landing(conn, row["id"], retry_status)
@@ -1545,8 +1548,9 @@ def check_respawn_guard(
     Called per ready/review row before any claim attempt. Priority order:
     ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
     refused — no restart-safe scope — within the cooldown; never counted),
-    ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
-    checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
+    ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown) or
+    ``"rate_limit_route_probed"`` (past it, while a sibling already probes the same exhausted pool:
+    ``kanban_db_provider_wall``); both checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
     path never increments ``consecutive_failures``), ``"blocker_auth"``
     (quota/auth pattern, unless a later spawned attempt superseded the run
@@ -1575,7 +1579,7 @@ def check_respawn_guard(
     #    wall-clock ended_at, which only measures the cooldown's elapsed time.
     rl_cooldown = _kb._resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
-        "SELECT outcome, ended_at, metadata FROM task_runs "
+        "SELECT outcome, started_at, ended_at, metadata, profile FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
         f"ORDER BY {LATEST_RUN_FIRST} LIMIT 1",
         (task_id,),
@@ -1586,17 +1590,11 @@ def check_respawn_guard(
             if ended_at is not None and (now - ended_at) < rl_cooldown:
                 return "infrastructure_cooldown"
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
-        if rl_cooldown <= 0:
-            # Cooldown disabled — respawn immediately, skipping blocker_auth so
-            # the stamped rate-limit text doesn't re-trap the task.
-            return None
-        ended_at = _kb._to_epoch(latest_run["ended_at"])
-        if ended_at is not None and (now - ended_at) < rl_cooldown:
-            return "rate_limit_cooldown"
-        # Cooldown elapsed — return early so blocker_auth doesn't catch the
-        # stamped rate-limit text; this path intentionally retries forever
-        # (spaced by the cooldown) until quota returns or a real run supersedes it.
-        return None
+        # Return here either way so blocker_auth never catches the stamped rate-limit text: this
+        # path retries forever, spaced by the cooldown (one probe per exhausted pool), until quota
+        # returns or a real run supersedes it.
+        from hermes_cli.kanban_db_provider_wall import rate_limit_guard
+        return rate_limit_guard(conn, task_id, latest_run, now, rl_cooldown)
 
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
     # crash is different: its persisted error includes the worker's last
