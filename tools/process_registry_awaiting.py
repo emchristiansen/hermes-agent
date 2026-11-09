@@ -88,6 +88,15 @@ def retained_for_delivery(s) -> bool:
     return bool(getattr(s, "_finish_claimed", False)) and not s._completion_event.is_set()
 
 
+def completion_settled(s) -> bool:
+    """Exited with a final outcome, so a completion may be built from it: not a reconcile's provisional mark while
+    the reader that owns the output, the exit and the scope's OOM cause still finalizes. Read under the session lock,
+    so ``exited`` comes with the outcome recorded in the same step (``mark_exited``)."""
+    from tools.process_registry import ProcessRegistry
+    with s._lock:
+        return s.exited and not ProcessRegistry._reader_finalizing(s)
+
+
 def _notifies(s) -> bool:
     return bool(s.notify_on_complete or (s.watch_patterns and not s._watch_disabled))
 

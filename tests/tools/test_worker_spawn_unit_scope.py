@@ -198,3 +198,57 @@ def test_a_later_turn_timeout_spares_an_earlier_turns_retained_scope(scoped_daem
     assert stopped['status'] == 'already_exited' and 'scope_stop_failed' not in stopped, stopped
     assert not job.descendant_in_scope()
     assert job.durable() == ([], '')
+
+
+@pytest.mark.platforms("linux")
+def test_an_unlimited_workers_command_scope_gets_no_memory_max_and_keeps_its_provenance(tmp_path, request):
+    """BG-SCOPE-03: a registered worker in an unlimited service unit starts a command; its scope is
+    accounted but has no MemoryMax (production 2026-11-09: a host-derived 4 GiB default OOM-killed
+    ordinary commands). Its nonzero exit is collected as observed, and the receipt keeps the scope's
+    name after custody is released, with no claim of an OOM kill."""
+    from tools.process_registry import _systemd_run_user_scope_available, systemd_user_bus_env
+    if not _systemd_run_user_scope_available():
+        pytest.skip("needs a reachable systemd user manager (systemd-run --user --scope)")
+    home, bus = tmp_path / 'home', systemd_user_bus_env()
+    home.mkdir()
+    spawner = textwrap.dedent(f'''
+        import json, os, subprocess
+        from agent import runtime_session_store
+        runtime_session_store._worker_process = True
+        from tools.process_registry import process_registry, systemd_user_bus_env
+        session = process_registry.spawn_local('sleep 3; exit 3', cwd={str(tmp_path)!r})
+        shown = subprocess.run(['systemctl', '--user', 'show', '-p', 'MemoryAccounting', '-p', 'MemoryMax',
+                                session.systemd_unit], env=systemd_user_bus_env(), capture_output=True, text=True)
+        print(json.dumps([session.id, session.systemd_unit, shown.stdout]), flush=True)
+        os._exit(0)
+    ''')
+    unit = f'hermes-test-worker-memory-{uuid.uuid4().hex[:12]}'
+    out = subprocess.run(
+        ['systemd-run', '--user', '--quiet', '--wait', '--pipe', '--collect', f'--unit={unit}',
+         '--property=TimeoutStopSec=2', f'--working-directory={ROOT}', f'--setenv=HERMES_HOME={home}',
+         f'--setenv=PYTHONPATH={ROOT}', f'--setenv=PATH={os.environ.get("PATH", "")}',
+         '--', sys.executable, '-c', spawner],
+        env=bus, stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding='utf-8', timeout=120,
+        check=False)
+    session_id, scope, shown = json.loads(out.stdout.strip().splitlines()[-1])
+    request.node.live_system_guard_owned_units = (scope,)
+    assert scope == f'hermes-worker-{session_id}.scope'
+    assert dict(line.partition('=')[::2] for line in shown.split()) == {
+        'MemoryAccounting': 'yes', 'MemoryMax': 'infinity'}, shown
+    adopter = textwrap.dedent(f'''
+        import json
+        from tools.process_registry import ProcessRegistry
+        registry = ProcessRegistry()
+        registry.recover_from_checkpoint()
+        print(json.dumps(registry.wait({session_id!r}, timeout=30)))
+    ''')
+    env = {k: v for k, v in os.environ.items() if k not in ('HERMES_HOME', 'PYTHONPATH')}
+    env.update(HERMES_HOME=str(home), PYTHONPATH=str(ROOT))
+    out = subprocess.run([sys.executable, '-c', adopter], env=env, cwd=ROOT, capture_output=True, text=True,
+                         encoding='utf-8', timeout=120, check=False)
+    result = json.loads(out.stdout.strip().splitlines()[-1])
+    assert (result['status'], result['exit_code'], result['scope_unit']) == ('exited', 3, scope), (
+        result, out.stderr[-2000:])
+    receipt = json.loads((home / 'logs' / 'process-results' / f'{session_id}.json').read_text(encoding='utf-8-sig'))
+    assert (receipt['exit_code'], receipt['systemd_unit'], receipt['scope_unit']) == (3, '', scope), receipt
+    assert receipt['scope_oom_killed'] is not True, receipt

@@ -38,7 +38,8 @@ def test_list_leaves_live_reader_as_completion_owner():
 
     listed = registry.list_sessions(session_key="owner-session")
 
-    assert listed[0]["status"] == "exited"
+    # The reader still owns the outcome: pending, never listed as final (MEMCG-R7-12).
+    assert listed[0]["status"] == "settling" and "exit_code" not in listed[0]
     assert session._reader_finish_requested.is_set()
     assert session.id in registry._running
     assert registry.completion_queue.empty()

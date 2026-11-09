@@ -50,8 +50,10 @@ class ProcessCheckpointMixin:
             entries = []
             # A finished session stays while its scope is in custody (process_registry_scope_custody).
             for s in (*self._running.values(), *self._finished.values()):
-                custody = bool(s.exited and s._scope_stop_pending and s.systemd_unit)
-                if s.exited and not custody:
+                # A settling exit (its outcome still being recorded) stays a running entry, scope and all.
+                outcome_settled = s.exited and not self._reader_finalizing(s)
+                custody = bool(outcome_settled and s._scope_stop_pending and s.systemd_unit)
+                if outcome_settled and not custody:
                     continue
                 # Backfill the start time so recovery can detect PID recycling
                 # even for sessions spawned before this field existed.
