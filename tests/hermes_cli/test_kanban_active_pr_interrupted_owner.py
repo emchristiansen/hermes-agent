@@ -26,6 +26,8 @@ followed only by refused-before-launch runs is honoured as when it was written; 
 claim was reclaimed and re-claimed before its spawn failure returns writes nothing over the newer claim.
 c6 (review t_cf892b2a C5-WORKSPACE-01): the same stale dispatcher whose workspace resolves successfully
 publishes no workspace path, branch or scratch tip over the newer claim and spawns nothing.
+c7 (review t_cf892b2a, c5 final precision): the tie is also witnessed as it arises, in real chronological
+order on one frozen second before the first claim and refusal, in both orders of PR comment and ``continued``.
 """
 
 from __future__ import annotations
@@ -698,6 +700,48 @@ def test_a_same_second_continuation_survives_a_host_refusal(conn, tmp_path: Path
     assert _spawned(conn) == [tid]
     assert [e["interrupted_run"] for e in _continued(conn, tid)] == [first]
     assert kb.latest_run(conn, tid).id == second + 1
+
+
+@pytest.mark.parametrize("order", ["comment_then_continued", "continued_then_comment"])
+def test_a_tie_arising_before_the_first_refusal_is_retried_after_the_cooldown(conn, tmp_path: Path, monkeypatch,
+                                                                                 order: str) -> None:
+    """C4-TIE-01 in real order, nothing restamped afterwards: on one frozen second the owner posts a newer PR
+    comment and the dispatcher writes run 1's ``continued`` (either first: the comment before the tick, or
+    between the continuation and the claim of run 2), then claims run 2 and the host refuses it before launch.
+    After the cooldown the tie still reads ``active_pr``, yet the owner is retried, with no second release."""
+    tid, first = _restarted_owner(conn, tmp_path)
+    stamp = int(time.time()) + 5  # one second for the whole first tick, later than the owner's run
+    with monkeypatch.context() as patch:
+        patch.setattr(time, "time", lambda: stamp)
+        _host_cannot_place_workers(patch)
+        if order == "comment_then_continued":
+            kb.add_comment(conn, tid, author="theseus-implementer", body=PR_COMMENT)
+        else:
+            claim_task = kb.claim_task
+
+            def comment_then_claim(*args, **kwargs):
+                if _continued(conn, tid) and conn.execute("SELECT COUNT(*) FROM task_comments WHERE task_id=?",
+                                                          (tid,)).fetchone()[0] == 1:
+                    kb.add_comment(conn, tid, author="theseus-implementer", body=PR_COMMENT)
+                return claim_task(*args, **kwargs)
+            patch.setattr(kb, "claim_task", comment_then_claim)
+        assert not kbd.dispatch_once(conn).spawned
+        assert kbd.check_respawn_guard(conn, tid) == "infrastructure_cooldown"
+    second = kb.latest_run(conn, tid)
+    assert second.outcome == "spawn_failed" and second.metadata["launch"] == "refused_before_launch"
+    released = conn.execute("SELECT id, created_at FROM task_events WHERE task_id=? AND kind='continued'",
+                            (tid,)).fetchall()
+    comments = conn.execute("SELECT id, created_at FROM task_comments WHERE task_id=? ORDER BY id", (tid,)).fetchall()
+    assert len(released) == 1 and len(comments) == 2
+    assert released[0]["created_at"] == comments[1]["created_at"] == stamp  # the tie, as written
+    assert [e["interrupted_run"] for e in _continued(conn, tid)] == [first]
+    # The cooldown runs from the refusal's own (frozen) second, not from the restored clock.
+    after = stamp + kb._resolve_rate_limit_cooldown_seconds() + 1
+    monkeypatch.setattr(kbd.time, "time", lambda: after)
+    assert kbd.check_respawn_guard(conn, tid) == "active_pr"  # the tie stays reported
+    assert _spawned(conn) == [tid]
+    assert [e["interrupted_run"] for e in _continued(conn, tid)] == [first]
+    assert kb.latest_run(conn, tid).id == second.id + 1 and kb.get_task(conn, tid).consecutive_failures == 0
 
 
 @pytest.mark.parametrize("later", ["newer_pr_comment", "run_admitted", "run_bound"])
