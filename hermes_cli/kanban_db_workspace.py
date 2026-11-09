@@ -996,6 +996,40 @@ def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str) ->
     _set_task_column(conn, task_id, "branch_name", str(branch_name))
 
 
+def publish_claimed_workspace(
+    conn: sqlite3.Connection,
+    claim,
+    task_id: str,
+    workspace: Path | str,
+    *,
+    workspace_kind: Optional[str],
+    branch_name: Optional[str] = None,
+) -> bool:
+    """Publish the dispatcher's resolved workspace for its exact claim (a ``SpawnClaim``); False: spawn nothing.
+
+    ``workspace_path``, a worktree's ``branch_name`` and the first-use scratch tip
+    (:func:`_maybe_emit_scratch_tip`) are written in ONE write transaction, and only while the
+    card is still that claim (``claim.holds``). Resolving can outlast the claim TTL: the card may
+    then have been reclaimed and claimed by another dispatcher, whose row and events this leaves
+    exactly as that dispatcher wrote them; the stale caller must not spawn a worker for it."""
+    tip = (workspace_kind or "scratch") == "scratch" and not _scratch_tip_shown()
+    with _kb.write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None or not claim.holds(row):
+            return False
+        conn.execute("UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(workspace), task_id))
+        if branch_name is not None:
+            conn.execute("UPDATE tasks SET branch_name = ? WHERE id = ?", (str(branch_name), task_id))
+        if tip:
+            _kb._append_event(conn, task_id, "tip_scratch_workspace", {"message": _SCRATCH_TIP_MESSAGE})
+    if tip:
+        _kb._log.warning("kanban: %s (task %s)", _SCRATCH_TIP_MESSAGE, task_id)
+        _mark_scratch_tip_shown()
+    return True
+
+
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb

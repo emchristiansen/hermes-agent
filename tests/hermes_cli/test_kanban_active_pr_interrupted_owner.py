@@ -24,6 +24,8 @@ infrastructure cooldown; anything that may have run still ends it.
 c5 (review t_cf892b2a C4-TIE-01, C4-FENCE-01): a same-second ``continued`` (held by the strict tie)
 followed only by refused-before-launch runs is honoured as when it was written; and a dispatcher whose
 claim was reclaimed and re-claimed before its spawn failure returns writes nothing over the newer claim.
+c6 (review t_cf892b2a C5-WORKSPACE-01): the same stale dispatcher whose workspace resolves successfully
+publishes no workspace path, branch or scratch tip over the newer claim and spawns nothing.
 """
 
 from __future__ import annotations
@@ -725,6 +727,19 @@ def _card_state(conn, tid) -> tuple:
     return task, runs, events
 
 
+def _taken_over_by_b(conn, tid, seen: dict) -> None:
+    """While dispatcher A stalls, the independent supported routes run (not a second dispatch tick, which
+    the board lock serializes): the stale-claim sweep ``release_stale_claims`` reclaims A's run and
+    claimer B takes the next with ``claim_task``. ``seen`` keeps A's claim, B's and B's card state."""
+    a = kb.get_task(conn, tid)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET claim_expires=? WHERE id=?", (int(time.time()) - 1, tid))
+    assert kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None) == 1
+    b = kb.claim_task(conn, tid, claimer=f"{kb._claimer_id().split(':', 1)[0]}:dispatcher-b")
+    assert b is not None and b.current_run_id != a.current_run_id
+    seen.update(a=a, a_run=a.current_run_id, b=b, before=_card_state(conn, tid))
+
+
 @pytest.mark.parametrize("failure", ["host_refusal", "workspace"])
 def test_a_stale_spawn_failure_never_touches_the_newer_claim(conn, tmp_path: Path, monkeypatch, failure: str) -> None:
     """C4-FENCE-01, normal path: dispatcher A claims run 1 and stalls past its claim TTL before its spawn
@@ -735,17 +750,10 @@ def test_a_stale_spawn_failure_never_touches_the_newer_claim(conn, tmp_path: Pat
     B left them (c4 ended run 2, cleared B's claim and restored the phase), and B's spawn still lands."""
     from tools import process_registry
     tid = kb.create_task(conn, title="re-claimed while A stalled", assignee="theseus-implementer")
-    host = kb._claimer_id().split(":", 1)[0]
     seen: dict = {}
 
     def b_takes_over() -> None:
-        a_run = kb.get_task(conn, tid).current_run_id
-        with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET claim_expires=? WHERE id=?", (int(time.time()) - 1, tid))
-        assert kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None) == 1
-        b = kb.claim_task(conn, tid, claimer=f"{host}:dispatcher-b")
-        assert b is not None and b.current_run_id != a_run
-        seen.update(a_run=a_run, b=b, before=_card_state(conn, tid))
+        _taken_over_by_b(conn, tid, seen)
 
     if failure == "host_refusal":
         _host_cannot_place_workers(monkeypatch)
@@ -769,6 +777,51 @@ def test_a_stale_spawn_failure_never_touches_the_newer_claim(conn, tmp_path: Pat
     kbd._set_worker_pid(conn, tid, os.getpid(), run_id=b.current_run_id, claim_lock=b.claim_lock)
     assert kb.get_task(conn, tid).worker_pid == os.getpid()
     assert conn.execute("SELECT worker_pid FROM task_runs WHERE id=?", (b.current_run_id,)).fetchone()[0] == os.getpid()
+
+
+@pytest.mark.parametrize("kind", ["scratch", "worktree"])
+def test_a_stale_resolved_workspace_is_never_published_over_the_newer_claim(conn, tmp_path: Path, monkeypatch, kind: str) -> None:
+    """C5-WORKSPACE-01: A's claim is reclaimed and re-claimed by B while A's workspace resolves, and the
+    resolution SUCCEEDS. A must publish nothing (c5 wrote ``workspace_path``, a worktree's ``branch_name``
+    and the first-use scratch tip by task id over B's card) and spawn nothing; B's task row, runs and
+    events stay exactly as B left them, and B's own publication and spawn bookkeeping still land."""
+    from hermes_cli import kanban_db_workspace as kbw
+    from hermes_cli.kanban_db_retry_policy import SpawnClaim
+    if kind == "worktree":
+        tid = kb.create_task(conn, title="re-claimed while A resolved", assignee="theseus-implementer",
+                             workspace_kind="worktree", workspace_path=str(tmp_path / "b-tree"), branch_name="wt/b-branch")
+    else:
+        tid = kb.create_task(conn, title="re-claimed while A resolved", assignee="theseus-implementer")
+    assert not kbw._scratch_tip_shown()
+    seen: dict = {}
+    a_workspace = tmp_path / "a-resolved"
+
+    def resolved_after_takeover(claimed, board=None):
+        _taken_over_by_b(conn, tid, seen)
+        a_workspace.mkdir()
+        return (a_workspace, "wt/a-resolved") if kind == "worktree" else a_workspace
+    resolver = "_resolve_worktree_workspace" if kind == "worktree" else "resolve_workspace"
+    monkeypatch.setattr(kbd._kbw, resolver, resolved_after_takeover)
+    spawns: list = []
+    result = kbd.dispatch_once(conn, spawn_fn=lambda task, workspace: spawns.append((task.id, workspace)) or 4242)
+    assert spawns == [] and tid not in [s[0] for s in result.spawned] and tid not in result.auto_blocked
+    assert _card_state(conn, tid) == seen["before"]
+    assert not kbw._scratch_tip_shown()
+    a, b = seen["a"], seen["b"]
+    assert not kbw.publish_claimed_workspace(conn, SpawnClaim.of(a), tid, a_workspace, workspace_kind=kind,
+                                             branch_name="wt/a-resolved" if kind == "worktree" else None)
+    assert _card_state(conn, tid) == seen["before"]
+    b_workspace = tmp_path / "b-resolved"
+    assert kbw.publish_claimed_workspace(conn, SpawnClaim.of(b), tid, b_workspace, workspace_kind=kind,
+                                         branch_name="wt/b-branch" if kind == "worktree" else None)
+    task = kb.get_task(conn, tid)
+    assert (task.status, task.current_run_id, task.claim_lock) == ("running", b.current_run_id, b.claim_lock)
+    assert task.workspace_path == str(b_workspace)
+    assert task.branch_name == ("wt/b-branch" if kind == "worktree" else b.branch_name)
+    tips = [e for e in _card_state(conn, tid)[2] if e["kind"] == "tip_scratch_workspace"]
+    assert len(tips) == (1 if kind == "scratch" else 0) and kbw._scratch_tip_shown() == (kind == "scratch")
+    kbd._set_worker_pid(conn, tid, os.getpid(), run_id=b.current_run_id, claim_lock=b.claim_lock)
+    assert kb.get_task(conn, tid).worker_pid == os.getpid()
 
 
 def test_a_current_host_refusal_is_still_recorded_and_retried(conn, tmp_path: Path, monkeypatch) -> None:

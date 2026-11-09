@@ -2104,10 +2104,10 @@ def _dispatch_lane_task(
         ):
             result.auto_blocked.append(claimed.id)
         return False
-    _kbw.set_workspace_path(conn, claimed.id, str(workspace))
-    if claimed.workspace_kind == "worktree":
-        _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
-    _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+    branch = resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}"
+    if not _kbw.publish_claimed_workspace(conn, SpawnClaim.of(claimed), claimed.id, workspace, workspace_kind=claimed.workspace_kind,
+                                          branch_name=branch if claimed.workspace_kind == "worktree" else None):
+        return False  # the claim was lost while resolving: the newer claim's card stays untouched, nothing spawns
     if lane == "review":
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
