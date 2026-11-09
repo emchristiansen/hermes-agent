@@ -16,6 +16,8 @@ from urllib.parse import unquote_plus
 # Shared with agent/file_safety's read-block list so the two defenses can't
 # drift: a blocked file_tools read that falls back to ``cat`` is still caught.
 from agent.file_safety import _BLOCKED_PROJECT_ENV_BASENAMES as _ENV_FILE_BASENAMES
+# E.164 phone numbers; signed quantities of the same shape are told apart there.
+from agent.redact_quantities import SIGNAL_PHONE_RE as _SIGNAL_PHONE_RE, signed_quantity_offsets
 
 logger = logging.getLogger(__name__)
 
@@ -1078,9 +1080,6 @@ _URL_BARE_TOKEN_RE = re.compile(
 # JWTs always start with "eyJ" (base64 "{"); 1-, 2- and 3-part forms.
 _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_=-]{4,}){0,2}")
 
-# E.164 phone numbers, 7-15 digits; the lookahead rejects hex strings / identifiers.
-_SIGNAL_PHONE_RE = re.compile(r"(\+[1-9]\d{6,14})(?![A-Za-z0-9])")
-
 # CDP-URL path: web URLs with a query string / with ``user:password@`` userinfo
 # (DB protocols are covered by _DB_CONNSTR_RE).
 _URL_WITH_QUERY_RE = re.compile(r"(https?|wss?|ftp)://([^\s/?#]+)([^\s?#]*)\?([^\s#]+)(#\S*)?")
@@ -1521,7 +1520,8 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         text = _redact_form_body(text)
 
     if "+" in text:
-        text = _SIGNAL_PHONE_RE.sub(_redact_phone, text)
+        signed = signed_quantity_offsets(text)
+        text = _SIGNAL_PHONE_RE.sub(lambda m: m.group(0) if m.start() in signed else _redact_phone(m), text)
 
     return text
 
