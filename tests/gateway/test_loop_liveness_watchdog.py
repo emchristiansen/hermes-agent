@@ -109,7 +109,8 @@ def test_loop_liveness_watchdog_stop_during_final_miss_disarms_hard_exit():
             handle.stop()
             return False
 
-        probe_event_ref["event"].is_set = stop_during_miss
+        # The post-wait observation is the first check after the probe's wait expires.
+        probe_event_ref["event"]._answers.observe_new = stop_during_miss
         release_probe.set()
         handle.join(timeout=1.0)
 
