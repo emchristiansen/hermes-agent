@@ -27,7 +27,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
-from hermes_cli.kanban_db_active_pr import released_after
+from hermes_cli.kanban_db_active_pr import dispatch_guard, released_after
 from hermes_cli.kanban_db_failure_stamp import LATEST_RUN_FIRST, RESPAWN_BLOCKER_RE as _RESPAWN_BLOCKER_RE, stamp_superseded
 from hermes_cli.kanban_db_retry_policy import CrashSweep as _CrashSweep, DeadWorker as _DeadWorker, KANBAN_OWNER_RESTART_EXIT_CODE
 from hermes_cli.kanban_db_retry_policy import first_failure_landing
@@ -1555,8 +1555,8 @@ def check_respawn_guard(
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
     handoff, unblock or dependency release followed the comment: the named profile must work on
-    that PR, or the card was resumed with it). The review lane skips the last two (the *inputs* to
-    a review handoff). Stale / dead claim locks are NOT a guard reason — reclaim passes own those.
+    that PR, or the card was resumed with it; ``dispatch_guard`` resumes a proven-interrupted owner).
+    The review lane skips the last two (review-handoff inputs). Stale/dead claims are reclaim's, never a guard.
     """
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
@@ -1628,8 +1628,8 @@ def check_respawn_guard(
     #    Exception: a release AFTER the newest PR comment names who must now work on THAT PR, not a
     #    duplicate implementation (#111910): a handoff (reassign, changes_requested, review reopen),
     #    an operator ``unblock``/``promote`` (incl. a ready-card continuation), or a dependency
-    #    release (``promoted`` from ``todo``). Crash/reclaim, reprioritize and a breaker park's
-    #    auto-recovery are none; ``kanban_db_active_pr.is_release`` holds the provenance rules.
+    #    release (``promoted`` from ``todo``). Crash/reclaim, reprioritize and breaker auto-recovery
+    #    are none (``kanban_db_active_pr``: provenance; ``dispatch_guard``: proven interruption).
     pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
                                           cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
                 if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
@@ -2062,7 +2062,7 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
-    guard_reason = check_respawn_guard(conn, task_id, lane=lane)
+    guard_reason = dispatch_guard(conn, task_id, lane=lane, dry_run=dry_run)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
         # Event so ``hermes kanban tail`` shows why the task looks stuck.

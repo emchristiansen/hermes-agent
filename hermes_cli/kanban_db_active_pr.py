@@ -1,24 +1,28 @@
-"""Release provenance for the dispatcher's ``active_pr`` respawn guard, and the operator's
-exact-run continuation of a READY card that guard holds, or of a TRIAGE card whose loop run was
-interrupted before its worker recorded a result or finished with its own bound worker's result
-(either way the input it awaited has since arrived).
+"""Release provenance for the dispatcher's ``active_pr`` respawn guard, the dispatcher's own
+continuation of a READY card that guard holds after its owner's run was interrupted, and the
+operator's exact-run continuation of a READY card that guard holds, or of a TRIAGE card whose loop
+run was interrupted before its worker recorded a result or finished with its own bound worker's
+result (either way the input it awaited has since arrived).
 
 A PR URL in a recent comment holds the ready lane (a re-spawned opener risks a duplicate PR)
 until a *release* is recorded strictly after the newest such comment. A release persists:
 later crash/reclaim retries of the same card (breaker-bounded) do not consume it, and only a
-newer PR comment guards again. Nothing here infers intent from a missing field.
+newer PR comment guards again. An open PR is neither a live owner nor a finished card: when the
+latest run was interrupted and nothing can still write for it, the dispatcher records that
+release itself (``continue_interrupted``). Nothing here infers intent from a missing field.
 """
 import os
 
 from hermes_cli.kanban_db_retry_policy import terminal_run_matches
 from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked
 
-RELEASE_KINDS = ('assigned', 'changes_requested', 'review_reopened', 'unblocked', 'promoted', 'promoted_manual')
+RELEASE_KINDS = ('assigned', 'changes_requested', 'review_reopened', 'unblocked', 'promoted', 'promoted_manual',
+                 'continued')
 # Every event that moves a card into or out of a parked phase. The newest one before a legacy
 # ``promoted`` says where that promotion came from.
 _LANDINGS = ('dependency_wait', 'blocked', 'gave_up', 'block_loop_detected', 'status', 'unblocked',
              'review_reopened', 'changes_requested', 'claimed', 'reclaimed', 'crashed', 'timed_out',
-             'stale', 'spawn_failed', 'rate_limited', 'promoted', 'promoted_manual')
+             'stale', 'spawn_failed', 'rate_limited', 'promoted', 'promoted_manual', 'continued')
 
 
 def released_after(conn, task_id, since) -> bool:
@@ -42,7 +46,8 @@ def is_release(conn, task_id, event_id, kind, payload) -> bool:
       between cannot be told apart from breaker recovery, so it stays guarded.
     * ``changes_requested``, ``review_reopened``, ``unblocked`` and ``promoted_manual`` are
       explicit verdicts or operator acts (``promoted_manual`` includes the ready-card
-      continuation below).
+      continuation below); ``continued`` is the dispatcher's continuation of an interrupted
+      owner, written only after ``interrupted_owner_refusal`` proved it (``continue_interrupted``).
     """
     from hermes_cli import kanban_db as kb
     data = kb._json_dict(payload)
@@ -85,6 +90,81 @@ def continuation_refusal(conn, task_id, expected_run, reason=None):
                 '(admission not terminal, or accounting pending)')
     return None
 
+
+# Run outcomes that end an attempt under its owner rather than by the owner's own verdict: the
+# worker died (``crashed``), was killed for its runtime (``timed_out``), lost its claim
+# (``reclaimed``) or its owner ended under it (``owner_restarted``). ``completed``, ``blocked``,
+# ``scheduled`` and the review outcomes are the owner's own decisions; ``rate_limited`` and
+# ``spawn_failed`` have their own cooldowns in ``check_respawn_guard``.
+INTERRUPTED_OUTCOMES = ('crashed', 'timed_out', 'reclaimed', 'owner_restarted')
+
+
+def interrupted_owner_refusal(conn, task_id):
+    """Why the dispatcher may NOT continue a READY card held by ``active_pr`` on its own, else None.
+
+    The operator continuation (``continuation_refusal``) leaves "is the PR's owner really gone?"
+    to the operator. Without one, every answer must be positive proof on the exact latest run:
+    it ended in an ``INTERRUPTED_OUTCOMES`` outcome; the operator continuation's checks hold (the
+    card is ``ready``, no live claim, the owner admission terminal, no failure accounting pending);
+    no other run is open; the run came from the implementation lane; its owner admission was
+    RECORDED (an unmanaged run has nothing to prove the owner gone); and every worker recorded
+    for it is dead or recycled on this host (``_writers_refusal``). The continued owner then
+    sees the PR and every later comment on its card, exactly as an unguarded crashed card's
+    retry does."""
+    from hermes_cli import kanban_db as kb
+    latest = conn.execute('SELECT * FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1', (task_id,)).fetchone()
+    if latest is None:
+        return f'{task_id} has no run to continue'
+    run = latest['id']
+    if latest['outcome'] not in INTERRUPTED_OUTCOMES:
+        return f"run {run} of {task_id} ended {latest['outcome']!r}, not interrupted under its owner"
+    refusal = continuation_refusal(conn, task_id, run)
+    if refusal is not None:
+        return refusal
+    if conn.execute('SELECT 1 FROM task_runs WHERE task_id=? AND ended_at IS NULL', (task_id,)).fetchone():
+        return f'{task_id} has an open run'
+    if kb._retry_status_for_run(conn, task_id, run) != 'ready':
+        return f'run {run} of {task_id} was claimed from review; only the implementation lane continues'
+    if _run_event(conn, task_id, run, 'owner_admitted') is None:
+        return f'run {run} has no owner admission; the owner cannot be proven terminal'
+    return _writers_refusal(conn, task_id, latest)
+
+
+def continue_interrupted(conn, task_id, *, dry_run):
+    """Release a READY card held by ``active_pr`` once ``interrupted_owner_refusal`` proves its
+    owner's latest run interrupted with nothing left to write for it. True when the card may be
+    claimed; a refusal or dry run writes nothing.
+
+    Re-checked under the write lock, where a release another dispatcher recorded first is
+    honoured rather than duplicated. The ``continued`` event (on the interrupted run) is the
+    persistent release ``released_after`` honours, as an operator continuation is: later
+    crash/reclaim retries stay breaker-bounded, and a newer PR comment guards again."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_dispatch import check_respawn_guard
+    if interrupted_owner_refusal(conn, task_id) is not None:
+        return False
+    if dry_run:
+        return True
+    with kb.write_txn(conn):
+        reason = check_respawn_guard(conn, task_id)
+        if reason != 'active_pr' or interrupted_owner_refusal(conn, task_id) is not None:
+            return reason is None
+        latest = conn.execute('SELECT id,outcome FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1',
+                              (task_id,)).fetchone()
+        kb._append_event(conn, task_id, 'continued', {
+            'from': 'ready', 'continuation': True, 'interrupted_run': latest['id'], 'outcome': latest['outcome'],
+        }, run_id=latest['id'])
+    return True
+
+
+def dispatch_guard(conn, task_id, *, lane, dry_run):
+    """``check_respawn_guard`` for one dispatch, except that an ``active_pr`` hold over an
+    interrupted owner is lifted by ``continue_interrupted`` instead of holding forever."""
+    from hermes_cli.kanban_db_dispatch import check_respawn_guard
+    reason = check_respawn_guard(conn, task_id, lane=lane)
+    if reason == 'active_pr' and continue_interrupted(conn, task_id, dry_run=dry_run):
+        return None
+    return reason
 
 def _run_event(conn, task_id, run_id, kind):
     """The newest ``kind`` event of run ``run_id`` as ``(id, payload dict)``, else None (an
