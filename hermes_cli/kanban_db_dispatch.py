@@ -32,7 +32,7 @@ from hermes_cli.kanban_db_failure_stamp import LATEST_RUN_FIRST, RESPAWN_BLOCKER
 from hermes_cli.kanban_db_retry_policy import CrashSweep as _CrashSweep, DeadWorker as _DeadWorker, KANBAN_OWNER_RESTART_EXIT_CODE
 from hermes_cli.kanban_db_retry_policy import first_failure_landing
 from hermes_cli.kanban_db_retry_policy import reclaim_transaction
-from hermes_cli.kanban_db_retry_policy import record_failure_counted, record_first_failure_hold
+from hermes_cli.kanban_db_retry_policy import record_first_failure_hold, settle_failure_accounting
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -1244,8 +1244,10 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 int(task_override) if task_override is not None else _PROTOCOL_VIOLATION_FAILURE_LIMIT
             )
             if streak < violation_limit:
-                # Below budget: already back at ``ready`` with the error stamped.
-                # No ``_record_task_failure`` — must not consume the unified budget.
+                # Below budget: already back at ``ready`` with the error stamped. No ``_record_task_failure``
+                # — must not consume the unified budget — but the run's accounting is settled, uncounted.
+                with _kb.write_txn(conn):
+                    settle_failure_accounting(conn, run_id)
                 continue
             # ``force_trip``: the decision (incl. per-task ``max_retries``) was
             # already made against the violation streak above.
@@ -1359,24 +1361,22 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
-    infrastructure: bool = False, run_id: Optional[int] = None,
+    infrastructure: bool = False, run_id: Optional[int] = None, launch_refused: bool = False,
 ) -> bool:
-    """Record a non-success outcome and maybe trip the circuit breaker; every
-    non-success path funnels through here so ``consecutive_failures`` stays
-    consistent. Returns True when the task was auto-blocked.
+    """Record a non-success outcome and maybe trip the circuit breaker; every non-success path funnels
+    through here so ``consecutive_failures`` stays consistent. Returns True when the task was auto-blocked.
 
-    ``release_claim=True, end_run=True``: spawn-failure path (task still running with an open
-    run — restore source phase or ``blocked``, release claim, close run). Both False:
-    timeout/crash path (caller already restored the phase and closed the run; only the counter moves, a trip flips to
-    ``blocked`` + ``gave_up``). Threshold: per-task ``max_retries`` > ``failure_limit`` >
-    ``DEFAULT_FAILURE_LIMIT``. ``force_trip`` trips unconditionally (caller applied its own
-    bounded-retry policy). ``run_id``, the run a timeout/crash/reclaim caller already ended, gets
-    ``failure_counted`` in this transaction (``kanban_db_retry_policy.record_failure_counted``).
+    ``release_claim=True, end_run=True``: spawn-failure path (task still running with an open run —
+    restore source phase or ``blocked``, release claim, close run). Both False: timeout/crash path
+    (caller already restored the phase and closed the run; only the counter moves, a trip flips to
+    ``blocked`` + ``gave_up``). Threshold: per-task ``max_retries`` > ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``.
+    ``force_trip`` trips unconditionally (caller applied its own bounded-retry policy). ``run_id``, the run
+    a timeout/crash/reclaim caller already ended, has its pending failure accounting settled here.
 
-    ``infrastructure=True``: the host refused the spawn (no restart-safe scope, #114720) —
-    nothing about the card ran, so the run and event are recorded with ``infrastructure: true``
-    but ``consecutive_failures`` is left alone and the breaker never trips; the card stays
-    retryable and :func:`check_respawn_guard` spaces the retries.
+    ``infrastructure=True``: the host refused the spawn (no restart-safe scope, #114720) — nothing about the
+    card ran, so the run and event are recorded with ``infrastructure: true`` but ``consecutive_failures``
+    is left alone and the breaker never trips; the card stays retryable and :func:`check_respawn_guard` spaces the retries.
+    ``launch_refused``: that refusal proved this exact run never launched, recorded ``launch: refused_before_launch``.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -1396,7 +1396,7 @@ def _record_task_failure(
         if row["max_retries"] == 1 and row["status"] == "blocked" and not release_claim:
             retry_status = _kb._resume_status_from_events(conn, task_id)
         failures = int(row["consecutive_failures"]) + (0 if infrastructure else 1)
-        record_failure_counted(conn, task_id, run_id, failures, outcome, _kb._append_event)
+        settle_failure_accounting(conn, run_id)
 
         # Per-task override wins over caller-supplied and default thresholds.
         task_override = _kb._row_get(row, "max_retries")
@@ -1425,7 +1425,7 @@ def _record_task_failure(
             if end_run:
                 detail = {"failures": failures, "retry_status": retry_status}
                 if infrastructure:
-                    detail["infrastructure"] = True
+                    detail.update(infrastructure=True, **({"launch": "refused_before_launch"} if launch_refused else {}))
                 run_id = _kb._end_run(
                     conn, task_id, outcome=outcome, status=outcome, error=error, metadata=detail,
                 )
@@ -2002,8 +2002,7 @@ def dispatch_once(
 
 
 def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
-    """Back-compat: older spawn_fn signatures (and test stubs) accept only
-    ``(task, workspace)``; pass ``board`` only when the callable supports it."""
+    """Back-compat: older spawn_fn signatures (and test stubs) accept only ``(task, workspace)``; pass ``board`` only when the callable supports it."""
     import inspect
     try:
         sig = inspect.signature(spawn_fn)
@@ -2127,15 +2126,15 @@ def _dispatch_lane_task(
     except Exception as exc:
         from tools.process_registry import RestartSafeScopeUnavailable
 
-        # The host refused the spawn (no restart-safe scope): nothing about the
-        # card ran, so it must not spend the card's retry budget (#114720).
+        # The host refused the spawn (no restart-safe scope): nothing about the card ran, so it must not spend the card's retry budget (#114720).
         infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
         if infrastructure:
             _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
         if _record_task_failure(
             conn, claimed.id, str(exc),
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
-            infrastructure=infrastructure,
+            infrastructure=infrastructure, launch_refused=infrastructure
+            and getattr(exc, "kanban_refused_run", None) == claimed.current_run_id,
         ):
             result.auto_blocked.append(claimed.id)
         return False
@@ -2682,20 +2681,19 @@ def _open_worker_log(task: Task, board: Optional[str]):
 def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     """Wrap a systemd-hosted dispatcher's worker in the shared restart-safe scope.
 
-    Kanban workers are long-lived agentic runs that outlive the dispatcher
-    tick, so they never take cron's degraded mode under the managed gateway:
-    ``require_restart_safe_scope=True`` makes the helper raise
-    ``RestartSafeScopeUnavailable`` there (an infrastructure spawn failure the
-    dispatcher does not charge to the card). Under any other systemd unit
-    (``Type=oneshot`` dispatch timers, #113612) ``outlives_parent=True`` gets the
-    worker its own scope so the unit's cgroup teardown cannot kill it.
+    Kanban workers are long-lived agentic runs that outlive the dispatcher tick, so they never take
+    cron's degraded mode under the managed gateway: ``require_restart_safe_scope=True`` makes the
+    helper raise ``RestartSafeScopeUnavailable`` there (an infrastructure spawn failure the dispatcher
+    does not charge to the card; tagged with the claimed run, which it proves never launched:
+    ``_default_spawn`` builds this argv before ``Popen``). Under any other systemd unit (``Type=oneshot``
+    dispatch timers, #113612) ``outlives_parent=True`` gets the worker its own scope so the unit's
+    cgroup teardown cannot kill it.
     """
-    from tools.process_registry import restart_safe_gateway_child_argv
+    from tools.process_registry import RestartSafeScopeUnavailable, restart_safe_gateway_child_argv
 
     if task.current_run_id is None:
-        # Outside managed systemd this is harmless, but a managed dispatch must
-        # never mint an untraceable worker.  Check topology through the shared
-        # helper first, using a placeholder suffix that cannot be launched.
+        # Outside managed systemd this is harmless, but a managed dispatch must never mint an untraceable
+        # worker.  Check topology through the shared helper first, using a placeholder suffix that cannot be launched.
         dispatch = restart_safe_gateway_child_argv(
             command,
             unit_suffix=f"kanban-{task.id}-run-missing",
@@ -2709,12 +2707,14 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
             )
         return command
 
-    return restart_safe_gateway_child_argv(
-        command,
-        unit_suffix=f"kanban-{task.id}-run-{task.current_run_id}",
-        require_restart_safe_scope=True,
-        outlives_parent=True,
-    ).argv
+    try:
+        return restart_safe_gateway_child_argv(
+            command, unit_suffix=f"kanban-{task.id}-run-{task.current_run_id}",
+            require_restart_safe_scope=True, outlives_parent=True,
+        ).argv
+    except RestartSafeScopeUnavailable as exc:
+        exc.kanban_refused_run = task.current_run_id
+        raise
 
 
 def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
