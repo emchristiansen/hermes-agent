@@ -162,7 +162,7 @@ class AuthError(RuntimeError):
 
     def __init__(
         self, message: str, *, provider: str = "", code: Optional[str] = None, relogin_required: bool = False,
-        retry_after: Optional[float] = None, retryable: Optional[bool] = None,
+        retry_after: Optional[float] = None, retryable: Optional[bool] = None, exhausted: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.provider = provider
@@ -173,6 +173,9 @@ class AuthError(RuntimeError):
         # "retryable, no hint" for transport-shaped errors and as terminal for auth refusals.
         self.retry_after = retry_after
         self.retryable = retryable
+        # The credential source a quota verdict covers: ``"credential_pool"`` when every pool row of
+        # ``provider`` was cooling and no other credential was available; None for one credential.
+        self.exhausted = exhausted
 
 
 def _provider_error_factory(provider: str) -> Callable[..., AuthError]:
