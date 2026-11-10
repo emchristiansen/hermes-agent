@@ -181,10 +181,37 @@ def _resolve_peer_target(target: str) -> tuple[str, str | None, dict, str]:
 
 
 def _message_from_args(args) -> str:
-    message = (getattr(args, "message", None) or "").strip()
-    if not message and not sys.stdin.isatty():
-        message = sys.stdin.read().strip()
-    return message
+    """The message (argument, else stdin), or "" when it is blank.
+
+    With ``--exact`` a non-blank message is sent byte-for-byte; otherwise surrounding
+    whitespace is stripped, as before.
+    """
+    message = getattr(args, "message", None) or ""
+    if not message.strip() and not sys.stdin.isatty():
+        message = _exact_stdin() if getattr(args, "exact", False) else sys.stdin.read()
+    if not message.strip():
+        return ""
+    return message if getattr(args, "exact", False) else message.strip()
+
+
+def _exact_stdin() -> str:
+    """TR-3 (TR2-01): ``--exact`` stdin as raw bytes decoded as UTF-8 here, independent of the process's stdin text
+    encoding. Invalid bytes become lone surrogates, which ``_exact_deliverable`` refuses (exit 2, nothing sent)."""
+    buffer = getattr(sys.stdin, "buffer", None)
+    if buffer is None:  # an already-decoded stream (embedded callers): its text is what it is
+        return sys.stdin.read()
+    return buffer.read().decode("utf-8", "surrogateescape")
+
+
+def _exact_deliverable(message: str) -> bool:
+    """TR-2 D1: whether ``--exact`` can carry ``message`` byte-for-byte (no NUL, encodable as UTF-8)."""
+    if "\x00" in message:
+        return False
+    try:
+        message.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _peer_run_durability(base: str, key: str) -> bool | None:
@@ -414,6 +441,10 @@ def cmd_peer(args) -> int:
     if not message:
         print("Message required (argument or stdin).", file=sys.stderr)
         return 2
+    if getattr(args, "exact", False) and not _exact_deliverable(message):
+        print("--exact: the message contains NUL or is not valid UTF-8, so it cannot be sent byte-for-byte; "
+              "nothing was sent.", file=sys.stderr)
+        return 2
     handler = _peer_run if action == "run" else _peer_dm
     return handler(args, message, peer_name, profile, base, key)
 
@@ -461,6 +492,9 @@ def build_peer_parser(subparsers) -> None:
             sp.add_argument("run_id", help="Run ID returned by 'hermes peer run'")
         else:
             sp.add_argument("message", nargs="?", default=None, help="Message text (or stdin)")
+            sp.add_argument(
+                "--exact", action="store_true", default=False,
+                help="Send the message byte-for-byte, without stripping surrounding whitespace")
             if name == "run":
                 sp.add_argument(
                     "--idempotency-key", default=None, help="Stable retry key (generated when omitted)")
