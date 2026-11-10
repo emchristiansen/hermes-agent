@@ -40,9 +40,40 @@ class CrashSweep:
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
     owner_restarted: list[str] = field(default_factory=list)
-    crash_details: list[tuple[str, int, str, object]] = field(default_factory=list)
+    crash_details: list[tuple[str, int, str, object, int]] = field(default_factory=list)
+    """``(task_id, pid, claim_lock, DeadWorker, ended run id)`` per counted crash."""
     exited_hook_payloads: list[dict] = field(default_factory=list)
 
+
+
+@dataclass(frozen=True)
+class SpawnClaim:
+    """The exact claim a dispatcher's spawn-failure transition belongs to (``_record_task_failure``).
+
+    The dispatcher can stall between its claim and that commit (claim TTL expires); the card may then
+    have been reclaimed and claimed again by another dispatcher, whose worker may be running. The commit
+    therefore changes nothing unless the card is still exactly this claim (``holds``): it never ends
+    another run, clears another claim or pid, charges another attempt or moves another phase.
+    ``refused_before_launch`` comes only from the launch-boundary producer's tag for this very run
+    (``_restart_safe_worker_argv`` raises before ``Popen``); under ``holds`` it marks the run it ends."""
+
+    run_id: int
+    claim_lock: Optional[str]
+    refused_before_launch: bool = False
+
+    @classmethod
+    def of(cls, claimed, exc: Optional[BaseException] = None) -> "SpawnClaim":
+        refused = exc is not None and getattr(exc, "kanban_refused_run", None) == claimed.current_run_id
+        return cls(claimed.current_run_id, claimed.claim_lock, refused)
+
+    def holds(self, task_row) -> bool:
+        """Whether the card (``tasks`` row read in the failure commit) is still this running claim."""
+        return (task_row["status"] == "running" and task_row["current_run_id"] == self.run_id
+                and task_row["claim_lock"] == self.claim_lock)
+
+    def launch_detail(self) -> dict:
+        """The run detail a host refusal records for the run it ends (only under ``holds``)."""
+        return {"launch": "refused_before_launch"} if self.refused_before_launch else {}
 
 
 # Worker result "the attempt's owner ended under it" (``session_kanban.record_owner_restart_result``):
@@ -156,6 +187,53 @@ def edit_retry_policy(conn, task_id, limit, expected_run, mixed_values, *,
     return True
 
 
+def _run_metadata(conn, run_id):
+    """The run's decoded metadata; None when unreadable (missing run or malformed JSON)."""
+    row = conn.execute('SELECT metadata FROM task_runs WHERE id=?', (run_id,)).fetchone()
+    if row is None:
+        return None
+    try:
+        data = json.loads(row['metadata']) if row['metadata'] else {}
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _set_run_metadata(conn, run_id, data):
+    """Write ``data`` back exactly as ``kanban_db._end_run`` serializes metadata (empty -> NULL)."""
+    conn.execute('UPDATE task_runs SET metadata=? WHERE id=?',
+                 (json.dumps(data, ensure_ascii=False) if data else None, run_id))
+
+
+def owe_failure_accounting(conn, run_id):
+    """In the commit that ends a counted run: mark it ``failure_accounting: pending``.
+
+    The run is ended and its card re-queued in one commit and the failure counted in a later one
+    (``_reclaim_dead_workers`` / ``_account_crashes``, timeout, stale-claim reclaim); a dispatcher
+    lost between them leaves a retryable card whose failure no counter holds, and this mark."""
+    data = _run_metadata(conn, run_id)
+    if data is not None:
+        _set_run_metadata(conn, run_id, {**data, 'failure_accounting': 'pending'})
+
+
+def settle_failure_accounting(conn, run_id):
+    """In the commit that accounts ``run_id``'s failure (counted or deliberately not): record it
+    ``failure_accounting: settled``, the only positive proof that the accounting happened."""
+    data = _run_metadata(conn, run_id) if run_id is not None else None
+    if data is not None:
+        _set_run_metadata(conn, run_id, {**data, 'failure_accounting': 'settled'})
+
+
+def failure_accounting_state(conn, run_id):
+    """``'pending'``, ``'settled'``, None (never marked: an uncounted end, or a run ended by a
+    runtime that did not mark) or ``'unreadable'``; absence is never proof of settlement."""
+    data = _run_metadata(conn, run_id)
+    if data is None:
+        return 'unreadable'
+    state = data.get('failure_accounting')
+    return state if state in (None, 'pending', 'settled') else 'unreadable'
+
+
 def own_scheduled_attempt(conn, task_id):
     """The run a scheduled card's ordinary callback wake resumes, if the card cleanly yielded.
 
@@ -249,6 +327,8 @@ def reclaim_transaction(conn, task_id, write_txn, append_event, *, accounting_re
         transition = {}
         yield transition
         after = conn.execute('SELECT status,max_retries,current_run_id FROM tasks WHERE id=?', (task_id,)).fetchone()
+        if accounting_required and transition.get('run_id') is not None:
+            owe_failure_accounting(conn, transition['run_id'])
         if ('run_id' in transition and before is not None and before['status'] == 'running'
                 and before['current_run_id'] == transition['run_id'] and after is not None
                 and after['max_retries'] == 1 and after['status'] in {'ready', 'review'}
@@ -265,7 +345,12 @@ def reclaim_transaction(conn, task_id, write_txn, append_event, *, accounting_re
 
 
 def record_first_failure_hold(conn, task_id, run_id, phase, append_event, *, accounting_required=False):
-    """Called inside the reclaim transaction, before another connection can claim a retry."""
+    """Called inside the reclaim transaction, before another connection can claim a retry.
+
+    ``accounting_required``: a later commit counts this failure, so the run is marked pending for
+    every policy (``owe_failure_accounting``); ``max_retries=1`` also parks the card ``blocked``."""
+    if accounting_required:
+        owe_failure_accounting(conn, run_id)
     row = conn.execute('SELECT max_retries FROM tasks WHERE id=?', (task_id,)).fetchone()
     if row is None or row['max_retries'] != 1:
         return

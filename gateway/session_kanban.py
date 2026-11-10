@@ -11,7 +11,10 @@ import sqlite3
 from hermes_state_runtime import RuntimeStoreError
 
 
-def build_kanban_policy(connection, params, config):
+def build_kanban_policy(connection, params, config, *, route_inputs=None):
+    """The attempt's policy from ``config``; ``route_inputs`` are the profile's route inputs as
+    stamped before ``config`` was read (``kanban_db_provider_wall.route_inputs``), kept only when
+    unchanged after the policy is built, so a wall can name the route its attempt actually used."""
     from hermes_cli import kanban_db as kb
     from hermes_cli.profiles import resolve_profile_env
     from gateway.session_policy import build_policy
@@ -63,6 +66,9 @@ def build_kanban_policy(connection, params, config):
         skills=skills, goal_mode=task.goal_mode, goal_max_turns=task.goal_max_turns,
         goal_text='\n\n'.join(p for p in (task.title, task.body) if p), context=context,
         max_runtime_seconds=task.max_runtime_seconds, accept_hooks=True)
+    from hermes_cli.kanban_db_provider_wall import route_inputs as current_route_inputs
+    context['route_inputs'] = (route_inputs if route_inputs is not None
+                               and route_inputs == current_route_inputs(authority.profile_id) else None)
     context['db'] = str(path)
     request = json.loads(policy.request_json)
     request.update(source='kanban', board=board, task_id=task.id, run_id=task.current_run_id)
@@ -98,7 +104,9 @@ async def run_task(connection, params):
         from gateway.session_local_recovery import restore_local_session
         ref = restore_local_session(authority, sid)
     else:
-        policy, private = build_kanban_policy(connection, params, _load_gateway_config())
+        from hermes_cli.kanban_db_provider_wall import route_inputs
+        captured = route_inputs(authority.profile_id)  # before the config read it vouches for
+        policy, private = build_kanban_policy(connection, params, _load_gateway_config(), route_inputs=captured)
         ref = create_local_session(authority, connection.actor, {'request_id': request_id},
                                    trusted_policy=policy, trusted_secrets=private)
     from hermes_cli.kanban_db_connect import connect_closing
@@ -292,18 +300,21 @@ def _run_worker_turns(agent, frame, history):
             return agent.run_conversation(frame['text'], conversation_history=history, **worker_display_kwargs(),
                                           **({'task_id': task_id} if task_id else {}),
                                           **({'turn_author': author} if author is not None else {}))
+    from hermes_cli.kanban_db_provider_wall import wall_from_exception, wall_from_result
     from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
-    code, last_output = 1, ''
+    code, last_output, wall = 1, '', None
     try:
         result = _run_task_turns(agent, frame, history, context)
         code = turn_exit_code(result, kanban_worker=True)
         last_output = str(result.get('final_response') or '')[-500:] if isinstance(result, dict) else ''
+        wall = wall_from_result(result, agent)
         return result
     except Exception as exc:
         code = turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc))
+        wall = wall_from_exception(exc, frame)
         raise
     finally:
-        _record_worker_result(context, code, last_output)
+        _record_worker_result(context, code, last_output, wall)
 
 
 def record_start_failure(frame, exc):
@@ -312,11 +323,13 @@ def record_start_failure(frame, exc):
     context = json.loads(frame['policy'].get('kanban_json') or 'null')
     if context is None:
         return
+    from hermes_cli.kanban_db_provider_wall import wall_from_exception
     from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
-    _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)), '')
+    _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)), '',
+                          wall_from_exception(exc, frame))
 
 
-def _record_worker_result(context, code, last_output):
+def _record_worker_result(context, code, last_output, wall=None):
     _TURNS_DONE.set()
     import os
     from hermes_cli.kanban_db_connect import connect_closing
@@ -326,9 +339,12 @@ def _record_worker_result(context, code, last_output):
             if _bound_worker_matches(conn, context):
                 # Closing a run clears its claim/PID and replaces metadata; keep the
                 # result in the immutable attempt event stream instead.
+                # The provider wall a requeued attempt met is the evidence its card's retries are judged by.
                 kb._append_event(conn, context['task_id'], 'worker_result',
                     {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
-                     'last_output': last_output}, run_id=context['run_id'])
+                     'last_output': last_output,
+                     **({'provider_wall': wall.payload()} if wall is not None and code == kb.KANBAN_RATE_LIMIT_EXIT_CODE else {})},
+                    run_id=context['run_id'])
         _remove_finished_workspace(conn, context)
 
 

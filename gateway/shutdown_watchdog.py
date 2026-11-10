@@ -87,6 +87,53 @@ def _arm_loop_floor_timer(
     return _LoopFloorTimerHandle(loop, iv if iv > 0 else DEFAULT_LOOP_FLOOR_TIMER_INTERVAL_S)
 
 
+class _ProbeAnswers:
+    """Answers to one liveness-watchdog generation's probes.
+
+    A probe's callback may run after its own wait expired, even during a later probe's wait; it
+    still proves the loop dispatches, so the watchdog's next observation clears every strike.
+    Recording an answer and observing take one lock, so they are totally ordered: an observation
+    sees exactly the answers recorded before it. Answers are probe sequence numbers and an
+    observation reports only a number above the previous one, so a repeated callback is no new
+    evidence. Each watchdog owns its instance, so another generation's probes can never answer it.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._issued = 0
+        self._answered = 0  # highest sequence whose callback has run
+        self._observed = 0  # ``_answered`` at the previous observation
+
+    def issue(self) -> _LivenessProbe:
+        with self._lock:
+            self._issued += 1
+            return _LivenessProbe(self, self._issued)
+
+    def record(self, sequence: int) -> None:
+        with self._lock:
+            self._answered = max(self._answered, sequence)
+
+    def observe_new(self) -> bool:
+        """Whether any probe answered since the previous observation."""
+        with self._lock:
+            new = self._answered > self._observed
+            self._observed = self._answered
+            return new
+
+
+class _LivenessProbe(threading.Event):
+    """One probe; the loop runs its ``set``. The answer is recorded before the event is set, so a
+    watchdog woken by the event always observes it."""
+
+    def __init__(self, answers: _ProbeAnswers, sequence: int) -> None:
+        super().__init__()
+        self._answers, self.sequence = answers, sequence
+
+    def set(self) -> None:
+        self._answers.record(self.sequence)
+        super().set()
+
+
 def start_loop_liveness_watchdog(
     loop: asyncio.AbstractEventLoop, *, probe_interval: float = DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
     probe_timeout: float = DEFAULT_LOOP_WATCHDOG_TIMEOUT_S,
@@ -99,9 +146,12 @@ def start_loop_liveness_watchdog(
     stop_event = threading.Event()
 
     def _watchdog() -> None:
+        answers = _ProbeAnswers()  # this watchdog generation's own probes only
         strikes = 0
         while not stop_event.wait(timeout=probe_interval):
-            probe_event = threading.Event()
+            if answers.observe_new():  # answered between probes: the next miss starts a fresh sequence
+                strikes = 0
+            probe_event = answers.issue()
             try:
                 loop.call_soon_threadsafe(probe_event.set)
             except RuntimeError:  # normally closed loop: nothing left to backstop
@@ -116,7 +166,7 @@ def start_loop_liveness_watchdog(
                     break
             else:
                 return
-            if probe_event.is_set():
+            if answers.observe_new():  # this probe, or an earlier one answering late, during this wait
                 strikes = 0
                 continue
             if stop_event.is_set():  # re-checked before each irreversible step: a late stop() wins
@@ -139,6 +189,14 @@ def start_loop_liveness_watchdog(
                 event="loop_liveness_watchdog_fired")
             if stop_event.is_set():
                 return
+            # The dump can take seconds under I/O pressure. A probe answered meanwhile withdraws the
+            # restart. This observation is the commit point: an answer recorded after it cannot.
+            if answers.observe_new():
+                strikes = 0
+                with contextlib.suppress(Exception):
+                    logger.warning("Gateway event loop answered a liveness probe while its stacks were "
+                                   "being dumped; restart withdrawn.")
+                continue
             _mark_exited_quietly(exit_code, "loop_liveness_watchdog")
             _hard_exit(exit_code)
     thread = threading.Thread(target=_watchdog, daemon=True, name="gateway-loop-liveness-watchdog")

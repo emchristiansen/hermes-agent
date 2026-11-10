@@ -27,12 +27,12 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
-from hermes_cli.kanban_db_active_pr import released_after
+from hermes_cli.kanban_db_active_pr import dispatch_guard, released_after
 from hermes_cli.kanban_db_failure_stamp import LATEST_RUN_FIRST, RESPAWN_BLOCKER_RE as _RESPAWN_BLOCKER_RE, stamp_superseded
 from hermes_cli.kanban_db_retry_policy import CrashSweep as _CrashSweep, DeadWorker as _DeadWorker, KANBAN_OWNER_RESTART_EXIT_CODE
 from hermes_cli.kanban_db_retry_policy import first_failure_landing
 from hermes_cli.kanban_db_retry_policy import reclaim_transaction
-from hermes_cli.kanban_db_retry_policy import record_first_failure_hold
+from hermes_cli.kanban_db_retry_policy import SpawnClaim, record_first_failure_hold, settle_failure_accounting
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -735,7 +735,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 error=error,
                 outcome="timed_out",
                 release_claim=False,
-                end_run=False,
+                end_run=False, run_id=run_id,
                 event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
             )
     return timed_out
@@ -1148,6 +1148,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
         ).fetchall()
         host_prefix = _kb._host_prefix()
         from hermes_cli.kanban_owner_recovery import managed_run_exit_code, owner_reclaim_blocked, presubmit_restart_fence as fence
+        from hermes_cli.kanban_db_provider_wall import attach_wall
         for row in rows:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
@@ -1168,6 +1169,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             # A managed run's authority-recorded exit (its bound interpreter's, under this claim).
             exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
             dead = fence(conn, row, exit_code, _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board))
+            if dead.rate_limited:
+                attach_wall(conn, row, dead.event_payload)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             landing = first_failure_landing(conn, row["id"], retry_status)
@@ -1214,7 +1217,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 sweep.owner_restarted.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
-                sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
+                sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead, run_id))
     return sweep
 
 
@@ -1229,10 +1232,10 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     """
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
-    for _, _, _, dead in crash_details:
+    for _, _, _, dead, _ in crash_details:
         fp = _error_fingerprint(dead.error_text)
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
-    for tid, pid, claimer, dead in crash_details:
+    for tid, pid, claimer, dead, run_id in crash_details:
         error_text = dead.error_text
         if dead.protocol_violation:
             streak = _protocol_violation_streak(conn, tid)
@@ -1244,8 +1247,10 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 int(task_override) if task_override is not None else _PROTOCOL_VIOLATION_FAILURE_LIMIT
             )
             if streak < violation_limit:
-                # Below budget: already back at ``ready`` with the error stamped.
-                # No ``_record_task_failure`` — must not consume the unified budget.
+                # Below budget: already back at ``ready`` with the error stamped. No ``_record_task_failure``
+                # — must not consume the unified budget — but the run's accounting is settled, uncounted.
+                with _kb.write_txn(conn):
+                    settle_failure_accounting(conn, run_id)
                 continue
             # ``force_trip``: the decision (incl. per-task ``max_retries``) was
             # already made against the violation streak above.
@@ -1256,7 +1261,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 failure_limit=violation_limit,
                 force_trip=True,
                 release_claim=False,
-                end_run=False,
+                end_run=False, run_id=run_id,
                 event_payload_extra={
                     "pid": pid,
                     "claimer": claimer,
@@ -1275,7 +1280,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 outcome="crashed",
                 force_trip=True,
                 release_claim=False,
-                end_run=False,
+                end_run=False, run_id=run_id,
                 event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
             )
         else:
@@ -1290,7 +1295,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 outcome="crashed",
                 failure_limit=1 if is_systemic else None,
                 release_claim=False,
-                end_run=False,
+                end_run=False, run_id=run_id,
                 event_payload_extra=extra,
             )
         if tripped:
@@ -1359,35 +1364,33 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
-    infrastructure: bool = False,
+    infrastructure: bool = False, run_id: Optional[int] = None, spawn_claim: Optional[SpawnClaim] = None,
 ) -> bool:
-    """Record a non-success outcome and maybe trip the circuit breaker; every
-    non-success path funnels through here so ``consecutive_failures`` stays
-    consistent. Returns True when the task was auto-blocked.
+    """Record a non-success outcome and maybe trip the circuit breaker; every non-success path funnels
+    through here so ``consecutive_failures`` stays consistent. Returns True when the task was auto-blocked.
 
-    ``release_claim=True, end_run=True``: spawn-failure path (task still
-    running with an open run — restore source phase or ``blocked``, release
-    claim, close run). Both False: timeout/crash path (caller already restored
-    the phase and closed the run; only the counter moves, a trip flips to
-    ``blocked`` + ``gave_up``). Threshold: per-task ``max_retries`` >
-    ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``. ``force_trip`` trips
-    unconditionally (caller applied its own bounded-retry policy).
+    ``release_claim=True, end_run=True``: spawn-failure path (task still running with an open run —
+    restore source phase or ``blocked``, release claim, close run). Both False: timeout/crash path
+    (caller already restored the phase and closed the run; only the counter moves, a trip flips to
+    ``blocked`` + ``gave_up``). Threshold: per-task ``max_retries`` > ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``.
+    ``force_trip`` trips unconditionally (caller applied its own bounded-retry policy). ``run_id``, the run
+    a timeout/crash/reclaim caller already ended, has its pending failure accounting settled here.
 
-    ``infrastructure=True``: the host refused the spawn (no restart-safe scope,
-    #114720) — nothing about the card ran, so the run and event are recorded
-    with ``infrastructure: true`` but ``consecutive_failures`` is left alone and
-    the breaker never trips; the card stays retryable and
-    :func:`check_respawn_guard` spaces the retries.
+    ``infrastructure=True``: the host refused the spawn (no restart-safe scope, #114720) — nothing about the
+    card ran, so the run and event are recorded with ``infrastructure: true`` but ``consecutive_failures``
+    is left alone and the breaker never trips; the card stays retryable and :func:`check_respawn_guard` spaces the retries.
+    ``spawn_claim`` (the dispatcher's spawn path; implies both flags): applied only while the card is still exactly
+    that claim (``SpawnClaim.holds``), else nothing is written; its producer-proved ``launch`` joins the run detail.
     """
-    if failure_limit is None:
-        failure_limit = DEFAULT_FAILURE_LIMIT
+    failure_limit = DEFAULT_FAILURE_LIMIT if failure_limit is None else failure_limit
+    release_claim, end_run = (True, True) if spawn_claim is not None else (release_claim, end_run)
     error = error[:500]
     with _kb.write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, current_run_id "
+            "SELECT consecutive_failures, status, max_retries, current_run_id, claim_lock "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
-        if row is None:
+        if row is None or (spawn_claim is not None and not spawn_claim.holds(row)):
             return False
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
@@ -1397,6 +1400,7 @@ def _record_task_failure(
         if row["max_retries"] == 1 and row["status"] == "blocked" and not release_claim:
             retry_status = _kb._resume_status_from_events(conn, task_id)
         failures = int(row["consecutive_failures"]) + (0 if infrastructure else 1)
+        settle_failure_accounting(conn, run_id)
 
         # Per-task override wins over caller-supplied and default thresholds.
         task_override = _kb._row_get(row, "max_retries")
@@ -1425,7 +1429,7 @@ def _record_task_failure(
             if end_run:
                 detail = {"failures": failures, "retry_status": retry_status}
                 if infrastructure:
-                    detail["infrastructure"] = True
+                    detail.update(infrastructure=True, **(spawn_claim.launch_detail() if spawn_claim else {}))
                 run_id = _kb._end_run(
                     conn, task_id, outcome=outcome, status=outcome, error=error, metadata=detail,
                 )
@@ -1545,8 +1549,9 @@ def check_respawn_guard(
     Called per ready/review row before any claim attempt. Priority order:
     ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
     refused — no restart-safe scope — within the cooldown; never counted),
-    ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
-    checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
+    ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown) or
+    ``"rate_limit_route_probed"`` (past it, while a sibling already probes the same exhausted pool:
+    ``kanban_db_provider_wall``); both checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
     path never increments ``consecutive_failures``), ``"blocker_auth"``
     (quota/auth pattern, unless a later spawned attempt superseded the run
@@ -1555,8 +1560,8 @@ def check_respawn_guard(
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
     handoff, unblock or dependency release followed the comment: the named profile must work on
-    that PR, or the card was resumed with it). The review lane skips the last two (the *inputs* to
-    a review handoff). Stale / dead claim locks are NOT a guard reason — reclaim passes own those.
+    that PR, or the card was resumed with it; ``dispatch_guard`` resumes a proven-interrupted owner).
+    The review lane skips the last two (review-handoff inputs). Stale/dead claims are reclaim's, never a guard.
     """
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
@@ -1575,7 +1580,7 @@ def check_respawn_guard(
     #    wall-clock ended_at, which only measures the cooldown's elapsed time.
     rl_cooldown = _kb._resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
-        "SELECT outcome, ended_at, metadata FROM task_runs "
+        "SELECT outcome, started_at, ended_at, metadata, profile FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
         f"ORDER BY {LATEST_RUN_FIRST} LIMIT 1",
         (task_id,),
@@ -1586,17 +1591,11 @@ def check_respawn_guard(
             if ended_at is not None and (now - ended_at) < rl_cooldown:
                 return "infrastructure_cooldown"
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
-        if rl_cooldown <= 0:
-            # Cooldown disabled — respawn immediately, skipping blocker_auth so
-            # the stamped rate-limit text doesn't re-trap the task.
-            return None
-        ended_at = _kb._to_epoch(latest_run["ended_at"])
-        if ended_at is not None and (now - ended_at) < rl_cooldown:
-            return "rate_limit_cooldown"
-        # Cooldown elapsed — return early so blocker_auth doesn't catch the
-        # stamped rate-limit text; this path intentionally retries forever
-        # (spaced by the cooldown) until quota returns or a real run supersedes it.
-        return None
+        # Return here either way so blocker_auth never catches the stamped rate-limit text: this
+        # path retries forever, spaced by the cooldown (one probe per exhausted pool), until quota
+        # returns or a real run supersedes it.
+        from hermes_cli.kanban_db_provider_wall import rate_limit_guard
+        return rate_limit_guard(conn, task_id, latest_run, now, rl_cooldown)
 
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
     # crash is different: its persisted error includes the worker's last
@@ -1628,8 +1627,8 @@ def check_respawn_guard(
     #    Exception: a release AFTER the newest PR comment names who must now work on THAT PR, not a
     #    duplicate implementation (#111910): a handoff (reassign, changes_requested, review reopen),
     #    an operator ``unblock``/``promote`` (incl. a ready-card continuation), or a dependency
-    #    release (``promoted`` from ``todo``). Crash/reclaim, reprioritize and a breaker park's
-    #    auto-recovery are none; ``kanban_db_active_pr.is_release`` holds the provenance rules.
+    #    release (``promoted`` from ``todo``). Crash/reclaim, reprioritize and breaker auto-recovery
+    #    are none (``kanban_db_active_pr``: provenance; ``dispatch_guard``: proven interruption).
     pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
                                           cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
                 if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
@@ -2002,8 +2001,7 @@ def dispatch_once(
 
 
 def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
-    """Back-compat: older spawn_fn signatures (and test stubs) accept only
-    ``(task, workspace)``; pass ``board`` only when the callable supports it."""
+    """Back-compat: older spawn_fn signatures (and test stubs) accept only ``(task, workspace)``; pass ``board`` only when the callable supports it."""
     import inspect
     try:
         sig = inspect.signature(spawn_fn)
@@ -2062,7 +2060,7 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
-    guard_reason = check_respawn_guard(conn, task_id, lane=lane)
+    guard_reason = dispatch_guard(conn, task_id, lane=lane, dry_run=dry_run)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
         # Event so ``hermes kanban tail`` shows why the task looks stuck.
@@ -2100,14 +2098,14 @@ def _dispatch_lane_task(
     except Exception as exc:
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            outcome="spawn_failed", failure_limit=failure_limit, spawn_claim=SpawnClaim.of(claimed),
         ):
             result.auto_blocked.append(claimed.id)
         return False
-    _kbw.set_workspace_path(conn, claimed.id, str(workspace))
-    if claimed.workspace_kind == "worktree":
-        _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
-    _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+    branch = resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}"
+    if not _kbw.publish_claimed_workspace(conn, SpawnClaim.of(claimed), claimed.id, workspace, workspace_kind=claimed.workspace_kind,
+                                          branch_name=branch if claimed.workspace_kind == "worktree" else None):
+        return False  # the claim was lost while resolving: the newer claim's card stays untouched, nothing spawns
     if lane == "review":
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
@@ -2127,14 +2125,13 @@ def _dispatch_lane_task(
     except Exception as exc:
         from tools.process_registry import RestartSafeScopeUnavailable
 
-        # The host refused the spawn (no restart-safe scope): nothing about the
-        # card ran, so it must not spend the card's retry budget (#114720).
+        # The host refused the spawn (no restart-safe scope): nothing about the card ran, so it must not spend the card's retry budget (#114720).
         infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
         if infrastructure:
             _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
         if _record_task_failure(
             conn, claimed.id, str(exc),
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            outcome="spawn_failed", failure_limit=failure_limit, spawn_claim=SpawnClaim.of(claimed, exc),
             infrastructure=infrastructure,
         ):
             result.auto_blocked.append(claimed.id)
@@ -2682,20 +2679,19 @@ def _open_worker_log(task: Task, board: Optional[str]):
 def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     """Wrap a systemd-hosted dispatcher's worker in the shared restart-safe scope.
 
-    Kanban workers are long-lived agentic runs that outlive the dispatcher
-    tick, so they never take cron's degraded mode under the managed gateway:
-    ``require_restart_safe_scope=True`` makes the helper raise
-    ``RestartSafeScopeUnavailable`` there (an infrastructure spawn failure the
-    dispatcher does not charge to the card). Under any other systemd unit
-    (``Type=oneshot`` dispatch timers, #113612) ``outlives_parent=True`` gets the
-    worker its own scope so the unit's cgroup teardown cannot kill it.
+    Kanban workers are long-lived agentic runs that outlive the dispatcher tick, so they never take
+    cron's degraded mode under the managed gateway: ``require_restart_safe_scope=True`` makes the
+    helper raise ``RestartSafeScopeUnavailable`` there (an infrastructure spawn failure the dispatcher
+    does not charge to the card; tagged with the claimed run, which it proves never launched:
+    ``_default_spawn`` builds this argv before ``Popen``). Under any other systemd unit (``Type=oneshot``
+    dispatch timers, #113612) ``outlives_parent=True`` gets the worker its own scope so the unit's
+    cgroup teardown cannot kill it.
     """
-    from tools.process_registry import restart_safe_gateway_child_argv
+    from tools.process_registry import RestartSafeScopeUnavailable, restart_safe_gateway_child_argv
 
     if task.current_run_id is None:
-        # Outside managed systemd this is harmless, but a managed dispatch must
-        # never mint an untraceable worker.  Check topology through the shared
-        # helper first, using a placeholder suffix that cannot be launched.
+        # Outside managed systemd this is harmless, but a managed dispatch must never mint an untraceable
+        # worker.  Check topology through the shared helper first, using a placeholder suffix that cannot be launched.
         dispatch = restart_safe_gateway_child_argv(
             command,
             unit_suffix=f"kanban-{task.id}-run-missing",
@@ -2709,12 +2705,14 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
             )
         return command
 
-    return restart_safe_gateway_child_argv(
-        command,
-        unit_suffix=f"kanban-{task.id}-run-{task.current_run_id}",
-        require_restart_safe_scope=True,
-        outlives_parent=True,
-    ).argv
+    try:
+        return restart_safe_gateway_child_argv(
+            command, unit_suffix=f"kanban-{task.id}-run-{task.current_run_id}",
+            require_restart_safe_scope=True, outlives_parent=True,
+        ).argv
+    except RestartSafeScopeUnavailable as exc:
+        exc.kanban_refused_run = task.current_run_id
+        raise
 
 
 def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:

@@ -2413,7 +2413,7 @@ def release_stale_claims(
         _record_task_failure(
             conn, row["id"], f"stale_lock={row['claim_lock']}",
             outcome="reclaimed", failure_limit=failure_limit,
-            release_claim=False, end_run=False,
+            release_claim=False, end_run=False, run_id=run_id,
             event_payload_extra={"worker_pid": _opt_int(row["worker_pid"]), "retry_status": retry_status},
         )
         # Post-commit observer; every non-reclaim branch ``continue``d above.
