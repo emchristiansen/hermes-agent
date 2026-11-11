@@ -212,6 +212,7 @@ def test_kill_of_an_exited_session_reports_a_failed_scope_stop(monkeypatch):
     registry = ProcessRegistry()
     session = _session("proc_exited_scope_stuck", systemd_unit="hermes-worker-proc_exited_scope_stuck.scope")
     session.mark_exited(0)
+    session._finish_claimed = True  # finished as _move_to_finished leaves it: claimed once its receipt is written
     registry._finished[session.id] = session
     monkeypatch.setattr(module, "_stop_systemd_unit", lambda _unit: False)
 

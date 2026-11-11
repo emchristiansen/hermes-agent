@@ -1551,11 +1551,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         with self._lock:
             was_running = session.id in self._running
             if was_running:
-                session._finish_claimed = True
                 session.exited_at = time.time()
-                # Keep the session tracked until its result is durable. A finite
-                # parent must not observe completion and exit during this write.
+                # Tracked, and claimed (reported complete) only once the receipt write returns (disk failure: logged).
                 save_completed_result(session)
+                session._finish_claimed = True
                 self._running.pop(session.id)
             self._finished[session.id] = session
         # Release the retained Popen/PTY handles now: otherwise every
@@ -1645,11 +1644,12 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
 
     @staticmethod
     def _reader_finalizing(session: ProcessSession) -> bool:
-        """A reconcile saw the direct child exit and set ``exited``, but the reader that owns the
-        output is still on its final drain: the buffer is not the whole output yet, so nothing
-        may consume it as the completion."""
+        """No consumer may treat the exit as final: a final outcome (or a kill's claim) is recorded but its owner has not
+        yet written the receipt (``_move_to_finished`` claims after the write), or a reconcile saw the direct child
+        exit while the reader that owns the output is still on its final drain."""
         reader = session._reader_thread
-        if session._kills_in_flight and session.exited and not session._finish_claimed:  # a kill publishes it
+        if (session.exited and (session._outcome_final or session._kills_in_flight)
+                and not (session._finish_claimed or session._completion_event.is_set())):
             return True
         return (session._reader_finish_requested.is_set() and not session._completion_event.is_set()
                 and reader is not None and reader.is_alive())
