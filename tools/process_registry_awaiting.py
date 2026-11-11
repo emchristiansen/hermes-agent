@@ -97,6 +97,23 @@ def completion_settled(s) -> bool:
         return s.exited and not ProcessRegistry._reader_finalizing(s)
 
 
+def take_settled_exit(registry, s, timeout: float):
+    """``wait``'s terminal decision, its exit snapshot and its consumption of the completion, as one observation under
+    the session lock every exit writer holds (``mark_exited`` sets ``exited`` before the outcome it records, so an
+    unlocked read can see an exit without one). None: not settled, or a writer still held the lock after ``timeout``
+    seconds; the caller keeps waiting, still seeing interrupts and yields."""
+    from tools.process_registry import ProcessRegistry
+    if not s._lock.acquire(timeout=max(timeout, 0.0)):
+        return None
+    try:
+        if not s.exited or ProcessRegistry._reader_finalizing(s):
+            return None
+        registry._completion_consumed.add(s.id)
+        return ProcessRegistry._exit_snapshot(s, "exited")
+    finally:
+        s._lock.release()
+
+
 def _notifies(s) -> bool:
     return bool(s.notify_on_complete or (s.watch_patterns and not s._watch_disabled))
 

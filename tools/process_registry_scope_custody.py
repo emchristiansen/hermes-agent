@@ -228,8 +228,9 @@ class ProcessScopeCustodyMixin:
         stopped = _stop_systemd_unit(session.systemd_unit)
         session._scope_stop_pending = not stopped
         if session.exited and held != session._scope_stop_pending:
+            from tools.process_registry_awaiting import completion_settled
             from tools.process_registry_results import forget_result_scope, save_completed_result
-            if self._reader_finalizing(session):
+            if not completion_settled(session):
                 pass  # no receipt yet: the owner's publication persists the outcome with this custody
             elif stopped:
                 forget_result_scope(session.id)

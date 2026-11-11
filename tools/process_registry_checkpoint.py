@@ -46,12 +46,13 @@ class ProcessCheckpointMixin:
     def _checkpoint_snapshot(self, extra_entries, settled):
         """This registry's entries (running, or finished with its scope in custody) and the IDs it decides."""
         from tools.process_registry import _CHECKPOINT_FIELDS
+        from tools.process_registry_awaiting import completion_settled
         with self._lock:
             entries = []
             # A finished session stays while its scope is in custody (process_registry_scope_custody).
             for s in (*self._running.values(), *self._finished.values()):
                 # A settling exit (its outcome still being recorded) stays a running entry, scope and all.
-                outcome_settled = s.exited and not self._reader_finalizing(s)
+                outcome_settled = completion_settled(s)  # the session lock, taken inside the registry lock
                 custody = bool(outcome_settled and s._scope_stop_pending and s.systemd_unit)
                 if outcome_settled and not custody:
                     continue

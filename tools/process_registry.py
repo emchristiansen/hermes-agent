@@ -1044,11 +1044,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
 
     def _uncollected_gone(self, session: Optional[ProcessSession]) -> bool:
         """True when a detached entry was closed without a collected exit status
-        and the PID is no longer alive. List/poll must not report that as exited."""
-        return bool(
-            session is not None and session.exited and session.exit_code is None
-            and session.detached and session.pid_scope == "host"
-            and not self._is_host_pid_alive(session.pid))
+        and the PID is no longer alive. List/poll must not report that as exited. Read under the session lock: an
+        exit being recorded (``mark_exited``) is ``exited`` before it has its exit code."""
+        if session is None or not (session.detached and session.pid_scope == "host"):
+            return False
+        with session._lock:
+            closed = session.exited and session.exit_code is None
+        return closed and not self._is_host_pid_alive(session.pid)
 
     @staticmethod
     def _config_value(section: str, key: str, fallback):
@@ -2052,6 +2054,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         ``timeout`` defaults to (and is clamped by) TERMINAL_TIMEOUT. Returns a dict
         with status exited|timeout|interrupted|not_found|error and an output snapshot."""
         from tools.interrupt import consume_yield as _consume_yield, is_interrupted as _is_interrupted
+        from tools.process_registry_awaiting import take_settled_exit
 
         try:
             max_timeout = int(os.getenv("TERMINAL_TIMEOUT", "180"))
@@ -2075,15 +2078,12 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             if session is None:
                 return _not_found(session_id)
             self._reconcile_local_exit(session)  # orphaned-pipe reader guard
-            result = None
-            if session.exited and not self._reader_finalizing(session):
-                self._completion_consumed.add(session_id)
-                result = self._exit_snapshot(session, "exited")
-            elif _is_interrupted():
+            result = take_settled_exit(self, session, timeout=min(1.0, deadline - time.monotonic()))
+            if result is None and _is_interrupted():
                 result = {
                     "status": "interrupted", "command": session.command, "output": _output_tail(session, 1000),
                     "note": "User sent a new message -- wait interrupted"}
-            elif _consume_yield(threading.current_thread().ident):
+            elif result is None and _consume_yield(threading.current_thread().ident):
                 # A steer/redirect landed mid-turn: redirect() asks tool workers to YIELD so
                 # the user's message is delivered instead of parked behind this wait. The
                 # process is untouched and still notify-tracked; the model should read the
