@@ -5,10 +5,10 @@
 # list to mkPnpmDevShellHook, which stamps all package.jsons at once,
 # then runs a single `pnpm install --lockfile-only` if any changed and
 # `pnpm install --frozen-lockfile` if the lockfile changed.
-{ ... }:
+{ inputs, ... }:
 {
   perSystem =
-    { pkgs, lib, self', ... }:
+    { pkgs, lib, self', system, ... }:
     let
       packages = builtins.attrValues self'.packages;
       hermesNpmLib = self'.packages.default.passthru.hermesNpmLib;
@@ -19,11 +19,19 @@
       );
 
       hermesAgentDevShellHook = self'.packages.default.passthru.devShellHook;
+      # The Fenix input is immutable; stable at that revision is exactly 1.100.0.
+      rustToolchain = inputs.fenix.packages.${system}.stable.withComponents [
+        "cargo"
+        "rustc"
+        "rustfmt"
+        "clippy"
+      ];
     in
     {
       devShells.default = pkgs.mkShell {
         packages = with pkgs; [
           self'.packages.sandbox
+          rustToolchain
         ]
         # Wayland-only: cage and ghostty pull alsa-lib, which does not
         # evaluate on darwin.
@@ -41,6 +49,9 @@
           grim
         ]
         ++ self'.packages.default.passthru.devDeps;
+        # Environment policy also reaches Cargo children with a private CARGO_HOME.
+        CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE = "14 days";
+        CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE = "deny";
         shellHook = ''
           # The editable venv's .pth resolves the checkout through this.
           export HERMES_PYTHON_SRC_ROOT=$(git rev-parse --show-toplevel)

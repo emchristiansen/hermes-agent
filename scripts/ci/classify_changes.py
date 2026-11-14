@@ -223,8 +223,8 @@ _FIXTURE_CONSUMER_LANES = ("python", "rust", "frontend", "desktop_updater")
 # These live under ``apps/``, so before this lane existed a ``.rs`` edit matched
 # ``frontend`` and nothing more: the TypeScript matrix built, cargo never ran,
 # and the crate's unit tests had never executed in CI at all.
-_RUST_PATHS = ("apps/bootstrap-installer/src-tauri/",)
-_RUST_FILENAMES = {"Cargo.toml", "Cargo.lock"}
+_RUST_PATHS = ("apps/bootstrap-installer/src-tauri/", ".cargo/")
+_RUST_FILENAMES = {"Cargo.toml", "Cargo.lock", "rust-toolchain", "rust-toolchain.toml"}
 
 # The real SSH/Docker backend lane: the backends, the terminal tool that drives
 # them, the tests it runs, the sshd it starts, and the runner's env allowlist

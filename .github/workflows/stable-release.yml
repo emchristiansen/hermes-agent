@@ -421,10 +421,16 @@ jobs:
     needs: admit
     if: fromJSON(needs.admit.outputs.jobs)['bootstrap-version']
     runs-on: blacksmith-2vcpu-ubuntu-2404
+    env:
+      RUSTUP_TOOLCHAIN: '1.100.0'
+      CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE: '14 days'
+      CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: deny
     steps:
       - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
         with:
           ref: ${{ needs.admit.outputs.commit }}
+      - name: Select Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       - name: Stamp and verify the Cargo and Tauri release identity
         env:
           RELEASE_COMMIT: ${{ needs.admit.outputs.commit }}

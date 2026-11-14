@@ -25,6 +25,11 @@ on:
 permissions:
   contents: read
 
+env:
+  RUSTUP_TOOLCHAIN: '1.100.0'
+  CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE: '14 days'
+  CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: deny
+
 concurrency:
   group: rust-tests-${{ (github.ref_type == 'tag' || inputs.commit != '') && github.run_id || github.ref }}
   cancel-in-progress: ${{ github.ref_type != 'tag' && inputs.commit == '' }}
@@ -44,6 +49,9 @@ jobs:
       - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
         with:
           ref: ${{ inputs.commit }}
+
+      - name: Select Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
 
       # Tauri links against the system webkit2gtk on Linux, so the crate does
       # not compile without these even for `cargo test --lib`.

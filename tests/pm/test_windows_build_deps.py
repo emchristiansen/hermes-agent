@@ -130,11 +130,12 @@ function Initialize-HermesArm64BuildTools {
 
 
 @pytest.mark.parametrize("rust_homes", ["default", "explicit"])
-def test_initializer_preserves_rust_homes_and_shared_openssl_without_downloads(tmp_path, rust_homes):
+@pytest.mark.parametrize("rust_release", ["1.100.0", "1.98.0"])
+def test_initializer_preserves_rust_homes_and_shared_openssl_without_downloads(tmp_path, rust_homes, rust_release):
     """Real cmd.exe imports the SDK; the warm installer never acquires tools."""
     script = tmp_path / "initialize.ps1"
     script.write_text(r'''
-param([string]$Helper, [string]$Root, [string]$Homes)
+param([string]$Helper, [string]$Root, [string]$Homes, [string]$RustRelease)
 $ErrorActionPreference = 'Stop'
 . $Helper
 $vs = Join-Path $Root 'VS with spaces'
@@ -155,7 +156,7 @@ set "VSINSTALLDIR=$vs\"
 set "VCToolsInstallDir=$vs\VC\Tools\MSVC\14.44\"
 "@)
 $rustcPath = Join-Path $Root 'rustc.cmd'
-[IO.File]::WriteAllText($rustcPath, "@echo off`r`necho host: aarch64-pc-windows-msvc`r`n")
+[IO.File]::WriteAllText($rustcPath, "@echo off`r`necho host: aarch64-pc-windows-msvc`r`necho release: $RustRelease`r`n")
 $vcpkg = Join-Path $Root 'vcpkg checkout'
 $openssl = Join-Path $Root 'separate shared openssl'
 $prefix = Join-Path $openssl 'installed\arm64-windows-static-md'
@@ -177,7 +178,16 @@ function Get-Command {
         default { throw "Unexpected command discovery: $Name" }
     }
 }
-function Invoke-HermesBuildCommand { throw 'Unexpected installation' }
+$script:rustInstalls = 0
+function Invoke-HermesBuildCommand {
+    param([string]$Command, [string[]]$Arguments, [string]$Label)
+    if ($Command -ne (Join-Path $Root 'rustup.exe') -or
+        ($Arguments -join ' ') -ne 'toolchain install 1.100.0-aarch64-pc-windows-msvc --profile minimal') {
+        throw 'Unexpected installation'
+    }
+    $script:rustInstalls += 1
+    [IO.File]::WriteAllText($rustcPath, "@echo off`r`necho host: aarch64-pc-windows-msvc`r`necho release: 1.100.0`r`n")
+}
 function Invoke-WebRequest { throw 'Unexpected download' }
 Remove-Item Env:VCPKG_ROOT -ErrorAction SilentlyContinue
 Remove-Item Env:VCPKG_VISUAL_STUDIO_PATH -ErrorAction SilentlyContinue
@@ -201,7 +211,10 @@ Initialize-HermesArm64BuildTools -StateRoot $Root -OpenSSLRoot $openssl
 # The discovered instance is the one VsDevCmd used; vcpkg must not pick another.
 if ($env:VCPKG_VISUAL_STUDIO_PATH -ne $vs) { throw 'vcpkg was not pinned to the discovered Visual Studio' }
 if ($env:CARGO_HOME -ne $cargoHome -or $env:RUSTUP_HOME -ne $rustupHome) { throw 'Rust homes lost' }
-if ($env:RUSTUP_TOOLCHAIN -ne 'caller-selected-toolchain') { throw 'Caller Rust toolchain lost' }
+if ($env:RUSTUP_TOOLCHAIN -ne '1.100.0-aarch64-pc-windows-msvc') { throw 'Exact Rust toolchain not selected' }
+if ($script:rustInstalls -ne [int]($RustRelease -ne '1.100.0')) { throw 'Wrong Rust installation count' }
+if ($env:CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE -ne '14 days' -or
+    $env:CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE -ne 'deny') { throw 'Cargo registry policy lost' }
 if ($env:PATH -ne $expectedPath) { throw 'PATH lost or reordered' }
 if ($env:OPENSSL_DIR -ne $prefix -or $env:OPENSSL_STATIC -ne '1') { throw 'Wrong OpenSSL tree' }
 if ($env:INCLUDE -ne 'fixture SDK include' -or $env:LIB -ne 'fixture SDK lib') { throw 'SDK environment lost' }
@@ -242,7 +255,7 @@ try { Initialize-HermesArm64BuildTools -StateRoot $Root -OpenSSLRoot $openssl } 
 if (-not $failed) { throw 'Failed VS activation was accepted' }
 Write-Output 'PASS'
 ''', encoding="utf-8")
-    result = _powershell(script, HELPER, tmp_path, rust_homes)
+    result = _powershell(script, HELPER, tmp_path, rust_homes, rust_release)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "PASS" in result.stdout
 
