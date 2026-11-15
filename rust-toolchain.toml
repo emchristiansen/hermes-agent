@@ -1,0 +1,5 @@
+[toolchain]
+# Build compiler; apps/bootstrap-installer/src-tauri/Cargo.toml retains its MSRV.
+channel = "1.100.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

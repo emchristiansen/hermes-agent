@@ -240,6 +240,14 @@ CASES = {
         ["apps/bootstrap-installer/src-tauri/src/powershell.rs"],
         _lanes(frontend=True, bootstrap=True, rust=True),
     ),
+    "root Rust toolchain → rust": (
+        ["rust-toolchain.toml"],
+        _lanes(python=True, rust=True),
+    ),
+    "root Cargo policy → rust": (
+        [".cargo/config.toml"],
+        _lanes(python=True, rust=True),
+    ),
     "cargo lockfile → rust": (
         ["apps/bootstrap-installer/src-tauri/Cargo.lock"],
         _lanes(frontend=True, bootstrap=True, rust=True),

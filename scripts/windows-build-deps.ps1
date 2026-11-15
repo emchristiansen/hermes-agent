@@ -214,16 +214,20 @@ function Initialize-HermesArm64BuildTools {
         if ((Get-FileHash -Algorithm SHA256 $installer).Hash.ToLowerInvariant() -ne 'de9f7d29ccd39efa59a3dda3ec363b396e09b92681229b9b8f6aaa4c84285e9c') {
             throw 'rustup installer SHA256 mismatch'
         }
-        Invoke-HermesBuildCommand $installer @('-y', '--no-modify-path', '--profile', 'minimal', '--default-toolchain', '1.98.0-aarch64-pc-windows-msvc') 'Installing the Rust toolchain (1.98.0, ARM64) for those source builds'
+        Invoke-HermesBuildCommand $installer @('-y', '--no-modify-path', '--profile', 'minimal', '--default-toolchain', '1.100.0-aarch64-pc-windows-msvc') 'Installing the Rust toolchain (1.100.0, ARM64) for those source builds'
         $rustup = Get-Command rustup.exe -ErrorAction Stop
     }
     $rustc = Get-Command rustc.exe -ErrorAction SilentlyContinue
     $rustInfo = if ($rustc) { (& $rustc.Source -vV) -join "`n" } else { '' }
-    if ($rustInfo -notmatch 'host: aarch64-pc-windows-msvc') {
-        Invoke-HermesBuildCommand $rustup.Source @('toolchain', 'install', '1.98.0-aarch64-pc-windows-msvc', '--profile', 'minimal') 'Installing Rust 1.98.0 for ARM64'
-        $env:RUSTUP_TOOLCHAIN = '1.98.0-aarch64-pc-windows-msvc'
+    if ($rustInfo -notmatch 'host: aarch64-pc-windows-msvc' -or $rustInfo -notmatch '(?m)^release: 1\.100\.0\r?$') {
+        Invoke-HermesBuildCommand $rustup.Source @('toolchain', 'install', '1.100.0-aarch64-pc-windows-msvc', '--profile', 'minimal') 'Installing Rust 1.100.0 for ARM64'
     }
-    Write-HermesBuildNote 'ARM64 Rust toolchain ready'
+    # Native Python dependency builds use temporary source trees and isolated
+    # homes, so both the compiler selection and registry policy must travel.
+    $env:RUSTUP_TOOLCHAIN = '1.100.0-aarch64-pc-windows-msvc'
+    $env:CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE = '14 days'
+    $env:CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE = 'deny'
+    Write-HermesBuildNote 'ARM64 Rust 1.100.0 toolchain ready'
 
     $env:CC_aarch64_pc_windows_msvc = $clangPath
     Write-HermesBuildNote "ARM64 Rust C compiler: $clangPath"
