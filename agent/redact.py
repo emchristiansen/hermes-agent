@@ -16,6 +16,8 @@ from urllib.parse import unquote_plus
 # Shared with agent/file_safety's read-block list so the two defenses can't
 # drift: a blocked file_tools read that falls back to ``cat`` is still caught.
 from agent.file_safety import _BLOCKED_PROJECT_ENV_BASENAMES as _ENV_FILE_BASENAMES
+# E.164 phone numbers (the pattern lives there); signed quantities of the same shape are told apart there.
+from agent.redact_quantities import SIGNAL_PHONE_RE as _SIGNAL_PHONE_RE, non_phone_offsets
 from agent.redact_approval_display import sanitize_command_for_display  # re-exported: callers import it from agent.redact
 from agent.redact_command_segments import _command_segments
 from agent.redact_connstr import _KV_CONNSTR_GATE_RE, _redact_kv_connection_strings
@@ -753,10 +755,6 @@ _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_=-]{4,}){0,2}")
 # URL-safe base64 (43 characters); the 20-character floor leaves placeholders and code (``${token}``).
 _WEBAPP_LINK_CREDENTIAL_RE = re.compile(
     r"((?<![A-Za-z0-9_-])hermes-session=|/webapp/launch#(?:[^\s#]*?&)?ticket=)[A-Za-z0-9_-]{20,}")
-
-# E.164 phone numbers, 7-15 digits; the lookahead rejects hex strings / identifiers. A ``+`` glued
-# to a word or dot is a version suffix, not a phone: ``python-3.14.7+20260901-linux-x64`` (#142574).
-_SIGNAL_PHONE_RE = re.compile(r"(?<![0-9A-Za-z_.])(\+[1-9]\d{6,14})(?![A-Za-z0-9])")  # ASCII: CJK-glued numbers still mask
 
 # CDP-URL path: web URLs with a query string / with ``user:password@`` userinfo
 # (DB protocols are covered by _DB_CONNSTR_RE).
@@ -1643,7 +1641,8 @@ def redact_credential_shapes(text: str, *, force: bool = False, code_file: bool 
         text = _redact_form_body(text)
 
     if "+" in text and not keep_phone_numbers:  # opt-out: agent.redact_phone_policy
-        text = _SIGNAL_PHONE_RE.sub(_redact_phone, text)
+        kept = non_phone_offsets(text)
+        text = _SIGNAL_PHONE_RE.sub(lambda m: m.group(0) if m.start() in kept else _redact_phone(m), text)
 
     return text
 
