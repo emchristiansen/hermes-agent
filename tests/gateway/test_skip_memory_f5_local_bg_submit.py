@@ -131,7 +131,7 @@ async def test_a_messaging_origin_bg_is_unchanged(tmp_path, monkeypatch):
 
     built = []
     monkeypatch.setenv('GATEWAY_ALLOW_ALL_USERS', 'true')
-    runner, authority, db = await _local_runner(tmp_path, monkeypatch, built)
+    runner, _authority, db = await _local_runner(tmp_path, monkeypatch, built)
     adapter = AsyncMock()
     adapter.extract_media = MagicMock(side_effect=lambda text: ([], text))
     adapter.extract_images = MagicMock(side_effect=lambda text: ([], text))

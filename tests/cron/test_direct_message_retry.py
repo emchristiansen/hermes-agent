@@ -16,7 +16,11 @@ import pytest
 from cron import delivery_queue, executions, jobs, scheduler
 from gateway.config import Platform
 from gateway.platforms.base import SendResult
-from tests.cron.test_delivery_uncertain_retry import env
+from tests.cron import test_delivery_uncertain_retry as _uncertain_retry
+
+# The shared cron store fixture, registered under its own name (a bare import of a fixture that
+# test parameters then name is a redefinition of an unused import, ruff F811).
+env = _uncertain_retry.env
 
 _REAL_RUN_JOB = scheduler.run_job
 

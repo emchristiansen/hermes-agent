@@ -111,21 +111,18 @@ async def test_claim_refuses_unproven_or_still_authorized_work(tmp_path, monkeyp
     try:
         old = _reserve(first, claimed, child, state='running')
         second = await _owner(runner, 'owner-2')
-        def corrupt_or_active(conn):
-            if blocker == 'orphan':
-                conn.execute('UPDATE worker_executions SET execution_id=? WHERE execution_id=?',
-                             ('unlinked-orphan', old['execution_id']))
-            elif blocker == 'foreign-link':
-                from gateway.session_worker_reservation import _OWNER_KEY
-                conn.execute('UPDATE state_meta SET value=? WHERE key=?',
-                             (json.dumps('another-admission'), _OWNER_KEY + old['execution_id']))
-            elif blocker == 'current-epoch':
-                conn.execute('UPDATE worker_executions SET owner_epoch=?', (second.epoch,))
-            elif blocker == 'running':
-                conn.execute("UPDATE worker_executions SET status='running'")
-            else:
-                conn.execute("UPDATE session_admissions SET status='started',owner_epoch=? WHERE admission_id=?",
-                             (second.epoch, claimed['admission_id']))
+        from gateway.session_worker_reservation import _OWNER_KEY
+        corrupt_or_active = {
+            'orphan': lambda conn: conn.execute('UPDATE worker_executions SET execution_id=? WHERE execution_id=?',
+                                                ('unlinked-orphan', old['execution_id'])),
+            'foreign-link': lambda conn: conn.execute('UPDATE state_meta SET value=? WHERE key=?',
+                                                      (json.dumps('another-admission'), _OWNER_KEY + old['execution_id'])),
+            'current-epoch': lambda conn: conn.execute('UPDATE worker_executions SET owner_epoch=?', (second.epoch,)),
+            'running': lambda conn: conn.execute("UPDATE worker_executions SET status='running'"),
+            'started': lambda conn: conn.execute(
+                "UPDATE session_admissions SET status='started',owner_epoch=? WHERE admission_id=?",
+                (second.epoch, claimed['admission_id'])),
+        }[blocker]
         second.db._execute_write(corrupt_or_active)
         before = _statuses(second.db)
         try:

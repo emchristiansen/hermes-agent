@@ -220,18 +220,21 @@ async def test_fallback_does_not_widen_existing_claim_result_or_unknown_fences(t
     try:
         row = claim_session_input(db, epoch=first.epoch, session_id='s')
         first.pending_results[ids[0]] = {'result': {'interrupted': True, 'interrupt_message': 'Gateway shutting down'}}
-        if fence == 'epoch':
-            begin_runtime_epoch(db, instance_id='moved-owner')
-        elif fence == 'generation':
-            row = dict(row, generation=row['generation'] + 1)
-        elif fence == 'terminal':
-            settle_session_input(db, epoch=first.epoch, admission_id=ids[0], generation=row['generation'],
-                                 outcome='completed', result={'result': {'final_response': 'COMMITTED'}})
-        elif fence == 'already-unknown':
-            db._execute_write(lambda conn: conn.execute(
-                "UPDATE session_admissions SET status='unknown' WHERE admission_id=?", (ids[0],)))
-        else:
+        def completed_result():
             first.pending_results[ids[0]] = {'result': {'completed': True, 'final_response': 'FINISHED'}}
+
+        {
+            'epoch': lambda: begin_runtime_epoch(db, instance_id='moved-owner'),
+            'generation': lambda: None,  # the row presented below names a later generation
+            'terminal': lambda: settle_session_input(db, epoch=first.epoch, admission_id=ids[0],
+                                                     generation=row['generation'], outcome='completed',
+                                                     result={'result': {'final_response': 'COMMITTED'}}),
+            'already-unknown': lambda: db._execute_write(lambda conn: conn.execute(
+                "UPDATE session_admissions SET status='unknown' WHERE admission_id=?", (ids[0],))),
+            'completed-result': completed_result,
+        }[fence]()
+        if fence == 'generation':
+            row = dict(row, generation=row['generation'] + 1)
         if fence in ('epoch', 'generation'):
             with pytest.raises(RuntimeStoreError, match='stale_' + fence):
                 await recovery.recover_failed_settlement(first, row)

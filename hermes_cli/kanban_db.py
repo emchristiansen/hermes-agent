@@ -20,7 +20,6 @@ import os
 import re
 import secrets
 import sqlite3
-import stat
 import subprocess
 import sys
 import logging
@@ -32,6 +31,15 @@ from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
+from hermes_cli.kanban_attachments.copies import (
+    KANBAN_ATTACHMENT_MAX_BYTES,
+    ArtifactPreservationError,
+    VettedArtifact,
+    _copy_capped,
+    _copy_vetted_artifact,
+    _discard_staged_copies,
+    _unique_attachment_path,
+)
 from hermes_cli import kanban_db_retry_policy as _retry_policy
 from toolsets import get_toolset_names
 from utils import unlink_files_older_than
@@ -136,7 +144,6 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
 
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
-KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024  # one cap for dashboard, tools and CLI
 
 
 def _assert_not_delegated_child_mutation(path: str | Path | None = None) -> None:
@@ -2600,10 +2607,6 @@ class EmptyCompletionError(ValueError):
         )
 
 
-class ArtifactPreservationError(RuntimeError):
-    """Raised when a declared scratch deliverable cannot be preserved."""
-
-
 class LiveClaimError(ValueError):
     """``complete_task`` refused: the task is ``running`` under a live claim and
     the caller neither owns its run (``expected_run_id``) nor passed ``force``.
@@ -2915,32 +2918,6 @@ def _merge_completion_prose_artifacts(
     return updated
 
 
-@dataclass(frozen=True)
-class VettedArtifact:
-    """A declared completion artifact outside managed scratch that the caller's file-sending
-    policy allowed (``tools.kanban_tools``), bound to the file object it vetted.
-
-    ``path`` is the resolved host path; ``device``/``inode`` identify the regular file found there
-    when it was vetted. :func:`_copy_vetted_artifact` copies only that same object, so a path
-    swapped after vetting is refused rather than read."""
-
-    path: Path
-    device: int
-    inode: int
-
-    @classmethod
-    def bind(cls, resolved: str) -> VettedArtifact:
-        """Bind the regular file now at ``resolved`` (an already symlink-resolved path); raises
-        :class:`ArtifactPreservationError` if it is not one."""
-        try:
-            st = os.stat(resolved, follow_symlinks=False)
-        except OSError as exc:
-            raise ArtifactPreservationError(f"declared artifact {resolved} cannot be read: {exc}") from exc
-        if not stat.S_ISREG(st.st_mode):
-            raise ArtifactPreservationError(f"declared artifact is not a regular file: {resolved}")
-        return cls(Path(resolved), st.st_dev, st.st_ino)
-
-
 def external_completion_artifacts(conn: sqlite3.Connection, task_id: str, metadata: Any) -> list[str]:
     """Declared ``metadata["artifacts"]`` entries a handoff can only keep by copying them from
     outside the task's managed scratch workspace: neither inside that workspace (staged here
@@ -3082,55 +3059,6 @@ _UNATTACHED_REASON = (
 )
 
 
-def _copy_vetted_artifact(vetted: VettedArtifact, dest: Path, artifact: str) -> None:
-    """Copy exactly the file object ``vetted`` bound: opened without following a final symlink,
-    and refused unless it is still that regular file (same device and inode) within the cap."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
-    try:
-        fd = os.open(vetted.path, flags)
-    except OSError as exc:
-        raise ArtifactPreservationError(f"declared artifact {artifact} cannot be opened: {exc}") from exc
-    with os.fdopen(fd, "rb") as source_file:
-        st = os.fstat(source_file.fileno())
-        if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != (vetted.device, vetted.inode):
-            raise ArtifactPreservationError(
-                f"declared artifact {artifact} changed after it was checked; nothing was copied")
-        if st.st_size > KANBAN_ATTACHMENT_MAX_BYTES:
-            raise ArtifactPreservationError(
-                f"declared artifact exceeds the {KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}")
-        with dest.open("xb") as destination_file:
-            copied = 0
-            while chunk := source_file.read(1024 * 1024):
-                copied += len(chunk)
-                if copied > KANBAN_ATTACHMENT_MAX_BYTES:
-                    raise ArtifactPreservationError(
-                        f"declared artifact grew beyond the size limit: {artifact}")
-                destination_file.write(chunk)
-
-
-def _discard_staged_copies(copies: Iterable[Path], attachment_dir: Path) -> None:
-    """Remove staged attachment copies whose DB rows never committed; a leaked
-    copy would make the retry stage ``name_1.ext`` next to an orphan."""
-    for copied in copies:
-        with contextlib.suppress(OSError):
-            Path(copied).unlink(missing_ok=True)
-    with contextlib.suppress(OSError):
-        attachment_dir.rmdir()
-
-
-def _copy_capped(src: Path, dest: Path, artifact: str) -> None:
-    """Chunked copy that aborts if the file grows past the attachment cap mid-copy."""
-    with src.open("rb") as source_file, dest.open("xb") as destination_file:
-        copied = 0
-        while chunk := source_file.read(1024 * 1024):
-            copied += len(chunk)
-            if copied > KANBAN_ATTACHMENT_MAX_BYTES:
-                raise ArtifactPreservationError(
-                    f"declared scratch artifact grew beyond the size limit: {artifact}"
-                )
-            destination_file.write(chunk)
-
-
 def _insert_completion_attachment(
     conn: sqlite3.Connection, task_id: str, *, filename: str, stored_path: str, size: int,
     created_at: int, uploaded_by: str = "kanban_complete",
@@ -3143,18 +3071,6 @@ def _insert_completion_attachment(
         (task_id, filename, stored_path, size, uploaded_by, created_at),
     )
     _append_event(conn, task_id, "attached", {"filename": filename, "size": size, "by": uploaded_by})
-
-
-def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> Path:
-    """Return a non-conflicting path under ``directory`` for ``filename``."""
-    safe_name = Path(filename).name or "artifact"
-    stem, suffix = Path(safe_name).stem or "artifact", Path(safe_name).suffix
-    candidate = directory / safe_name
-    idx = 1
-    while candidate in used or candidate.exists():
-        candidate = directory / f"{stem}_{idx}{suffix}"
-        idx += 1
-    return candidate
 
 
 @_retry_policy.guarded_edit(lambda: (write_txn, _append_event, notify_task_updated))
