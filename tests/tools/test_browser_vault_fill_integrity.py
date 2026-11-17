@@ -453,3 +453,26 @@ def test_cli_without_an_actual_password_field_resolves_nothing_and_leaves_no_sta
     assert _evaluate(browser.page, "document.querySelectorAll('[data-hermes-vault-slot]').length") == 0
     assert _evaluate(browser.page, "document.getElementById('p').value") == ""
 
+
+
+@_integration
+def test_cli_fills_an_empty_password_field_inside_an_open_shadow_root(browser, store, capsys):
+    """The exact-target fill keeps this tree's shadow-root reach: the inspection, the emptiness gate, the
+    recheck after focus and the stamp cleanup all see a password control rendered inside an open shadow
+    root, and the composed input event reaches a listener on its host."""
+    _evaluate(browser.page, "document.getElementById('p').remove();const h=document.createElement('div');h.id='host';"
+                            "document.querySelector('form').appendChild(h);const r=h.attachShadow({mode:'open'});"
+                            "r.innerHTML='<input id=\"sp\" type=\"password\" autocomplete=\"current-password\">';"
+                            "window.hostInputs=0;h.addEventListener('input',function(){window.hostInputs++})")
+    shadow = "document.getElementById('host').shadowRoot"
+    code, out, _ = _cli_fill(browser, store, "shadow-value-5", capsys)
+    assert code == 0 and out["success"] is True and out["filled_fields"] == 1
+    assert _evaluate(browser.page, f"{shadow}.getElementById('sp').value") == "shadow-value-5"
+    assert _evaluate(browser.page, "window.hostInputs") == 1
+    assert _evaluate(browser.page, f"{shadow}.querySelectorAll('[data-hermes-vault-slot]').length") == 0
+    assert _evaluate(browser.page, "window.submits") == 0
+    _evaluate(browser.page, f"{shadow}.getElementById('sp').value='HUMAN-shadow-value'")
+    code, out, resolved = _cli_fill(browser, store, "shadow-value-6", capsys)
+    assert code == 1 and out["error_type"] == "field_not_empty" and resolved == []
+    assert _evaluate(browser.page, f"{shadow}.getElementById('sp').value") == "HUMAN-shadow-value"
+    assert _evaluate(browser.page, f"{shadow}.querySelectorAll('[data-hermes-vault-slot]').length") == 0
