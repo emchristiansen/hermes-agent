@@ -384,8 +384,19 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
 })()"""
 
 
+# The fill script's page-clock budget: a script that first runs, or reaches its write, more than this long
+# after the anchor read just before it was sent (``performance.now()`` of the same document, same
+# ``performance.timeOrigin``) writes nothing. A dialog, debugger pause or long script that blocks the
+# renderer queues the script; once the page is free again it can no longer write. It must be strictly
+# shorter than the caller's wait for the script's reply (tools.browser_vault_tool asserts the margin).
+FILL_PAGE_BUDGET_S = 3.0
+
+# The non-secret page-clock read sent just before a fill script: its answer is the script's anchor.
+PAGE_CLOCK_JS = "JSON.stringify({timeOrigin: performance.timeOrigin, now: performance.now()})"
+
+
 def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str = "", *,
-                  require_empty: bool = False) -> str:
+                  require_empty: bool = False, anchor: Optional[dict[str, float]] = None) -> str:
     """Build a JS expression that fills the selected controls and reports only a count. The
     returned expression never echoes the values back.
 
@@ -416,11 +427,25 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
     is still connected and never left the tree, checked after the rollback and again after the cleanup) and
     ``cleared`` (``intact`` and the field is empty at that point; a page may put a value back or replace the
     field).
-    Neither refusal is ever reported as filled. Values are rendered by :func:`_render_js`, so they reach the
-    page unchanged whatever they contain.
+    Neither refusal is ever reported as filled.
+
+    A ``current-password`` write counts as filled only if, at the very end (after the write's notifications
+    and the stamp cleanup's own callbacks), the original node is intact (the same registered node, never left
+    the tree since inspection, connected, still ``type=password``) and holds exactly the stored value;
+    otherwise the script refuses with ``not_established`` (the page removed, replaced, moved or changed the
+    field). The result object is built last: no claim about the field is computed before any of the
+    script's own DOM mutations that can run page code.
+
+    With ``anchor`` (``{"timeOrigin", "now"}`` from :data:`PAGE_CLOCK_JS` read just before sending), the
+    script refuses with ``expired`` (``written``: how many fields were already written) when the page's
+    ``performance.timeOrigin`` differs or more than :data:`FILL_PAGE_BUDGET_S` has passed on the page's
+    clock, checked when it starts and again as the last gate immediately before each write. Values are
+    rendered by :func:`_render_js`, so they reach the page unchanged whatever they contain.
     """
     return _render_js(
         _FILL_JS_TEMPLATE,
+        anchor=anchor,
+        budget_ms=FILL_PAGE_BUDGET_S * 1000.0,
         expected_origin=expected_origin,
         fills=[{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"]} for f in fills],
         nonce=nonce,
@@ -433,6 +458,12 @@ _FILL_JS_TEMPLATE = """(() => {
   const fills = __FILLS__;
   const nonce = __NONCE__;
   const requireEmpty = __REQUIRE_EMPTY__;
+  const anchor = __ANCHOR__;
+  const budgetMs = __BUDGET_MS__;
+  // Past the page-clock budget (or in another document) the script writes nothing: a script queued behind a
+  // dialog or a paused renderer cannot write once the page is free again.
+  const late = () => anchor !== null && (performance.timeOrigin !== anchor.timeOrigin
+    || !(performance.now() - anchor.now <= budgetMs));
   // The native accessors, so a value is read and written without page-defined element properties.
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
   const current = (el) => String((el.tagName !== "SELECT" && setter && setter.get) ? setter.get.call(el) : (el.value || ""));
@@ -444,21 +475,23 @@ _FILL_JS_TEMPLATE = """(() => {
     registry.note(registry.observer.takeRecords());
     return registry.nodes.get(f.index) === el && !registry.left.has(f.index) && el.isConnected;
   };
-  // A value_mismatch's report waits for the cleanup: no emptiness claim is computed before our own DOM
-  // mutations (events, stamp removal) that can run page code.
+  // The report waits for the cleanup: no claim about a field is computed before our own DOM mutations
+  // (events, stamp removal) that can run page code. ``written``: password writes that landed exactly.
   let mismatch = null;
+  const written = [];
+  let filled = 0;
   let early;
   try { early = (() => {
     if (window.location.origin !== expectedOrigin) {
       return JSON.stringify({ refused: "origin_changed", found: window.location.origin });
     }
+    if (late()) return JSON.stringify({ refused: "expired", written: 0 });
     if (requireEmpty && fills.some((f) => {
       const el = slotOf(f);
       return el && current(el).length > 0;
     })) {
       return JSON.stringify({ refused: "field_not_empty" });
     }
-    let filled = 0;
     const norm = (t) => String(t || "").trim().toLowerCase();
     for (const f of fills) {
       const el = slotOf(f);
@@ -468,6 +501,7 @@ _FILL_JS_TEMPLATE = """(() => {
         if (el.tagName === "SELECT") {
           const want = norm(f.value);
           const opt = Array.from(el.options).find((o) => [o.value, o.textContent].some((t) => norm(t) === want || norm(t) === want.replace(/^0/, "")));
+          if (opt && late()) return JSON.stringify({ refused: "expired", written: filled });
           if (opt) { el.value = opt.value; el.dispatchEvent(new Event("change", { bubbles: true, composed: true })); filled += 1; }
           continue;
         }
@@ -482,6 +516,8 @@ _FILL_JS_TEMPLATE = """(() => {
           continue;
         }
         if (requireEmpty && current(el).length > 0) return JSON.stringify({ refused: "field_not_empty" });
+        // The last gate before the write: still within the page-clock budget.
+        if (late()) return JSON.stringify({ refused: "expired", written: filled });
         // one-time-code split into single-character boxes: f.value is the slice for THIS box (see build_otp_fills)
         if (setter && setter.set) { setter.set.call(el, f.value); } else { el.value = f.value; }
         // composed: a component listening on its shadow host must see the value change too.
@@ -498,20 +534,30 @@ _FILL_JS_TEMPLATE = """(() => {
           mismatch = { f, el, intact: original(f, el) };
           return null;
         }
-        if (current(el).length > 0) filled += 1;
+        if (current(el).length > 0) {
+          filled += 1;
+          // Final identity and value are re-checked after the cleanup (below the finally).
+          if (f.token === "current-password") written.push({ f, el, intact: original(f, el) });
+        }
       } catch (e) { /* skip */ }
     }
     return JSON.stringify({ filled });
   })(); } finally {
     retireInspection(nonce);
   }
-  if (!mismatch) return early;
-  // Built last: the original is the field only if it was intact after the rollback and, after the cleanup's
-  // own callbacks, is still the registered node, never left the tree and connected; cleared only if it is
-  // also empty now.
-  const intact = mismatch.intact && registry.nodes.get(mismatch.f.index) === mismatch.el
-    && !registry.left.has(mismatch.f.index) && mismatch.el.isConnected;
-  return JSON.stringify({ refused: "value_mismatch", intact, cleared: intact && current(mismatch.el).length === 0 });
+  // Built last. The original is the field only if it was intact when last checked and, after the cleanup's
+  // own callbacks, is still the registered node, never left the tree, connected and a password control.
+  const holds = (w) => w.intact && registry.nodes.get(w.f.index) === w.el && !registry.left.has(w.f.index)
+    && w.el.isConnected && w.el.type === "password";
+  if (mismatch) {
+    const intact = holds(mismatch);
+    return JSON.stringify({ refused: "value_mismatch", intact, cleared: intact && current(mismatch.el).length === 0 });
+  }
+  // A password write counts as filled only while the original still holds exactly the stored value.
+  if (written.some((w) => !(holds(w) && current(w.el) === w.f.value))) {
+    return JSON.stringify({ refused: "not_established" });
+  }
+  return early;
   // Declared last (hoisted) so the origin check precedes every DOM lookup. Stamped controls may live
   // inside a shadow root (see the inspection script's walk): look in the document and every open
   // shadow root, walked afresh on each call since focus listeners may have changed the tree.

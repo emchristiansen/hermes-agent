@@ -11,7 +11,7 @@ from unittest.mock import patch
 import pytest
 
 from agent.vault_backends.local import LocalLoginBackend
-from agent.vault_login_classifier import build_fill_js
+from agent.vault_login_classifier import PAGE_CLOCK_JS, build_fill_js
 from agent.vault_store import VaultStore, normalize_origin
 
 _PASSWORD = "dummy-password-9"
@@ -34,7 +34,9 @@ class _Page:
     def focus_page(self, origin, accept=None):
         return {"ok": origin == _ORIGIN, "url": _ORIGIN + "/login"}
 
-    def evaluate_runtime(self, expression):
+    def evaluate_runtime(self, expression, **_):
+        if expression == PAGE_CLOCK_JS:  # the page-clock read before the fill script
+            return {"ok": True, "result": json.dumps({"timeOrigin": 1.0, "now": 0.0})}
         if expression.strip() == "window.location.href":
             return {"ok": True, "result": _ORIGIN + "/login"}
         if "expectedOrigin" in expression:

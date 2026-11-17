@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from agent.browser_page_backend import BrowserPageBackend
+from agent.vault_login_classifier import PAGE_CLOCK_JS
 from agent.vault_store import VaultStore
 
 SECRET = "s3cret-pw"
@@ -32,6 +33,8 @@ class FakePage(BrowserPageBackend):
             raise RuntimeError(f"page.evaluate failed: {expression}")
         if "location.href" in expression:
             return self.url
+        if expression == PAGE_CLOCK_JS:
+            return json.dumps({"timeOrigin": 1.0, "now": 0.0})
         if SECRET in expression:
             return json.dumps({"filled": 1})
         return json.dumps(CONTROLS)

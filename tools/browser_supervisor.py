@@ -68,6 +68,11 @@ def _schedule(coro, loop, *, timeout: float):
     return fut.result(timeout=timeout)
 
 
+# How long ``evaluate_runtime`` waits for a page's reply by default. A vault fill script carries a page-clock
+# budget strictly shorter than this (agent.vault_login_classifier.FILL_PAGE_BUDGET_S).
+EVAL_REPLY_WAIT_S = 10.0
+
+
 def _fail(error: str) -> dict[str, Any]:
     return {"ok": False, "error": error}
 
@@ -134,6 +139,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         # State protected by ``_state_lock`` for cross-thread reads.
         self._state_lock = threading.Lock()
         self._pending_dialogs: dict[str, PendingDialog] = {}
+        # Native dialogs open per page session, recorded passively (``open_dialog``), bridge or not.
+        self._open_native_dialogs: dict[str, dict[str, Any]] = {}
         self._recent_dialogs: list[DialogRecord] = []
         self._frames: dict[str, FrameInfo] = {}
         self._active = False
@@ -172,7 +179,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             self.stop()
             # ``err`` is a raw ``websockets`` exception embedding the full cdp_url (token /
             # userinfo): re-raise redacted, ``from None`` so the traceback chain leaks nothing.
-            raise RuntimeError(f"CDP supervisor failed to start: {_redact_cdp_error_text(err)}") from None
+            detail = _redact_cdp_error_text(err) or type(err).__name__  # a bare TimeoutError has no text
+            raise RuntimeError(f"CDP supervisor failed to start: {detail}") from None
 
     def stop(self, timeout: float = 5.0) -> None:
         """Cancel the supervisor task and join the thread."""
@@ -234,7 +242,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         return {"ok": True, "dialog": dialog.to_dict()}
 
     def evaluate_runtime(self, expression: str, *, return_by_value: bool = True,
-                         await_promise: bool = True, timeout: float = 10.0) -> dict[str, Any]:
+                         await_promise: bool = True, timeout: float = EVAL_REPLY_WAIT_S) -> dict[str, Any]:
         """Evaluate ``expression`` in the page's Runtime context over the live WS.
         Returns ``{"ok": True, "result", "result_type"}`` or ``{"ok": False, "error"}``.
         ``return_by_value=True`` JSON-serializes the result (DevTools-console

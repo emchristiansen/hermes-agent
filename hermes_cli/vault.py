@@ -291,7 +291,10 @@ def _cmd_fill(args) -> None:
     try:
         SUPERVISOR_REGISTRY.get_or_start(task_id, cdp_url, attach_target_id=args.target_id, dialog_bridge=False)
     except (RuntimeError, TimeoutError, ValueError) as exc:  # the attach failures get_or_start raises; nothing was filled
-        _finish({"success": False, "error_type": "attach_failed", "error": str(exc)})
+        blocked = ("; the tab did not answer in time (a JavaScript dialog, a debugger pause or a long-running script "
+                   "can block it)") if "timeout" in str(exc).lower() else ""
+        _finish({"success": False, "error_type": "attach_failed",
+                 "error": f"Could not attach to the tab: {exc}{blocked}. Nothing was resolved, sent or written."})
     try:
         with supervisor_only():
             raw = _fenced_page_op(task_id, lambda: browser_vault_fill(args.handle, task_id, require_empty=True,

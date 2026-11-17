@@ -143,13 +143,17 @@ class _Page:
     def focus_page(self, origin, accept=None):
         return {"ok": origin == _ORIGIN, "url": _ORIGIN + "/login"}
 
-    def evaluate_runtime(self, expression):
+    def evaluate_runtime(self, expression, **_):
+        from agent.vault_login_classifier import PAGE_CLOCK_JS
+
+        if expression == PAGE_CLOCK_JS:  # the page-clock read before the fill script
+            return {"ok": True, "result": json.dumps({"timeOrigin": 1.0, "now": 0.0})}
         if expression.strip() == "window.location.href":
             return {"ok": True, "result": _ORIGIN + "/login"}
         if "expectedOrigin" in expression:
             self.writes.append(expression)
             return {"ok": True, "result": json.dumps(self.fill_result)}
-        if "const prefix = " in expression:
+        if "return retireInspection(" in expression:
             self.cleared.append(expression)
             return {"ok": True, "result": 0}
         self.inspections.append(expression)
@@ -557,13 +561,19 @@ _REGISTRIES = "Object.getOwnPropertyNames(window).filter(x=>x.startsWith('hermes
 @_integration
 def test_stamp_cleanup_survives_transient_input_detachment(browser, store, capsys):
     """The page's input listener detaches the filled field and queues its reinsertion: the fill script's
-    cleanup runs while the field is detached, and must still remove this inspection's stamp from it."""
+    cleanup runs while the field is detached, and must still remove this inspection's stamp from it.
+
+    Deliberate behaviour change (Fable FA-1): this used to report success. The field left the page between
+    the write and the script's return, so it is not the intact inspected field; even though the microtask
+    puts it back holding the value, the fill is reported as not established (no Submit hint)."""
     _evaluate(browser.page, "document.getElementById('p').addEventListener('input',function(){const p=this;"
                             "const parent=p.parentNode;p.remove();queueMicrotask(()=>parent.appendChild(p))},{once:true})")
     code, out, _ = _cli_fill(browser, store, "DETACHED-SECRET", capsys)
     actual = _state(browser)
-    assert code == 0 and out["success"]
+    assert code == 1 and out["success"] is False and out["error_type"] == "not_established", out
+    assert "next" not in out and "DETACHED-SECRET" not in json.dumps(out)
     assert actual["slots"] == 0, actual
+    assert actual["pw"] == "DETACHED-SECRET"  # back in the page, but left it in between: not established
     assert _evaluate(browser.page, f"{_REGISTRIES}.length") == 0
 
 
@@ -580,7 +590,7 @@ def test_cleanup_retains_detached_node_reference(browser, mode):
         out = json.loads(_evaluate(browser.page, build_fill_js(
             [{"index": 1, "token": "current-password", "value": "DETACHED-SECRET"}], browser.origin, nonce,
             require_empty=True)))
-        assert out == {"filled": 1}, out
+        assert out == {"refused": "not_established"}, out  # FA-1: the field left the page (was {"filled": 1})
     else:
         _evaluate(browser.page, "window.old=document.getElementById('p');old.remove()")
         _evaluate(browser.page, build_clear_stamps_js(nonce))
@@ -707,7 +717,7 @@ def test_rollback_change_replacing_original_with_an_empty_clone_is_still_not_est
 # marked extra assertions on the exact report. A customized built-in input observing the stamp attribute runs
 # page code synchronously when the cleanup removes the stamp, after the rollback's notifications.
 
-from tools.browser_vault_tool import _fill_outcome  # noqa: E402
+from tools.browser_vault_tool import _fill_outcome
 
 
 @_integration
@@ -778,3 +788,387 @@ def test_cli_finally_cleanup_report(browser,store,capsys,mutation):
     # Maintained addition: the tool's wording matches the report built after cleanup.
     assert ('the field is not empty' if mutation=='refill' else 'not established') in out['error'], out
     assert 'REVIEW-CLEANUP' not in json.dumps(out)
+
+
+# ── a password counts as filled only while the intact original holds the exact value (Fable FA-1) ──────────
+
+_FRESH_FIELD = ("const n=document.createElement('input');n.type='password';n.id='p';"
+                "n.setAttribute('autocomplete','current-password');")
+_STAMPS_ANYWHERE = ("(function w(r){let n=0;for(const e of r.querySelectorAll('*')){"
+                    "if(e.hasAttribute('data-hermes-vault-slot'))n++;if(e.shadowRoot)n+=w(e.shadowRoot)}return n})(document)")
+
+
+@_integration
+@pytest.mark.parametrize("listener, page_field", [
+    ("old.addEventListener('input',function(){" + _FRESH_FIELD + "this.replaceWith(n)},{once:true})", ""),
+    ("old.addEventListener('change',function(){" + _FRESH_FIELD + "this.replaceWith(n)},{once:true})", ""),
+    ("old.addEventListener('input',function(){this.remove()},{once:true})", None),
+    ("old.addEventListener('change',function(){" + _FRESH_FIELD + "n.value='PAGE-OTHER';this.replaceWith(n)},{once:true})",
+     "PAGE-OTHER"),
+    ("old.addEventListener('change',function(){this.type='text'},{once:true})", None),
+    ("void 0", "FA1-vault-value"),
+], ids=["input-replaces-with-empty", "change-replaces-with-empty", "input-removes-for-good",
+        "change-replaces-with-other-value", "change-turns-into-text", "control-no-listener"])
+def test_success_counts_only_an_intact_field_holding_the_value(browser, store, capsys, listener, page_field):
+    """Fable FA-1, through the real `hermes vault fill`: a write-time listener that replaces, removes or
+    retypes the original leaves the fill not established (no success, no Submit hint); the control fills."""
+    _evaluate(browser.page, "window.old=document.getElementById('p');old.value='';" + listener)
+    code, out, resolved = _cli_fill(browser, store, "FA1-vault-value", capsys)
+    assert len(resolved) == 1 and "FA1-vault-value" not in json.dumps(out), out
+    page = json.loads(_evaluate(browser.page, "JSON.stringify({pw:(document.querySelector('input[type=password]')||{value:null}).value,"
+                                              f"stamps:{_STAMPS_ANYWHERE},registries:{_REGISTRIES}.length,submits:window.submits}})"))
+    if listener == "void 0":
+        assert code == 0 and out["success"] is True and out["filled_fields"] == 1 and "next" in out, out
+    else:
+        assert code == 1 and out["success"] is False and out["error_type"] == "not_established", out
+        assert "next" not in out and "not established" in out["error"], out
+    assert page["pw"] == page_field and page["stamps"] == 0 and page["registries"] == 0 and page["submits"] == 0, page
+
+
+# ── a fill script cannot write late: page-clock budget and passive dialog awareness (Fable FA-2) ───────────
+
+def test_the_page_budget_is_strictly_shorter_than_the_reply_wait():
+    """The script's page-clock budget ends well before the command stops waiting for its reply, so a script
+    that would write after the command has given up (a dialog, a paused renderer) is always past its budget."""
+    from agent.vault_login_classifier import FILL_PAGE_BUDGET_S
+    from tools.browser_supervisor import EVAL_REPLY_WAIT_S
+    from tools.browser_vault_tool import _PAGE_CLOCK_WAIT_S
+
+    assert FILL_PAGE_BUDGET_S + 2.0 <= EVAL_REPLY_WAIT_S
+    assert _PAGE_CLOCK_WAIT_S < EVAL_REPLY_WAIT_S
+    import inspect
+
+    from tools.browser_supervisor import CDPSupervisor
+    assert inspect.signature(CDPSupervisor.evaluate_runtime).parameters["timeout"].default == EVAL_REPLY_WAIT_S
+
+
+def test_the_budget_is_the_last_gate_before_the_write():
+    from agent.vault_login_classifier import FILL_PAGE_BUDGET_S
+
+    anchor = {"timeOrigin": 1700000000123.25, "now": 4321.5}
+    js = build_fill_js([{"index": 0, "token": "current-password", "value": "v"}], "https://m.example", "n",
+                       require_empty=True, anchor=anchor)
+    assert f"const anchor = {json.dumps(anchor)};" in js and f"const budgetMs = {FILL_PAGE_BUDGET_S * 1000.0};" in js
+    focus, write = js.index("el.focus();"), js.index("setter.set.call(el, f.value)")
+    gate = js.index('if (late()) return JSON.stringify({ refused: "expired", written: filled });', focus)
+    assert js.index('if (requireEmpty && current(el).length > 0) return JSON.stringify({ refused: "field_not_empty" });',
+                    focus) < gate < write
+    assert js.index('if (late()) return JSON.stringify({ refused: "expired", written: 0 });') < focus  # and at start
+    assert "const anchor = null;" in build_fill_js([], "https://m.example", "n")  # direct use without a clock
+
+
+def test_the_supervisor_records_dialogs_passively():
+    """Page.javascriptDialogOpening/Closed are recorded per page session, with or without the dialog bridge;
+    with the bridge off nothing is answered, queued or archived."""
+    import asyncio
+
+    from tools.browser_supervisor import CDPSupervisor
+
+    sup = CDPSupervisor("t", "ws://127.0.0.1:1/devtools/browser/x", attach_target_id="T1", dialog_bridge=False)
+    sup._page_session_id = "S1"
+    assert sup.open_dialog() is None
+    asyncio.run(sup._on_dialog_opening({"type": "confirm", "message": "m"}, "S2"))  # another session
+    assert sup.open_dialog() is None
+    asyncio.run(sup._on_dialog_opening({"type": "alert", "message": "m"}, "S1"))
+    assert sup.open_dialog()["type"] == "alert"
+    assert sup.snapshot().pending_dialogs == () and sup.snapshot().recent_dialogs == ()  # never acted on
+    asyncio.run(sup._on_dialog_closed({"result": True}, "S1"))
+    assert sup.open_dialog() is None
+
+
+class _BlockedPage(_Page):
+    """A recording page whose dialog state and clock answers a test controls."""
+
+    def __init__(self, controls, fill_result=None, *, dialog=None, clock=True, fill_error=None):
+        super().__init__(controls, fill_result)
+        self.dialog, self.clock, self.fill_error, self.waits = dialog, clock, fill_error, []
+
+    def open_dialog(self):
+        return self.dialog
+
+    def evaluate_runtime(self, expression, **kw):
+        from agent.vault_login_classifier import PAGE_CLOCK_JS
+
+        self.waits.append((expression[:24], kw.get("timeout")))
+        if expression == PAGE_CLOCK_JS and not self.clock:
+            return {"ok": False, "error": "TimeoutError: "}
+        if "expectedOrigin" in expression and self.fill_error:
+            self.writes.append(expression)
+            return {"ok": False, "error": self.fill_error}
+        return super().evaluate_runtime(expression, **kw)
+
+
+def test_a_dialog_open_before_the_fill_refuses_before_anything_is_inspected(item):
+    page, backend = _BlockedPage([_EMAIL, _PW], dialog={"type": "alert"}), _Recording()
+    out = _fill(item, page, backend)
+    assert out["error_type"] == "dialog_open" and out["success"] is False and "next" not in out
+    assert "alert dialog is open" in out["error"] and "nothing was inspected, resolved, sent or written" in out["error"]
+    assert page.inspections == [] and backend.resolved == [] and page.writes == []
+
+
+def test_a_dialog_opening_during_resolution_means_the_value_is_never_sent(item):
+    page = _BlockedPage([_EMAIL, _PW])
+
+    class _OpensDialog(_Recording):
+        def resolve_password(self, handle):
+            page.dialog = {"type": "confirm"}
+            return super().resolve_password(handle)
+
+    backend = _OpensDialog()
+    out = _fill(item, page, backend)
+    assert out["error_type"] == "dialog_open" and "the value was not sent; nothing was written" in out["error"]
+    assert backend.resolved == [item.id] and page.writes == [] and _PASSWORD not in json.dumps(out)
+    [cleanup] = page.cleared  # the stamps are still removed, with the short wait (the page is blocked)
+    assert (cleanup[:24], 2.0) in page.waits
+
+
+def test_a_page_that_does_not_answer_the_clock_read_never_gets_the_value(item):
+    page, backend = _BlockedPage([_EMAIL, _PW]), _Recording()
+    original = page.evaluate_runtime
+    clock_reads = []
+
+    def evaluate_runtime(expression, **kw):  # answers before inspection, then stops answering
+        from agent.vault_login_classifier import PAGE_CLOCK_JS
+
+        if expression == PAGE_CLOCK_JS:
+            clock_reads.append(kw.get("timeout"))
+            page.clock = len(clock_reads) == 1
+        return original(expression, **kw)
+
+    page.evaluate_runtime = evaluate_runtime
+    out = _fill(item, page, backend)
+    assert out["error_type"] == "page_unresponsive" and "nothing was written" in out["error"], out
+    assert clock_reads == [2.0, 2.0] and backend.resolved == [item.id] and page.writes == []
+
+
+def test_an_unanswered_fill_script_reports_the_truth_not_a_bare_timeout(item):
+    page, backend = _BlockedPage([_EMAIL, _PW], fill_error="TimeoutError: "), _Recording()
+    out = _fill(item, page, backend)
+    assert out["error_type"] == "fill_timeout" and out["success"] is False and "next" not in out
+    assert out["error"] != "TimeoutError: " and "not established" in out["error"]
+    assert "no dialog was recorded open" in out["error"] and "cannot write later" in out["error"]
+    assert len(page.writes) == 1 and len(page.cleared) == 1
+
+
+@_integration
+@pytest.mark.parametrize("case", ["past-the-budget", "another-document", "within-the-budget"])
+def test_a_script_run_later_than_its_budget_writes_nothing(browser, case):
+    """The real fill script on a real page: a script that first runs more than FILL_PAGE_BUDGET_S after its
+    anchor (or in another document) writes nothing and still retires its inspection."""
+    from agent.vault_login_classifier import FILL_PAGE_BUDGET_S
+
+    anchor_js = {
+        "past-the-budget": f"({{timeOrigin: performance.timeOrigin, now: performance.now() - {FILL_PAGE_BUDGET_S * 1000 + 500}}})",
+        "another-document": "({timeOrigin: performance.timeOrigin + 1, now: performance.now()})",
+        "within-the-budget": "({timeOrigin: performance.timeOrigin, now: performance.now()})",
+    }[case]
+    expected = {"filled": 1} if case == "within-the-budget" else {"refused": "expired", "written": 0}
+    nonce = "budget"
+    _evaluate(browser.page, "document.getElementById('p').value=''")
+    _evaluate(browser.page, build_inspection_js(nonce))
+    anchor = _evaluate(browser.page, f"JSON.stringify({anchor_js})")
+    js = build_fill_js([{"index": 1, "token": "current-password", "value": "BUDGET-value"}], browser.origin, nonce,
+                       require_empty=True, anchor=json.loads(anchor))
+    assert json.loads(_evaluate(browser.page, js)) == expected
+    state = _state(browser)
+    assert state["pw"] == ("BUDGET-value" if "filled" in expected else "") and state["slots"] == 0, state
+    assert _evaluate(browser.page, f"{_REGISTRIES}.length") == 0
+
+
+class _PersonAtTheBrowser:
+    """A second CDP connection to the tab, standing in for the person at the browser: it sees native dialogs
+    open and closes them (the vault fill never does)."""
+
+    def __init__(self, page):
+        from websockets.sync.client import connect
+
+        self.ws, self.next_id, self.events = connect(page["webSocketDebuggerUrl"], open_timeout=5), 0, []
+        self.call("Page.enable")
+
+    def _recv(self, until, timeout):
+        import time as _time
+
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            try:
+                msg = json.loads(self.ws.recv(timeout=max(0.05, deadline - _time.monotonic())))
+            except TimeoutError:
+                return None
+            if "method" in msg:
+                self.events.append(msg["method"])
+            if until(msg):
+                return msg
+        return None
+
+    def call(self, method, params=None, timeout=10):
+        self.next_id += 1
+        call_id = self.next_id
+        self.ws.send(json.dumps({"id": call_id, "method": method, "params": params or {}}))
+        return self._recv(lambda m: m.get("id") == call_id, timeout)
+
+    def wait_open(self, timeout=10):
+        if "Page.javascriptDialogOpening" in self.events:
+            return True
+        return self._recv(lambda m: m.get("method") == "Page.javascriptDialogOpening", timeout) is not None
+
+    def close_dialog(self):
+        self.events = [e for e in self.events if e != "Page.javascriptDialogOpening"]
+        return self.call("Page.handleJavaScriptDialog", {"accept": True})
+
+    def close_after(self, delay):
+        """In the background: wait for a dialog to open, keep it open ``delay`` seconds, then close it."""
+        import time as _time
+
+        def run():
+            if self.wait_open(30):
+                _time.sleep(delay)  # health: a person reading the dialog
+                self.close_dialog()
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        return thread
+
+    def close(self):
+        self.ws.close()
+
+
+def _supervisor_saw_a_dialog():
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+    with SUPERVISOR_REGISTRY._lock:
+        supervisors = list(SUPERVISOR_REGISTRY._by_task.values())
+    return any(s.open_dialog() for s in supervisors)
+
+
+def _page_after(browser, person):
+    """The page once the person has closed any dialog and the renderer is free again."""
+    return wait_until(lambda: _settled(browser), timeout=15, what="the page settling after the dialog closed")
+
+
+def _settled(browser):
+    state = json.loads(_evaluate(browser.page, "JSON.stringify({pw:document.getElementById('p').value,"
+                                              f"stamps:{_STAMPS_ANYWHERE},registries:{_REGISTRIES}.length,"
+                                              "submits:window.submits})"))
+    return state if state["stamps"] == 0 and state["registries"] == 0 else None
+
+
+@_integration
+@pytest.mark.parametrize("kind", ["alert", "confirm"])
+def test_a_dialog_during_resolution_is_refused_and_nothing_is_written_after_it_closes(browser, store, capsys, kind):
+    """Fable FA-2: the page opens a native dialog after inspection, while the value is resolved. The value is
+    never sent (a plain dialog_open refusal); when the person closes the dialog after the command has
+    exited, nothing is written and no stamp remains."""
+    _evaluate(browser.page, "document.getElementById('p').value=''")
+    person = _PersonAtTheBrowser(browser.page)
+    try:
+        sent = []
+        from tools import browser_vault_tool
+        real_secret = browser_vault_tool._eval_js_secret
+
+        def during_resolve_dialog():
+            person.call("Runtime.evaluate", {"expression": f"setTimeout(()=>{{window.dialogResult={kind}('FA-2')}},0);1"})
+            assert person.wait_open(5)
+            wait_until(_supervisor_saw_a_dialog, timeout=5, what="the supervisor recording the dialog")
+
+        original = LocalLoginBackend.resolve_password
+
+        def resolve(self, handle):
+            value = original(self, handle)
+            during_resolve_dialog()
+            return value
+
+        with patch.object(LocalLoginBackend, "resolve_password", resolve), \
+             patch.object(browser_vault_tool, "_eval_js_secret", lambda *a, **k: sent.append(a) or real_secret(*a, **k)):
+            code, out, _ = _cli_fill(browser, store, "FA2-vault-value", capsys)
+        assert code == 1 and out["error_type"] == "dialog_open" and "next" not in out, out
+        assert f"{kind} dialog is open" in out["error"] and "the value was not sent" in out["error"], out
+        assert sent == []
+        person.close_dialog()
+        state = _page_after(browser, person)
+        assert state == {"pw": "", "stamps": 0, "registries": 0, "submits": 0}, state
+    finally:
+        person.close()
+
+
+@_integration
+def test_a_dialog_already_open_refuses_plainly_and_nothing_is_resolved(browser, store, capsys):
+    _evaluate(browser.page, "document.getElementById('p').value=''")
+    person = _PersonAtTheBrowser(browser.page)
+    try:
+        person.call("Runtime.evaluate", {"expression": "setTimeout(()=>{alert('already open')},0);1"})
+        assert person.wait_open(5)
+        code, out, resolved = _cli_fill(browser, store, "FA2-open-before", capsys)
+        print("FA2_OPEN_BEFORE=" + json.dumps(out))
+        assert code == 1 and out["success"] is False and "next" not in out, out
+        # The exact-target supervisor cannot even attach (Runtime.enable waits on the blocked renderer), or it
+        # attaches and the passive record / clock read refuses: either way a plain refusal, nothing resolved.
+        assert out["error_type"] in ("dialog_open", "page_unresponsive", "attach_failed"), out
+        assert ("Nothing was resolved, sent or written" in out["error"]
+                or "nothing was inspected, resolved, sent or written" in out["error"]), out
+        assert resolved == [], resolved
+        if out["error_type"] == "attach_failed":
+            assert "did not answer in time" in out["error"], out
+        person.close_dialog()
+        state = _page_after(browser, person)
+        assert state == {"pw": "", "stamps": 0, "registries": 0, "submits": 0}, state
+    finally:
+        person.close()
+
+
+@_integration
+def test_a_dialog_opened_and_closed_within_the_budget_still_fills(browser, store, capsys):
+    """A focus listener opens an alert in the middle of the fill script; the person closes it well within the
+    page-clock budget, and the script goes on to fill."""
+    _evaluate(browser.page, "document.getElementById('e').focus();document.getElementById('p').value='';"
+                            "document.getElementById('p').addEventListener('focus',function(){alert('quick')},{once:true})")
+    person = _PersonAtTheBrowser(browser.page)
+    try:
+        closer = person.close_after(0.3)
+        code, out, _ = _cli_fill(browser, store, "FA2-quick-value", capsys)
+        closer.join(10)
+        assert code == 0 and out["success"] is True and out["filled_fields"] == 1, out
+        assert _state(browser) == {"slots": 0, "email": "human@example.invalid", "pw": "FA2-quick-value", "submits": 0}
+    finally:
+        person.close()
+
+
+@_integration
+def test_a_dialog_held_past_the_budget_inside_the_script_writes_nothing(browser, store, capsys):
+    """The alert opens inside the fill script (a focus listener) and stays open past the page-clock budget,
+    but is closed before the command stops waiting: the last gate refuses, nothing is written."""
+    _evaluate(browser.page, "document.getElementById('e').focus();document.getElementById('p').value='';"
+                            "document.getElementById('p').addEventListener('focus',function(){alert('slow')},{once:true})")
+    person = _PersonAtTheBrowser(browser.page)
+    from agent.vault_login_classifier import FILL_PAGE_BUDGET_S
+
+    try:
+        closer = person.close_after(FILL_PAGE_BUDGET_S + 1.5)
+        code, out, _ = _cli_fill(browser, store, "FA2-slow-value", capsys)
+        closer.join(10)
+        assert code == 1 and out["error_type"] == "expired" and "Nothing was written" in out["error"], out
+        assert "next" not in out
+        assert _state(browser) == {"slots": 0, "email": "human@example.invalid", "pw": "", "submits": 0}
+    finally:
+        person.close()
+
+
+@_integration
+@pytest.mark.parametrize("kind", ["alert", "confirm"])
+def test_a_dialog_closed_after_the_command_exits_cannot_cause_a_late_write(browser, store, capsys, kind):
+    """The dialog opens inside the fill script and is closed only after the command has given up waiting:
+    the command says what it knows (no bare TimeoutError), and when the script finally resumes it is past its
+    budget, so nothing is written and it retires its inspection."""
+    _evaluate(browser.page, "document.getElementById('e').focus();document.getElementById('p').value='';"
+                            f"document.getElementById('p').addEventListener('focus',function(){{{kind}('late')}},{{once:true}})")
+    person = _PersonAtTheBrowser(browser.page)
+    try:
+        code, out, _ = _cli_fill(browser, store, "FA2-late-value", capsys)
+        assert code == 1 and out["success"] is False and out["error_type"] == "fill_timeout" and "next" not in out, out
+        assert f"{kind} dialog is open" in out["error"] and "not established" in out["error"], out
+        assert "cannot write later" in out["error"] and out["error"] != "TimeoutError: "
+        assert person.wait_open(1)
+        person.close_dialog()
+        state = _page_after(browser, person)
+        assert state == {"pw": "", "stamps": 0, "registries": 0, "submits": 0}, state
+    finally:
+        person.close()

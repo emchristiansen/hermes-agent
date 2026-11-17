@@ -49,16 +49,21 @@ class _FakePage:
 
     def __init__(self, href: str, controls: list[dict]):
         self.href, self.controls, self.writes = href, controls, []
+        self.fill_result = {"filled": 1}
 
     def focus_page(self, origin: str, accept=None) -> dict:
         return {"ok": bool(origin) and normalize_origin(self.href) == origin, "url": self.href}
 
-    def evaluate_runtime(self, expression: str) -> dict:
+    def evaluate_runtime(self, expression: str, **_) -> dict:
+        from agent.vault_login_classifier import PAGE_CLOCK_JS
+
+        if expression == PAGE_CLOCK_JS:  # the page-clock read before the fill script
+            return {"ok": True, "result": json.dumps({"timeOrigin": 1.0, "now": 0.0})}
         if expression.strip() == "window.location.href":
             return {"ok": True, "result": self.href}
         if "expectedOrigin" in expression:  # the fill script (build_fill_js)
             self.writes.append(expression)
-            return {"ok": True, "result": json.dumps({"filled": 1})}
+            return {"ok": True, "result": json.dumps(self.fill_result)}
         return {"ok": True, "result": json.dumps(self.controls)}  # input inspection
 
 
@@ -155,6 +160,28 @@ class TestOneTimeCode:
             out = json.loads(browser_vault_tool.browser_vault_enter_code(task_id="t"))
         assert out["success"] is True and out["source"] == "user"
         assert asked == ["elsewhere.example"] and backend.resolved == []
+
+
+    @pytest.mark.parametrize("report, error_type", [
+        ({"refused": "target_changed"}, "target_changed"),
+        ({"refused": "field_not_empty"}, "field_not_empty"),
+        ({"refused": "expired", "written": 0}, "expired"),
+        ({"filled": 0}, None),
+    ])
+    def test_a_code_write_that_wrote_nothing_never_asks_to_submit(self, vault, report, error_type):
+        """enter_code maps every fill-script refusal through the same truthful outcome as the password fill:
+        no success, no Submit hint, and it says that nothing was written."""
+        from tools import browser_vault_tool
+
+        store, backend, _ = vault
+        meta = _login(store)
+        page = _FakePage("https://bank.example/2fa", _OTP_CONTROLS)
+        page.fill_result = report
+        with _on_page(page):
+            out = json.loads(browser_vault_tool.browser_vault_enter_code(meta.id, task_id="t"))
+        assert out["success"] is False and "next" not in out and out.get("error_type") == error_type, out
+        assert ("Nothing was written" in out["error"]) if error_type else ("No code field was written" in out["error"])
+        assert len(page.writes) == 1 and backend.resolved == ["otp"]
 
 
 class TestFill:
