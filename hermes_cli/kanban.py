@@ -214,7 +214,7 @@ def _audit_author(requested: str | None = None) -> str:
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "set-skills", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "redirect", "steer", "attach", "attach-rm", "complete", "edit", "block",
-    "schedule", "unblock", "settle-triage", "settle-delivered", "promote", "archive", "dispatch", "daemon", "repair",
+    "schedule", "unblock", "settle-triage", "settle-delivered", "settle-record-only", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
     "gc",
@@ -477,6 +477,13 @@ def _print_section(title: str, lines) -> None:
         print(line)
 
 
+def _show_retentions(field, retentions: list[dict]) -> None:
+    """One ``retained`` line per workspace retention (``kanban_db_retention``) of the shown card."""
+    for retention in retentions:
+        field("retained", f"{retention['workspace_path']} (record-only settlement by "
+                          f"{retention['created_by']} at {_fmt_ts(retention['created_at'])}; no expiry)")
+
+
 def _cmd_show(args: argparse.Namespace) -> int:
     rsk, rc = _run_state_kwargs(args, "show")
     if rc:
@@ -494,6 +501,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         runs = kb.list_runs(conn, args.task_id, **rsk)
         # Workers hand off via task_runs.summary; tasks.result stays NULL unless set.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        from hermes_cli.kanban_db_retention import retentions_for_task
+        retentions = retentions_for_task(conn, args.task_id)
         if not want_json:
             graph = kb.task_graph_context(conn, task.id)
 
@@ -503,6 +512,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
+            "workspace_retentions": retentions,
         })
         return 0
 
@@ -515,6 +525,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.tenant:
         field("tenant", task.tenant)
     field("workspace", f"{task.workspace_kind}" + (f" @ {task.workspace_path}" if task.workspace_path else ""))
+    _show_retentions(field, retentions)
     if task.branch_name:
         field("branch", task.branch_name)
     if task.skills:
@@ -1125,6 +1136,34 @@ def _cmd_settle_delivered(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_settle_record_only(args: argparse.Namespace) -> int:
+    from agent.swarm_capabilities import worker_board_management_enabled
+    if os.environ.get("HERMES_KANBAN_TASK") and not worker_board_management_enabled():
+        return _err("kanban settle-record-only is orchestrator-only; workers must hand off their assigned task")
+    metadata, rc = _parse_metadata_flag(getattr(args, "metadata", None))
+    if rc:
+        return rc
+    from hermes_cli.kanban_db_retention import settle_record_only
+    try:
+        with kbc.connect_closing() as conn:
+            gate_err = _goal_gate_error(
+                conn, args.task_id, (args.result or "").strip(), "record-only settlement",
+                "Record the block with kanban block instead of settling.",
+                "Provide evidence matching the task's acceptance criteria.")
+            if gate_err:
+                return _err(gate_err)
+            ok, reason = settle_record_only(
+                conn, args.task_id, expected_terminal_run=args.expected_terminal_run, result=args.result,
+                accepted_by=args.accepted_by, custody=args.custody, author=_audit_author(),
+                metadata=metadata)
+    except ValueError as exc:
+        return _err(f"kanban settle-record-only: {exc}", 2)
+    if not ok:
+        return _err(f"cannot settle {args.task_id}: {reason} (nothing changed)")
+    print(f"Settled {args.task_id}: {reason}")
+    return 0
+
+
 def _cmd_unblock(args: argparse.Namespace) -> int:
     from agent.swarm_capabilities import worker_board_management_enabled
     from hermes_cli.kanban_db_retry_policy import unblock_refusal
@@ -1471,6 +1510,7 @@ _HANDLERS = {
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock, "settle-triage": _cmd_settle_triage,
     "settle-delivered": _cmd_settle_delivered,
+    "settle-record-only": _cmd_settle_record_only,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
