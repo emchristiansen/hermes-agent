@@ -412,6 +412,27 @@ def settled_handoff(conn, task_id):
     return task['result'], settlement, row['created_at']
 
 
+def settlement_identity_event_ids(conn, task_id):
+    """The events :func:`settled_handoff` reads the task's current handoff from, when its newest
+    completion is a delivered-assessment settlement: that ``completed`` event and every
+    ``settlement_correction`` edit after it. Empty otherwise (no settlement, or a later ordinary
+    completion superseded it). Event retention keeps these however old (KAN-RETENTION-01): without
+    them the readers fall back to an older completed run and hand dependents its superseded result."""
+    row = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id=? AND kind='completed' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    settlement = _kb._json_dict(row['payload']).get('settlement') if row else None
+    if not isinstance(settlement, dict) or settlement.get('kind') != 'delivered_assessment':
+        return []
+    corrections = [
+        edit['id'] for edit in conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? AND kind='edited' AND id>?", (task_id, row['id']))
+        if isinstance(_kb._json_dict(edit['payload']).get('settlement_correction'), dict)
+    ]
+    return [row['id'], *corrections]
+
+
 def settlement_correction(conn, task_id, summary, metadata):
     """For ``edit_task --result``: the record to append beside the newest completion when that is a
     delivered-assessment settlement, else None (the edit then targets the completed run as before).

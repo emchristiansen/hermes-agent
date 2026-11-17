@@ -234,19 +234,28 @@ def _conn_live_worker_inside(conn: sqlite3.Connection, key: str) -> Optional[str
 def _prune_terminal_events(conn: sqlite3.Connection, cutoff: int) -> int:
     """Delete done/archived cards' events created before *cutoff*, except ``decomposed``, a spent
     owner-restart grace (``owner_restart_grace``: pruning it would let a card reopened without an
-    admission earn a second one, ``kanban_presubmit_grace``) and any unfinished ``worker_bound``
+    admission earn a second one, ``kanban_presubmit_grace``), any unfinished ``worker_bound``
     whose worker may still be live, however old: that binding is the only evidence that the worker
     still uses its card's workspace (:func:`_conn_live_worker_inside`). It is pruned once the worker
-    is gone. Returns the number of events deleted."""
+    is gone. Also kept, however old: a card's current delivered-assessment settlement and its
+    corrections (``kanban_db_settle.settlement_identity_event_ids``), the only record of the
+    handoff dependents read; a later ordinary completion supersedes them and they age out as usual.
+    Returns the number of events deleted."""
+    from hermes_cli.kanban_db_settle import settlement_identity_event_ids
     terminal = "created_at < ? AND task_id IN (SELECT id FROM tasks WHERE status IN ('done', 'archived'))"
     with _kb.write_txn(conn):
         old_bindings = conn.execute(
             f"SELECT e.id, e.payload FROM task_events e WHERE e.{terminal} AND {_UNFINISHED_BINDING_SQL}",
             (cutoff,)).fetchall()
-        live = [row[0] for row in old_bindings if _binding_may_be_live(row[1])]
+        keep = [row[0] for row in old_bindings if _binding_may_be_live(row[1])]
+        settled = conn.execute(
+            f"SELECT DISTINCT task_id FROM task_events WHERE {terminal} AND kind = 'completed' "
+            "AND payload LIKE '%delivered_assessment%'", (cutoff,)).fetchall()
+        for row in settled:
+            keep.extend(settlement_identity_event_ids(conn, row[0]))
         cur = conn.execute(
             f"DELETE FROM task_events WHERE {terminal} AND kind NOT IN ('decomposed', 'owner_restart_grace') "
-            "AND id NOT IN (SELECT value FROM json_each(?))", (cutoff, json.dumps(live)))
+            "AND id NOT IN (SELECT value FROM json_each(?))", (cutoff, json.dumps(keep)))
     return int(cur.rowcount or 0)
 
 

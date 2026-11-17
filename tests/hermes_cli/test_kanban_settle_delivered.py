@@ -939,3 +939,77 @@ def test_si19_a_quoted_root_never_hides_a_continuation_into_the_named_report(boa
 def test_si19_a_bare_name_starting_with_a_quote_character_is_preserved(board, capsys, tmp_path, filename):
     """SI-19 control: without an opening quote before the path, the whole name is attached."""
     assert settle_naming(board, capsys, tmp_path, "si19-bare", filename, "{}") == "preserved"
+
+
+# KAN-RETENTION-01: default event GC must not change a settled card's current handoff. The settlement
+# and its corrections are runless events; once they aged out, the readers fell back to an older
+# completed run (OLD_PASS) and the scheduling run's reason. Timestamps are aged 40 days (an accelerated
+# retention boundary, the reviewer's witness), then the real default ``gc_events`` runs.
+AGE = 40 * 86400
+
+
+def _age_everything(conn, tid):
+    with kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET created_at=created_at-? WHERE task_id=?", (AGE, tid))
+        conn.execute("UPDATE task_runs SET started_at=started_at-?, ended_at=ended_at-? WHERE task_id=?", (AGE, AGE, tid))
+        conn.execute("UPDATE tasks SET completed_at=completed_at-? WHERE id=?", (AGE, tid))
+
+
+def _handoff(conn, child):
+    """The dependent's parent-results section without its relative-age stamps."""
+    import re
+    context = kb.build_worker_context(conn, child)
+    section = context.split("## Parent task results", 1)[1]
+    return re.sub(r" \(completed [^)]*\)", "", section)
+
+
+def _gc_keeps_handoff(conn, tid, child):
+    before, runs_before = _handoff(conn, child), image(conn, tid)[1]
+    summary_before = kb.latest_summary(conn, tid)
+    _age_everything(conn, tid)
+    runs_aged = image(conn, tid)[1]
+    assert kb.gc_events(conn) > 0  # ordinary history did age out
+    assert _handoff(conn, child) == before
+    assert kb.latest_summary(conn, tid) == summary_before
+    assert image(conn, tid)[1] == runs_aged == [  # no run rewritten (only the fixture's aging moved times)
+        {**r, "started_at": r["started_at"] - AGE, "ended_at": r["ended_at"] - AGE if r["ended_at"] else r["ended_at"]}
+        for r in runs_before]
+    return before
+
+
+@pytest.mark.parametrize("corrected", [False, True])
+def test_kan_retention_01_gc_keeps_the_settled_handoff_over_an_older_pass(board, capsys, corrected):
+    tid, child, settled_run = settled_with_older_pass(board, capsys, {"report_sha256": "SETTLED_DIGEST"})
+    if corrected:
+        assert run("edit", tid, "--result", "CORRECTED_NEGATIVE_REPORT", "--summary", "CORRECTED_NEGATIVE_SUMMARY") == 0
+    handoff = _gc_keeps_handoff(board, tid, child)
+    current = "CORRECTED_NEGATIVE_SUMMARY" if corrected else "NEW_CHANGES_REQUIRED_CURRENT_EDITION"
+    assert current in handoff and "SETTLED_DIGEST" in handoff
+    assert f"from run {settled_run} as a delivered changes_required assessment" in handoff
+    assert "OLD_PASS_FROM_PREVIOUS_EDITION" not in handoff
+    assert kb.latest_summary(board, tid) == current
+
+
+def test_kan_retention_01_gc_keeps_a_settlement_with_no_older_pass(board):
+    tid, _first, reviewer = delivered_after_stale_schedule(board)
+    child = kb.create_task(board, title="consumer", assignee="consumer", project_id="", parents=[tid])
+    assert run(*settle(tid, reviewer, "--metadata", json.dumps({"report_sha256": "ONLY_SETTLEMENT"}))) == 0
+    handoff = _gc_keeps_handoff(board, tid, child)
+    assert VERDICT in handoff and "ONLY_SETTLEMENT" in handoff
+    assert f"from run {reviewer} as a delivered changes_required assessment" in handoff
+    assert kb.latest_summary(board, tid) == VERDICT
+
+
+def test_kan_retention_01_a_later_completion_still_supersedes_the_settlement_through_gc(board, capsys):
+    from hermes_cli.kanban_db_settle import settlement_identity_event_ids
+    tid, child, _settled_run = settled_with_older_pass(board, capsys, {"report_sha256": "SUPERSEDED_DIGEST"})
+    assert settlement_identity_event_ids(board, tid)
+    assert dashboard_api()._set_status_direct(board, tid, "ready")
+    assert kb.complete_task(board, tid, result="LATER_ORDINARY_COMPLETION", summary="LATER_ORDINARY_COMPLETION")
+    assert settlement_identity_event_ids(board, tid) == []  # superseded: nothing extra is retained
+    handoff = _gc_keeps_handoff(board, tid, child)
+    assert "_settled by" not in handoff and "SUPERSEDED_DIGEST" not in handoff
+    assert "NEW_CHANGES_REQUIRED_CURRENT_EDITION" not in handoff
+    # The superseded settlement aged out like any other history.
+    assert not board.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='completed' "
+                             "AND payload LIKE '%delivered_assessment%'", (tid,)).fetchall()
