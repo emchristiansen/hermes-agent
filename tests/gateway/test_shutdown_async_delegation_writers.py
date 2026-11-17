@@ -152,6 +152,9 @@ async def _stop_with_live_child(monkeypatch, tmp_path, answer, *, release_on_int
             ad._finalize(handle['delegation_id'], {'status': 'stalled', 'error': 'forced'}, 'stalled')
         runner, _ = make_restart_runner()
         runner._restart_drain_timeout = 0.0
+        # v0.23.2 drains background delegations on the cron floor; zero opts out (restart.py), so the
+        # stop still reaches its fence and interrupt while the child is live, as this test needs.
+        runner._cron_drain_timeout = 0.0
         runner._session_db = child_db
         try:
             await runner.stop()
@@ -292,6 +295,9 @@ async def test_a_dispatch_admitted_before_the_fence_but_not_yet_submitted_keeps_
         assert await asyncio.to_thread(published.wait, 30)
         runner, _ = make_restart_runner()
         runner._restart_drain_timeout = 0.0
+        # v0.23.2 drains background delegations on the cron floor; zero opts out (restart.py), so the
+        # stop still reaches its fence and interrupt while the child is live, as this test needs.
+        runner._cron_drain_timeout = 0.0
         runner._session_db = child_db
         try:
             await runner.stop()

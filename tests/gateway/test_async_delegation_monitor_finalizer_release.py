@@ -28,11 +28,11 @@ def test_a_counted_monitor_finalizer_releases_the_close_once_its_completion_is_p
     worker_entered, release_worker, persist_entered, release_persist, persisted = [threading.Event() for _ in range(5)]
     original_persist = ad._persist_completion
 
-    def held_persist(event, result):
+    def held_persist(event, result, **kwargs):  # v0.23.2 adds the keyword-only ``delivery``
         persist_entered.set()
         assert release_persist.wait(30)
         try:
-            return original_persist(event, result)
+            return original_persist(event, result, **kwargs)
         finally:
             persisted.set()
 

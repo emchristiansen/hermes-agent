@@ -50,8 +50,8 @@ async def test_api_nested_transfer_must_not_escape_close(monkeypatch, tmp_path, 
     def childclose(*a,**kw):
         try:return real_child_close(*a,**kw)
         finally:child_closed.set()
-    def defer(c,f):
-        nested.append(f); return real_defer(c,f)
+    def defer(c,f,**kw):  # v0.23.2 adds the keyword-only ``cleanup``
+        nested.append(f); return real_defer(c,f,**kw)
     def parent():
         parent_entered.set(); assert begin_child.wait(30)
         r=dt._run_single_child(0,'late nested child',child=child,parent_agent=SimpleNamespace())
@@ -68,7 +68,7 @@ async def test_api_nested_transfer_must_not_escape_close(monkeypatch, tmp_path, 
     monkeypatch.setattr(db,'_execute_write',write);monkeypatch.setattr(db,'close',close)
     monkeypatch.setattr(child,'close',childclose);monkeypatch.setattr(cr,'_defer_close_after_timeout',defer)
     monkeypatch.setattr(cr._ChildRun,'seed_workspace',lambda self:None)
-    monkeypatch.setattr(dt,'_get_child_timeout',lambda:5.0)
+    monkeypatch.setattr(cr,'_get_child_timeout',lambda:5.0)  # v0.23.2: bound from delegate_tool_config at import
     runner,_=make_restart_runner();runner._session_db=db
     ctx=GatewayShutdownMixin._StopContext(deferred_count=lambda:0,started_at=time.monotonic())
     ctx.api_live=0
@@ -132,8 +132,8 @@ async def test_started_api_child_registration_transfer(monkeypatch,tmp_path,late
     def childclose(*a,**kw):
         try:return real_child_close(*a,**kw)
         finally:child_closed.set()
-    def defer(c,f):
-        nested.append(f);return real_defer(c,f)
+    def defer(c,f,**kw):  # v0.23.2 adds the keyword-only ``cleanup``
+        nested.append(f);return real_defer(c,f,**kw)
     def parent():
         r=dt._run_single_child(0,'already running nested child',child=child,parent_agent=SimpleNamespace())
         result.append(r);return r
@@ -149,7 +149,7 @@ async def test_started_api_child_registration_transfer(monkeypatch,tmp_path,late
     monkeypatch.setattr(db,'_execute_write',write);monkeypatch.setattr(db,'close',close)
     monkeypatch.setattr(child,'close',childclose);monkeypatch.setattr(cr,'_defer_close_after_timeout',defer)
     monkeypatch.setattr(cr._ChildRun,'seed_workspace',lambda self:None)
-    monkeypatch.setattr(dt,'_get_child_timeout',lambda:5.0)
+    monkeypatch.setattr(cr,'_get_child_timeout',lambda:5.0)  # v0.23.2: bound from delegate_tool_config at import
     runner,_=make_restart_runner();runner._session_db=db
     ctx=GatewayShutdownMixin._StopContext(deferred_count=lambda:0,started_at=time.monotonic());ctx.api_live=0
     with patch.object(child,'_cleanup_task_resources'),_probe_tools_only():

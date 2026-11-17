@@ -29,11 +29,11 @@ def test_monitor_finalization_is_a_physical_writer(monkeypatch, tmp_path, worker
     writes, closes = [], []
     original_persist, original_close = ad._persist_completion, db.close
 
-    def held_persist(event, result):
+    def held_persist(event, result, **kwargs):  # v0.23.2 adds the keyword-only ``delivery``
         persist_entered.set()
         assert release_persist.wait(30)
         writes.append({'after_close': bool(closes), 'thread': threading.current_thread().name})
-        return original_persist(event, result)
+        return original_persist(event, result, **kwargs)
 
     def close(*a, **kw):
         closes.append({'physical_worker_count': ad.join_workers(0), 'logical_live': ad.active_count(),
@@ -68,6 +68,9 @@ def test_monitor_finalization_is_a_physical_writer(monkeypatch, tmp_path, worker
         ctx.api_live = 0
         if full_stop:
             runner._restart_drain_timeout = 0.0
+            # v0.23.2 drains background delegations on the cron floor; zero opts out (restart.py), so the
+            # stop still reaches its fence and interrupt while the child is live, as this test needs.
+            runner._cron_drain_timeout = 0.0
             with ExitStack() as patches:
                 for target in ('tools.terminal_tool_lifecycle.cleanup_all_environments',
                                'tools.browser_session_lifecycle.cleanup_all_browsers',
