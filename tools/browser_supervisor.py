@@ -76,6 +76,16 @@ def _err(exc: BaseException) -> dict[str, Any]:
     return _fail(f"{type(exc).__name__}: {exc}")
 
 
+class SupervisorTargetError(RuntimeError):
+    """An exact-target supervisor's ``attach_target_id`` is not an open page target: it never falls back
+    to another tab or creates one."""
+
+
+class SupervisorScopeConflict(RuntimeError):
+    """``get_or_start`` found a supervisor for the task bound to a different endpoint, target or options
+    where either side is target-scoped: it refuses rather than stop or replace that supervisor."""
+
+
 @dataclass(frozen=True)
 class SupervisorSnapshot:
     """Read-only snapshot of supervisor state for tool handlers."""
@@ -102,13 +112,24 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
     are sync, thread-safe bridges onto that loop; all CDP I/O lives on the loop."""
 
     def __init__(self, task_id: str, cdp_url: str, *, dialog_policy: str = DEFAULT_DIALOG_POLICY,
-                 dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S) -> None:
+                 dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S, attach_target_id: Optional[str] = None,
+                 dialog_bridge: bool = True) -> None:
+        """``attach_target_id`` scopes the supervisor to that one CDP page target (a shared browser whose
+        other tabs belong to someone else): it attaches only that target, fails when it is not an open
+        page, and focuses nothing else. ``dialog_bridge=False`` installs no dialog bridge (no init script,
+        Fetch interception or ``alert``/``confirm``/``prompt`` override) on any tab and makes no automatic
+        dialog choice: native dialogs stay with whoever is at the browser. The defaults keep the managed
+        behaviour (first page target, bridge on every attached session)."""
         if dialog_policy not in _VALID_POLICIES:
             raise ValueError(f"Invalid dialog_policy {dialog_policy!r}; must be one of {sorted(_VALID_POLICIES)}")
+        if attach_target_id is not None and (not isinstance(attach_target_id, str) or not attach_target_id.strip()):
+            raise ValueError("attach_target_id must be a non-empty CDP target id")
         self.task_id = task_id
         self.cdp_url = cdp_url
         self.dialog_policy = dialog_policy
         self.dialog_timeout_s = float(dialog_timeout_s)
+        self.attach_target_id = attach_target_id
+        self.dialog_bridge = bool(dialog_bridge)
 
         # State protected by ``_state_lock`` for cross-thread reads.
         self._state_lock = threading.Lock()
@@ -325,10 +346,37 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                 return {"ok": True, "url": url}
             return _fail(f"no open page on {origin or 'any site'}" + (" with the expected form" if accept and candidates else ""))
 
+        # An exact-target supervisor never looks at, or attaches to, another tab.
+        focus = _focus() if self.attach_target_id is None else self._focus_exact_target(origin, accept, timeout=timeout)
         try:
-            return _schedule(_focus(), loop, timeout=timeout + 1)
+            return _schedule(focus, loop, timeout=timeout + 1)
         except Exception as exc:
             return _err(exc)
+
+    async def _focus_exact_target(self, origin: str, accept: Optional[str], *, timeout: float) -> dict[str, Any]:
+        """``focus_page`` for an exact-target supervisor: the one attached session, no other tab and no new
+        attach. Fails when the target is gone, is not on ``origin`` or ``accept`` is falsy there."""
+        from agent.vault_store import VaultError, normalize_origin
+        sid = self._page_session_id
+        if not sid:
+            return _fail(f"target {self.attach_target_id} is not attached")
+        info = await self._cdp("Target.getTargetInfo", {"targetId": self.attach_target_id}, timeout=timeout)
+        target = info.get("result", {}).get("targetInfo") or {}
+        url = str(target.get("url") or "")
+        if target.get("type") != "page" or not target.get("attached"):
+            return _fail(f"target {self.attach_target_id} is not an attached page")
+        try:
+            on_origin = not origin or (url.startswith(("http://", "https://")) and normalize_origin(url) == origin)
+        except VaultError:  # an http(s) URL without a host
+            on_origin = False
+        if not on_origin:
+            return _fail(f"target {self.attach_target_id} is not on {origin}")
+        if accept:
+            probe = await self._cdp("Runtime.evaluate", {"expression": accept, "returnByValue": True},
+                                    session_id=sid, timeout=timeout)
+            if not probe.get("result", {}).get("result", {}).get("value"):
+                return _fail(f"target {self.attach_target_id} on {origin or 'its site'} lacks the expected form")
+        return {"ok": True, "url": url}
 
     # ── Supervisor loop internals ────────────────────────────────────────────
 
@@ -454,9 +502,16 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             backoff = min(backoff * 2, 10.0)
 
     async def _attach_initial_page(self) -> None:
-        """Find (or create) a page target, attach flattened, enable domains, install dialog bridge."""
+        """Find (or create) a page target, attach flattened, enable domains, install dialog bridge.
+        With ``attach_target_id`` only that target qualifies: missing or not a page raises
+        ``SupervisorTargetError``, with nothing attached and no target created."""
         targets = (await self._cdp("Target.getTargets")).get("result", {}).get("targetInfos", [])
-        page_target = next((t for t in targets if t.get("type") == "page"), None)
+        if self.attach_target_id is not None:
+            page_target = next((t for t in targets if t.get("targetId") == self.attach_target_id), None)
+            if page_target is None or page_target.get("type") != "page":
+                raise SupervisorTargetError(f"CDP target {self.attach_target_id} is not an open page")
+        else:
+            page_target = next((t for t in targets if t.get("type") == "page"), None)
         if page_target is None:
             page_target = (await self._cdp("Target.createTarget", {"url": "about:blank"}))["result"]
         attach = await self._cdp("Target.attachToTarget", {"targetId": page_target["targetId"], "flatten": True})
@@ -539,14 +594,34 @@ class _SupervisorRegistry:
         return capture(self, task_id, timeout=timeout)
 
     def get_or_start(self, task_id: str, cdp_url: str, *, dialog_policy: str = DEFAULT_DIALOG_POLICY,
-                     dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S, start_timeout: float = 15.0) -> CDPSupervisor:
+                     dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S, start_timeout: float = 15.0,
+                     attach_target_id: Optional[str] = None, dialog_bridge: bool = True) -> CDPSupervisor:
         """Idempotently ensure a supervisor runs for ``(task_id, cdp_url)``; one bound to a
-        different ``cdp_url`` or unhealthy (dead thread / stopped loop) is stopped and replaced."""
+        different ``cdp_url`` or unhealthy (dead thread / stopped loop) is stopped and replaced.
+
+        Target-scoped (``attach_target_id`` or ``dialog_bridge=False``, see ``CDPSupervisor``): a
+        supervisor for the task with the same endpoint, target and options is reused while healthy and a
+        dead one replaced; any other supervisor for the task, on either side, raises
+        ``SupervisorScopeConflict`` and is left running."""
         from hermes_constants import hermes_home_key
         home = hermes_home_key()
+        scope = (cdp_url, attach_target_id, bool(dialog_bridge))
+        scoped = attach_target_id is not None or not dialog_bridge
+
+        def _scope_of(sup: CDPSupervisor) -> tuple:
+            # getattr: a registered stand-in without the scoped fields is a managed (unscoped) supervisor.
+            return (sup.cdp_url, getattr(sup, "attach_target_id", None), bool(getattr(sup, "dialog_bridge", True)))
+
+        def _conflicts(sup: CDPSupervisor) -> bool:
+            _, sup_target, sup_bridge = _scope_of(sup)
+            return (scoped or sup_target is not None or not sup_bridge) and _scope_of(sup) != scope
+
         with self._lock:
             existing = self._by_task.get(task_id)
             if existing is not None:
+                if _conflicts(existing):
+                    raise SupervisorScopeConflict(
+                        f"task {task_id!r} already has a supervisor with a different endpoint, target or options")
                 thread, loop = existing._thread, existing._loop
                 healthy = thread is not None and thread.is_alive() and loop is not None and loop.is_running()
                 if existing.cdp_url == cdp_url and healthy:
@@ -555,14 +630,19 @@ class _SupervisorRegistry:
         if existing is not None:
             existing.stop()
 
+        # A managed (unscoped) supervisor is constructed exactly as before the scoped options existed.
+        scoped_kwargs = {"attach_target_id": attach_target_id, "dialog_bridge": dialog_bridge} if scoped else {}
         supervisor = CDPSupervisor(task_id=task_id, cdp_url=cdp_url,
-                                   dialog_policy=dialog_policy, dialog_timeout_s=dialog_timeout_s)
+                                   dialog_policy=dialog_policy, dialog_timeout_s=dialog_timeout_s, **scoped_kwargs)
         supervisor.start(timeout=start_timeout)
         with self._lock:
             # Guard against a concurrent get_or_start from another thread.
             already = self._by_task.get(task_id)
-            if already is not None and already.cdp_url == cdp_url:
+            if already is not None and (already.cdp_url == cdp_url or _conflicts(already)):
                 supervisor.stop()
+                if _conflicts(already):
+                    raise SupervisorScopeConflict(
+                        f"task {task_id!r} already has a supervisor with a different endpoint, target or options")
                 return already
             self._by_task[task_id] = supervisor
             self._home_by_task[task_id] = home
@@ -593,4 +673,5 @@ class _SupervisorRegistry:
 SUPERVISOR_REGISTRY = _SupervisorRegistry()
 
 
-__all__ = ["SUPERVISOR_REGISTRY", "CDPSupervisor", "SupervisorSnapshot", "_SupervisorRegistry"]
+__all__ = ["SUPERVISOR_REGISTRY", "CDPSupervisor", "SupervisorScopeConflict", "SupervisorSnapshot",
+           "SupervisorTargetError", "_SupervisorRegistry"]
