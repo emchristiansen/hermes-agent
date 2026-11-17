@@ -96,7 +96,10 @@ def test_template_and_values_must_match():
 
 def test_stamp_cleanup_is_scoped_to_its_own_inspection():
     js = build_clear_stamps_js("feedc0de")
-    assert 'const prefix = "feedc0de" + ":";' in js and "startsWith(prefix)" in js
+    assert 'return retireInspection("feedc0de");' in js
+    assert 'const prefix = nonce + ":";' in js and "startsWith(prefix)" in js
+    # The retained original nodes are cleaned too, connected or not, before the tree walk.
+    assert js.index("registry.nodes.forEach") < js.index('querySelectorAll("*")', js.index("function retireInspection"))
 
 
 def test_fill_script_rechecks_after_focus_before_the_write():
@@ -106,7 +109,8 @@ def test_fill_script_rechecks_after_focus_before_the_write():
     write = js.index("setter.set.call(el, f.value)")
     assert focus < js.index("const still = el.isConnected", focus) < write
     assert focus < js.index('if (requireEmpty && current(el).length > 0) return JSON.stringify({ refused: "field_not_empty" });', focus) < write
-    assert js.index("} finally {") > write and 'startsWith(nonce + ":")' in js
+    assert js.index("} finally {") > write
+    assert js.index("retireInspection(nonce);", js.index("} finally {")) > write and "startsWith(prefix)" in js
 
 
 def _ctrl(**kw):
@@ -203,6 +207,8 @@ _FAKE_PW = {"autocomplete": "current-password", "formIndex": 0, "index": 0, "nam
         ([_EMAIL, _PW], {"refused": "field_not_empty"}, "field_not_empty", True),  # value appeared in the page
         ([_EMAIL, _PW], {"refused": "target_changed"}, "target_changed", True),
         ([_EMAIL, _PW], {"refused": "origin_changed", "found": "https://other.example"}, "origin_changed", True),
+        ([_EMAIL, _PW], {"refused": "value_mismatch", "cleared": True}, "value_mismatch", True),
+        ([_EMAIL, _PW], {"refused": "value_mismatch", "cleared": False}, "value_mismatch", True),
         ([_EMAIL, _PW], {"filled": 0}, None, True),
         ([_EMAIL, _PW], {"filled": 1}, None, True),
     ],
@@ -219,9 +225,29 @@ def test_every_exit_after_inspection_removes_its_stamps(item, controls, fill_res
     if fill_result is None:  # the fill script never ran: the tool removes this inspection's stamps
         [cleanup] = page.cleared
         [nonce] = re.findall(r'const nonce = "([0-9a-f]+)";', inspection)
-        assert f'const prefix = "{nonce}" + ":";' in cleanup  # only this inspection's stamps
+        assert f'return retireInspection("{nonce}");' in cleanup  # only this inspection's stamps
     else:  # the fill script ran to completion and removed them in its own finally
         assert page.cleared == []
+    assert _PASSWORD not in json.dumps(out)
+
+
+@pytest.mark.parametrize(
+    "fill_result, field_cleared",
+    [({"refused": "value_mismatch", "cleared": True}, True),
+     ({"refused": "value_mismatch", "cleared": False}, False),
+     ({"refused": "value_mismatch"}, False)],  # no report of the final state: not established
+)
+def test_a_mismatch_says_nothing_is_filled_only_when_the_page_reported_the_field_empty(item, fill_result,
+                                                                                     field_cleared):
+    """The rollback's own input/change notifications run page code; the fill script reports whether the field
+    is empty after them, and only then does the result say that nothing is filled."""
+    out = _fill(item, _Page([_EMAIL, _PW], fill_result), _Recording())
+    assert out["success"] is False and out["error_type"] == "value_mismatch" and "next" not in out
+    assert out["field_cleared"] is field_cleared
+    assert ("nothing is filled" in out["error"]) is field_cleared
+    if not field_cleared:
+        assert "not established" in out["error"]
+        assert ("the field is not empty" in out["error"]) is (fill_result.get("cleared") is False)
     assert _PASSWORD not in json.dumps(out)
 
 
@@ -517,3 +543,117 @@ def test_cli_refuses_when_a_focus_listener_detaches_and_reinserts_the_field(brow
     code, out, _ = _cli_fill(browser, store, "vault-value-8", capsys)
     assert code == 1 and out["error_type"] == "target_changed", out
     assert _state(browser) == {"slots": 0, "email": "human@example.invalid", "pw": "", "submits": 0}
+
+
+# ── stamp cleanup reaches the inspected nodes even while they are detached (review23311 V2) ──────────────
+
+_REGISTRIES = "Object.getOwnPropertyNames(window).filter(x=>x.startsWith('hermesVaultSlots:'))"
+
+
+@_integration
+def test_stamp_cleanup_survives_transient_input_detachment(browser, store, capsys):
+    """The page's input listener detaches the filled field and queues its reinsertion: the fill script's
+    cleanup runs while the field is detached, and must still remove this inspection's stamp from it."""
+    _evaluate(browser.page, "document.getElementById('p').addEventListener('input',function(){const p=this;"
+                            "const parent=p.parentNode;p.remove();queueMicrotask(()=>parent.appendChild(p))},{once:true})")
+    code, out, _ = _cli_fill(browser, store, "DETACHED-SECRET", capsys)
+    actual = _state(browser)
+    assert code == 0 and out["success"]
+    assert actual["slots"] == 0, actual
+    assert _evaluate(browser.page, f"{_REGISTRIES}.length") == 0
+
+
+@_integration
+@pytest.mark.parametrize("mode", ["fill-finally", "explicit-clear"])
+def test_cleanup_retains_detached_node_reference(browser, mode):
+    """Both cleanups (the fill script's finally and the tool's explicit stamp removal) reach a stamped node
+    that is detached at cleanup time, through the inspection's retained node references."""
+    nonce = "reviewDetached"
+    _evaluate(browser.page, build_inspection_js(nonce))
+    if mode == "fill-finally":
+        _evaluate(browser.page, "window.old=document.getElementById('p');"
+                                "old.addEventListener('input',function(){this.remove()},{once:true})")
+        out = json.loads(_evaluate(browser.page, build_fill_js(
+            [{"index": 1, "token": "current-password", "value": "DETACHED-SECRET"}], browser.origin, nonce,
+            require_empty=True)))
+        assert out == {"filled": 1}, out
+    else:
+        _evaluate(browser.page, "window.old=document.getElementById('p');old.remove()")
+        _evaluate(browser.page, build_clear_stamps_js(nonce))
+    data = json.loads(_evaluate(browser.page, "JSON.stringify({stamp:old.getAttribute('data-hermes-vault-slot'),"
+                                              f"value:old.value,registries:{_REGISTRIES},submits:window.submits}})"))
+    assert data["registries"] == [] and data["submits"] == 0, data
+    assert data["stamp"] is None, data
+
+
+@_integration
+def test_clear_only_own_nonce(browser):
+    _evaluate(browser.page, build_inspection_js("first"))
+    _evaluate(browser.page, build_inspection_js("second"))
+    _evaluate(browser.page, build_clear_stamps_js("first"))
+    assert _evaluate(browser.page, "document.getElementById('p').getAttribute('data-hermes-vault-slot')") == "second:1"
+    assert _evaluate(browser.page, "!!window['hermesVaultSlots:second']") is True
+    _evaluate(browser.page, build_clear_stamps_js("second"))
+    assert _evaluate(browser.page, "document.querySelectorAll('[data-hermes-vault-slot]').length") == 0
+
+
+@_integration
+def test_detached_cleanup_keeps_another_inspections_stamp(browser):
+    """A node detached after a second inspection re-stamped it: removing the first inspection's stamps (which
+    still holds that node) leaves the second's marker; the second's own cleanup then removes it."""
+    _evaluate(browser.page, build_inspection_js("first"))
+    _evaluate(browser.page, build_inspection_js("second"))
+    _evaluate(browser.page, "window.old=document.getElementById('p');old.remove()")
+    _evaluate(browser.page, build_clear_stamps_js("first"))
+    assert _evaluate(browser.page, "old.getAttribute('data-hermes-vault-slot')") == "second:1"
+    assert _evaluate(browser.page, f"JSON.stringify({_REGISTRIES})") == '["hermesVaultSlots:second"]'
+    _evaluate(browser.page, build_clear_stamps_js("second"))
+    assert _evaluate(browser.page, "old.getAttribute('data-hermes-vault-slot')") is None
+    assert _evaluate(browser.page, f"{_REGISTRIES}.length") == 0
+
+
+# ── a mismatch reports the field's actual state after the rollback's notifications (review23311 V3) ───────
+
+def _mismatch_state(browser):
+    return dict(_state(browser), registries=_evaluate(browser.page, f"{_REGISTRIES}.length"))
+
+
+@_integration
+def test_mismatch_rollback_reports_a_field_the_page_refills_as_not_empty(browser, store, capsys):
+    """An input listener rewrites the field on every input event, so it runs during the write's notification
+    and again during the rollback's. The refusal stands, without a Submit hint, and must not claim that
+    nothing is filled: the field is not empty."""
+    _evaluate(browser.page, "document.getElementById('p').value='';window.inputs=0;document.getElementById('p')"
+                            ".addEventListener('input',function(){window.inputs++;this.value='PAGE-REWRITE'})")
+    code, out, resolved = _cli_fill(browser, store, "before\nafter", capsys)
+    assert code == 1 and out["success"] is False and out["error_type"] == "value_mismatch", out
+    assert len(resolved) == 1 and "next" not in out and out["field_cleared"] is False
+    assert "nothing is filled" not in out["error"] and "not empty" in out["error"], out
+    assert _evaluate(browser.page, "window.inputs") == 2  # the write's notification, then the rollback's
+    assert _mismatch_state(browser) == {"slots": 0, "email": "human@example.invalid", "pw": "PAGE-REWRITE",
+                                        "submits": 0, "registries": 0}
+
+
+@_integration
+def test_mismatch_rollback_reports_a_field_a_change_listener_refills_as_not_empty(browser, store, capsys):
+    """Only the rollback's change notification puts a value back (a page restoring an emptied field)."""
+    _evaluate(browser.page, "document.getElementById('p').value='';document.getElementById('p')"
+                            ".addEventListener('change',function(){if(this.value==='')this.value='PAGE-RESTORE'})")
+    code, out, _ = _cli_fill(browser, store, "line-one\nline-two", capsys)
+    assert code == 1 and out["error_type"] == "value_mismatch" and "next" not in out, out
+    assert out["field_cleared"] is False and "nothing is filled" not in out["error"]
+    assert _mismatch_state(browser) == {"slots": 0, "email": "human@example.invalid", "pw": "PAGE-RESTORE",
+                                        "submits": 0, "registries": 0}
+
+
+@_integration
+def test_mismatch_from_an_insertion_listener_is_cleared_and_says_so(browser, store, capsys):
+    """A listener rewrites the value during the write's input notification only; the rollback's notifications
+    leave the field empty, and only then does the refusal say that nothing is filled."""
+    _evaluate(browser.page, "document.getElementById('p').value='';document.getElementById('p')"
+                            ".addEventListener('input',function(){this.value=this.value+'-PAGE'},{once:true})")
+    code, out, _ = _cli_fill(browser, store, "exact-value-9", capsys)
+    assert code == 1 and out["error_type"] == "value_mismatch" and "next" not in out, out
+    assert out["field_cleared"] is True and "nothing is filled" in out["error"]
+    assert _mismatch_state(browser) == {"slots": 0, "email": "human@example.invalid", "pw": "",
+                                        "submits": 0, "registries": 0}

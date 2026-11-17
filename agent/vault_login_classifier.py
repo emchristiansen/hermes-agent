@@ -272,22 +272,44 @@ def build_inspection_js(nonce: str) -> str:
 
 
 def build_clear_stamps_js(nonce: str) -> str:
-    """Remove the slot stamps of the inspection ``nonce`` (and only those), in the document and open
-    shadow roots, and retire that inspection's node registry. No values are read."""
+    """Remove the slot stamps of the inspection ``nonce`` (and only those) from every node it stamped,
+    connected or detached, and from stamped nodes in the document and open shadow roots, and retire that
+    inspection's node registry and observer. No values are read."""
     return _render_js(_CLEAR_STAMPS_JS_TEMPLATE, nonce=nonce)
 
 
+# Shared by the stamp cleanup and the fill script's finally (a hoisted function declaration). The
+# inspection's registry holds the exact nodes it stamped, so a stamped node that is detached when cleanup
+# runs (a page listener may remove a field and reinsert it later) still loses this inspection's stamp; the
+# walk of the document and open shadow roots also reaches a stamp copied onto a clone. A stamp of another
+# inspection stays.
+_RETIRE_INSPECTION_JS = """
+  function retireInspection(nonce) {
+    const prefix = nonce + ":";
+    const registry = window["hermesVaultSlots:" + nonce];
+    const stamped = new Set();
+    if (registry) {
+      registry.observer.disconnect();
+      delete window["hermesVaultSlots:" + nonce];
+      registry.nodes.forEach((n) => stamped.add(n));
+    }
+    (function walk(root) {
+      for (const e of root.querySelectorAll("*")) {
+        if (e.hasAttribute("data-hermes-vault-slot")) stamped.add(e);
+        if (e.shadowRoot) walk(e.shadowRoot);
+      }
+    })(document);
+    let removed = 0;
+    stamped.forEach((n) => {
+      const stamp = n.getAttribute("data-hermes-vault-slot");
+      if (stamp !== null && stamp.startsWith(prefix)) { n.removeAttribute("data-hermes-vault-slot"); removed += 1; }
+    });
+    return removed;
+  }"""
+
+
 _CLEAR_STAMPS_JS_TEMPLATE = """(() => {
-  const prefix = __NONCE__ + ":";
-  const registry = window["hermesVaultSlots:" + __NONCE__];
-  if (registry) { registry.observer.disconnect(); delete window["hermesVaultSlots:" + __NONCE__]; }
-  const roots = [];
-  (function walk(root) { roots.push(root); for (const e of root.querySelectorAll("*")) if (e.shadowRoot) walk(e.shadowRoot); })(document);
-  let removed = 0;
-  roots.forEach((r) => r.querySelectorAll("[data-hermes-vault-slot]").forEach((n) => {
-    if (String(n.getAttribute("data-hermes-vault-slot")).startsWith(prefix)) { n.removeAttribute("data-hermes-vault-slot"); removed += 1; }
-  }));
-  return removed;
+  return retireInspection(__NONCE__);""" + _RETIRE_INSPECTION_JS + """
 })()"""
 
 
@@ -387,8 +409,10 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
     clone carrying the stamp, refuses with ``target_changed`` before and after focus. A
     ``current-password`` write must leave the field holding exactly the stored value (an input strips
     CR/LF, a page may rewrite it); otherwise what was written is cleared and the script refuses with
-    ``value_mismatch``. Neither refusal is ever reported as filled. Values are rendered by :func:`_render_js`,
-    so they reach the page unchanged whatever they contain.
+    ``value_mismatch``. The clearing's own input/change notifications run page code synchronously, so the
+    refusal carries ``cleared``: whether the field is empty after them (a page may put a value back).
+    Neither refusal is ever reported as filled. Values are rendered by :func:`_render_js`, so they reach the
+    page unchanged whatever they contain.
     """
     return _render_js(
         _FILL_JS_TEMPLATE,
@@ -460,17 +484,16 @@ _FILL_JS_TEMPLATE = """(() => {
           if (setter && setter.set) { setter.set.call(el, ""); } else { el.value = ""; }
           el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "deleteContent" }));
           el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-          return JSON.stringify({ refused: "value_mismatch" });
+          // Those notifications ran page code synchronously: the field counts as cleared only if it is
+          // empty after them.
+          return JSON.stringify({ refused: "value_mismatch", cleared: current(el).length === 0 });
         }
         if (current(el).length > 0) filled += 1;
       } catch (e) { /* skip */ }
     }
     return JSON.stringify({ filled });
   } finally {
-    if (registry) { registry.observer.disconnect(); delete window["hermesVaultSlots:" + nonce]; }
-    find("[data-hermes-vault-slot]").forEach((n) => {
-      if (String(n.getAttribute("data-hermes-vault-slot")).startsWith(nonce + ":")) n.removeAttribute("data-hermes-vault-slot");
-    });
+    retireInspection(nonce);
   }
   // Declared last (hoisted) so the origin check precedes every DOM lookup. Stamped controls may live
   // inside a shadow root (see the inspection script's walk): look in the document and every open
@@ -482,5 +505,5 @@ _FILL_JS_TEMPLATE = """(() => {
       for (const e of root.querySelectorAll("*")) if (e.shadowRoot) walk(e.shadowRoot);
     })(document);
     return roots.flatMap((r) => Array.from(r.querySelectorAll(selector)));
-  }
+  }""" + _RETIRE_INSPECTION_JS + """
 })()"""
