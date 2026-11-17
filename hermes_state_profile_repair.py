@@ -225,8 +225,13 @@ class SessionProfileRepairMixin:
                 "SELECT * FROM messages WHERE session_id = ? ORDER BY id", (session_id,))]
             usage = [dict(r) for r in conn.execute(
                 "SELECT * FROM session_model_usage WHERE session_id = ?", (session_id,))]
+            from hermes_state_portability import FOREIGN_IMPORT_EXPORT_FIELD, FOREIGN_IMPORT_META_PREFIX
+            from utils import safe_json_loads
+            meta = conn.execute("SELECT value FROM state_meta WHERE key = ?",
+                                (FOREIGN_IMPORT_META_PREFIX + session_id,)).fetchone()
+            record = safe_json_loads(meta[0], default=None) if meta else None
             return {"session": dict(session), "system_prompt": prompt, "tool_pin": tool_pin, "messages": messages,
-                    "usage": usage}
+                    "usage": usage, **({FOREIGN_IMPORT_EXPORT_FIELD: record} if isinstance(record, dict) else {})}
         payload = self._read_retrying_ioerr(_read)
         if payload is not None and session_id in self._ledgered_session_ids():
             # Re-checked at apply time: the scan may predate a turn, and copying first would leave
@@ -265,10 +270,14 @@ class SessionProfileRepairMixin:
             for message in payload.get("messages") or []:
                 moved[message["id"]] = self._insert_row(
                     conn, "messages", {**message, "session_id": session_id}, skip=_MESSAGE_MOVE_SKIP)
-            # A foreign import's boundary is a message id of the source store: renumber it with the rows.
-            from hermes_state_portability import moved_foreign_origin
+            # A foreign import's boundary is a message id of the source store: renumber it with the rows, in
+            # origin_json or, for a CLI import, in its kept record (AGENT-02).
+            from hermes_state_portability import (
+                FOREIGN_IMPORT_EXPORT_FIELD, moved_foreign_origin, record_moved_foreign_import_meta)
             if (origin := moved_foreign_origin(session.get("origin_json"), moved)) is not None:
                 conn.execute("UPDATE sessions SET origin_json = ? WHERE id = ?", (origin, session_id))
+            if not session.get("origin_json"):
+                record_moved_foreign_import_meta(conn, session_id, payload.get(FOREIGN_IMPORT_EXPORT_FIELD), moved)
             for usage in payload.get("usage") or []:
                 self._insert_row(conn, "session_model_usage", {**usage, "session_id": session_id}, skip=frozenset())
             return "imported"
@@ -292,6 +301,8 @@ class SessionProfileRepairMixin:
             conn.execute("UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?", (session_id,))
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM session_model_usage WHERE session_id = ?", (session_id,))
+            from hermes_state_portability import FOREIGN_IMPORT_META_PREFIX
+            conn.execute("DELETE FROM state_meta WHERE key = ?", (FOREIGN_IMPORT_META_PREFIX + session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             self._delete_unreferenced_system_prompts(conn)
             return True
