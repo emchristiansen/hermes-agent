@@ -159,10 +159,86 @@ def _apply_output_transform_hook(command, output, returncode, task_id, env_type)
     return output
 
 
-def _truncate_head_tail(output: str) -> str:
+def _truncate_head_tail(output: str, limit: Optional[int] = None) -> str:
     from tools.tool_output_limits import get_max_bytes
     from tools.tool_output_truncate import truncate_head_tail
-    return truncate_head_tail(output, get_max_bytes())
+    return truncate_head_tail(output, get_max_bytes() if limit is None else limit)
+
+
+def _apply_output_control(control, sink, result: dict) -> tuple[str, list[tuple[str, Any]], Optional[int], bool, Optional[str]]:
+    """The caller's ``output_control`` for one finished foreground command.
+
+    Returns ``(inline_output, fields, window, selected, error)``. ``window`` bounds the inline
+    head/tail cut (None = profile default); ``selected`` means *inline_output* is already the
+    requested content and skips the transform hook and head/tail cut. ``fields`` always carry
+    the ``output_control`` metadata, which makes the result a controlled envelope the executor
+    bounds in place (``tools.output_control.bound_envelope``). The destination (when given)
+    received the raw stream from byte 0 via the collector, or receives the projection here; it
+    is never ANSI-stripped, redacted or rewritten afterwards."""
+    from tools import output_control as oc
+    raw = result.get("output", "")
+    total = result.get("stream_total_chars", len(raw))
+    if control.select is None:
+        # The captured stream travels as the payload: the executor cuts it to the caller's inline
+        # budget (``bound_envelope``), storing it verbatim first when nothing else holds it. With a
+        # destination the window is already the caller's budget (the file holds everything);
+        # without one, a stream that fit the collector travels whole, else the ordinary window.
+        from tools.tool_output_limits import get_max_bytes
+        if sink is not None:
+            window = control.inline_chars if control.inline_chars is not None else get_max_bytes()
+        else:
+            window = max(1, len(raw)) if total <= len(raw) else get_max_bytes()
+        error = None
+        if sink is not None:
+            receipt = sink.close()
+            if control.inline_chars == 0:
+                raw = ""
+            meta: dict[str, Any] = {**receipt.fields(),
+                                    "inline_complete": receipt.complete and receipt.chars <= min(len(raw), window)}
+            fields: list[tuple[str, Any]] = [("full_output_path", str(receipt.path))]
+            if not receipt.complete:
+                error = oc.failed_delivery(receipt)["error"]
+                raw = ""  # the payload stays where it landed; nothing inline to re-spill
+        else:
+            # A stream longer than the ordinary window overflowed into the default tee
+            # (cache/terminal-output, up to its cap), which then is the recovery location.
+            from tools.environments.base_output import _BoundedOutputCollector
+            meta = {"chars": total, "complete": total <= _BoundedOutputCollector._SPILL_CAP_CHARS,
+                    "inline_complete": total <= min(len(raw), window)}
+            fields = []
+        return raw, [*fields, (oc.PARAM, meta)], window, False, error
+
+    failure = None
+    if total > oc.SELECT_CAPTURE_CEILING_CHARS:
+        failure = (f"output_control.select: stdout was {total:,} chars, over the "
+                   f"{oc.SELECT_CAPTURE_CEILING_CHARS:,}-char selection ceiling; nothing was selected or stored. "
+                   "Narrow the command's output (e.g. pipe through jq) and retry.")
+    else:
+        try:
+            document = json.loads(raw)
+        except ValueError as exc:
+            failure = f"output_control.select: stdout is not one JSON document ({exc}); nothing was selected or stored."
+    if failure is not None:
+        meta = {"complete": False, "error": failure}
+        if sink is not None:
+            meta.update({k: v for k, v in sink.close().fields().items() if k in ("destination", "bytes")})
+        # The caller asked for a selection only: the unselected stream is never shown or stored.
+        return "", [(oc.PARAM, meta)], None, True, failure
+    projection = control.project(document)
+    text = json.dumps(projection, ensure_ascii=False)
+    meta = {"chars": len(text), "missing_count": len(projection["missing"])}
+    if sink is None:
+        # The complete projection travels inline; the executor bounds it to the caller's and the
+        # model's budgets, storing it in the ordinary archive first when it must be cut.
+        return text, [(oc.PARAM, {**meta, "complete": True})], None, True, None
+    sink.write(text)
+    receipt = sink.close()
+    if not receipt.complete:
+        return "", [(oc.PARAM, receipt.fields())], None, True, oc.failed_delivery(receipt)["error"]
+    preview = oc.cut_inline(text, control.inline_chars if control.inline_chars is not None
+                            else oc.DEFAULT_PREVIEW_CHARS)
+    return preview, [("full_output_path", str(receipt.path)),
+                     (oc.PARAM, {**meta, **receipt.fields(), "inline_complete": preview == text})], None, True, None
 
 
 def _failure_hint(command: str, returncode: int, output: str, exit_note) -> Optional[str]:
@@ -219,8 +295,11 @@ def finalize_foreground_result(
     *, command: str, result: dict, env: Any, env_type: str, effective_task_id: str,
     task_id: Optional[str], session_id: Optional[str], session_key: str,
     workdir: Optional[str], command_cwd: Optional[str], approval_note: Optional[str],
+    output_control=None, sink=None,
 ) -> str:
-    """Turn a raw ``env.execute`` result into the tool's JSON result string."""
+    """Turn a raw ``env.execute`` result into the tool's JSON result string. ``output_control``
+    (``tools.output_control.OutputControl``) and its opened destination ``sink`` apply the
+    caller's prospective selection, inline budget and destination."""
     from tools.terminal_tool import record_session_cwd
 
     # Record the cwd this command finished in as THIS session's durable cwd —
@@ -237,9 +316,14 @@ def finalize_foreground_result(
 
     output = result.get("output", "")
     returncode = result.get("returncode", 0)
+    control_fields: list[tuple[str, Any]] = []
+    window, selected, control_error = None, False, None
+    if output_control is not None:
+        output, control_fields, window, selected, control_error = _apply_output_control(output_control, sink, result)
     output, sudo_auth_failed, sudo_cache_cleared = _sudo_annotations(command, output, env_type)
-    output = _apply_output_transform_hook(command, output, returncode, effective_task_id, env_type)
-    output = _truncate_head_tail(output)
+    if not selected:
+        output = _apply_output_transform_hook(command, output, returncode, effective_task_id, env_type)
+        output = _truncate_head_tail(output, window) if output else ""
     # Strip ANSI so the model never copies escapes into file writes, then
     # redact secrets; redact_terminal_output is command-aware (env-dump
     # commands get the KEY=value pass, source/config dumps skip it).
@@ -267,7 +351,7 @@ def finalize_foreground_result(
     if approval_note and returncode == 130 and "[Command interrupted]" in output:
         approval_note = approval_note.rstrip(".") + ", then interrupted."
 
-    result_dict = {"output": output, "exit_code": returncode, "error": None}
+    result_dict = {"output": output, "exit_code": returncode, "error": control_error}
     # Optional fields in observable JSON key order; None means "omit". Spill
     # metadata is present only when output overflowed the capture window.
     optional_fields: list[tuple[str, Any]] = [
@@ -275,6 +359,7 @@ def finalize_foreground_result(
         ("environment_recreated", _ENV_RECREATED_NOTE if result.get("environment_recreated") else None),
         ("cwd_fallback", _cwd_fallback_note(result.get("cwd_fallback"))),
         *_redact_spill_file(result.get("full_output_path"), result.get("output_total_chars"), command),
+        *control_fields,
         ("verification_evidence", _verification_evidence(
             command, command_cwd, session_id or task_id or effective_task_id or "default",
             returncode, output, result.get("pipeline_status"))),

@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from hermes_cli.kanban_workflow import ARCHIVED, DEFAULT_WORKFLOW
+from tools.output_control import OUTPUT_CONTROL_PROPERTY
 
 _DESC_TASK_ID_DEFAULT = (
     "Task id. If omitted, defaults to HERMES_KANBAN_TASK from the env — the "
@@ -57,6 +58,7 @@ KANBAN_SHOW_SCHEMA = _schema(
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "output_control": OUTPUT_CONTROL_PROPERTY,
     },
     [],
 )

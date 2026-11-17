@@ -8,6 +8,7 @@ or a temp file (local). Cohesive pieces live in sibling modules (``base_output``
 """
 
 import contextvars
+import dataclasses
 import hashlib
 import logging
 import os
@@ -47,6 +48,9 @@ _DEBUG_INTERRUPT = env_var_enabled("HERMES_DEBUG_INTERRUPT")
 # The inner poll loop is what returns partial output + returncode 124; this outer bound only exists for when
 # that loop itself never returns (family A of #94285: a blocked wait that silently disables asyncio timers).
 _EXECUTE_WAIT_BOUND_GRACE_S = 2.0
+# Longest cwd-marker line minus the two markers: ``_split_cwd_marker`` looks back 4 KiB for the
+# opening marker, plus the injected newlines.
+_CWD_MARKER_SPAN = 4096 + 8
 
 if _DEBUG_INTERRUPT:
     # quiet_mode forces the `tools` logger to ERROR on CLI startup, which would
@@ -294,6 +298,9 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
     # commands (a sandbox hiding paths, mounting them read-only or giving them their own $TMPDIR) sets
     # it False, so the file tools see exactly what its commands see. Read via env_uses_host_filesystem().
     uses_host_filesystem: bool = False
+    # execute() streams output through ``_new_output_collector`` and honours ``capture=``
+    # (caller output control); backends returning one payload instead set False.
+    supports_stream_capture: bool = True
 
     # Snapshot creation timeout (override for slow cold-starts).
     _snapshot_timeout: int = 30
@@ -655,6 +662,15 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         self._kill_process(proc)
 
     # --- CWD extraction ---
+    def _strip_stream_trailer(self, text: str) -> str:
+        """*text* without the wrapper's in-band trailer lines, removed in the order
+        ``_extract_cwd_from_output`` consumes them (pipeline status, then cwd), so a caller's
+        destination holds only the command's own output."""
+        for marker in (getattr(self, "_pipe_marker", ""), self._cwd_marker):
+            if marker and (split := _split_cwd_marker(text, marker)) is not None:
+                text = split[1]
+        return text
+
     def _update_cwd(self, result: dict):
         """Extract CWD from command output. Override for local file-based read."""
         self._extract_cwd_from_output(result)
@@ -714,7 +730,8 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         stdin_data: str | None = None,
         rewrite_compound_background: bool = True,
         bounded_capture: bool = False,
-        yield_handler: Callable[[ProcessHandle, str], dict] | None = None) -> dict:
+        yield_handler: Callable[[ProcessHandle, str], dict] | None = None,
+        capture=None) -> dict:
         """Execute a command, return {"output": str, "returncode": int}. ``bounded_capture=True``
         caps retention at ``tool_output.max_bytes`` WHILE draining; only the foreground terminal
         tool may set it — internal full-fidelity consumers (file-op ``cat`` reads feeding the
@@ -725,8 +742,21 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         ``bounded_capture=True`` caps stdout/stderr retention at ``tool_output.max_bytes`` WHILE the stream
         is drained (head/tail window) instead of holding the full output in memory (#64435).
         See #94285.
+
+        ``capture`` (``tools.output_control.StreamCapture``) is the caller's prospective output
+        control for the foreground terminal tool: it sets the window and the destination the
+        stream is teed into from byte 0 (see ``_new_output_collector``).
         """
         self._before_execute()
+        if capture is not None:
+            # The wrapper appends its in-band trailer lines to the stream. They are protocol:
+            # hold enough of the tail back that the destination never receives them, and widen
+            # the window by the same span so a small caller window still captures them whole
+            # for _update_cwd (the finalizer cuts the window back to the caller's size).
+            trailer = 2 * (_CWD_MARKER_SPAN + 2 * len(self._cwd_marker))
+            if capture.sink is not None:
+                capture.sink.hold_back(trailer)
+            capture = dataclasses.replace(capture, window_chars=capture.window_chars + trailer)
 
         exec_command, sudo_stdin = self._prepare_command(command)
         # Guard against the `A && B &` subshell-wait trap by default; callers
@@ -772,7 +802,7 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
             proc_holder.append(spawned)
             if fenced:  # the hard-exit kill may have stopped waiting for us before we registered
                 self._force_kill_process(spawned)
-            output = _new_output_collector(spawned, bounded_capture)
+            output = _new_output_collector(spawned, bounded_capture, capture)
             output_holder.append(output)
             try:
                 return self._wait_for_process(
@@ -819,6 +849,8 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         else:
             result = bounded.value
         self._update_cwd(result)
+        if capture is not None and capture.sink is not None:
+            capture.sink.finish_tail(self._strip_stream_trailer)
         if getattr(self, "_recreated_notice_pending", False):
             self._recreated_notice_pending = False
             result["environment_recreated"] = True

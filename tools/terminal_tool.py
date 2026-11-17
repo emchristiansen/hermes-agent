@@ -1415,14 +1415,42 @@ def _yield_kwargs(command: str, **ctx) -> dict:
     return {"yield_handler": handler} if handler is not None else {}
 
 
+def _open_output_destination(output_control: Any, env: Any) -> Any:
+    """Create the caller's destination BEFORE the command runs (``None`` without one).
+    Raises ``_Rejected`` (command not run) for a backend without streaming capture or a
+    destination that cannot be created exclusively."""
+    if output_control is None:
+        return None
+    from tools.output_control import OutputControlError, env_supports_stream_capture, open_destination
+    if not env_supports_stream_capture(env):
+        raise _Rejected(_error_json(
+            f"output_control is not supported by the {type(env).__name__} backend (no streaming "
+            "capture). The command was not run.", status="error"))
+    try:
+        return open_destination(output_control)
+    except OutputControlError as exc:
+        raise _Rejected(_error_json(f"{exc}. The command was not run.", status="error")) from None
+
+
+def _partial_destination(sink: Any) -> dict:
+    """``output_control`` fields for a run that ended without a result: whatever reached the
+    destination is kept there and reported as incomplete."""
+    if sink is None:
+        return {}
+    from tools.output_control import PARAM
+    return {PARAM: {**sink.close().fields(), "complete": False}}
+
+
 def _run_foreground(
     command: str, env: Any, plan: _ExecPlan, *,
     task_id: Optional[str], session_id: Optional[str], session_key: str, cwd_key: str,
     workdir: Optional[str], approval_note: Optional[str], clear_interrupt: bool,
-    metered: bool = True,
+    metered: bool = True, output_control: Any = None, sink: Any = None,
 ) -> str:
     """Execute in the foreground with retry on transient errors, then finalize. ``metered``
-    is False for Hermes' own control-plane commands (``_host_local``)."""
+    is False for Hermes' own control-plane commands (``_host_local``). Under
+    ``output_control`` the stream is captured as the caller asked (no yield-to-background:
+    a handed-off process would write past the destination)."""
     from hermes_cli.observability.shared_metrics_harness import record_terminal_outcome
     max_retries = 3
     env_type, eff, effective_timeout = plan.env_type, plan.effective_task_id, plan.effective_timeout
@@ -1446,17 +1474,25 @@ def _run_foreground(
             # bounded_capture: model-facing output keeps a head/tail window
             # while streaming so a verbose command can't OOM the gateway;
             # internal env.execute() consumers stay unbounded.
+            if output_control is None:
+                extra = _yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
+                                      task_id=task_id, session_key=session_key)
+            else:
+                from tools.output_control import StreamCapture
+                from tools.tool_output_limits import get_max_bytes
+                if sink is not None:
+                    sink.reset()  # a retried attempt starts the destination over
+                extra = {"capture": StreamCapture.for_control(output_control, sink, get_max_bytes())}
             result = env.execute(
-                command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
-                **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
-                                task_id=task_id, session_key=session_key),
+                command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True, **extra,
             )
             break
         except Exception as e:
             # A backend exception (e.g. an SSH connect timeout) never reached an exit status, so it
             # is not a terminal outcome; Hermes' own deadline arrives as ``hermes_timed_out``.
             if "timeout" in str(e).lower():
-                return _error_json(f"Command timed out after {effective_timeout} seconds", exit_code=124)
+                return _error_json(f"Command timed out after {effective_timeout} seconds", exit_code=124,
+                                   **_partial_destination(sink))
             # Retry on transient errors
             if retry_count < max_retries:
                 wait_time = 2 ** (retry_count + 1)
@@ -1466,7 +1502,8 @@ def _run_foreground(
                 continue
             logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
                          max_retries, _safe_command_preview(command), type(e).__name__, e, eff, env_type)
-            return _error_json(_redact_terminal_error_text(f"Command execution failed: {type(e).__name__}: {e}"))
+            return _error_json(_redact_terminal_error_text(f"Command execution failed: {type(e).__name__}: {e}"),
+                               **_partial_destination(sink))
 
     if result.get("yielded_session_id"):  # handed to the background: no exit status yet
         return json.dumps({
@@ -1480,7 +1517,7 @@ def _run_foreground(
     return finalize_foreground_result(
         command=command, result=result, env=env, env_type=env_type, effective_task_id=eff,
         task_id=task_id, session_id=session_id, session_key=cwd_key, workdir=workdir,
-        command_cwd=command_cwd, approval_note=approval_note,
+        command_cwd=command_cwd, approval_note=approval_note, output_control=output_control, sink=sink,
     )
 
 
@@ -1578,8 +1615,13 @@ def terminal_tool(
     _completion_output_chars: int = 0,
     heartbeat: int = 0,
     persist_on_release: bool = False,
+    output_control: Any = None,
 ) -> str:
     """Execute *command* in the configured terminal environment; returns a JSON string.
+
+    ``output_control`` (``tools.output_control.OutputControl``, foreground only) is the
+    caller's prospective selection / inline budget / destination: the destination is created
+    before the command runs and receives the stream instead of Hermes' default spill file.
 
     ``force`` (internal, not in the model schema) skips the dangerous-command
     check after the user confirmed. ``workdir`` is per-command and never
@@ -1671,6 +1713,12 @@ def terminal_tool(
                 # Promotion implies notify_on_complete; watch_patterns is a background-only flag the
                 # caller could not have meant for a foreground call, and the two are exclusive anyway.
                 background, notify_on_complete, watch_patterns = True, True, None
+            if output_control is not None and background:
+                raise _Rejected(_error_json(
+                    "output_control applies to foreground commands only; this call would run in the "
+                    "background (timeout above the foreground maximum). The command was not run.",
+                    status="error",
+                ))
             if background:
                 result = spawn_background_process(
                     command=command, env=env, env_type=env_type, effective_task_id=effective_task_id,
@@ -1687,12 +1735,17 @@ def terminal_tool(
                 if plan.promoted_from_foreground_timeout is not None:
                     result = _with_promoted_note(result, plan.promoted_from_foreground_timeout)
                 return _metered(None if _host_local else plan, result)
-            return _metered(None if _host_local else plan, _run_foreground(
-                command, env, plan,
-                task_id=task_id, session_id=session_id, session_key=session_key, cwd_key=cwd_key,
-                workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
-                metered=not _host_local,
-            ))
+            sink = _open_output_destination(output_control, env)
+            try:
+                return _metered(None if _host_local else plan, _run_foreground(
+                    command, env, plan,
+                    task_id=task_id, session_id=session_id, session_key=session_key, cwd_key=cwd_key,
+                    workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
+                    metered=not _host_local, output_control=output_control, sink=sink,
+                ))
+            finally:
+                if sink is not None:
+                    sink.close()  # idempotent; the finalizer normally closed it already
     except _Rejected as r:
         return r.result_json
     except EnvironmentConnectionError as e:
@@ -1714,6 +1767,7 @@ def check_terminal_requirements() -> bool:
         return False
 
 
+from tools.output_control import OUTPUT_CONTROL_PROPERTY
 from tools.registry import registry
 
 TERMINAL_SCHEMA = {
@@ -1759,7 +1813,10 @@ TERMINAL_SCHEMA = {
                 "type": "boolean",
                 "default": False,
                 "description": "With background=true: survive session end, /new, compression and other cleanup (not host exit). Only for jobs the user explicitly wants to outlive the conversation."
-            }
+            },
+            # Foreground only. select applies to stdout that is one JSON document; destination is
+            # a path on the Hermes host and receives the raw stream (or the projection) unaltered.
+            "output_control": OUTPUT_CONTROL_PROPERTY,
             # Legacy aliases (unadvertised, still accepted): notify_on_complete
             # (bool) and watch_patterns (list). notify=true|[...] maps onto
             # them in the dispatch wrapper; explicit notify wins on conflict.
@@ -1831,6 +1888,15 @@ def _handle_terminal(args, **kw):
             )
     if heartbeat:
         notify_on_complete = True  # the heartbeat rides the completion delivery path
+    from tools.output_control import OutputControlError, parse_args
+    try:
+        output_control = parse_args(args)
+    except OutputControlError as exc:
+        return tool_error(f"{exc}. The command was not run.")
+    if output_control is not None and args.get("background", False):
+        return tool_error(
+            "output_control applies to foreground commands only (a background process's output "
+            "streams to its process log). The command was not run.")
     return terminal_tool(
         command=args.get("command"),
         background=args.get("background", False),
@@ -1843,6 +1909,7 @@ def _handle_terminal(args, **kw):
         watch_patterns=watch_patterns,
         heartbeat=heartbeat,
         persist_on_release=persist_on_release,
+        output_control=output_control,
     )
 
 
