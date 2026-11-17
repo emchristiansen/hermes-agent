@@ -159,7 +159,10 @@ def worker_lineage_context(db, conn, sid, payload):
 
 
 def worker_lineage(db, conn, sid, payload):
-    _fields(payload, ('target',))
+    _fields(payload, ('target',), ('strict',))
+    strict = payload.get('strict', False)
+    if type(strict) is not bool:
+        raise RuntimeStoreError('invalid_params')
     view = CompressionSnapshot(db, conn)
     target = payload['target']
     view.authorize(sid, target)
@@ -167,7 +170,7 @@ def worker_lineage(db, conn, sid, payload):
             'lineage': view.get_compression_lineage(target),
             'root': view.get_conversation_root(target),
             'tip': view.get_compression_tip(target),
-            'resume': view.resolve_resume_session_id(target),
+            'resume': view.resolve_resume_session_id(target, strict=strict),
             'identity': view.declared_scope_identity(target),
             'tool_root': view.get_tool_rotation_root(target)}
 

@@ -49,9 +49,10 @@ class RuntimeSessionCompressionMixin:
         return self._apply('compression.lineage', {'target': session_id})['tip']
 
     def resolve_resume_session_id(self, session_id, *, strict=False):
-        # SessionDB's ``strict`` only decides whether a failed lineage read is swallowed; this
-        # owner call never swallows one (``_apply`` raises), so it already answers strictly.
-        return self._apply('compression.lineage', {'target': session_id})['resume']
+        # ``strict`` reaches the owner's selector: without it a failed selection read is swallowed there and
+        # comes back as the input id inside a successful receipt, which a reset must not accept.
+        payload = {'target': session_id, **({'strict': True} if strict else {})}
+        return self._apply('compression.lineage', payload)['resume']
 
     def declared_scope_identity(self, session_id):
         return tuple(self._apply('compression.lineage', {'target': session_id})['identity'])
