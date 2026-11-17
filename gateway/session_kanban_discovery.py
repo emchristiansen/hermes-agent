@@ -26,16 +26,31 @@ from hermes_state_runtime import RuntimeStoreError
 
 
 def _read_claim(authority, params):
-    """Worker thread: ``(session_id, db_path)`` of the run's owner admission iff the card's claim is current."""
+    """Worker thread: ``(session_id, db_path)`` of the run's owner admission iff the card's claim is current.
+
+    The board is opened by a genuinely read-only, non-initializing reader (``mode=ro``): a board that is
+    absent stays absent and is ``not_found``, whatever name or ``HERMES_KANBAN_DB`` pin selected the path; a
+    file without the kanban schema is not a board either. Nothing is created, migrated or backfilled."""
+    import sqlite3
     from hermes_cli import kanban_db as kb
-    from hermes_cli.kanban_db_connect import connect_closing
     db_path = kb.kanban_db_path(board=params['board'])
-    with connect_closing(db_path) as conn:
-        task = kb.get_task(conn, params['task_id'])
-        if not (task and task.status == 'running' and task.current_run_id == params['run_id']):
-            raise RuntimeStoreError('stale_kanban_claim')
-        marker = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='owner_admitted' "
-                              "ORDER BY id DESC LIMIT 1", (params['task_id'], params['run_id'])).fetchone()
+    if not db_path.is_file():
+        raise RuntimeStoreError('not_found')
+    conn = sqlite3.connect(db_path.resolve().as_uri() + '?mode=ro', uri=True)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.text_factory = kb._lossy_text
+        try:
+            task = kb.get_task(conn, params['task_id'])
+            marker = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                                  "AND kind='owner_admitted' ORDER BY id DESC LIMIT 1",
+                                  (params['task_id'], params['run_id'])).fetchone()
+        except sqlite3.OperationalError as exc:  # no tasks table: not an initialized board
+            raise RuntimeStoreError('not_found') from exc
+    finally:
+        conn.close()
+    if not (task and task.status == 'running' and task.current_run_id == params['run_id']):
+        raise RuntimeStoreError('stale_kanban_claim')
     if marker is None:
         raise RuntimeStoreError('not_found')
     payload = json.loads(marker[0])
@@ -69,13 +84,18 @@ async def kanban_run(connection, ref, params):
             raise RuntimeStoreError('profile_mismatch')
     session_id, db_path = await asyncio.to_thread(_read_claim, authority, params)
     from gateway.session_contract import SessionRef
-    from gateway.session_retirement import LISTING_READ
     ref = SessionRef(authority.profile_id, session_id)
-    token = LISTING_READ.set(True)  # a read never restores a parked session
+    # Live BEFORE authorize: ``authorize`` restores a stored session that is not live, and a read must not
+    # restore anything. The check and the authorization share one synchronous step on the owner loop, so
+    # no await lets the entry leave between them; a session that is gone anyway is refused as stale.
+    if session_id not in authority.sessions:
+        raise RuntimeStoreError('stale_kanban_claim')
     try:
         authority.authorize(connection.actor, ref, 'session:read')
-    finally:
-        LISTING_READ.reset(token)
+    except RuntimeStoreError as exc:
+        if exc.reason == 'not_found':
+            raise RuntimeStoreError('stale_kanban_claim') from exc
+        raise
     live = authority.sessions.get(session_id)
     if live is None:
         raise RuntimeStoreError('stale_kanban_claim')
