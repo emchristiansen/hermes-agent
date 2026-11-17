@@ -443,6 +443,16 @@ def worker_compression_append(db, conn, sid, payload):
     return {'count': count, 'annotations': row_annotations(payload['messages'])}
 
 
+def worker_conversation_end(db, conn, sid, payload):
+    """A reset in place (``SessionDB.end_conversation_in_place``) of one session in the worker's readable
+    lineage, on the receipt's own transaction."""
+    _fields(payload, ('target',))
+    target = _text(payload['target'])
+    CompressionSnapshot(db, conn).authorize(sid, target)
+    db._end_conversation_in_transaction(conn, target)
+    return {'value': None}
+
+
 def worker_turn_cleanup(db, conn, sid, payload):
     _fields(payload, ('target', 'holder'))
     target = _text(payload['target'])
@@ -458,6 +468,7 @@ def worker_turn_cleanup(db, conn, sid, payload):
 WORKER_COMPRESSION_HANDLERS = {
     'turn.cleanup': worker_turn_cleanup,
     'compression.append': worker_compression_append,
+    'conversation.end': worker_conversation_end,
     'compression.reopen': worker_reopen,
     'compression.cleanup': worker_compression_cleanup,
     'compression.watermark': worker_watermark,

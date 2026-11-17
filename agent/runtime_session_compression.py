@@ -33,6 +33,9 @@ class RuntimeSessionCompressionMixin:
                 raise WorkerPersistenceError('permission_denied')
         return self._apply('compression.context', {'target': session_id})['session']
 
+    def end_conversation_in_place(self, session_id):
+        self._apply('conversation.end', {'target': session_id})
+
     def get_compression_lineage(self, session_id):
         return self._apply('compression.lineage', {'target': session_id})['lineage']
 
