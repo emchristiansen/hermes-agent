@@ -5,7 +5,11 @@ run id). The owner answers with that attempt's session and the execution generat
 running, so the caller can carry both into the existing ``session.steer`` / ``session.redirect``
 (``session:control``), whose protected control point rechecks claim, run and generation.
 
-Read-only: nothing is attached, resumed, restored or written. Internal finite sessions stay out of
+Read-only contract (stated exactly): no session is attached, resumed or restored, and no retirement timer is
+refreshed (``LISTING_READ``). The board is opened ``mode=ro`` and never initialized: an absent board stays
+absent (no database, no directory) and is ``not_found``. SQLite may create or update the ``-wal``/``-shm``
+sidecars as any reader of a WAL database does; no database content, schema or file is created or modified.
+(``immutable=1`` is deliberately not used: it would read without the current WAL and answer stale data.) Internal finite sessions stay out of
 ``session.active_list`` and the pickers; this exact lookup is the only route to one, and it binds only
 a claim that is current now:
 
@@ -90,12 +94,16 @@ async def kanban_run(connection, ref, params):
     # no await lets the entry leave between them; a session that is gone anyway is refused as stale.
     if session_id not in authority.sessions:
         raise RuntimeStoreError('stale_kanban_claim')
+    from gateway.session_retirement import LISTING_READ
+    token = LISTING_READ.set(True)  # a lookup must not reset a retired route's idle timer
     try:
         authority.authorize(connection.actor, ref, 'session:read')
     except RuntimeStoreError as exc:
         if exc.reason == 'not_found':
             raise RuntimeStoreError('stale_kanban_claim') from exc
         raise
+    finally:
+        LISTING_READ.reset(token)
     live = authority.sessions.get(session_id)
     if live is None:
         raise RuntimeStoreError('stale_kanban_claim')
