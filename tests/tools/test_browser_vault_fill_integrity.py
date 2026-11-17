@@ -476,3 +476,44 @@ def test_cli_fills_an_empty_password_field_inside_an_open_shadow_root(browser, s
     assert code == 1 and out["error_type"] == "field_not_empty" and resolved == []
     assert _evaluate(browser.page, f"{shadow}.getElementById('sp').value") == "HUMAN-shadow-value"
     assert _evaluate(browser.page, f"{shadow}.querySelectorAll('[data-hermes-vault-slot]').length") == 0
+
+
+@_integration
+@pytest.mark.parametrize("value", ["line-one\nline-two", "carriage\rreturn", "crlf\r\nvalue", "trailing-newline\n"])
+def test_cli_never_reports_a_value_the_field_normalized_and_clears_it(browser, store, capsys, value):
+    """A single-line input strips CR/LF: the field then holds something other than the stored value. The
+    fill compares the field's value with the exact stored value after writing; on a mismatch it clears
+    what it wrote, removes its stamps and refuses (never success, never a Submit hint)."""
+    _evaluate(browser.page, "document.getElementById('p').value=''")
+    code, out, resolved = _cli_fill(browser, store, value, capsys)
+    assert code == 1 and out["success"] is False and out["error_type"] == "value_mismatch", out
+    assert len(resolved) == 1 and "next" not in out and value not in json.dumps(out)
+    assert _state(browser) == {"slots": 0, "email": "human@example.invalid", "pw": "", "submits": 0}
+
+
+_REINSERT = ("const p=document.getElementById('p');const parent=p.parentNode,next=p.nextSibling;"
+             "p.remove();parent.insertBefore(p,next);")
+_REPLACE = "const p=document.getElementById('p');p.replaceWith(p.cloneNode(true));"
+
+
+@_integration
+@pytest.mark.parametrize("change", [_REINSERT, _REPLACE], ids=["detached_and_reinserted", "replaced_by_a_clone"])
+def test_cli_refuses_a_stamped_field_that_left_the_document_before_the_write(browser, store, capsys, change):
+    """Between stamping (inspection) and writing, the stamped password node is detached and reinserted, or
+    replaced by a clone that carries the stamp. Neither is the verified connected original: nothing is
+    written, the refusal is target_changed and no stamp remains."""
+    _evaluate(browser.page, "document.getElementById('p').value=''")
+    code, out, resolved = _cli_fill(browser, store, "vault-value-7", capsys, during_resolve=change)
+    assert code == 1 and out["success"] is False and out["error_type"] == "target_changed", out
+    assert len(resolved) == 1 and "next" not in out
+    assert _state(browser) == {"slots": 0, "email": "human@example.invalid", "pw": "", "submits": 0}
+
+
+@_integration
+def test_cli_refuses_when_a_focus_listener_detaches_and_reinserts_the_field(browser, store, capsys):
+    _evaluate(browser.page, "document.getElementById('e').focus();document.getElementById('p').value='';"
+                            "document.getElementById('p').addEventListener('focus',function(){const parent=this.parentNode,"
+                            "next=this.nextSibling;this.remove();parent.insertBefore(this,next)},{once:true})")
+    code, out, _ = _cli_fill(browser, store, "vault-value-8", capsys)
+    assert code == 1 and out["error_type"] == "target_changed", out
+    assert _state(browser) == {"slots": 0, "email": "human@example.invalid", "pw": "", "submits": 0}
