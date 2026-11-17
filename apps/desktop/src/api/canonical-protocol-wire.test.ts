@@ -1,6 +1,8 @@
 // @vitest-environment node
 import { expect, test, vi } from 'vitest'
 
+import { CorrectionTargetChanged } from '@/lib/uncertain-correction'
+
 import { HermesGateway } from './client'
 
 test('named canonical prompt listeners receive replay-safe IDs before answering on the wire', async () => {
@@ -205,6 +207,108 @@ test('shared-socket equal-ID streams use replay owners and unknown epochs reconc
     client.close()
 
     for (const peer of server.clients) {peer.terminate()}
+    await new Promise<void>(resolve => server.close(() => resolve()))
+  }
+})
+
+// NC13-CLIENT-01: a correction's retry is fenced to the execution its first send named. A later
+// execution's state event, another correction and a rebuilt gateway client never re-decorate it;
+// the client-only `correction_id` that carries the pin never reaches either wire.
+test('a correction retry presents its first generation through a newer execution and a new client', async () => {
+  const wsPackage = 'ws'
+  const { WebSocketServer } = await import(wsPackage)
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 })
+  await new Promise<void>(resolve => server.once('listening', resolve))
+  const controls: any[] = []
+  const sockets: any[] = []
+  let snapshot = { session_id: 's', revision: 1, execution_generation: 4, replay_epoch: 'epoch-1', prompts: [] }
+
+  server.on('connection', (socket: any) => {
+    sockets.push(socket)
+    socket.on('message', (bytes: Buffer) => {
+      const frame = JSON.parse(bytes.toString())
+
+      if (frame.method === 'session.steer' || frame.method === 'session.redirect') { controls.push([frame.method, frame.params]) }
+
+      const result = frame.method === 'session.resume' ? { ...snapshot, session_id: frame.params.session_id }
+        : { status: 'queued', text: frame.params.text, execution_generation: frame.params.execution_generation }
+
+      socket.send(JSON.stringify({ jsonrpc: '2.0', id: frame.id, result }))
+    })
+  })
+  const url = `ws://127.0.0.1:${(server.address() as { port: number }).port}/api/ws?native_dial=fixture&ticket=one-use`
+  const first = new HermesGateway()
+  const second = new HermesGateway()
+  const generations = () => controls.map(([, params]) => params.execution_generation)
+
+  try {
+    await first.connect(url)
+    await first.request('session.resume', { session_id: 's' })
+    await first.request('session.steer', { session_id: 's', text: 'A', correction_id: 'pin-A' })
+    // The owner's next execution starts before the user sends A again.
+    snapshot = { ...snapshot, revision: 2, execution_generation: 5 }
+    sockets[0].send(JSON.stringify({ jsonrpc: '2.0', method: 'event', params: { type: 'session.info', session_id: 's',
+      replay_epoch: 'epoch-1', execution_generation: 5, payload: { revision: 2, execution_generation: 5, running: true } } }))
+    await vi.waitFor(async () => {
+      await first.request('session.steer', { session_id: 's', text: 'probe', correction_id: `probe-${controls.length}` })
+      expect(controls.at(-1)[1].execution_generation).toBe(5)
+    })
+    await first.request('session.steer', { session_id: 's', text: 'A', correction_id: 'pin-A' })
+    await first.request('session.redirect', { session_id: 's', text: 'B', correction_id: 'pin-B' })
+    expect(generations().at(-2)).toBe(4)
+    expect(generations().at(-1)).toBe(5)
+    // A rebuilt client (a new gateway instance) retrying A still names A's execution.
+    await second.connect(url)
+    await second.request('session.resume', { session_id: 's' })
+    await second.request('session.steer', { session_id: 's', text: 'A', correction_id: 'pin-A' })
+    expect(generations().at(-1)).toBe(4)
+    expect(generations()[0]).toBe(4)
+    // Another session (or profile) is never A's destination, whatever its generation number.
+    const sent = controls.length
+    await second.request('session.resume', { session_id: 'other' })
+    await expect(second.request('session.steer', { session_id: 'other', text: 'A', correction_id: 'pin-A' }))
+      .rejects.toBeInstanceOf(CorrectionTargetChanged)
+    await expect(second.request('session.steer', { session_id: 's', profile: 'beta', text: 'A', correction_id: 'pin-A' }))
+      .rejects.toBeInstanceOf(CorrectionTargetChanged)
+    expect(controls).toHaveLength(sent)
+    expect(controls.filter(([, params]) => 'correction_id' in params)).toEqual([])
+  } finally {
+    first.close()
+    second.close()
+
+    for (const socket of server.clients) { socket.terminate() }
+    await new Promise<void>(resolve => server.close(() => resolve()))
+  }
+})
+
+test('a legacy dial strips the client-only correction id from steer and redirect', async () => {
+  const wsPackage = 'ws'
+  const { WebSocketServer } = await import(wsPackage)
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 })
+  await new Promise<void>(resolve => server.once('listening', resolve))
+  const sent: any[] = []
+  server.on('connection', (socket: any) => {
+    socket.on('message', (bytes: Buffer) => {
+      const frame = JSON.parse(bytes.toString())
+      sent.push(frame)
+      socket.send(JSON.stringify({ jsonrpc: '2.0', id: frame.id, result: { status: 'queued' } }))
+    })
+  })
+  const client = new HermesGateway()
+
+  try {
+    const address = server.address() as { port: number }
+    await client.connect(`ws://127.0.0.1:${address.port}/api/ws?ticket=legacy`)
+
+    for (const method of ['session.steer', 'session.redirect']) {
+      await client.request(method, { session_id: 's', text: 'fix', correction_id: 'pin' })
+      expect(sent.at(-1)).toMatchObject({ method, params: { session_id: 's', text: 'fix' } })
+      expect(sent.at(-1).params).not.toHaveProperty('correction_id')
+    }
+  } finally {
+    client.close()
+
+    for (const socket of server.clients) { socket.terminate() }
     await new Promise<void>(resolve => server.close(() => resolve()))
   }
 })

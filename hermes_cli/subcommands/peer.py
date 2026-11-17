@@ -229,10 +229,37 @@ def _resolve_peer_target(target: str) -> tuple[str, str | None, dict, str]:
 
 
 def _message_from_args(args) -> str:
-    message = (getattr(args, "message", None) or "").strip()
-    if not message and not sys.stdin.isatty():
-        message = sys.stdin.read().strip()
-    return message
+    """The message (argument, else stdin), or "" when it is blank.
+
+    With ``--exact`` a non-blank message is sent byte-for-byte; otherwise surrounding
+    whitespace is stripped, as before.
+    """
+    message = getattr(args, "message", None) or ""
+    if not message.strip() and not sys.stdin.isatty():
+        message = _exact_stdin() if getattr(args, "exact", False) else sys.stdin.read()
+    if not message.strip():
+        return ""
+    return message if getattr(args, "exact", False) else message.strip()
+
+
+def _exact_stdin() -> str:
+    """TR-3 (TR2-01): ``--exact`` stdin as raw bytes decoded as UTF-8 here, independent of the process's stdin text
+    encoding. Invalid bytes become lone surrogates, which ``_exact_deliverable`` refuses (exit 2, nothing sent)."""
+    buffer = getattr(sys.stdin, "buffer", None)
+    if buffer is None:  # an already-decoded stream (embedded callers): its text is what it is
+        return sys.stdin.read()
+    return buffer.read().decode("utf-8", "surrogateescape")
+
+
+def _exact_deliverable(message: str) -> bool:
+    """TR-2 D1: whether ``--exact`` can carry ``message`` byte-for-byte (no NUL, encodable as UTF-8)."""
+    if "\x00" in message:
+        return False
+    try:
+        message.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _peer_run_durability(base: str, key: str) -> bool | None:
@@ -347,11 +374,12 @@ def _peer_run_ctl(args, action: str, peer_name: str, profile: str | None, base: 
 
 
 def _turn_body(message: str, *, message_key: str, **extra) -> dict:
-    """Request body for one turn. ``author`` is added only when a dispatcher set HERMES_TURN_AUTHOR."""
+    """Request body with the bound swarm session author, else dispatcher-supplied attribution."""
     from agent.turn_author import turn_author_from_env
 
     body = {message_key: message, **extra}
-    author = turn_author_from_env()
+    from agent.swarm_capabilities import peer_session_author
+    author = peer_session_author() or turn_author_from_env()
     if author is not None:
         body["author"] = author
     return body
@@ -401,26 +429,23 @@ def _peer_dm(args, message: str, peer_name: str, profile: str | None, base: str,
         print(f"Peer '{peer_name}': {exc}", file=sys.stderr)
         return 1
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        # A timeout while awaiting the response, once the Bot Chat is known, means the peer took
-        # this turn: the message is already in its Bot Chat and the gateway runs the turn to
-        # completion regardless of this client, so reporting it unreachable makes the sender resend
-        # and deliver it twice. urllib raises that timeout bare; one it wraps in URLError hit while
-        # connecting or sending, so the request never arrived and "could not reach" is the truth.
+        # Resolving a session does not prove admission of the following POST.
+        # A lost response can leave delivery uncertain; retrying a message is allowed.
         if session_id and isinstance(exc, TimeoutError):
-            print(f"Peer '{peer_name}' accepted the message but its turn is still running after "
-                  f"{DM_TIMEOUT_S}s: the message is already in its Bot Chat (session {session_id}) "
-                  "and will be answered there. The reply cannot come back on this call. Do NOT resend.",
+            print(f"No reply from peer '{peer_name}' within {DM_TIMEOUT_S}s "
+                  f"(session {session_id}); delivery may have been accepted. "
+                  "Retry promptly if the reply is still needed; duplicate messages do not authorize repeated effects.",
                   file=sys.stderr)
             return 1
         return _peer_failure(peer_name, exc)
     if result.get("object") == "hermes.session.chat.queued":
         # The peer's Bot Chat is open in its Desktop and that turn outlasted the peer's wait: the
-        # message is in the open chat and is answered there, so a resend would run it twice.
+        # message is queued in that chat; keep its delivery handle for follow-up.
         queued_in = result.get("session_id") or session_id
         return _emit(args, {"peer": peer_name, "profile": profile, "session_id": queued_in,
                             "status": result.get("status") or "queued", "delivery_id": result.get("delivery_id")},
                      [f"Peer '{peer_name}' has its Bot Chat open, so the message went into that chat (session "
-                      f"{queued_in}) and is answered there. The reply cannot come back on this call. Do NOT resend."])
+                      f"{queued_in}) and is answered there. The reply cannot come back on this call. Retry promptly if delivery fails, times out or remains uncertain; duplicate messages do not authorize repeated effects."])
     msg = result.get("message")
     reply = str(msg.get("content") or "") if isinstance(msg, dict) else ""
     # A successful bare silence marker is a delivery decision, not a message:
@@ -466,6 +491,10 @@ def cmd_peer(args) -> int:
     message = _message_from_args(args)
     if not message:
         print("Message required (argument or stdin).", file=sys.stderr)
+        return 2
+    if getattr(args, "exact", False) and not _exact_deliverable(message):
+        print("--exact: the message contains NUL or is not valid UTF-8, so it cannot be sent byte-for-byte; "
+              "nothing was sent.", file=sys.stderr)
         return 2
     handler = _peer_run if action == "run" else _peer_dm
     return handler(args, message, peer_name, profile, base, key)
@@ -514,6 +543,9 @@ def build_peer_parser(subparsers) -> None:
             sp.add_argument("run_id", help="Run ID returned by 'hermes peer run'")
         else:
             sp.add_argument("message", nargs="?", default=None, help="Message text (or stdin)")
+            sp.add_argument(
+                "--exact", action="store_true", default=False,
+                help="Send the message byte-for-byte, without stripping surrounding whitespace")
             if name == "run":
                 sp.add_argument(
                     "--idempotency-key", default=None, help="Stable retry key (generated when omitted)")

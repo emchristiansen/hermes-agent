@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 from typing import TYPE_CHECKING
 import contextlib
+import json
 
 from hermes_cli.worktree_ops import release_lsp_clients
 
@@ -120,6 +121,135 @@ def _conn_uses_path(
     return False
 
 
+def _json_field_sql(column: str, field: str) -> str:
+    return f"(CASE WHEN json_valid({column}) THEN json_extract({column}, '$.{field}') END)"
+
+
+# Marks a ``worker_result`` that someone other than the bound interpreter recorded on its behalf:
+# the replacement owner's restart accounting (``gateway.session_kanban.record_owner_restart_result``,
+# exit 79) carries the bound pid but the recording owner's pid under this key.
+OWNER_RECORDED_RESULT_KEY = "recorded_by_owner_pid"
+
+# A ``worker_bound`` event (alias ``e``) whose interpreter has not itself recorded its
+# ``worker_result``: that worker's turns may still be running in the card's workspace. Only the
+# interpreter's own result (``_record_worker_result``: same run, same pid, written before it runs
+# its own deferred cleanup) says it has stopped using the workspace. An owner's accounting result
+# (``OWNER_RECORDED_RESULT_KEY``) settles the attempt, not the workspace: the interpreter may
+# outlive its owner (a tool in flight gets a grace period after owner-pipe EOF), so such a binding
+# stays open and :func:`_binding_may_be_live` decides from the process itself. Every unfinished
+# binding counts, not only a card's latest: after a review handoff (``request_review`` then
+# ``claim_review_task``) or a re-dispatch, an earlier run's worker can still be in its turn while a
+# later run's worker binds and finishes.
+_UNFINISHED_BINDING_SQL = (
+    "e.kind = 'worker_bound' AND NOT EXISTS (SELECT 1 FROM task_events r "
+    "    WHERE r.task_id = e.task_id AND r.run_id IS e.run_id AND r.kind = 'worker_result' "
+    f"    AND r.id > e.id AND {_json_field_sql('r.payload', 'pid')} = {_json_field_sql('e.payload', 'pid')} "
+    f"    AND {_json_field_sql('r.payload', OWNER_RECORDED_RESULT_KEY)} IS NULL)"
+)
+_OPEN_BINDINGS_SQL = (
+    "SELECT t.id, t.workspace_path, e.payload FROM task_events e JOIN tasks t ON t.id = e.task_id "
+    f"WHERE t.workspace_path IS NOT NULL AND {_UNFINISHED_BINDING_SQL}"
+)
+
+
+def _binding_may_be_live(payload: Optional[str]) -> bool:
+    """Whether the worker a ``worker_bound`` payload names may still be running, failing closed.
+
+    False only when the process is provably gone: its pid is dead, or the pid's identity was
+    read and differs from the recorded one (the pid was recycled). Anything unreadable (the
+    payload, the pid, the recorded or the current identity) counts as live. Each identity part is
+    read once and that one reading decides (:func:`_identity_differs`), the same fail-closed rule
+    as ``kanban_db_dispatch._worker_identity``."""
+    from hermes_cli.kanban_db_dispatch import _pid_alive  # late: import cycle
+
+    try:
+        bound = json.loads(payload or "")
+        pid = int(bound["pid"])
+    except (TypeError, ValueError, KeyError):
+        return True
+    if pid <= 0:
+        return True
+    if not _pid_alive(pid):
+        return False
+    return not _identity_differs(pid, bound.get("started_at"))
+
+
+def _identity_differs(pid: int, recorded) -> bool:
+    """True only when a reading of live *pid*'s identity succeeds and differs from *recorded*,
+    the ``started_at`` that ``bind_worker_context`` stored: ``"<instantiation epoch>|<start>"``
+    (``kanban_db_dispatch._process_fingerprint``), a legacy integer start time, the
+    ``unverified`` marker or nothing. The start time is read once; the epoch decides only when
+    both its recorded and its current value are complete (``"<boot_id>:<pid1 start>"``)."""
+    from gateway.drain_control import current_instantiation_epoch
+    from gateway.status import _start_times_agree, get_process_start_time
+    from hermes_cli.kanban_db_dispatch import UNVERIFIED_WORKER_FINGERPRINT
+
+    if recorded is None or recorded == UNVERIFIED_WORKER_FINGERPRINT:
+        return False
+    if isinstance(recorded, str) and "|" in recorded:
+        recorded_epoch, recorded_start = recorded.rsplit("|", 1)
+        current = get_process_start_time(pid)
+        if current is None:
+            return False
+        if str(current) != recorded_start:
+            return True
+        epoch = current_instantiation_epoch()
+        return _complete_epoch(recorded_epoch) and _complete_epoch(epoch) and epoch != recorded_epoch
+    current = get_process_start_time(pid)
+    if current is None:
+        return False
+    try:
+        return not _start_times_agree(current, recorded)
+    except (TypeError, ValueError):
+        return False  # an unreadable recorded identity proves nothing
+
+
+def _complete_epoch(epoch: str) -> bool:
+    boot_id, _, pid1_start = epoch.partition(":")
+    return bool(boot_id and pid1_start)
+
+
+def _conn_live_worker_inside(conn: sqlite3.Connection, key: str) -> Optional[str]:
+    """A card with a live bound worker whose workspace is at or under *key*, else None.
+
+    Card status says nothing here: a worker goes on with its turn after completing its card (the
+    model reads the tool result, steered comments arrive), and so may a worker whose card someone
+    else completed, archived or handed to review. The card's own workers count too. Liveness is
+    each unfinished ``worker_bound`` pid with its start fingerprint
+    (:func:`_binding_may_be_live`), so a hard-killed worker (or a recycled pid) no longer holds
+    the directory."""
+    target = Path(key)
+    for row in conn.execute(_OPEN_BINDINGS_SQL).fetchall():
+        try:
+            workspace = Path(_path_key(Path(row["workspace_path"]).expanduser().resolve(strict=False)))
+        except OSError:
+            continue
+        if workspace != target and not workspace.is_relative_to(target):
+            continue
+        if _binding_may_be_live(row["payload"]):
+            return row["id"]
+    return None
+
+
+def _prune_terminal_events(conn: sqlite3.Connection, cutoff: int) -> int:
+    """Delete done/archived cards' events created before *cutoff*, except ``decomposed``, a spent
+    owner-restart grace (``owner_restart_grace``: pruning it would let a card reopened without an
+    admission earn a second one, ``kanban_presubmit_grace``) and any unfinished ``worker_bound``
+    whose worker may still be live, however old: that binding is the only evidence that the worker
+    still uses its card's workspace (:func:`_conn_live_worker_inside`). It is pruned once the worker
+    is gone. Returns the number of events deleted."""
+    terminal = "created_at < ? AND task_id IN (SELECT id FROM tasks WHERE status IN ('done', 'archived'))"
+    with _kb.write_txn(conn):
+        old_bindings = conn.execute(
+            f"SELECT e.id, e.payload FROM task_events e WHERE e.{terminal} AND {_UNFINISHED_BINDING_SQL}",
+            (cutoff,)).fetchall()
+        live = [row[0] for row in old_bindings if _binding_may_be_live(row[1])]
+        cur = conn.execute(
+            f"DELETE FROM task_events WHERE {terminal} AND kind NOT IN ('decomposed', 'owner_restart_grace') "
+            "AND id NOT IN (SELECT value FROM json_each(?))", (cutoff, json.dumps(live)))
+    return int(cur.rowcount or 0)
+
+
 def _sibling_board_db_files(conn: sqlite3.Connection) -> list[Path]:
     """Every other board's ``kanban.db``. Raises ``OSError`` when the set is unknown.
 
@@ -153,12 +283,14 @@ def _sibling_board_db_files(conn: sqlite3.Connection) -> list[Path]:
     return found
 
 
-def _other_board_uses_path(db_file: Path, task_id: str, key: str) -> bool:
+def _other_board_in_use(db_file: Path, task_id: str, key: str) -> Optional[str]:
     uri = db_file.as_uri() + "?mode=ro"
     other = sqlite3.connect(uri, uri=True, timeout=1.0)
     try:
         other.row_factory = sqlite3.Row
-        return _conn_uses_path(other, task_id, key, exclude_task_id=False)
+        if _conn_live_worker_inside(other, key):
+            return "live_worker"
+        return "shared" if _conn_uses_path(other, task_id, key, exclude_task_id=False) else None
     finally:
         other.close()
 
@@ -166,7 +298,16 @@ def _other_board_uses_path(db_file: Path, task_id: str, key: str) -> bool:
 def _workspace_in_use_by_other(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> Optional[str]:
-    """Why *path* must be kept: ``"shared"``, ``"unknown"``, or None when free.
+    """Why *path* must be kept: ``"live_worker"``, ``"shared"``, ``"unknown"``, or None when free.
+
+    ``"live_worker"``: a bound worker that has not ended works at or under *path*, whatever its
+    card's status and whether or not that card is *task_id* itself. Every removal route (the
+    card's own cleanup, the deferred parent sweep, ``gc``) asks here first, so a directory is
+    removed only once the last worker using it has ended. A done or archived card's worker runs
+    its card's cleanup, and so its parents' sweep, at its end
+    (``gateway.session_kanban._remove_finished_workspace``). Archiving a card runs its cleanup,
+    and ``kanban gc`` retries archived cards only, so a done card held back for some other
+    card's worker keeps its directory until it is archived.
 
     ``gc``, completion and deferred parent cleanup used to ``rmtree`` a shared
     ``workspace_path`` as soon as one of its tasks went terminal. Compare the
@@ -185,6 +326,11 @@ def _workspace_in_use_by_other(
     if not key:
         return None
     try:
+        worker_task = _conn_live_worker_inside(conn, key)
+        if worker_task:
+            _kb._log.debug("Workspace %s of task %s is still in use by the live worker of task %s",
+                           path, task_id, worker_task)
+            return "live_worker"
         if _conn_uses_path(conn, task_id, key):
             return "shared"
     except sqlite3.Error as exc:
@@ -197,8 +343,9 @@ def _workspace_in_use_by_other(
         return "unknown"
     for db_file in siblings:
         try:
-            if _other_board_uses_path(db_file, task_id, key):
-                return "shared"
+            reason = _other_board_in_use(db_file, task_id, key)
+            if reason:
+                return reason
         except (OSError, sqlite3.Error) as exc:
             _kb._log.warning(
                 "Cannot read board db %s for task %s: %s", db_file, task_id, exc,
@@ -210,11 +357,15 @@ def _workspace_in_use_by_other(
 def _defer_shared_workspace_cleanup(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> bool:
-    """Skip removal and record why, when *path* may still be used by a live task."""
+    """Skip removal and record why, when *path* may still be used by a live task or worker."""
     reason = _workspace_in_use_by_other(conn, task_id, path)
     if reason is None:
         return False
-    if reason == "shared":
+    if reason == "live_worker":
+        # Ordinary: a worker that completed its own card is still in its turn. Its end retries.
+        _kb._log.info("Deferring workspace cleanup for task %s: a live worker still uses %s",
+                      task_id, path)
+    elif reason == "shared":
         _kb._log.warning(
             "Deferring workspace cleanup for task %s: %s is still used by "
             "another non-terminal task",
@@ -364,7 +515,13 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     Called from :func:`complete_task` after the transaction commits; best-effort
     so cleanup never blocks completion. ``scratch`` is removed; ``worktree``
     only when provably free of work (clean tree, every commit reachable from a
-    remote-tracking ref); ``dir`` is intentionally preserved."""
+    remote-tracking ref); ``dir`` is intentionally preserved.
+
+    Nothing is removed while a live bound worker, this card's own included, works
+    at or under the directory (:func:`_workspace_in_use_by_other`), whether this is
+    the card's own workspace or a parent's in the deferred sweep. A done or archived
+    card's worker re-runs this cleanup when its turns end, so the last of a card's
+    and its children's workers to end removes what nothing needs any more."""
     try:
         row = conn.execute(_WORKSPACE_ROW_SQL, (task_id,)).fetchone()
         if not row:
@@ -836,6 +993,40 @@ def set_workspace_path(conn: sqlite3.Connection, task_id: str, path: Path | str)
 
 def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str) -> None:
     _set_task_column(conn, task_id, "branch_name", str(branch_name))
+
+
+def publish_claimed_workspace(
+    conn: sqlite3.Connection,
+    claim,
+    task_id: str,
+    workspace: Path | str,
+    *,
+    workspace_kind: Optional[str],
+    branch_name: Optional[str] = None,
+) -> bool:
+    """Publish the dispatcher's resolved workspace for its exact claim (a ``SpawnClaim``); False: spawn nothing.
+
+    ``workspace_path``, a worktree's ``branch_name`` and the first-use scratch tip
+    (:func:`_maybe_emit_scratch_tip`) are written in ONE write transaction, and only while the
+    card is still that claim (``claim.holds``). Resolving can outlast the claim TTL: the card may
+    then have been reclaimed and claimed by another dispatcher, whose row and events this leaves
+    exactly as that dispatcher wrote them; the stale caller must not spawn a worker for it."""
+    tip = (workspace_kind or "scratch") == "scratch" and not _scratch_tip_shown()
+    with _kb.write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None or not claim.holds(row):
+            return False
+        conn.execute("UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(workspace), task_id))
+        if branch_name is not None:
+            conn.execute("UPDATE tasks SET branch_name = ? WHERE id = ?", (str(branch_name), task_id))
+        if tip:
+            _kb._append_event(conn, task_id, "tip_scratch_workspace", {"message": _SCRATCH_TIP_MESSAGE})
+    if tip:
+        _kb._log.warning("kanban: %s (task %s)", _SCRATCH_TIP_MESSAGE, task_id)
+        _mark_scratch_tip_shown()
+    return True
 
 
 # Late-bound origin namespace (see module docstring); imported LAST so this

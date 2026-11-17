@@ -220,6 +220,25 @@ each operation's previous content reflects earlier operations in that batch.
 Older Hermes versions can omit `previous_content`. Providers that require exact
 identity should skip destructive mirroring when it is absent.
 
+### Synchronous current-query prefetch
+
+Cached/background providers keep the host's short prefetch wait (eight seconds by
+default). A provider doing synchronous recall for the current message can instead
+expose a `prefetch_timeout` property containing its configured positive, finite
+budget in seconds, and accept `prefetch(query, *, session_id="", deadline=None)`.
+Returning `None` from the property preserves the cached-prefetch behavior.
+
+The host passes an absolute `time.monotonic()` deadline so thread startup, client
+preparation and retries consume the same budget. The provider must stop scheduling
+new attempts when it expires and cancel its local async work. The host permits a
+one-second epilogue for timeout handling, not additional recall: a result completed
+after the deadline is not injected. The home-keyed stuck-call gate, bounded thread
+wait and in-flight cap still protect against a provider that fails to return.
+Failures remain non-fatal; they yield no recall context for that turn.
+
+Both host and provider must implement this contract. An old provider keeps the
+short wait, and an old host cannot honor a new provider's advertised budget.
+
 ### Oversized prefetch results
 
 External `prefetch()` results are returned in full by default, preserving the

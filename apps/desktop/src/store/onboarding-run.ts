@@ -115,8 +115,8 @@ export interface OnboardingIntroHooks {
 interface StartOptions {
   /** Points the window's gateway at the profile onboarding runs in (`store/profile.ts::ensureGatewayProfile`). */
   ensureProfile?: (profile: string) => Promise<void>
-  /** The launch's start: a run the app was closed on does not count, so the backend deletes its chat
-   *  and starts over (`decideOnboarding` only). */
+  /** The launch's start: a run the app was closed on does not count, so the backend ends it as
+   *  replaced (its chat is kept) and starts over (`decideOnboarding` only). */
   freshLaunch?: boolean
   intro?: OnboardingIntroHooks
   rerun?: boolean

@@ -3502,6 +3502,13 @@ export const en: Translations = {
     terminalSelectionMissingTitle: 'Terminal selection unavailable',
     terminalSelectionMissingBody:
       'Re-select the terminal lines (Ctrl/Cmd+L) before sending — this chip has no original text.',
+    correctionUnconfirmedTitle: 'Correction not confirmed',
+    correctionUnconfirmedBody:
+      'It may already have reached the run. Send it again as the same correction; a duplicate is fine.',
+    correctionSendAgain: 'Send again',
+    correctionNotSentTitle: 'Correction not sent',
+    correctionNotSentBody:
+      'It was not sent, and your current draft was left as it is. Its words are below; send them again yourself if they still apply.',
     queuedTerminalSelectionExpiredBody:
       'This queued terminal selection is no longer available. Re-select the lines (Ctrl/Cmd+L) and queue the message again.',
     previewUnavailable: 'Preview unavailable',

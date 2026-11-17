@@ -290,7 +290,13 @@ describe('steer mid-turn keeps arrival order (user bubble never above prior outp
     await act(async () => {
       await expect(redirect!('use the other file', 'steer')).resolves.toBe(true)
     })
-    expect(requestGatewayMock).toHaveBeenLastCalledWith('session.steer', { session_id: SID, text: 'use the other file' })
+    // The correction carries its own pinned identity, so a resend after a lost reply is the same
+    // correction (session-tile-actions.test.ts asserts the same shape).
+    expect(requestGatewayMock).toHaveBeenLastCalledWith('session.steer', {
+      session_id: SID,
+      text: 'use the other file',
+      correction_id: expect.any(String)
+    })
 
     // The steer interrupts nothing: the tool it waits on still reads as running.
     const sealed = states.get(SID)!.messages[0]

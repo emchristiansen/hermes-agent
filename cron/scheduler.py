@@ -534,6 +534,7 @@ from cron.executions import (
     recover_interrupted_executions, settle_unstarted_execution, terminalize_dead_owner)
 from cron.scheduler_liveness import ExecutionProgressStamper, _inactivity_watchdog_loop
 from cron.scheduler_bookkeeping import _classify_delivery_outcome
+from cron.delivery_outcome import settle_quietly
 from cron.cancellation import (CancelRequest, _CancelEventLike, _CombinedCancelEvent, cancel_reason,
                                clear_cancel, finish_lost_execution,
                                run_job_unless_cancelled as _run_job_unless_cancelled)
@@ -1356,8 +1357,9 @@ def _reclaim_fds_best_effort() -> None:
         apply_nofile_soft_limit(None)
 
 
-def drain_delivery_queue(adapters, loop) -> int:
-    """Send queued worker results through this gateway's live adapters."""
+def drain_delivery_queue(adapters, loop, *, wait: bool = True) -> int:
+    """Send queued worker results through this gateway's live adapters; each row on its own send
+    (``cron.delivery_queue.drain``). ``wait=False`` returns once the sends are started."""
     from cron.delivery_queue import _path, drain
 
     # Only restart-safe workers create the queue file.  Every gateway (macOS,
@@ -1377,7 +1379,7 @@ def drain_delivery_queue(adapters, loop) -> int:
             _mark_incident_alerted(queued_job.get("_failure_incident_id"))
         return error
 
-    return drain(send)
+    return drain(send, wait=wait)
 
 
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
@@ -2852,6 +2854,7 @@ def run_one_job(
                     False,
                     error,
                     delivery_error=delivery_error,
+                    execution_id=execution_id,
                     **({"expected_fire_owner": owner} if owner else {}),
                     # A ladder re-run's occurrence already counted toward repeat.
                     **({"ladder_rung": True} if is_retry_run(job) else {}),
@@ -2860,6 +2863,7 @@ def run_one_job(
                 finish_execution(
                     execution_id, success=False, error=error,
                     delivery_outcome=delivery_outcome)
+                settle_quietly(job["id"], execution_id)
             return True
         if handed_off:
             from cron.scheduler_worker_failure import record_unknown_worker_outcome
@@ -3123,24 +3127,18 @@ def _save_compose_deliver(
         and not _resolve_delivery_targets(job, for_failure=not d.success)
     )
     execution_id = job.get('execution_id')
-    if execution_id and not job.get('no_agent'):
-        from cron.delivery_queue import enqueue
-        # Nothing to send: an origin-less job is ``not_configured``, never a queued "delivery".
+    if execution_id:
+        from cron.delivery_queue import enqueue_result
+        # Local/unconfigured results are not accepted outbound messages.
         if d.unresolved_origin or _normalize_deliver_value(
                 _delivery_lane_value(job, for_failure=not d.success)) == "local":
             return
-        queued_job = dict(job)
-        if d.failure_incident_id:
-            queued_job["_failure_incident_id"] = d.failure_incident_id
-        # The queue row IS the send: publish it under the same fence as a direct send, so a claim
-        # stolen after the lost() sample above cannot leave this stale fire's notice queued.
         with fence.side_effect_fence() as owns_delivery:
             if not owns_delivery:
                 raise _FireClaimLostDuringSideEffect
-            queued = enqueue(execution_id, queued_job, deliver_content, for_failure=not d.success)
-            # The queue owns this send even if subsequent bookkeeping fails.
+            enqueue_result(job, deliver_content, for_failure=not d.success,
+                           failure_incident_id=d.failure_incident_id)
             d.delivery_attempted = True
-        job['last_delivery_queued'] = {'canonical': {'status': queued['status'], 'execution_id': execution_id}}
         return
     try:
         with fence.side_effect_fence() as owns_delivery:
@@ -3164,42 +3162,44 @@ def _save_compose_deliver(
 
 
 def _deliver_crash_failure(
-    job: dict, err_text: str, *, adapters, loop,
+    job: dict, err_text: str, *, adapters, loop, fence=None,
 ) -> tuple[Optional[str], str]:
-    """Failure notice for a run that raised out of run_job. Returns (delivery_error, outcome)."""
+    """Compose a raised run's notice, accepting only the message for durable retry."""
     normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=True))
-    # Same ack gate as the normal failure delivery: acked signatures stay silent here too.
     incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)
     if incident_acked:
         return None, "suppressed_acked"
-    delivery_error = None
+    unresolved_origin = normalized_deliver == "origin" and not _resolve_delivery_targets(job, for_failure=True)
+    if unresolved_origin or normalized_deliver == "local":
+        if unresolved_origin:
+            _mark_incident_alerted(failure_incident_id)
+        return None, "not_configured" if unresolved_origin else "suppressed"
+    delivery_error, delivery_queued = None, None
     try:
-        delivery_error = _deliver_result(
-            job,
-            # Same text as the normal failure delivery: this run also counts toward
-            # failure_streak, so the nudge must leave through here too.
-            _summarize_cron_failure_for_delivery(job, err_text) + _failure_streak_nudge(job),
-            adapters=adapters,
-            loop=loop,
-            for_failure=True,
-        )
+        notice = _summarize_cron_failure_for_delivery(job, err_text) + _failure_streak_nudge(job)
+        ownership = fence if fence is not None else _FireOwnership(job)
+        if ownership.lost():
+            return None, "suppressed"
+        with ownership.side_effect_fence() as owns_delivery:
+            if not owns_delivery:
+                return None, "suppressed"
+            if job.get("execution_id"):
+                from cron.delivery_queue import enqueue_result
+                enqueue_result(job, notice, for_failure=True, failure_incident_id=failure_incident_id)
+                delivery_queued = job["last_delivery_queued"]
+            else:  # Legacy internal caller without a run; normal entry points allocate first.
+                delivery_error = _deliver_result(job, notice, adapters=adapters, loop=loop, for_failure=True)
     except Exception as delivery_exc:
         delivery_error = str(delivery_exc)
         logger.error("Delivery failed for job %s: %s", job["id"], delivery_exc)
-    unresolved_origin = bool(
-        not delivery_error
-        and normalized_deliver == "origin"
-        and not _resolve_delivery_targets(job, for_failure=True)
-    )
     delivery_outcome = _classify_delivery_outcome(
-        delivery_error=delivery_error, should_deliver=True, unresolved_origin=unresolved_origin,
+        delivery_error=delivery_error, should_deliver=True, unresolved_origin=False,
         normalized_deliver=normalized_deliver, incident_acked=False, success=False,
-        delivery_queued=job.get("last_delivery_queued"),
+        delivery_queued=delivery_queued,
         notification_suppressed=bool(job.get("_notification_all_targets_suppressed")))
-    if delivery_outcome in ("delivered", "not_configured"):
+    if delivery_outcome == "delivered":
         _mark_incident_alerted(failure_incident_id)
     return delivery_error, delivery_outcome
-
 
 
 def _install_fire_secret_scope() -> tuple[contextvars.Token, Optional[contextvars.Token]]:
@@ -3454,13 +3454,13 @@ def _run_one_job_body(
             and not _fire_claim_ownership_lost()
         ):
             delivery_error, delivery_outcome = _deliver_crash_failure(
-                job, _err_text, adapters=adapters, loop=loop)
+                job, _err_text, adapters=adapters, loop=loop, fence=fence)
         try:
             if (
                 not _consume_interrupted_flag(job["id"], execution_token)
                 and not self_removal_delivery_allowed(job["id"])  # no record left to mark
             ):
-                mark_kwargs = {}
+                mark_kwargs = {"execution_id": execution_id}
                 if fire_owner is not None:
                     mark_kwargs["expected_fire_owner"] = fire_owner
                 if contained:
@@ -3476,6 +3476,7 @@ def _run_one_job_body(
         try:
             finish_execution(
                 execution_id, success=False, error=_err_text, delivery_outcome=delivery_outcome)
+            settle_quietly(job["id"], execution_id)
         except Exception as record_err:
             logger.error("Failed to finish execution record for job %s: %s", job["id"], record_err)
         if not contained:

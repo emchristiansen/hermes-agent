@@ -121,3 +121,43 @@ it('settles a plain rejected correction as refused without re-sending it as a pr
   await new Promise(resolve => setTimeout(resolve, 20))
   expect(calls).toEqual(['session.redirect'])
 })
+
+// NC8-CONTRACT-01: a managed Kanban worker's correction is kept on the card's task before the child
+// sees it; when the running turn could not take it, the owner answers this exact acknowledgement
+// (``gateway/session_managed_worker.KeptCorrection.unreached`` merged into the correction ACK). Its
+// ``rejected``/``delivered: false`` must not re-admit it as a fresh prompt: that prompt would carry
+// no claim binding. The claim may have ended (same generation) or been replaced (another one).
+const keptOnTask = (generation: number) => ({
+  authority_epoch: 1,
+  delivered: false,
+  execution_generation: generation,
+  kept: 'task_comment',
+  status: 'rejected',
+  text: 'next thought'
+})
+
+it.each([
+  ['its claim ended', 4],
+  ['its claim was replaced', 5]
+])('settles a correction kept on its card task as kept, never re-sent as an unbound prompt (%s)', async (_name, generation) => {
+  const calls: Array<{ method: string; params: Record<string, unknown> }> = []
+  const settle = vi.fn()
+  const sys = vi.fn()
+
+  const request = vi.fn(async (method: string, params: Record<string, unknown>) => {
+    calls.push({ method, params })
+
+    return method === 'prompt.submit' ? { status: 'queued' } : keptOnTask(generation)
+  })
+
+  submitPrompt('next thought', { ...deps({ isCanonical: true, request } as unknown as GatewayClient), sys }, true, undefined, {
+    behindTurn: true,
+    queueItem: correction(settle),
+    skipDetectDrop: true
+  })
+
+  await vi.waitFor(() => expect(settle).toHaveBeenCalledWith(true))
+  await new Promise(resolve => setTimeout(resolve, 20))
+  expect(calls.map(c => c.method)).toEqual(['session.redirect'])
+  expect(sys).toHaveBeenCalledWith('correction kept on its task')
+})

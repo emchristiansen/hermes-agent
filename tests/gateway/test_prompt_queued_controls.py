@@ -27,6 +27,15 @@ class Agent:
         pass
 
 
+@pytest.fixture(autouse=True)
+def _explicit_controls_only(monkeypatch):
+    """These are the explicit ``prompt.steer_queued``/``replace_queued`` windows. The automatic busy pass
+    (``session_busy_ingress``, covered in ``test_every_message_steers``) writes through the same
+    ``transfer`` and would take each queued row before the control under test runs."""
+    from gateway import session_busy_ingress
+    monkeypatch.setattr(session_busy_ingress, 'steer_soon', lambda *args: None)
+
+
 class Turn:
     """Every turn the drain claims adopts one agent and runs until ``release`` (``fail``: that turn's
     text raises after adoption, so its execution fails)."""

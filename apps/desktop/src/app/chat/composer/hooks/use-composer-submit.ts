@@ -7,6 +7,7 @@ import { isSlashCommandText } from '@/lib/chat-runtime'
 import { isSideTaskSlashCommand } from '@/lib/desktop-slash-commands'
 import { triggerHaptic } from '@/lib/haptics'
 import { isTouchInteraction } from '@/lib/touch-interaction'
+import { UncertainCorrection } from '@/lib/uncertain-correction'
 import type { BusyInputMode } from '@/store/busy-input-mode'
 import { hasClarifyRequest, skipClarifyRequest } from '@/store/clarify'
 import {
@@ -46,6 +47,19 @@ function stashStillHoldsSent(scope: string | null, text: string, attachments: Co
     stashed.attachments.every(attachment => attachments.some(sent => sameOccurrence(sent, attachment)))
   )
 }
+
+// A draft scope as the submit contract spells it: every fresh-draft key is "no session yet" (null).
+const ownDraftScope = (key: string | null | undefined) => (key && !isFreshDraftScope(key) ? key : null)
+
+// A correction that was not sent and has no empty draft to return to keeps its exact words here.
+const notifyCorrectionNotSent = (displayText: string) =>
+  notify({
+    kind: 'warning',
+    persistent: true,
+    title: translateNow('composer.correctionNotSentTitle'),
+    message: translateNow('composer.correctionNotSentBody'),
+    detail: displayText
+  })
 
 interface UseComposerSubmitArgs {
   activeQueueSessionKey: string | null
@@ -215,6 +229,53 @@ export function useComposerSubmit({
       .finally(() => outgoing?.retire())
   }
 
+  // How a correction settles, for every entry that steers (a typed `steerDraft` and an external
+  // request alike). A refusal the owner confirmed undelivered (`accepted === false`) takes `keep`. On
+  // the canonical owner a correction whose outcome is unknown (its reply lost, or a failure after the
+  // owner may have taken it or kept it on a Kanban card's task) stays a correction: queued as an
+  // ordinary prompt it would carry no card binding (NC12-CLIENT-01, NC16-CLIENT-03). The user sends it
+  // again as the same correction to the session it was captured for; a duplicate is fine. Any other
+  // failure there (an UnsentCorrection never left) takes `unsent`, never a prompt.
+  const settleCorrection = (
+    outcome: Promise<boolean>,
+    {
+      canonical,
+      displayText,
+      keep,
+      unsent
+    }: { canonical: boolean; displayText: string; keep: () => void; unsent: () => void }
+  ) => {
+    const settle = (attempt: Promise<boolean>): Promise<void> =>
+      attempt.then(
+        accepted => {
+          if (!accepted) {
+            keep()
+          }
+        },
+        (err: unknown) => {
+          if (!canonical) {
+            keep()
+          } else if (!(err instanceof UncertainCorrection)) {
+            unsent()
+          } else {
+            notify({
+              kind: 'warning',
+              persistent: true,
+              title: translateNow('composer.correctionUnconfirmedTitle'),
+              message: translateNow('composer.correctionUnconfirmedBody'),
+              detail: displayText,
+              action: {
+                label: translateNow('composer.correctionSendAgain'),
+                onClick: () => void settle(err.retry())
+              }
+            })
+          }
+        }
+      )
+
+    void settle(outcome)
+  }
+
   // External "submit this prompt" requests (e.g. the review pane's agent-ship
   // button) route through the same send path. Match both the composer target
   // and the exact visible surface captured at click time — every tile stays
@@ -226,8 +287,8 @@ export function useComposerSubmit({
   // if the turn has already ended, or a steer is not possible, queue it so it
   // runs next. This holds for hidden setup notes and for visible messages a
   // button sends on the user's behalf alike.
-  const externalSubmitRef = useRef({ busy, dispatchSubmit, onSteer, onSteerHidden })
-  externalSubmitRef.current = { busy, dispatchSubmit, onSteer, onSteerHidden }
+  const externalSubmitRef = useRef({ busy, dispatchSubmit, onSteer, onSteerHidden, settleCorrection })
+  externalSubmitRef.current = { busy, dispatchSubmit, onSteer, onSteerHidden, settleCorrection }
 
   useLayoutEffect(
     () =>
@@ -291,13 +352,13 @@ export function useComposerSubmit({
             text.trim() &&
             !SLASH_COMMAND_RE.test(text.trim())
           ) {
-            void Promise.resolve(current.onSteer(text))
-              .then(accepted => {
-                if (!accepted) {
-                  enqueue()
-                }
-              })
-              .catch(() => enqueue())
+            // External text has no draft to return to: words that were not sent stay in a notice.
+            current.settleCorrection(Promise.resolve().then(() => current.onSteer?.(text) ?? false), {
+              canonical: serverOwnsComposerQueue(queueKey),
+              displayText: text,
+              keep: enqueue,
+              unsent: () => notifyCorrectionNotSent(text)
+            })
           } else {
             enqueue()
           }
@@ -551,7 +612,8 @@ export function useComposerSubmit({
 
   // Redirect the live turn with a correction. The gateway either restarts the
   // active model request with its displayed context or waits for the current
-  // tool boundary. If the turn already ended, queue the words instead.
+  // tool boundary. If the turn already ended, queue the words instead (on the canonical owner, only
+  // once the owner confirms it neither delivered nor kept them).
   const steerDraft = (mode: 'interrupt' | 'steer' = 'interrupt') => {
     const text = draftRef.current.trim()
     // The Steer action on a restored send: queued under its id like a busy Enter (see queueRetry).
@@ -584,9 +646,9 @@ export function useComposerSubmit({
     }
 
     triggerHaptic('submit')
+    // The draft these words leave (and may return to): captured before the clear.
+    const draftOwner = draftScopeRef.current
     clearDraft()
-
-    const submittedScope = activeQueueSessionKeyRef.current
 
     // The draft is already cleared, so a refused or failed redirect must keep
     // the only copy (#68927): the canonical gateway queue when the server owns
@@ -597,10 +659,36 @@ export function useComposerSubmit({
     const hasTerminalTransport = frozen.displayText !== frozen.transportText
     const canonical = serverOwnsComposerQueue(sessionId ?? activeQueueSessionKey)
 
+    // Gives the words back to the draft they were typed in only where nothing is replaced: a refusal
+    // may come long after the steer (the persistent Send again), when the composer shows another session
+    // (NC15-CLIENT-01) or the user has typed since, perhaps not yet mirrored into `draftRef`
+    // (NC16-CLIENT-01). The owner is the draft that was loaded when the words were taken (NC16-CLIENT-02),
+    // never the queue key, which can run ahead during a pending navigation. Otherwise the words stay in a
+    // persistent notice: never in another draft, never a prompt.
+    const giveBack = () => {
+      const loaded = ownDraftScope(draftScopeRef.current) === ownDraftScope(draftOwner)
+      const editor = editorRef.current
+
+      const current = loaded
+        ? { attachments: scope.attachments.$attachments.get(), text: editor ? composerPlainText(editor) : draftRef.current }
+        : takeSessionDraft(draftOwner)
+
+      if (!current.text.trim() && current.attachments.length === 0) {
+        stashAt(draftOwner, frozen.displayText, [])
+
+        if (loaded) {
+          loadIntoComposer(frozen.displayText, [])
+        }
+
+        return
+      }
+
+      notifyCorrectionNotSent(frozen.displayText)
+    }
+
     const keep = () => {
       if (!activeQueueSessionKey) {
-        loadIntoComposer(frozen.displayText, [])
-        stashAt(submittedScope, frozen.displayText, [])
+        giveBack()
       } else if (canonical) {
         // `fromQueue` skips the submit-side freeze, so hand it the frozen transport.
         dispatchSubmit(frozen.transportText, [], undefined, {
@@ -618,14 +706,12 @@ export function useComposerSubmit({
       }
     }
 
-    void Promise.resolve()
-      .then(() => onSteer(frozen.transportText, mode))
-      .then(accepted => {
-        if (!accepted) {
-          keep()
-        }
-      })
-      .catch(keep)
+    settleCorrection(Promise.resolve().then(() => onSteer(frozen.transportText, mode)), {
+      canonical: canonical && Boolean(activeQueueSessionKey),
+      displayText: frozen.displayText,
+      keep,
+      unsent: giveBack
+    })
   }
 
   const queueDraft = () => {

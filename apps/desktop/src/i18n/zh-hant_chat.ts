@@ -166,6 +166,13 @@ export const zhHantChat = {
     queueResumeTip: '已被停止操作暫停 — 繼續傳送排隊的回合',
     queueStuckTitle: '佇列訊息未送出',
     queueStuckBody: '佇列中的對話多次傳送失敗。它仍在佇列中，請重試傳送。',
+    correctionUnconfirmedTitle: '更正未確認',
+    correctionUnconfirmedBody:
+      '它可能已送達執行。請作為同一更正再次傳送；重複也沒關係。',
+    correctionSendAgain: '再次傳送',
+    correctionNotSentTitle: '更正未傳送',
+    correctionNotSentBody:
+      '它未被傳送，你目前的草稿保持不變。其內容在下方；如仍適用，請自行再次傳送。',
     queueDroppedTitle: '已捨棄佇列內容',
     queueDroppedBody: '該背景佇列項目因工作階段多次嘗試後仍無法恢復而遭捨棄。佇列中的其他內容不受影響。',
     terminalSelectionMissingTitle: '無法使用終端選區',

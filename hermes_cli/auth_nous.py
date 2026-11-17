@@ -94,14 +94,16 @@ def _format_nous_entitlement_auth_error(error: AuthError) -> str:
     return f"{error} Check credits or billing in Nous Portal, then retry."
 
 
-def _migrate_stale_nous_portal_url(providers: dict[str, Any]) -> None:
+def _migrate_stale_nous_portal_url(providers: dict[str, Any], *, log: bool = True) -> None:
+    """``log=False``: a read-only projection reporting other rows must not echo this stored URL."""
     nous = providers.get("nous")
     if not isinstance(nous, dict):
         return
     stored = (nous.get("portal_base_url") or "").strip()
     if stored and urlparse(stored).hostname in _NOUS_STALE_PORTAL_HOSTS:
-        logger.warning(
-            "auth: migrating stale nous portal_base_url %s -> %s", stored, DEFAULT_NOUS_PORTAL_URL)
+        if log:
+            logger.warning(
+                "auth: migrating stale nous portal_base_url %s -> %s", stored, DEFAULT_NOUS_PORTAL_URL)
         nous["portal_base_url"] = DEFAULT_NOUS_PORTAL_URL
 
 

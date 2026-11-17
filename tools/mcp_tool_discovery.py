@@ -109,19 +109,18 @@ def _owner_secret_mapping(home: Path) -> dict[str, str]:
     over the frozen launch env): a credential injected only by systemd ``Environment=`` /
     ``op run`` / Compose has no file to rebuild from, so a files-only rebuild dropped it, left the
     header literal ``${VAR}`` and parked a server that worked. A served profile gets its own ``.env``
-    + external sources only. A source that did not fully hydrate is retried at most once per
-    interval per home: every retry is a helper subprocess, and connect/reconnect loops are tight."""
-    from agent.secret_scope import _is_process_home, build_profile_secret_scope
+    + external sources only (``owner_secret_scope``: the launch env is added on the verdict the files
+    were read under, never on a separate identity check). A source that did not fully hydrate is
+    retried at most once per interval per home: every retry is a helper subprocess, and
+    connect/reconnect loops are tight."""
     from hermes_cli import env_loader
+    from tui_gateway.launch_profile_policy import owner_secret_scope
     key = str(home.resolve())
     if time.monotonic() >= _hydrate_retry_after.get(key, 0.0):
         env_loader.hydrate_profile_secret_sources(home)
         if key not in env_loader._APPLIED_HOMES:
             _hydrate_retry_after[key] = time.monotonic() + _HYDRATE_RETRY_INTERVAL_SEC
-    if _is_process_home(home):
-        from tui_gateway.launch_profile_policy import launch_secret_scope
-        return launch_secret_scope(home)
-    return build_profile_secret_scope(home)
+    return owner_secret_scope(home)
 
 
 @contextmanager

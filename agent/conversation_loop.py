@@ -805,9 +805,12 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     Mutates ``agent._cached_system_prompt`` and persists a freshly-built prompt on first
     build. Row states ``missing``/``null``/``empty``/``present`` are logged and DB
     failures log at WARNING so silent prefix-cache misses show in ``agent.log``."""
+    from agent.home_guidance import continues_without_prompt, foreign_import_view, restore_home_guidance, stored_messages
     stored_prompt = None
     stored_state = "missing"
     session_row = None
+    read_failure = None
+    continuing = False
     if conversation_history and agent._session_db:
         try:
             session_row = agent._session_db.get_session(agent.session_id)
@@ -815,13 +818,23 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 raw_prompt = session_row.get("system_prompt")
                 stored_state = "null" if raw_prompt is None else ("empty" if raw_prompt == "" else "present")
                 stored_prompt = raw_prompt or None
+            # A row that lost its prompt but shows a decided conversation, in the history this turn continues or in
+            # its stored transcript (whose row ids place an import's boundary), is a continuing conversation.
+            guidance_row = foreign_import_view(agent._session_db, session_row)  # a CLI import's boundary
+            continuing = stored_state in ("null", "empty") and (
+                continues_without_prompt(guidance_row, conversation_history)
+                or continues_without_prompt(guidance_row, stored_messages(agent._session_db, agent.session_id)))
         except Exception as exc:
+            read_failure = type(exc).__name__
             logger.warning(
                 "Session DB get_session failed for system-prompt restore (session=%s): %s. "
                 "Falling back to fresh build — prefix cache will miss for this turn.",
                 agent.session_id, exc,
             )
 
+    # A resumed session keeps its edition through every rebuild; a row that lost its prompt but shows a decided
+    # conversation, or a failed read with history to continue, is a continuing conversation, never a new one.
+    restore_home_guidance(agent, stored_prompt, unreadable=read_failure, continuing=continuing)
     if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
         # NULL/empty rows never reach this probe: they already rebuild below.
         if _bot_chat_prompt_stale(agent, stored_prompt):

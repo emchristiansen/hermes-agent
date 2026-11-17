@@ -110,6 +110,15 @@ def _admissions(held):
     return [row['request_id'] for row in list_session_admissions(held.db, session_id=CHAT, pending_only=False)]
 
 
+def _assert_retry_promptly(result):
+    """An unknown live outcome stays ambiguous and asks for a prompt retry: after uncertain delivery the message is
+    retried, and a repeated message never authorizes a repeated effect (the delivery id keeps one admission)."""
+    assert result.get('status') == 'ambiguous', result
+    assert 'Retry the message promptly' in result['error'], result
+    assert 'repeated messages do not authorize repeated effects' in result['error'], result
+    assert 'Do not resend' not in result['error'], result
+
+
 @pytest.mark.asyncio
 async def test_a_dm_refused_while_another_writer_holds_the_chat_is_a_definite_no_send(held):
     from gateway.session_bot import recover_bot_deliveries
@@ -146,9 +155,17 @@ async def test_a_refusal_after_the_owner_may_have_admitted_stays_ambiguous(held,
     monkeypatch.setattr(type(held.authority), 'admit_automation', committed_then_refused)
     held.authority._schedule = lambda ref: None
     result = await _send(held, 'ping')
-    assert result.get('status') == 'ambiguous' and 'Do not resend' in result['error'], result
+    _assert_retry_promptly(result)
     assert [path.name for path in held.dm_dir.glob('*.live.json')], 'the unknown admission keeps its intent'
     assert _admissions(held) == ['bot:' + result['delivery_id']]
+    # The prompt retry of the kept intent (same id and payload) is answered from the id's unknown outcome, never
+    # admitted again: no repeated effect.
+    from hermes_cli.gateway_client import GatewayRPCError
+    monkeypatch.setattr(type(held.authority), 'admit_automation', real)
+    with pytest.raises(GatewayRPCError) as retried:
+        await asyncio.to_thread(_resubmit, held, result['delivery_id'], 'ping')
+    assert str(retried.value) == 'unknown_execution', retried.value
+    assert _admissions(held) == ['bot:' + result['delivery_id']] and held.executed == []
 
 
 def _resubmit(held, delivery_id, text):
@@ -220,8 +237,15 @@ async def test_an_older_owner_without_the_marker_stays_ambiguous(held, monkeypat
 
     monkeypatch.setattr(session_bot, '_held_by_another_writer', old_owner)
     result = await _send(held, 'ping')
-    assert result.get('status') == 'ambiguous' and 'Do not resend' in result['error'], result
+    _assert_retry_promptly(result)
     assert [path.name for path in held.dm_dir.glob('*.live.json')], 'an unproven refusal keeps its intent'
+    assert _admissions(held) == [] and held.executed == []
+    # Once the writer closes, the prompt retry under the same id is admitted once; a repeat adds no second effect.
+    held.release()
+    first = await asyncio.to_thread(_resubmit, held, result['delivery_id'], 'ping')
+    again = await asyncio.to_thread(_resubmit, held, result['delivery_id'], 'ping')
+    assert first.get('admission_id') and again.get('admission_id') == first['admission_id'], (first, again)
+    assert _admissions(held) == ['bot:' + result['delivery_id']]
 
 
 @pytest.mark.asyncio
@@ -275,10 +299,11 @@ async def test_a_settle_refused_by_a_retired_owner_keeps_the_unknown_outcome(hel
 
     monkeypatch.setattr(bot_live_delivery, 'authority_settle', retire_then_settle)
     result = await _send(held, 'ping')
-    assert result.get('status') == 'ambiguous' and 'Do not resend' in result['error'], result
+    _assert_retry_promptly(result)
     assert 'NOT sent' not in result['error'], result
     assert [path.name for path in held.dm_dir.glob('*.live.json')], 'an unsettled refusal keeps its intent'
     assert bot_live_delivery.read_delivery_result(held.home, result['delivery_id']) is None
+    assert _admissions(held) == [] and held.executed == []   # the refusal admitted nothing to repeat
 
 
 @pytest.mark.asyncio

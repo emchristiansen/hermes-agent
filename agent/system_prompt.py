@@ -27,6 +27,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, drain_truncation_warnings,
 )
 from agent import prompt_builder as _pb
+from agent.home_guidance import apply_home_guidance, frozen as _frozen_home_guidance, state_line as _home_guidance_state
 from agent.runtime_cwd import resolve_agent_cwd, resolve_context_cwd
 from hermes_constants import get_default_hermes_root, get_hermes_home
 from utils import is_truthy_value
@@ -761,6 +762,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     _ctx_len = _cc_len if isinstance(_cc_len, int) and _cc_len > 0 else None
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts, _soul_loaded = _identity_parts(agent, _ctx_len)
+    _soul, _home_part = apply_home_guidance(agent, stable_parts[0] if _soul_loaded else None,
+                                            _pb.soul_md_path(_agent_home(agent)), _ctx_len)
+    if _soul_loaded:
+        stable_parts[0] = _soul  # a frozen edition replaces a different one the re-read SOUL.md carries
+    stable_parts.append(_home_part)
     # The skill_view() pointer dangles without skill tools OR without the
     # hermes-agent skill installed, so the variant is chosen after the skills
     # index is built; this slot holds its position.
@@ -794,6 +800,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Preserve the stable placement for non-workspace sessions; there is no
         # worktree snapshot whose later position would improve their prefix.
         stable_parts.extend([*coding_trailing_parts, *post_workspace_parts])
+    stable = _join_tier(stable_parts)
     # ── Volatile tier (most likely to differ on a rebuild; kept last so the stable prefix stays reusable) ──
     # Skills are runtime-mutable, so the index leads the volatile band: on a longest-prefix
     # backend an unchanged index stays inside the reused prefix; a changed one re-prefills from here.
@@ -804,14 +811,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # The profile line names this home's path, so it rides in the volatile tier: the stable
     # prefix then stays byte-identical across every profile (and home) on the host.
     volatile_parts.append(_active_profile_line(agent))
-    volatile_parts.append(_timestamp_line(agent))
+    # The trailer's last line records the home-guidance decision; a resumed session reads it back from there.
+    volatile_parts.append(_timestamp_line(agent) + _home_guidance_state(agent, stable))
     # Keep the renderer-owned runtime anchor after all user/plugin prose so quoted
     # host examples cannot shadow it during persisted-prompt validation.
     if environment_hints:
         # Embedder hints are prose too; reserve the delimiter for the renderer.
         environment_hints = environment_hints.replace(_pb.RUNTIME_ENVIRONMENT_HEADING, "> " + _pb.RUNTIME_ENVIRONMENT_HEADING)
         volatile_parts.append(f"{_pb.RUNTIME_ENVIRONMENT_HEADING}\n\n{environment_hints}\n\n{_pb.RUNTIME_ENVIRONMENT_END}")
-    return {"stable": _join_tier(stable_parts), "context": _join_tier(context_parts), "volatile": _join_tier(volatile_parts)}
+    return {"stable": stable, "context": _join_tier(context_parts), "volatile": _join_tier(volatile_parts)}
 
 
 def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str:
@@ -838,12 +846,13 @@ def invalidate_system_prompt(agent: Any) -> None:
     inside plugin-land. The previous bytes are stashed so a plugin whose render RAISES falls back to its
     last good section instead of vanishing (fail-open guard, not a freeze).
     """
+    _frozen_home_guidance(agent)  # recover it from the stored prompt first: a rebuild never re-reads the file
     agent._cached_system_prompt = None
     agent._cached_system_prompt_static = None
     if hasattr(agent, "_plugin_system_prompt_sections_snapshot"):
         agent._plugin_system_prompt_sections_previous = agent._plugin_system_prompt_sections_snapshot
         del agent._plugin_system_prompt_sections_snapshot
-    if agent._memory_store:
+    if getattr(agent, "_memory_store", None):
         agent._memory_store.load_from_disk()
 
 

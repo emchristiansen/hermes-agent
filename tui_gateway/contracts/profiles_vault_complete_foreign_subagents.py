@@ -399,7 +399,8 @@ class OnboardingFactsSource(WireEnum):
 class OnboardingStartParams(Params):
     """``rerun``: start a new onboarding chat even when one is in progress (Settings, Run onboarding
     again; it never claims the welcome trial). ``fresh_launch``: the app's once-per-launch start; a run
-    the app was closed on does not count, so its chat is deleted and the run starts over.
+    the app was closed on does not count, so it ends as ``replaced`` (its chat stays in the history) and
+    the run starts over in a new chat.
     ``facts_source``: whether the backend runs on the user's own computer. ``locale``: the desktop's UI
     language, preferred over the backend OS locale. ``assume_fresh``: as on ``onboarding.state``. A new
     run on a first install claims the welcome trial before its chat exists; a failed claim is error

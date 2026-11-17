@@ -18,8 +18,10 @@ import { useI18n } from '@/i18n'
 import { type ChatMessage, textPart } from '@/lib/chat-messages'
 import { isSlashCommandText } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
+import { CorrectionTargetChanged, UncertainCorrection, UnsentCorrection } from '@/lib/uncertain-correction'
 import { clearClarifyRequest } from '@/store/clarify'
 import type { ComposerAttachment } from '@/store/composer'
+import { serverOwnsComposerQueue } from '@/store/composer-queue'
 import { resetSessionBackground } from '@/store/composer-status'
 import { confirm } from '@/store/confirm'
 import { notify, notifyError } from '@/store/notifications'
@@ -436,89 +438,115 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
         return false
       }
 
-      const messageId = `user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      // Its retries present the execution generation its first send named (NC13-CLIENT-01).
+      const correctionId = crypto.randomUUID()
 
-      const mutate = (updater: (state: ClientSessionState) => ClientSessionState) =>
-        sessionTileDelegate()?.updateSession(sessionId, updater)
+      // One delivery attempt to this tile's session; a failure retries this same correction there.
+      const attempt = async (): Promise<boolean> => {
+        const messageId = `user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
-      // Reserve the correction's arrival position without sealing the stream.
-      // Deltas arriving during a refused RPC must keep their live bubble.
-      mutate(state => {
-        const message = { id: messageId, role: 'user' as const, parts: [textPart(text)] }
+        const mutate = (updater: (state: ClientSessionState) => ClientSessionState) =>
+          sessionTileDelegate()?.updateSession(sessionId, updater)
 
-        return { ...state, messages: [...state.messages, message] }
-      })
-
-      const discardOptimisticMessage = () =>
-        mutate(state => ({
-          ...state,
-          messages: state.messages.filter(message => message.id !== messageId)
-        }))
-
-      const moveOptimisticMessageToEnd = () =>
+        // Reserve the correction's arrival position without sealing the stream.
+        // Deltas arriving during a refused RPC must keep their live bubble.
         mutate(state => {
-          const message = state.messages.find(candidate => candidate.id === messageId)
+          const message = { id: messageId, role: 'user' as const, parts: [textPart(text)] }
 
-          return message
-            ? { ...state, messages: [...state.messages.filter(candidate => candidate.id !== messageId), message] }
-            : state
+          return { ...state, messages: [...state.messages, message] }
         })
 
-      try {
-        const { result } = await withSessionNotFoundResume(
-          sessionId,
-          storedIdRef.current,
-          liveId =>
-            requestSessionGateway<{ status?: string }>(mode === 'steer' ? 'session.steer' : 'session.redirect', {
-              session_id: liveId,
-              text
-            }),
-          {
-            requestGateway: requestSessionGateway,
-            onRecovered: bindRecoveredRuntime
+        const discardOptimisticMessage = () =>
+          mutate(state => ({
+            ...state,
+            messages: state.messages.filter(message => message.id !== messageId)
+          }))
+
+        const moveOptimisticMessageToEnd = () =>
+          mutate(state => {
+            const message = state.messages.find(candidate => candidate.id === messageId)
+
+            return message
+              ? { ...state, messages: [...state.messages.filter(candidate => candidate.id !== messageId), message] }
+              : state
+          })
+
+        try {
+          const { result } = await withSessionNotFoundResume(
+            sessionId,
+            storedIdRef.current,
+            liveId =>
+              requestSessionGateway<{ delivered?: boolean; kept?: 'task_comment' | null; status?: string }>(
+                mode === 'steer' ? 'session.steer' : 'session.redirect',
+                { session_id: liveId, text, correction_id: correctionId }
+              ),
+            {
+              requestGateway: requestSessionGateway,
+              onRecovered: bindRecoveredRuntime
+            }
+          )
+
+          if (result?.status === 'redirected') {
+            if (mode === 'interrupt') {
+              flushStreamDeltas(sessionId)
+              mutate(state => sealAcceptedCorrection(state, messageId))
+            }
+
+            triggerHaptic('submit')
+
+            return true
           }
-        )
 
-        if (result?.status === 'redirected') {
-          if (mode === 'interrupt') {
-            flushStreamDeltas(sessionId)
-            mutate(state => sealAcceptedCorrection(state, messageId))
+          // A card attempt's correction its running turn never took is kept on the card's task (the
+          // next attempt reads it): accepted and durable like a queued one, never sent again as a
+          // fresh, unbound prompt.
+          if (result?.status === 'queued' || result?.kept === 'task_comment') {
+            // A redirect queued in the build window is the next turn; an
+            // accepted steer joins this one after its running tool.
+            if (mode === 'steer') {
+              flushStreamDeltas(sessionId)
+              mutate(state => sealAcceptedCorrection(state, messageId, { keepRunningTools: true }))
+            } else {
+              moveOptimisticMessageToEnd()
+            }
+
+            triggerHaptic('submit')
+
+            return true
           }
 
-          triggerHaptic('submit')
+          // Only an owner-confirmed undelivered refusal hands the words back; on the canonical owner
+          // any other reply is uncertain and the correction stays a correction (NC12-CLIENT-01).
+          if (
+            serverOwnsComposerQueue(storedIdRef.current ?? sessionId) &&
+            !(result?.status === 'rejected' && result.delivered === false)
+          ) {
+            throw new Error(`Correction outcome unconfirmed: ${JSON.stringify(result ?? null)}`)
+          }
+        } catch (err) {
+          discardOptimisticMessage()
 
-          return true
+          // Refused before any agent saw it: the composer re-queues the words (#141644).
+          if (isUndeliveredCorrectionRefusal(err)) {
+            return false
+          }
+
+          // Its session changed under it (a resumed runtime): never sent there; the words go back.
+          if (err instanceof CorrectionTargetChanged) {
+            throw new UnsentCorrection('its session changed since it was first sent')
+          }
+
+          notifyError(err, copy.promptFailed)
+          // Uncertain (the owner may hold it): it stays a correction, retried to this tile's session.
+          throw new UncertainCorrection(err, attempt)
         }
 
-        if (result?.status === 'queued') {
-          // A redirect queued in the build window is the next turn; an
-          // accepted steer joins this one after its running tool.
-          if (mode === 'steer') {
-            flushStreamDeltas(sessionId)
-            mutate(state => sealAcceptedCorrection(state, messageId, { keepRunningTools: true }))
-          } else {
-            moveOptimisticMessageToEnd()
-          }
-
-          triggerHaptic('submit')
-
-          return true
-        }
-      } catch (err) {
         discardOptimisticMessage()
 
-        // Refused before any agent saw it: the composer re-queues the words (#141644).
-        if (isUndeliveredCorrectionRefusal(err)) {
-          return false
-        }
-
-        notifyError(err, copy.promptFailed)
-        throw err
+        return false
       }
 
-      discardOptimisticMessage()
-
-      return false
+      return attempt()
     },
     [bindRecoveredRuntime, copy.promptFailed, requestSessionGateway]
   )

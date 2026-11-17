@@ -23,8 +23,10 @@ class Peer:
         return True
 
 
-async def _restarted_owner_with_unknown_head(tmp_path, monkeypatch, executed):
-    """Real authority + SQLite: a started turn interrupted by an owner epoch change plus a queued follower."""
+async def _restarted_owner_with_unknown_head(tmp_path, monkeypatch, executed, *, tool_step=True):
+    """Real authority + SQLite: a started turn interrupted by an owner epoch change plus a queued follower.
+    ``tool_step``: the lost turn ran a tool (a business turn: never run again, so it stays ``unknown`` for
+    its Discard). Without one it is a message the next owner delivers again (msg-retry), ``queued``."""
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
     db = store._db
@@ -49,10 +51,13 @@ async def _restarted_owner_with_unknown_head(tmp_path, monkeypatch, executed):
     follower = await first.submit(actor, Submission('follower', ref, {'text': 'FOLLOWER'}, 'queue'))
     claimed = claim_session_input(db, epoch=first.epoch, session_id='s')
     assert claimed['admission_id'] == head.admission_id
+    if tool_step:
+        db.append_message('s', 'tool', 'done', tool_call_id='c1', tool_name='terminal')
     authority = await initialize_session_authority(runner, profile_id='p', instance_id='owner-2')
     authority.sessions['s'] = LiveSession(source, 's')
     rows = {r['admission_id']: r for r in list_session_admissions(db, session_id='s')}
-    assert rows[head.admission_id]['status'] == 'unknown' and rows[follower.admission_id]['status'] == 'queued'
+    assert rows[head.admission_id]['status'] == ('unknown' if tool_step else 'queued')
+    assert rows[follower.admission_id]['status'] == 'queued'
     return store, authority, ref, rows[head.admission_id], follower
 
 
@@ -200,4 +205,17 @@ async def test_discarded_lost_turn_is_closed_and_never_merged_into_the_follower_
     finally:
         provider.shutdown()
         await viewer.close()
+        store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_a_lost_head_that_ran_no_tool_is_queued_again_not_left_unknown(tmp_path, monkeypatch):
+    """msg-retry contract change (was: ``unknown`` until its Discard): a person's message whose lost turn
+    ran no tool is delivered again by the next owner, ahead of its follower; nothing waits on a Discard."""
+    store, authority, _ref, head, follower = await _restarted_owner_with_unknown_head(
+        tmp_path, monkeypatch, [], tool_step=False)
+    try:
+        rows = [(r['admission_id'], r['status']) for r in list_session_admissions(authority.db, session_id='s')]
+        assert rows == [(head['admission_id'], 'queued'), (follower.admission_id, 'queued')]
+    finally:
         store.close_all_db_handles()

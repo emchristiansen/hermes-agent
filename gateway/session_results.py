@@ -87,8 +87,12 @@ def finish_result(db, *, epoch, row, response, outcome, result=None, prepared=No
                                  (_RESULT_PREFIX + row['admission_id'],)).fetchone()
             if saved is None:
                 raise RuntimeStoreError('storage_unavailable')
-            result = load_result(saved[0])
-            return dict(current), result['result'].get('final_response') or ''
+            stored_result = load_result(saved[0])
+            # A retry that reads the committed row back publishes the notice that write committed, derived
+            # from DURABLE state only (the stored result's own cause, the durable row, the owed-redelivery
+            # marker), never from this call's capture, which may differ or be missing (MR-NOTICE-05).
+            settled = dict(current, owner_stop_notice=committed_owner_stop_notice(conn, current, stored_result))
+            return settled, stored_result['result'].get('final_response') or ''
     outcome, stored = prepared or prepare_result(row, response, outcome, result)
     # A turn the owner's restart/stop interrupted: its reason commits as a Hermes transcript notice
     # in this same write, so a viewer that reconnects after the restart reads why (#134889 GW-21);
@@ -97,16 +101,47 @@ def finish_result(db, *, epoch, row, response, outcome, result=None, prepared=No
     # A gateway-owned refusal (a message typed into a cron session) commits its explanation and
     # error card as the transcript's failed-turn boundary in this same write too: the admission
     # result is not history, so a reopened chat would otherwise show nothing about the refusal.
-    from gateway.session_settlement_recovery import gateway_refusal_boundary, owner_stop_notice
+    from gateway.session_message_redelivery import owner_stop_redelivery
+    from gateway.session_settlement_recovery import (
+        RESTART_INTERRUPT_NOTICE, SHUTDOWN_INTERRUPT_NOTICE, gateway_refusal_boundary, owner_stop_notice)
     notice, display_metadata = owner_stop_notice(result, outcome, row), None
     if notice is None and (refusal := gateway_refusal_boundary(result, outcome)) is not None:
         notice, display_metadata = refusal
-    write = None if notice is None else (lambda conn, _current: close_discarded_turn(
-        db, conn, row, notice, replace_after=row.get('transcript_mark'), display_metadata=display_metadata))
+    # A person's message whose turn the owner's stop cut short before any tool step runs again at the next
+    # owner (at least once): the settlement owes its redelivery, and the boundary says so.
+    owner_stopped = notice in (RESTART_INTERRUPT_NOTICE, SHUTDOWN_INTERRUPT_NOTICE)
+    # The live warning of this settlement: the owner-stop decision committed below, else the owner-stop copy
+    # (automation) or None. A refusal's notice is a transcript boundary only, never the live warning.
+    stop_notice = owner_stop_notice(result, outcome, row)
+    committed = {}
+
+    def write(conn, _current):
+        # One decision for the turn's notice, in the settlement's own write: the transcript boundary and
+        # the live warning (``_publish_completion`` reads ``settled['owner_stop_notice']``) say the same.
+        committed['notice'] = owner_stop_redelivery(conn, row, notice) if owner_stopped else notice
+        close_discarded_turn(db, conn, row, committed['notice'], replace_after=row.get('transcript_mark'),
+                             display_metadata=display_metadata)
     settled = settle_session_input(db, epoch=epoch, admission_id=row['admission_id'],
         generation=row['generation'], outcome=outcome, result=stored, _transfers=transfers,
-        _terminal_write=write)
+        _terminal_write=None if notice is None else write)
+    settled = dict(settled, owner_stop_notice=committed.get('notice', notice) if owner_stopped else stop_notice)
     return settled, response
+
+
+def committed_owner_stop_notice(conn, current, stored_result):
+    """The live notice a committed settlement made, from durable state: the stored result's interrupt cause and
+    the durable row (``owner_stop_notice``), then the owed-redelivery marker this settlement wrote."""
+    from gateway.session_message_redelivery import owed_redelivery, redelivery_notice
+    from gateway.session_settlement_recovery import (
+        RESTART_INTERRUPT_NOTICE, SHUTDOWN_INTERRUPT_NOTICE, owner_stop_notice)
+    import json
+    durable_row = dict(current)
+    if 'payload' not in durable_row and durable_row.get('payload_json'):
+        durable_row['payload'] = json.loads(durable_row['payload_json'])
+    stop = owner_stop_notice(stored_result, current['outcome'], durable_row)
+    if stop in (RESTART_INTERRUPT_NOTICE, SHUTDOWN_INTERRUPT_NOTICE) and owed_redelivery(conn, current):
+        return redelivery_notice(stop)
+    return stop
 
 
 def admission_result(db, admission_id):

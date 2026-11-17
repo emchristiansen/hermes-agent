@@ -205,6 +205,7 @@ def test_managed_worker_turn_settles_with_the_cause_of_the_stop_that_reached_it(
     async def scenario():
         await authority.submit(actor, Submission('turn', ref, {'text': 'go'}, 'queue'))
         row = claim_session_input(db, epoch=authority.epoch, session_id='s')
+        db.append_message('s', 'tool', 'done', tool_call_id='c1', tool_name='terminal')  # it ran a tool: a business turn keeps the owner-stop notice
         authority._stamp_claim(ref, live, row)
         task = asyncio.create_task(managed.execute_managed(authority, ref, row, policy))
         await async_wait_until(lambda: (w := getattr(authority, '_managed_workers', {}).get('s')) is not None and w.writer.is_alive(),
@@ -327,9 +328,11 @@ def test_automation_turn_the_owner_stop_interrupted_is_never_asked_to_resend(cau
     assert 'again' not in frame['warning'].replace('not run again', '')
 
 
-def _settle_on_real_store(tmp_path, cause, principal='person', payload=None):
+def _settle_on_real_store(tmp_path, cause, principal='person', payload=None, *, tool_step=True):
     """One claimed admission on a real SessionDB settled through commit_and_publish (the owner's
-    worker-thread settlement) with *cause* recorded. Returns (db, row, frames, settlement)."""
+    worker-thread settlement) with *cause* recorded. Returns (db, row, frames, settlement).
+    ``tool_step``: the turn ran a tool (a business turn: the owner-stop notice); without one a person's
+    message is owed its redelivery (msg-retry) and the notice says so."""
     from gateway.session_authority import LiveSession, SessionAuthority
     from gateway.session_contract import SessionRef
     from gateway.session_settlement_recovery import commit_and_publish
@@ -348,6 +351,8 @@ def _settle_on_real_store(tmp_path, cause, principal='person', payload=None):
     row = claim_session_input(db, epoch=epoch, session_id='s')
     authority._stamp_claim(ref, live, row)
     db.append_message('s', 'user', 'please work')  # the turn's own rows, as the agent wrote them
+    if tool_step:
+        db.append_message('s', 'tool', 'done', tool_call_id='c1', tool_name='terminal')
     db.append_message('s', 'assistant', 'partial reply')
     frames = []
     live.event_stream.observers.add(frames.append)
@@ -399,7 +404,7 @@ def test_automation_turn_transcript_notice_is_the_neutral_copy(tmp_path):
 
 
 
-def _core_closed_turn(tmp_path, monkeypatch, *, principal='person', earlier_failed=False):
+def _core_closed_turn(tmp_path, monkeypatch, *, principal='person', earlier_failed=False, tool_step=True):
     """A claimed admission whose agent was interrupted by the restart before any assistant text:
     the real AIAgent persists the user row and the real core closer
     (``agent/conversation_loop.py::_close_durable_failed_turn``) writes its failed-turn boundary.
@@ -428,11 +433,15 @@ def _core_closed_turn(tmp_path, monkeypatch, *, principal='person', earlier_fail
     row = claim_session_input(db, epoch=epoch, session_id='s')
     authority._stamp_claim(ref, live, row)
     result = {'final_response': '', 'interrupted': True, 'completed': False, 'interrupt_message': 'Gateway restarting'}
+    if earlier_failed and tool_step:
+        db.append_message('s', 'tool', 'done', tool_call_id='c1', tool_name='terminal')
     if not earlier_failed:
         agent = AIAgent(session_db=db, session_id='s', model='test-model', provider='openai-compat', api_key='test',
                         base_url='http://127.0.0.1:1/v1', quiet_mode=True, skip_context_files=True, skip_memory=True)
         messages = [{'role': 'user', 'content': 'please work'}]
         agent._flush_messages_to_session_db(messages)  # the turn-start flush of the accepted user row
+        if tool_step:  # it ran a tool: a business turn keeps the owner-stop notice (msg-retry)
+            db.append_message('s', 'tool', 'done', tool_call_id='c1', tool_name='terminal')
         result['messages'] = messages
         _close_durable_failed_turn(agent, result)
     return db, authority, live, ref, row, result
@@ -451,7 +460,7 @@ def test_restart_notice_replaces_the_core_failed_turn_boundary_of_the_same_turn(
         commit_and_publish(authority, live, ref, row, '', 'interrupted', {'result': result}, {})
         expected = RESTART_INTERRUPT_NOTICE if principal == 'person' else AUTOMATION_INTERRUPTED_NOTICE
         assert _notices(db) == [expected]
-        assert [m['role'] for m in db.get_messages('s')] == ['user', 'assistant']
+        assert [m['role'] for m in db.get_messages('s')] == ['user', 'tool', 'assistant']
 
 
 def test_an_earlier_turns_failed_boundary_is_kept_and_the_restart_notice_appended(tmp_path, monkeypatch):
@@ -610,3 +619,19 @@ def test_a_user_stop_first_keeps_no_shutdown_cause_before_spawn():
     authority.pending_stops = {}
     assert stop_authority_turns(authority, reason='Gateway shutting down') == 1
     assert authority.pending_stop_causes == {'s': (4, 'Gateway shutting down')}
+
+
+@pytest.mark.parametrize(('cause', 'notice'), [('Gateway restarting', RESTART_INTERRUPT_NOTICE),
+                                               ('Gateway shutting down', SHUTDOWN_INTERRUPT_NOTICE)])
+def test_a_person_turn_the_owner_stop_cut_short_before_any_tool_is_owed_its_redelivery(tmp_path, cause, notice):
+    """msg-retry contract change (was: the owner-stop notice, "will not be run again"): the turn ran no tool,
+    so the stopping owner's settlement owes its redelivery. msg-retry-3: the transcript boundary AND the live
+    ``message.complete.warning`` both say the message runs again (was: the warning kept the owner-stop copy)."""
+    from gateway.session_message_redelivery import REDELIVER_PREFIX, redelivery_notice
+    db, _authority, row, frames, settlement = _settle_on_real_store(tmp_path, cause, tool_step=False)
+    with db:
+        assert settlement['settled']['outcome'] == 'interrupted'
+        assert _notices(db) == [redelivery_notice(notice)]
+        (complete,) = [f['params']['payload'] for f in frames if f['params']['type'] == 'message.complete']
+        assert complete['warning'] == redelivery_notice(notice) != notice
+        assert db._read_one('SELECT 1 FROM state_meta WHERE key=?', (REDELIVER_PREFIX + row['admission_id'],))

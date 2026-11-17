@@ -519,7 +519,9 @@ class Soak:
         undrained = {e: s for e, s in deliveries.items() if s in ("pending", "delivering")}
         assert not undrained, f"{where} queued sends never drained: {undrained}"
         assert set(starts) - ends == self.killed_execs, f"{where} runs without an end"
-        assert len(starts) == len(set(starts)), f"{where} duplicate execution ids"
+        start_events = [r["exec"] for r in runs if r["event"] == "start"]
+        # Effects once (msg-retry-on-13f-6): the job body ran exactly once per execution, however many sends.
+        assert len(start_events) == len(set(start_events)), f"{where} a job body ran more than once"
         for exec_id, start in starts.items():
             row = rows.get(exec_id)
             assert row is not None, f"{where} run {exec_id} ({start['name']}) has no ledger row"
@@ -532,13 +534,14 @@ class Soak:
                 assert row["status"] == "unknown", label
                 assert not sent, label
                 continue
-            assert len(sent) <= 1, f"{label}: delivered more than once"
+            # At least once (msg-retry-on-13f-6, ea298f05): a failed attempt is retried, so a run may reach the
+            # sink more than once (duplicates accepted); every attempted send must end delivered.
             if outcome == "delivered":
-                assert len(ok_sent) == 1, f"{label}: 'delivered' but the sink never got it"
+                assert len(ok_sent) >= 1, f"{label}: 'delivered' but the sink never got it"
             if ok_sent:
                 assert outcome == "delivered", f"{label}: sink got it, ledger says not"
-            if sent and not ok_sent:
-                assert outcome == "failed", f"{label}: failed send not recorded"
+            if sent:
+                assert ok_sent, f"{label}: a failed send was never retried to delivery"
             assert "nterrupt" not in str(row.get("error") or ""), f"{label}: marked interrupted"
             agent_failed = "provider outage" in str(row.get("error") or "")
             if agent_failed:
@@ -546,7 +549,7 @@ class Soak:
             else:
                 assert row["status"] == "completed", label
                 assert ok_sent or sent, f"{label}: successful run never reached the platform"
-                assert not ok_sent or ok_sent[0]["exec_in_text"], f"{label}: wrong body delivered"
+                assert all(s["exec_in_text"] for s in ok_sent), f"{label}: wrong body delivered"
         for exec_id, row in rows.items():
             if exec_id not in starts:  # attempts that never ran must say so truthfully
                 # 'missed': the slots an outage collapsed or skipped (ee394bd9213), never a started run

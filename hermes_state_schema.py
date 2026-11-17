@@ -6,7 +6,9 @@ Must never import hermes_state (cycle); shared constants live in hermes_state_co
 
 import contextlib
 import datetime
+import functools
 import hashlib
+import inspect
 import logging
 import json
 import os
@@ -17,9 +19,9 @@ import uuid
 from typing import Dict, List, Optional, Sequence
 
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, profile_name_for_home
 from hermes_state_legacy_refusal import LEGACY_REFUSAL_REPAIR_DONE, advance_legacy_refusal_repair
-from hermes_startup_watchdog import report_startup_progress
+from hermes_startup_watchdog import startup_phase
 from utils import safe_json_loads
 from hermes_state_common import (
     DEFERRED_INDEX_SQL, FTS_REBUILD_DEFERRAL_KEY, FTS_STALE_KEY, FTS_SQL,
@@ -182,6 +184,32 @@ def schema_read_probe_statements() -> tuple:
             for table, cols in sorted(tables.items())
         )
     return _READ_PROBE_STATEMENTS
+
+
+def _scoped_startup_phase(phase: str, extra=None):
+    """Run a ``SessionDB`` step as a scoped startup phase: a 600 s lease released when the step returns
+    or raises, and begin/end lines naming the DB/profile. ``extra`` maps the step's bound arguments
+    (by parameter name) to extra detail text. Both happen only while the startup watchdog is armed;
+    the detail is built lazily and can never reject or fail a call the step itself accepts — the
+    step receives exactly the caller's arguments."""
+    def decorate(step):
+        signature = inspect.signature(step)
+
+        @functools.wraps(step)
+        def run(self, *args, **kwargs):
+            def detail() -> str:
+                text = ""
+                if extra is not None:
+                    try:
+                        text = extra(signature.bind(self, *args, **kwargs).arguments)
+                    except TypeError:
+                        text = ""  # the step raises its own TypeError for a call it rejects
+                return self._startup_phase_detail(text)
+
+            with startup_phase(phase, expected_s=600.0, detail=detail):
+                return step(self, *args, **kwargs)
+        return run
+    return decorate
 
 
 class SessionSchemaMixin:
@@ -896,21 +924,30 @@ class SessionSchemaMixin:
 
     # ── _init_schema ───────────────────────────────────────────────────────
 
+    def _startup_phase_detail(self, extra: str = "") -> str:
+        """``db=<path> [profile=<id>]`` for startup-phase logs and watchdog warnings.
+
+        The profile is the canonical owner of the DB's home (``hermes_constants.profile_name_for_home``:
+        ``default``, a named profile — including one legally named ``profiles`` — or none for a custom
+        home), never a guess from path components."""
+        path = getattr(self, "db_path", None)
+        detail = f"db={path}"
+        profile = profile_name_for_home(os.path.dirname(os.fspath(path))) if path is not None else None
+        if profile:
+            detail += f" profile={profile}"
+        return f"{detail} {extra}".strip()
+
+    # Startup-watchdog lease: on multi-GB state.db files the reconciliation + version-gated data
+    # migrations are legitimately slow and can be I/O-bound (near-zero CPU), which the watchdog's CPU
+    # fallback would misread as a parked deadlock (OOF-298 / PR #89750). Clamped to _MAX_LEASE_S=900.
+    # The lease is scoped: it is released when this DB's init ends, so a later, unrelated startup step
+    # is never covered (or mislabelled) by this DB's claim. The begin/end lines name the DB/profile.
+    # Honest worst case (unchanged): a genuinely wedged DB init delays supervisor respawn by up to the lease.
+    @_scoped_startup_phase("state_db_init_schema")
     def _init_schema(self):
         """Create tables and FTS if missing, reconcile columns, run data migrations. Column
         additions are declarative via _reconcile_columns(), so reordered migrations can
         never skip a column; schema_version remains for data migrations only."""
-        # Startup-watchdog lease: on multi-GB files this is I/O-bound (near-zero CPU), which
-        # the watchdog's CPU fallback would misread as a parked deadlock.
-        # Declare a startup-watchdog progress lease before potentially long synchronous work: on multi-GB
-        # state.db files the reconciliation + version-gated data migrations below are legitimately slow and
-        # can be I/O-bound (near-zero CPU), which the watchdog's CPU fallback would misread as a parked
-        # deadlock (OOF-298 / PR #89750). Single lease is deliberate: this is the one pre-loop phase that
-        # can legitimately exceed the 300s default deadline (multi-GB DBs), and the lease is clamped to
-        # _MAX_LEASE_S=900. Honest worst case: a genuinely wedged DB init delays supervisor respawn by up to
-        # the lease duration. Per-chunk renewal would shrink that, but adds complexity to the migration
-        # loops for a rare failure mode.
-        report_startup_progress(600.0, phase="state_db_init_schema")
         cursor = self._conn.cursor()
         cursor.executescript(SCHEMA_SQL)
         # Before the table rebuilds below: renaming a table re-parses every trigger, and the retired
@@ -1017,11 +1054,14 @@ class SessionSchemaMixin:
         ).fetchone() is None:
             cursor.execute(_STATE_META_UPSERT_SQL, ("fts_storage_version", str(FTS_STORAGE_VERSION)))
 
+    # Renew the lease, scoped to this chain (it can rewrite whole tables on large DBs); released when it returns.
+    @_scoped_startup_phase(
+        "state_db_data_migrations",
+        lambda bound: f"from_version={bound.get('current_version')} to_version={SCHEMA_VERSION}",
+    )
     def _run_data_migrations(self, cursor: sqlite3.Cursor, current_version: int, fts5_available: bool) -> None:
         """Version-gated chain for DATA migrations only (row backfills); column additions never
         belong here. Advances schema_version at the end unless FTS5 is unavailable."""
-        # Renew the lease: the chain can rewrite whole tables on large DBs.
-        report_startup_progress(600.0, phase="state_db_data_migrations")
         # (v10 trigram backfill and v11 inline FTS re-index were superseded by v23 and removed.)
         # v11 (SUPERSEDED by v23): re-index FTS5 tables to cover tool_name + tool_calls in inline mode
         # (#16751). v23 drops and rebuilds both FTS tables in external-content form, so running the v11

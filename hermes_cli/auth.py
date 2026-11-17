@@ -52,7 +52,7 @@ from hermes_cli.auth_nous import (
     NOUS_SESSION_TERMINAL, NOUS_SESSION_UNKNOWN, NOUS_SESSION_VALID, _ALLOWED_NOUS_INFERENCE_HOSTS,
     _agent_key_is_usable, _apply_nous_refreshed_tokens, _assert_nous_inference_jwt_usable,
     _compute_nous_auth_status, _format_nous_entitlement_auth_error, _healed_nous_inference_url,
-    _login_nous, _merge_shared_nous_oauth_state, _migrate_stale_nous_portal_url,
+    _login_nous, _merge_shared_nous_oauth_state,
     _nous_device_code_login, _nous_inference_env_override, _nous_invoke_jwt_is_usable,
     _nous_invoke_jwt_status, _nous_portal_base_url, _nous_portal_env_override, _nous_shared_store_lock,
     _nous_shared_store_path, _pool_first_oauth_status, _quarantine_nous_oauth_state,
@@ -87,6 +87,8 @@ from hermes_cli.auth_qwen import (
     _qwen_access_token_is_expiring, _qwen_base_url, _qwen_cli_auth_path, _read_qwen_cli_tokens,
     _refresh_qwen_cli_tokens, _save_qwen_cli_tokens, get_qwen_auth_status,
     resolve_qwen_runtime_credentials)
+from hermes_cli import auth_store_files
+from hermes_cli.auth_store_files import empty_auth_store as _empty_auth_store, same_path as _same_path
 from hermes_cli.auth_constants import (
     _decode_jwt_claims, AUTH_STORE_VERSION, AUTH_LOCK_TIMEOUT_SECONDS, DEFAULT_NOUS_PORTAL_URL,
     DEFAULT_NOUS_INFERENCE_URL, DEFAULT_NOUS_CLIENT_ID, NOUS_BILLING_MANAGE_SCOPE,
@@ -477,28 +479,12 @@ def _nonempty_str(value: Any) -> bool:
 # ── Auth Store — persistence layer for ~/.hermes/auth.json ──────────────────────────────────────────
 
 def _auth_file_path() -> Path:
-    path = get_hermes_home() / "auth.json"
-    # Seat belt: under pytest, refuse to touch the real user's auth store (tests that forgot to
-    # monkeypatch HERMES_HOME or escaped the hermetic conftest). In production: one dict lookup.
-    if (os.environ.get("PYTEST_CURRENT_TEST")
-            and _same_path(path, Path.home() / ".hermes" / "auth.json")):
-        raise RuntimeError(
-            f"Refusing to touch real user auth store during test run: {path}. "
-            "Set HERMES_HOME to a tmp_path in your test fixture, or run "
-            "via scripts/run_tests.sh for hermetic CI-parity env.")
-    return path
+    return auth_store_files.auth_file_path(get_hermes_home())
 
 
 def _global_auth_file_path() -> Optional[Path]:
-    """Global-root auth.json in profile mode; None when profile and global root are the same dir.
-
-    Read-only fallback path, so no pytest seat belt here (it lives on ``_auth_file_path()``)."""
-    try:
-        from hermes_constants import get_default_hermes_root
-        global_root = get_default_hermes_root()
-    except Exception:
-        return None
-    return None if _same_path(get_hermes_home(), global_root) else global_root / "auth.json"
+    """Global-root auth.json in profile mode; None when profile and global root are the same dir."""
+    return auth_store_files.global_auth_file_path(get_hermes_home())
 
 
 def _load_global_auth_store() -> dict[str, Any]:
@@ -509,6 +495,9 @@ def _load_global_auth_store() -> dict[str, Any]:
     if global_path is None or not global_path.exists():
         _global_auth_store_cache = None
         return {}
+    if auth_store_files.is_real_root_under_pytest(global_path):
+        _global_auth_store_cache = None
+        return {}
     try:
         cache_key: Optional[tuple[str, tuple[Any, ...]]] = (
             str(global_path.resolve(strict=False)), file_cache_version(global_path))
@@ -517,14 +506,6 @@ def _load_global_auth_store() -> dict[str, Any]:
     cached = _global_auth_store_cache
     if cache_key is not None and cached is not None and cached[:2] == cache_key:
         return cached[2]
-    if os.environ.get("PYTEST_CURRENT_TEST") and os.environ.get("HOME"):
-        real_root = Path(os.environ["HOME"]) / ".hermes" / "auth.json"
-        try:
-            if os.path.normcase(os.path.abspath(global_path)) == os.path.normcase(os.path.abspath(real_root)):
-                _global_auth_store_cache = None
-                return {}
-        except Exception:
-            pass
     try:
         store = _load_auth_store(global_path)
     except Exception:
@@ -537,13 +518,6 @@ def _load_global_auth_store() -> dict[str, Any]:
 
 _auth_target_lock_holders: dict[str, threading.local] = {}
 _auth_target_lock_holders_guard = threading.Lock()
-
-
-def _same_path(left: Path, right: Path) -> bool:
-    try:
-        return left.resolve(strict=False) == right.resolve(strict=False)
-    except Exception:
-        return left == right
 
 
 def _is_same_auth_store(left: Path, right: Path) -> bool:
@@ -719,56 +693,8 @@ def _auth_store_lock(
         yield
 
 
-def _empty_auth_store() -> dict[str, Any]:
-    return {"version": AUTH_STORE_VERSION, "providers": {}}
-
-
 def _load_auth_store(auth_file: Optional[Path] = None) -> dict[str, Any]:
-    auth_file = auth_file or _auth_file_path()
-    if not auth_file.exists():
-        return _empty_auth_store()
-    try:
-        raw = json.loads(auth_file.read_text(encoding="utf-8-sig"))
-    except OSError:
-        # Exists but unreadable (EMFILE, EACCES, EIO, stalled mount): contents are not bad, and this
-        # module read-modify-writes everywhere, so an empty store here is one _save_auth_store()
-        # away from erasing every credential. Fail loudly.
-        logger.warning(
-            "auth: could not read %s, leaving the store on disk untouched "
-            "rather than degrading to an empty one",
-            auth_file, exc_info=True)
-        raise
-    except Exception as exc:
-        # Genuine corruption: unparseable JSON or non-UTF-8 bytes. Preserve a copy, but never
-        # advertise a backup that was not written.
-        corrupt_path = auth_file.with_suffix(".json.corrupt")
-        try:
-            shutil.copy2(auth_file, corrupt_path)
-            preserved = True
-        except Exception:
-            preserved = False
-            logger.debug("auth: could not preserve a copy of the corrupt store at %s", corrupt_path,
-                         exc_info=True)
-        logger.warning(
-            "auth: failed to parse %s (%s), starting with empty store. %s %s",
-            auth_file, exc,
-            "Corrupt file preserved at" if preserved else "A copy could NOT be preserved at",
-            corrupt_path)
-        return _empty_auth_store()
-
-    if isinstance(raw, dict) and (
-        isinstance(raw.get("providers"), dict) or isinstance(raw.get("credential_pool"), dict)):
-        raw.setdefault("providers", {})
-        if isinstance(raw.get("providers"), dict):
-            _migrate_stale_nous_portal_url(raw["providers"])
-        return raw
-
-    if isinstance(raw, dict) and isinstance(raw.get("systems"), dict):  # legacy "systems" format
-        systems = raw["systems"]
-        providers = {"nous": systems["nous_portal"]} if "nous_portal" in systems else {}
-        return {**_empty_auth_store(), "providers": providers,
-                "active_provider": "nous" if providers else None}
-    return _empty_auth_store()
+    return auth_store_files.load_auth_store_file(auth_file or _auth_file_path())
 
 
 def _save_private_json(target: Path, data: Any, *, fsync_dir: bool = False, **dump_kwargs: Any) -> None:
@@ -936,26 +862,21 @@ def read_credential_pool(provider_id: Optional[str] = None) -> dict[str, Any]:
 
     In profile mode the global-root ``auth.json`` is a read-only fallback applied per provider ONLY
     when the profile has zero entries for it (``hermes auth add`` in the profile shadows global)."""
+    if provider_id is not None:
+        return auth_store_files.select_pool_rows(provider_id, _load_auth_store, _load_global_auth_store)[0]
     pool = _load_auth_store().get("credential_pool")
     pool = pool if isinstance(pool, dict) else {}
     global_pool = _load_global_auth_store().get("credential_pool")
     global_pool = global_pool if isinstance(global_pool, dict) else {}
 
-    if provider_id is None:
-        merged = dict(pool)
-        for gp_key, gp_entries in global_pool.items():
-            existing = merged.get(gp_key)
-            if not (isinstance(gp_entries, list) and gp_entries):
-                continue
-            if not (isinstance(existing, list) and existing):  # profile wins when it has ANY entries
-                merged[gp_key] = list(gp_entries)
-        return merged
-
-    provider_entries = pool.get(provider_id)
-    if isinstance(provider_entries, list) and provider_entries:
-        return list(provider_entries)
-    global_entries = global_pool.get(provider_id)
-    return list(global_entries) if isinstance(global_entries, list) else []
+    merged = dict(pool)
+    for gp_key, gp_entries in global_pool.items():
+        existing = merged.get(gp_key)
+        if not (isinstance(gp_entries, list) and gp_entries):
+            continue
+        if not (isinstance(existing, list) and existing):  # profile wins when it has ANY entries
+            merged[gp_key] = list(gp_entries)
+    return merged
 
 
 _POOL_STATUS_FIELDS = (

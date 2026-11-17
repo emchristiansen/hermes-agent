@@ -1,10 +1,12 @@
 """Profile-local durable handoff for cron delivery through live gateway adapters.
 
 A restart-safe cron worker executes outside the gateway cgroup.  It cannot own
-relay/E2EE adapter objects, so it queues the final send here.  A gateway claims
-each row at most once.  If that gateway dies after claiming, the outcome is
-marked unknown and never retried: losing a delivery is safer than duplicating a
-possibly-completed send.
+relay/E2EE adapter objects, so it queues the final send here.  A cron delivery is
+a MESSAGE (a chat/notification send): at least once, a duplicate is acceptable and
+a lost delivery is not.  A send whose outcome is uncertain (its gateway died
+mid-send, or it returned but its outcome could not be recorded) is queued again,
+never given up: each retry waits a capped backoff (``retry_after``), and a row
+waiting out its backoff never holds back any other delivery.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -31,8 +34,13 @@ DELIVERY_DB: Optional[Path] = None
 _PROCESS_ID = uuid.uuid4().hex
 _lock = threading.RLock()
 _ACTIVE_DELIVERIES: set[str] = set()
+# Claimed rows whose send thread never started: nothing was attempted (MR-DISPATCH-07).
+_UNSTARTED_DELIVERIES: set[str] = set()
 _TERMINAL = ("delivered", "failed", "unknown", "suppressed")
 MAX_TERMINAL_DELIVERIES = 1000
+# Backoff before an uncertain send is claimed again: base * 2**(claims-1), capped; never a give-up.
+RETRY_BACKOFF_BASE_SECONDS = 30.0
+RETRY_BACKOFF_MAX_SECONDS = 3600.0
 DEFAULT_DELIVERY_WAIT_TIMEOUT_SECONDS = 300.0
 
 
@@ -134,6 +142,12 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         conn, "deliveries", "for_failure",
         "for_failure INTEGER NOT NULL DEFAULT 0",
     )
+    add_column_if_missing(conn, "deliveries", "attempts", "attempts INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(conn, "deliveries", "retry_after", "retry_after REAL")
+
+
+def _now_seconds() -> float:
+    return time.time()
 
 
 def _connect() -> sqlite3.Connection:
@@ -203,6 +217,25 @@ def enqueue(
     return dict(row)
 
 
+def enqueue_result(job: dict, content: str, *, for_failure: bool = False,
+                   failure_incident_id: Optional[str] = None) -> dict:
+    """Accept a composed message under the caller's fire fence, never its business work.
+
+    Pin the accepted destinations, including failure-lane expansion; retrying must
+    not reinterpret an old message using a later job definition or home target.
+    Transport credentials remain the draining owner's responsibility.
+    """
+    from cron.scheduler_delivery import _resolve_delivery_targets
+
+    execution_id = job["execution_id"]
+    queued_job = dict(job, _queued_delivery_targets=_resolve_delivery_targets(job, for_failure=for_failure))
+    if failure_incident_id:
+        queued_job["_failure_incident_id"] = failure_incident_id
+    row = enqueue(execution_id, queued_job, content, for_failure=for_failure)
+    job["last_delivery_queued"] = {"canonical": {"status": row["status"], "execution_id": execution_id}}
+    return row
+
+
 def get_status(execution_id: str) -> Optional[dict]:
     with _transaction() as conn:
         row = conn.execute(
@@ -231,15 +264,18 @@ def claim_next() -> Optional[dict]:
     started = _process_start_time(pid)
     with _transaction() as conn:
         # created_at carries a DST-varying offset: order by instant, not text.
+        # A row waiting out its retry backoff is skipped, never a barrier to later deliveries.
         row = conn.execute(
             "SELECT execution_id FROM deliveries WHERE status='pending' "
-            "ORDER BY julianday(created_at), created_at, execution_id LIMIT 1"
+            "AND (retry_after IS NULL OR retry_after<=?) "
+            "ORDER BY julianday(created_at), created_at, execution_id LIMIT 1",
+            (_now_seconds(),),
         ).fetchone()
         if row is None:
             return None
         cur = conn.execute(
             """UPDATE deliveries SET status='delivering', owner_process_id=?,
-               owner_pid=?, owner_started_at=?
+               owner_pid=?, owner_started_at=?, attempts=attempts+1
                WHERE execution_id=? AND status='pending'""",
             (_PROCESS_ID, pid, started, row["execution_id"]),
         )
@@ -279,16 +315,67 @@ def _finish(execution_id: str, *, error: Optional[str], suppressed: bool = False
     return cur.rowcount == 1
 
 
-def recover_abandoned() -> int:
-    """Fence dead delivery owners as unknown; never replay uncertain sends.
+def _requeue_uncertain(conn: sqlite3.Connection, execution_id: str) -> bool:
+    """Queue an uncertain send again (at least once: a duplicate, never a loss), after its backoff."""
+    row = conn.execute("SELECT attempts FROM deliveries WHERE execution_id=? AND status='delivering'",
+                       (str(execution_id),)).fetchone()
+    if row is None:
+        return False
+    with _lock:
+        unstarted = str(execution_id) in _UNSTARTED_DELIVERIES
+        _UNSTARTED_DELIVERIES.discard(str(execution_id))
+    if unstarted:  # never attempted: claimable again at once, and the claim's attempt is not counted
+        return conn.execute(
+            """UPDATE deliveries SET status='pending', owner_process_id=NULL, owner_pid=NULL,
+               owner_started_at=NULL, retry_after=NULL, attempts=MAX(0, attempts-1)
+               WHERE execution_id=? AND status='delivering'""",
+            (str(execution_id),),
+        ).rowcount == 1
+    return conn.execute(
+        """UPDATE deliveries SET status='pending', owner_process_id=NULL, owner_pid=NULL,
+           owner_started_at=NULL, retry_after=? WHERE execution_id=? AND status='delivering'""",
+        (_now_seconds() + _retry_delay(int(row["attempts"])), str(execution_id)),
+    ).rowcount == 1
 
-    The firer settled long ago against a ``queued`` row, so each fenced row's outcome is written
-    back here (job ``delivery_failed`` + error, ledger ``failed``) instead of leaving the run at
-    ``delivery_queued`` forever."""
-    fenced: list[tuple[Optional[str], str]] = []
+
+def _retry_delay(attempts: int) -> float:
+    """The capped backoff after ``attempts`` claims. The exponent saturates BEFORE the power, so a row
+    retried for as long as it takes never overflows the float conversion (MR-RETRY-14): 2**32 base
+    periods already exceed any cap."""
+    return min(RETRY_BACKOFF_BASE_SECONDS * 2.0 ** min(max(0, attempts - 1), 32), RETRY_BACKOFF_MAX_SECONDS)
+
+
+def _retry_failed_send(row: dict, error: str) -> bool:
+    """A send that returned an error (negative result, timeout, no acknowledgement) is never terminal: its
+    payload stays and it is queued again after its backoff, independently of every other row (at least once;
+    a duplicate is accepted, a loss never). The returned error is kept as the row's last error, and the run
+    that queued it is told: ``delivery_retrying`` with that error (msg-retry-on-13f-6)."""
+    execution_id = row["execution_id"]
+    with _transaction() as conn:
+        owned = conn.execute(
+            """UPDATE deliveries SET error=? WHERE execution_id=? AND status='delivering'
+               AND owner_process_id=? AND owner_pid=?""",
+            (str(error), execution_id, _PROCESS_ID, os.getpid()),
+        ).rowcount == 1
+        requeued = owned and _requeue_uncertain(conn, execution_id)
+    if requeued:
+        logger.warning("Cron delivery %s: send returned an error; queued again (at least once)", execution_id)
+        from cron.delivery_outcome import settle_quietly
+
+        settle_quietly(row["job"].get("id"), execution_id)
+    return requeued
+
+
+def recover_abandoned() -> int:
+    """Queue again every send whose outcome is uncertain; never fence a message as given up.
+
+    A dead owner's send may or may not have reached its target; one this gateway returned from but
+    could not record may have failed. Either way it is queued again after its backoff and settles
+    (job outcome written back) when the resend finishes. Returns how many were queued again."""
+    requeued = 0
     with _transaction() as conn:
         rows = conn.execute(
-            "SELECT execution_id, job_json, owner_process_id, owner_pid, owner_started_at "
+            "SELECT execution_id, owner_process_id, owner_pid, owner_started_at "
             "FROM deliveries WHERE status='delivering'"
         ).fetchall()
         for row in rows:
@@ -299,61 +386,82 @@ def recover_abandoned() -> int:
                         continue
             elif _owner_is_live(int(row["owner_pid"]), row["owner_started_at"]):
                 continue
-            error = (
-                "Gateway finished delivery but could not persist its outcome; "
-                "send was not retried."
-                if same_process
-                else "Gateway exited during delivery; send outcome is unknown and was not retried."
-            )
-            cur = conn.execute(
-                """UPDATE deliveries SET status='unknown', finished_at=?, error=?
-                   WHERE execution_id=? AND status='delivering'""",
-                (
-                    _hermes_now().isoformat(),
-                    error,
-                    row["execution_id"],
-                ),
-            )
-            if cur.rowcount:
-                # Read the job id now: pruning below redacts a terminal row's job_json.
-                fenced.append((json.loads(row["job_json"] or "{}").get("id"), row["execution_id"]))
-        _prune_terminal_unlocked(conn)
-    from cron.delivery_outcome import settle_quietly
+            if _requeue_uncertain(conn, row["execution_id"]):
+                requeued += 1
+                logger.warning("Cron delivery %s: send outcome uncertain (%s); queued again (at least once)",
+                               row["execution_id"], "not recorded" if same_process else "its gateway exited")
+    return requeued
 
-    for job_id, execution_id in fenced:
-        settle_quietly(job_id, execution_id)
-    return len(fenced)
+
+def _send_one(send: Callable[[dict, str, bool], Optional[str]], row: dict,
+              errors: Optional[list] = None) -> None:
+    """One claimed row's own send: its outcome is recorded (and its job settled) by this row alone."""
+    try:
+        try:
+            error = send(
+                row["job"], row["content"], bool(row["for_failure"])
+            )
+        except BaseException as exc:  # health: allow BLE001 -- moved verbatim from drain: a raising send is this row's recorded failure
+            error = f"{type(exc).__name__}: {exc}"
+        try:
+            if error:  # MR-RETRY-08: retried with its payload, never finished as failed
+                _retry_failed_send(row, error)
+            elif _finish(row["execution_id"], error=None,
+                         suppressed=bool(row["job"].get("_notification_all_targets_suppressed"))):
+                from cron.delivery_outcome import settle_quietly
+
+                settle_quietly(row["job"].get("id"), row["execution_id"])
+        except BaseException as exc:  # health: allow BLE001 -- handed to the waiting drain, which re-raises it; else logged with its traceback
+            # Outcome not recorded: the row stays claimed and the next drain's recover_abandoned queues it
+            # again (at least once). A waiting drain re-raises it to its caller, as the serial drain did.
+            if errors is None:
+                logger.warning("Cron delivery %s: send outcome not recorded (%s); the next drain queues it "
+                               "again (at least once)", row["execution_id"], exc, exc_info=True)
+            else:
+                errors.append(exc)
+    finally:
+        with _lock:
+            _ACTIVE_DELIVERIES.discard(row["execution_id"])
 
 
 def drain(
-    send: Callable[[dict, str, bool], Optional[str]], *, limit: int = 20
+    send: Callable[[dict, str, bool], Optional[str]], *, limit: int = 20, wait: bool = True
 ) -> int:
-    """Deliver pending rows through *send*, terminalizing every claimed row."""
+    """Deliver pending rows through *send*, terminalizing every claimed row.
+
+    Every claimed row sends on its own thread, so a slow or hung send never holds a later ready row
+    (DISPATCH-PRIORITY-1: each eligible row gets its own in-flight send; order is best effort only). ``wait``
+    joins those sends before returning; a periodic caller passes ``wait=False`` so the next drain (new rows)
+    is never held behind an in-flight one. A send this process abandons (exit mid-send) stays ``delivering``
+    under its owner and is queued again by the next ``recover_abandoned`` (at least once)."""
     recover_abandoned()
-    processed = 0
+    sends, errors = [], ([] if wait else None)
     for _ in range(max(0, limit)):
         row = claim_next()
         if row is None:
             break
         with _lock:
             _ACTIVE_DELIVERIES.add(row["execution_id"])
+        # Under the caller's contextvars: the profile scope selects this queue and its adapters' home.
+        from agent.memory_provider import spawn_context_thread
         try:
-            try:
-                error = send(
-                    row["job"], row["content"], bool(row["for_failure"])
-                )
-            except BaseException as exc:
-                error = f"{type(exc).__name__}: {exc}"
-            if _finish(row["execution_id"], error=error,
-                       suppressed=bool(row["job"].get("_notification_all_targets_suppressed"))):
-                from cron.delivery_outcome import settle_quietly
-
-                settle_quietly(row["job"].get("id"), row["execution_id"])
-        finally:
+            thread = spawn_context_thread(_send_one, args=(send, row, errors), daemon=True,
+                                          name=f"cron-delivery-{row['execution_id']}")
+            thread.start()
+        except BaseException:
+            # MR-DISPATCH-07: nothing was sent. Release this claim so the next drain's recover_abandoned (in
+            # this live gateway) queues it again at once, uncounted; then surface the failure.
             with _lock:
                 _ACTIVE_DELIVERIES.discard(row["execution_id"])
-        processed += 1
-    return processed
+                _UNSTARTED_DELIVERIES.add(row["execution_id"])
+            raise
+        sends.append(thread)
+    if wait:
+        for thread in sends:
+            thread.join()
+        if errors:
+            raise errors[0]
+    return len(sends)
 
 
 def _terminalize_wait_timeout(execution_id: str) -> str:
@@ -363,14 +471,10 @@ def _terminalize_wait_timeout(execution_id: str) -> str:
     for whichever gateway comes up next (a restart that includes an update can
     easily exceed the worker's wait budget).  That is a deferral, not a
     failure: report success so the job is not recorded ``delivery_failed`` for
-    a message the drain will still send.  Only a row caught mid-send is
-    uncertain and gets fenced ``unknown``.
+    a message the drain will still send.  A row caught mid-send is a deferral
+    too: a live gateway still finishes and settles it; a dead one's send is
+    queued again (at least once), never fenced as given up.
     """
-    now = _hermes_now().isoformat()
-    uncertain_error = (
-        "timed out while gateway delivery was in progress; outcome is unknown and "
-        "was not retried"
-    )
     with _transaction() as conn:
         row = conn.execute(
             "SELECT status FROM deliveries WHERE execution_id=?",
@@ -383,11 +487,16 @@ def _terminalize_wait_timeout(execution_id: str) -> str:
                 execution_id,
             )
             return ""
-        conn.execute(
-            """UPDATE deliveries SET status='unknown', finished_at=?, error=?
-               WHERE execution_id=? AND status='delivering'""",
-            (now, uncertain_error, str(execution_id)),
-        )
+        owner = conn.execute(
+            "SELECT owner_pid, owner_started_at FROM deliveries WHERE execution_id=? AND status='delivering'",
+            (str(execution_id),),
+        ).fetchone()
+        if owner is not None:
+            if not _owner_is_live(int(owner["owner_pid"]), owner["owner_started_at"]):
+                _requeue_uncertain(conn, str(execution_id))
+            logger.warning("Cron delivery %s: still in flight past the wait budget; a gateway settles it",
+                           execution_id)
+            return ""
         row = conn.execute(
             "SELECT status, error FROM deliveries WHERE execution_id=?",
             (str(execution_id),),

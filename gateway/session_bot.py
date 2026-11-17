@@ -14,7 +14,7 @@ from agent.turn_author import parse_turn_author
 from gateway.session_contract import SessionActor, SessionRef
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent
-from hermes_state_runtime import RuntimeStoreError, get_session_admission
+from hermes_state_runtime import STEERING, RuntimeStoreError, get_session_admission
 from tools.bot_failure_reasons import HELD_NOT_SENT, UNKNOWN
 from tools.bot_live_delivery import _TERMINAL, _delivery_id, _read
 logger = logging.getLogger(__name__)
@@ -123,7 +123,7 @@ async def _scan_owner_receipts(authority, home):
     legacy ticket ordered after it may be admitted by this pass. It holds for one scan only: past
     the grace window the pin is requeued and released, and a failed requeue is re-read by the next
     scan (gone, admitted or a ticket again), so the barrier never outlives the pin."""
-    pins, barrier = [], None
+    pins, barrier, started = [], None, time.monotonic()
     root, records = await scan_receipts(home, pins)
     for path, record, mtime in pins:
         key, age, legacy = record['delivery_id'], time.time() - mtime, 'owner' in record
@@ -147,7 +147,32 @@ async def _scan_owner_receipts(authority, home):
             continue
         logging.getLogger(__name__).info('%s Bot delivery %s pre-admission pin (age %ds): nothing was admitted',
                                          'Requeued' if legacy else 'Withdrew', key, age)
+    _note_legacy_scan(authority, home, started, records, barrier)
     return root, records, barrier
+
+
+# A full owner scan reads every receipt. ``_deliver`` of an id with no receipt skips ``_migrate``
+# while this home's last scan, younger than this, found nothing for it to migrate: no queued or
+# claimed legacy ticket and no unresolved legacy pin. No code here creates a legacy ticket (only
+# ``_admit`` and ``requeue_pin`` rewrite one that already exists), so the bound only caps how
+# long a ticket a foreign process might still drop in waits for the next delivery's scan.
+_LEGACY_RESCAN_SECONDS = 60
+
+
+def _note_legacy_scan(authority, home, started, records, barrier):
+    pending = barrier is not None or any(
+        record and 'owner' in record and not record.get('admission_id') and record.get('status') in {'queued', 'claimed'}
+        for _, record in records)
+    scans = getattr(authority, '_bot_legacy_scans', None)
+    if scans is None:
+        scans = authority._bot_legacy_scans = {}
+    scans[str(home)] = (started, pending)
+
+
+def _legacy_scan_due(authority, home):
+    """Whether ``_deliver`` must run ``_migrate``'s scan: never scanned, legacy state seen, or stale."""
+    last = getattr(authority, '_bot_legacy_scans', {}).get(str(home))
+    return last is None or last[1] or time.monotonic() - last[0] >= _LEGACY_RESCAN_SECONDS
 
 
 def _pin_committed(authority, record, request_id):
@@ -420,8 +445,14 @@ def _admission_outcome(authority, admission_id, fallback=None):
     # A terminal row without a result blob is still definitive when the outcome says the
     # input never ran (cancelled) or was refused/failed; ambiguous is reserved for the
     # durable unknown state and for missing evidence (completed/interrupted without result).
+    # A delivery steered into a running claim has no result of its own: ``steering`` is still
+    # bound to that claim (pending: it settles with it, or returns to the queue); ``steered``
+    # is committed proof its text reached the claim's agent and that claim completed, so it is
+    # delivered with no reply of its own. ``interrupted`` (taken, claim did not complete) stays
+    # ambiguous.
     status = {'queued': 'queued', 'started': 'claimed', 'unknown': 'ambiguous',
-              'terminal': {'cancelled': 'cancelled', 'rejected': 'failed', 'failed': 'failed'}.get(row['outcome'], 'ambiguous')}[row['status']]
+              'terminal': {'cancelled': 'cancelled', 'rejected': 'failed', 'failed': 'failed',
+                           STEERING: 'claimed', 'steered': 'settled'}.get(row['outcome'], 'ambiguous')}[row['status']]
     reply = (fallback or {}).get('reply', '')
     if saved is not None:
         reply = saved['result'].get('final_response', '')
@@ -733,6 +764,12 @@ async def recover_bot_deliveries(authority):
         for path, record in records:
             if not record or record.get('profile_home') != str(home) or not record.get('admission_id'):
                 continue
+            if record.get('status') == 'settled':
+                # Final: ``_result`` re-derives ``settled`` (a completed or steered admission, or its
+                # completed retry; an aged-out admission keeps the receipt's own answer), it is never
+                # retry-eligible and nothing watches it. Skipping it spares two whole-Bot-Chat
+                # ``_admission_at`` scans per receipt that made startup quadratic in the mailbox.
+                continue
             try:
                 record.update(_result(authority, record))
                 if record['status'] in {'queued', 'claimed'}:
@@ -860,11 +897,14 @@ async def _deliver(connection, params):
         if answer is not None:
             return answer
         try:
-            await _migrate(authority, actor, home, root)
-            _, record = await read_receipt(home, key)
-            answer = await _receipt_answer(authority, actor, home, record, identity, retry_path=path)
-            if answer is not None:
-                return answer
+            # An existing unanswered receipt (a pre-admission pin) always takes the scan: it is
+            # what withdraws a stale pin so this same-id resend admits.
+            if record is not None or _legacy_scan_due(authority, home):
+                await _migrate(authority, actor, home, root)
+                _, record = await read_receipt(home, key)
+                answer = await _receipt_answer(authority, actor, home, record, identity, retry_path=path)
+                if answer is not None:
+                    return answer
             if record is not None:
                 raise RuntimeStoreError('unknown_execution')
             holder = authority.db.get_session_by_title('Bot Chat')

@@ -1,6 +1,7 @@
 """A managed worker keeps one authenticated owner connection instead of dialing per persistence call."""
 import contextlib
 import json
+import os
 import socket
 import threading
 import time
@@ -219,8 +220,8 @@ def test_idle_broadcasts_past_the_receive_high_water_mark_keep_the_connection(ow
 
 
 def test_owner_stall_shorter_than_the_receipt_budget_does_not_fail_on_a_ping_deadline(owner, tmp_path, monkeypatch):
-    """The receipt budget (20 s) is the only per-call deadline: a library keepalive whose pong is held
-    by the same stall must not close the connection first. The library defaults (20 s / 20 s) are
+    """The receipt budget is the only per-call deadline: a library keepalive whose pong is held by the
+    same stall must not close the connection first. The library defaults (20 s / 20 s) are
     scaled down so an inherited keepalive would fire inside the stall."""
     from websockets.sync import client
     from agent.runtime_session_store import WorkerRPC
@@ -238,6 +239,24 @@ def test_owner_stall_shorter_than_the_receipt_budget_does_not_fail_on_a_ping_dea
     assert time.monotonic() - started >= 1.4
     assert rpc('worker.persist')['n'] == 3
     assert owner.connections == 1
+
+
+def test_a_receipt_held_inside_the_owners_write_patience_is_still_received(owner, tmp_path):
+    """Regression for the 2026-11-04 managed-worker interruptions: owners committed every receipt,
+    but answered past the worker's fixed 20 s budget, so each worker failed sticky
+    ``worker_receipt_timeout`` on a lost ACK. The owner's receipt write alone may wait out
+    ``SessionDB._TRANSCRIPT_WRITE_PATIENCE_S``; a reply held 21 s is inside it and must arrive."""
+    from agent.runtime_session_store import WorkerRPC
+    from hermes_state import SessionDB
+    held = 21.0
+    assert held < SessionDB._TRANSCRIPT_WRITE_PATIENCE_S
+    rpc = WorkerRPC(tmp_path)
+    assert rpc('worker.persist')['n'] == 1
+    started = time.monotonic()
+    assert rpc('stall', seconds=held) == {'n': 2, 'seconds': held}
+    assert time.monotonic() - started >= held - 0.5
+    assert rpc('worker.persist')['n'] == 3
+    assert (owner.connections, owner.tickets) == (1, 1)
 
 
 def test_concurrent_callers_are_serialized_and_each_gets_its_own_reply(owner, tmp_path):
@@ -271,3 +290,54 @@ def test_an_owner_error_reply_keeps_the_connection_for_the_next_call(owner, tmp_
     assert rpc('worker.persist') == {'n': 2}
     assert owner.requests == ['fail', 'worker.persist']
     assert (owner.connections, owner.tickets) == (1, 1)
+
+
+def test_a_dial_that_times_out_on_a_stalled_owner_is_redialed_and_sends_once(owner, tmp_path, monkeypatch):
+    """2026-11-04, runs 440-446: a managed child's first ``worker.adopt`` dial hit the 5 s upgrade
+    deadline inside a ~20 s owner loop stall and the child exited, losing the attempt. Nothing had
+    been sent, so the dial is retried; the request itself is still written exactly once."""
+    from agent import runtime_session_store
+    from agent.runtime_session_store import WorkerRPC
+    monkeypatch.setattr(runtime_session_store, '_OPEN_TIMEOUT_S', 0.3)
+    owner.relay.stall(1.2)
+    started = time.monotonic()
+    assert WorkerRPC(tmp_path)('worker.adopt', pid=1) == {'n': 1, 'pid': 1}
+    assert time.monotonic() - started >= 1.1
+    assert owner.requests == ['worker.adopt']
+    assert owner.tickets >= 2  # each redial was a fresh, ticketed dial
+
+
+def test_redialing_gives_up_at_the_receipt_budget_without_sending(owner, tmp_path, monkeypatch):
+    from agent import runtime_session_store
+    from agent.runtime_session_store import WorkerRPC
+    monkeypatch.setattr(runtime_session_store, '_OPEN_TIMEOUT_S', 0.2)
+    monkeypatch.setattr(runtime_session_store, 'receipt_budget_s', lambda: 1.0)
+    owner.relay.stall(10)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        WorkerRPC(tmp_path)('worker.adopt', pid=1)
+    assert time.monotonic() - started < 2.5
+    assert owner.requests == []
+
+
+def test_an_unready_owner_is_redialed_but_a_self_rpc_is_refused_at_once(owner, tmp_path, monkeypatch):
+    """Discovery briefly finding no ready owner is transport state; dialing this very process is an
+    answer, and retrying it would only spend the budget."""
+    from hermes_cli import gateway_runtime
+    import hermes_cli.gateway_runtime_discovery as discovery
+    from agent.runtime_session_store import WorkerPersistenceError, WorkerRPC
+    ready = gateway_runtime.discover_gateway_endpoint
+    answers = iter(['starting', 'starting'])
+
+    def discover(home, timeout):
+        state = next(answers, 'ready')
+        return ready(home, timeout) if state == 'ready' else SimpleNamespace(state=state, endpoint=None)
+    monkeypatch.setattr(gateway_runtime, 'discover_gateway_endpoint', discover)
+    assert WorkerRPC(tmp_path)('worker.adopt', pid=1) == {'n': 1, 'pid': 1}
+
+    identified = []
+    monkeypatch.setattr(discovery, 'query_identify', lambda home, timeout: identified.append(1) or {'pid': os.getpid()})
+    with pytest.raises(WorkerPersistenceError, match='synchronous_self_rpc'):
+        WorkerRPC(tmp_path)('worker.adopt', pid=1)
+    assert identified == [1]
+    assert owner.requests == ['worker.adopt']

@@ -66,6 +66,7 @@ async def test_discard_after_resume_into_a_cold_conversation_resolves_its_lost_t
         receipt = await first.admit_native(head)
     sid = receipt.ref.session_id
     claimed = claim_session_input(first.db, epoch=first.epoch, session_id=sid)
+    first.db.append_message(sid, 'tool', 'done', tool_call_id='c1', tool_name='terminal')  # it ran a tool: a business turn, ``unknown`` until its Discard
     key = runner._session_key_for_source(source)
     try:
         # A restart fences the turn unknown; /resume moves away, a second restart, /resume back:
@@ -88,5 +89,43 @@ async def test_discard_after_resume_into_a_cold_conversation_resolves_its_lost_t
         row = get_session_admission(second.db, admission_id=claimed['admission_id'])
         assert (row['status'], row['outcome']) == ('terminal', 'interrupted'), (row, sent)
         assert runner.session_store.peek_session_id(key) == sid  # /discard never rotates the chat
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_a_lost_native_turn_that_ran_no_tool_is_queued_again_with_nothing_to_discard(tmp_path, monkeypatch):
+    """msg-retry contract change (was: ``unknown`` until ``/discard``): the restart finds the lost native
+    turn ran no tool, so the next owner delivers the message again; no Discard is owed."""
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from gateway.platforms.event import MessageEvent
+    from gateway.run import GatewayRunner
+    from gateway.session_authority import initialize_session_authority
+    from gateway.session_ingress_context import native_callback, register_transport_home
+    from hermes_constants import get_hermes_home
+    from hermes_state_runtime import claim_session_input, get_session_admission
+    from tests.gateway.test_command_bypass_active_session import _StubAdapter
+
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setenv('TELEGRAM_ALLOWED_USERS', '42')
+    monkeypatch.setattr('gateway.run._hermes_home', tmp_path)
+    monkeypatch.setattr('hermes_state.DEFAULT_DB_PATH', tmp_path / 'state.db')
+    runner = GatewayRunner(GatewayConfig(multiplex_profiles=False, sessions_dir=tmp_path / 'sessions'))
+    adapter = _StubAdapter(PlatformConfig(enabled=True, token='fixture', typing_indicator=False), Platform.TELEGRAM)
+    adapter.gateway_runner = runner
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    register_transport_home(runner, None, tmp_path)
+    source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
+    first = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='old')
+    first._schedule = lambda ref: None
+    first.register(source)
+    head = MessageEvent(text='lost human input', source=source, message_id='head')
+    with native_callback(runner, head, get_hermes_home()):
+        receipt = await first.admit_native(head)
+    claimed = claim_session_input(first.db, epoch=first.epoch, session_id=receipt.ref.session_id)
+    try:
+        recovered = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='next')
+        recovered._schedule = lambda ref: None
+        assert get_session_admission(recovered.db, admission_id=claimed['admission_id'])['status'] == 'queued'
     finally:
         runner.session_store.close_all_db_handles()

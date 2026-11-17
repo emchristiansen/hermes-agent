@@ -488,7 +488,7 @@ async def test_a_stale_owner_cannot_delete_a_stored_close(tmp_path, monkeypatch)
     assert db.get_meta(CLOSE_PREFIX + 'chat') is None
 
 
-async def _hard_killed_mid_turn(tmp_path, monkeypatch):
+async def _hard_killed_mid_turn(tmp_path, monkeypatch, *, tool_step=True):
     """Ctrl+D mid-turn, then the owner dies with no shutdown code (SIGKILL): the started admission
     and the stored close are all that is left; the next owner recovers the admission ``unknown``."""
     from hermes_state_runtime import admit_session_input, claim_session_input
@@ -499,11 +499,14 @@ async def _hard_killed_mid_turn(tmp_path, monkeypatch):
                         request_id='r1', payload={'text': 'mid-turn'})
     row = claim_session_input(db, epoch=authority.epoch, session_id='chat')
     assert row['status'] == 'started'
+    if tool_step:  # it ran a tool: a business turn, never run again (msg-retry redelivers one that did not)
+        db.append_message('chat', 'tool', 'done', tool_call_id='c1', tool_name='terminal')
     await _call(viewer, 'session.detach', session_id='chat', subscription_id=subscription, end_reason='cli_close')
     assert _stored(db)['reason'] == 'cli_close' and db.get_session('chat')['ended_at'] is None
     db2, restarted, calls2 = await _restarted_owner(tmp_path, monkeypatch, db)
     from hermes_state_runtime import get_session_admission
-    assert get_session_admission(db2, admission_id=row['admission_id'])['status'] == 'unknown'
+    assert get_session_admission(db2, admission_id=row['admission_id'])['status'] == (
+        'unknown' if tool_step else 'queued')
     return db2, restarted, calls2, row
 
 
@@ -563,3 +566,12 @@ async def test_attaching_a_session_restored_on_demand_cancels_its_stored_close(t
     assert restarted.pending_closes == {} and db2.get_meta(CLOSE_PREFIX + 'chat') is not None
     await _call(_viewer(restarted, tmp_path), 'session.resume', session_id='chat')
     assert db2.get_meta(CLOSE_PREFIX + 'chat') is None and calls2 == []
+
+
+@pytest.mark.asyncio
+async def test_a_hard_killed_turn_that_ran_no_tool_is_queued_again_past_the_close(tmp_path, monkeypatch):
+    """msg-retry contract change (was: recovered ``unknown``, then resolved interrupted by the stored close):
+    the lost turn ran no tool, so the next owner delivers the message again."""
+    db2, _restarted, _calls2, row = await _hard_killed_mid_turn(tmp_path, monkeypatch, tool_step=False)
+    from hermes_state_runtime import get_session_admission
+    assert get_session_admission(db2, admission_id=row['admission_id'])['status'] == 'queued'

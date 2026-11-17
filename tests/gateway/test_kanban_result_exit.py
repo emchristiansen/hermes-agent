@@ -53,6 +53,26 @@ def test_managed_result_persists_exact_worker_exit(tmp_path, monkeypatch, result
     assert session_kanban.worker_exit_code(path, context | {"claim_lock": "foreign"}) == 1
 
 
+def test_a_finalized_persistence_failure_is_the_booked_exit(tmp_path, monkeypatch):
+    """``finalize`` (the managed child's final usage flush) runs before the exit is booked: a turn
+    whose persistence failed books that failure, never the success its conversation alone claims;
+    a ``finalize`` that raises books a failure and the error goes on."""
+    path, context = _bound_claim(tmp_path, monkeypatch)
+    monkeypatch.setattr(session_kanban, "_run_task_turns", lambda *_args: {"completed": True})
+    frame = {"policy": {"kanban_json": json.dumps(context)}}
+    failed = {"completed": False, "failed": True, "failure_reason": "session_persistence_failed:timeout"}
+    assert session_kanban.run_worker_turns(SimpleNamespace(), frame, [], finalize=lambda result: failed) is failed
+    assert session_kanban.worker_exit_code(path, context) == 1
+
+    def lost(result):
+        raise TimeoutError("worker_receipt_timeout")
+    path, context = _bound_claim(tmp_path / "raised", monkeypatch)
+    frame = {"policy": {"kanban_json": json.dumps(context)}}
+    with pytest.raises(TimeoutError):
+        session_kanban.run_worker_turns(SimpleNamespace(), frame, [], finalize=lost)
+    assert session_kanban.worker_exit_code(path, context) == 1
+
+
 def _credential_failures():
     from hermes_cli.auth import AuthError
     from hermes_cli.auth_constants import CODEX_RATE_LIMITED_CODE

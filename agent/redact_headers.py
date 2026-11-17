@@ -7,6 +7,8 @@ headers stay in agent/redact.py (they carry a scheme word).
 
 import re
 
+from agent.redact_placeholders import auth_header_sub, slots_for  # auth_header_sub: re-exported to agent.redact
+
 
 # API-key style headers (single opaque value, no scheme word): non-vendor-prefix
 # values would otherwise leak when a curl command is echoed into tool output.
@@ -170,11 +172,47 @@ def _redact_header_line_value(m: re.Match) -> str:
     return m.group(1) + "***"
 
 
+# Any credential-bearing header name: a glued-tail mask (below) never runs into the next header.
+_ANY_HEADER_NAME_RE = re.compile(
+    rf"(?:{_SECRET_HEADER_NAMES}|(?:Proxy-)?Authorization|(?:Set-)?Cookie)[ \t]*:", re.IGNORECASE)
+_SECRET_HEADER_SLOT_RE = re.compile(rf"{_SECRET_HEADER_NAMES}\s*:\s*", re.IGNORECASE)
+
+
+def _mask_glued_placeholder_slots(text: str) -> str:
+    """Mask whole a secret-header value that starts with a placeholder but is not kept, with the
+    material glued to it (``$TOKEN"AbCd``, ``$TOKEN\\AbCd``, ``{{ token }}AbCd``), up to whitespace
+    or the next header name. The passes below stop at a quote or backslash, which would leave such
+    a tail readable; r15 masked it with the slot. Kept placeholders and other values are untouched."""
+    out, last, pos, cache = [], 0, 0, []
+    while (m := _SECRET_HEADER_SLOT_RE.search(text, pos)) is not None:
+        start = pos = m.end()
+        slots = slots_for(cache, text)
+        end = slots.glued_end(start)
+        if end is None or slots.kept_tail(start) is not None:
+            continue
+        nxt = _ANY_HEADER_NAME_RE.search(text, start, end)
+        end = nxt.start() if nxt else end
+        if end > start:
+            out += [text[last:start], "***"]
+            last = pos = end
+    return "".join(out) + text[last:]
+
+
+def _keep_placeholder(m: re.Match, group: int, cache: list) -> bool:
+    """True when the value group ``group`` of a secret-header match is a kept placeholder
+    (agent/redact_placeholders.py): the match is then emitted unchanged."""
+    return slots_for(cache, m.string).keeps(*m.span(group))
+
+
 def redact_header_credentials(text: str) -> str:
     """Mask secret-header and cookie-header values in raw, curl and inline forms; the JSON
-    forms run with the assignment passes in agent/redact.py."""
+    forms run with the assignment passes in agent/redact.py. A secret-header value that is
+    wholly a value-free placeholder (``$OWNER_TOKEN``, ``${VAR}``, ``{{ token }}``) stays
+    readable; anything else is masked as before."""
+    cache: list = []
+    text = _mask_glued_placeholder_slots(text)
     text = _SECRET_HEADER_LINE_RE.sub(
-        _redact_header_line_value,
+        lambda m: m.group(0) if _keep_placeholder(m, 2, cache) else _redact_header_line_value(m),
         text,
     )
     for pattern in (
@@ -182,14 +220,15 @@ def redact_header_credentials(text: str) -> str:
         _SECRET_HEADER_SINGLE_QUOTED_RE,
     ):
         text = pattern.sub(
-            lambda m: m.group(1) + m.group(2) + "***" + m.group(4),
+            lambda m: m.group(0) if _keep_placeholder(m, 3, cache) else m.group(1) + m.group(2) + "***" + m.group(4),
             text,
         )
     text = _SECRET_HEADER_UNQUOTED_CURL_RE.sub(
-        lambda m: m.group(1) + "***",
+        lambda m: m.group(0) if _keep_placeholder(m, 2, cache) else m.group(1) + "***",
         text,
     )
-    text = _SECRET_HEADER_INLINE_RE.sub(_redact_inline_secret_header, text)
+    text = _SECRET_HEADER_INLINE_RE.sub(
+        lambda m: m.group(0) if _keep_placeholder(m, 2, cache) else _redact_inline_secret_header(m), text)
 
     # Cookie: / Set-Cookie: header values (session/auth/CSRF tokens), whole payload masked.
     # Not gated on ``code_file``: terminal output from ``curl -i`` is scrubbed with

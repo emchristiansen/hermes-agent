@@ -11,6 +11,7 @@ for the same reason is skipped, and only the newest ``keep`` per reason survive,
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import time
 from pathlib import Path
@@ -60,18 +61,41 @@ def backup_config(config_path: Path, reason: str, *, keep: int = DEFAULT_KEEP) -
         existing = list_config_backups(config_path, reason)
         # Not filecmp.cmp: its process-wide cache keys on (size, mtime), so an equal-size edit
         # within one mtime tick of an earlier comparison is reported identical and never backed up.
-        if existing and config_path.read_bytes() == existing[0].read_bytes():  # config-reader: ok — file tooling, gated above
+        data = config_path.read_bytes()  # config-reader: ok — file tooling, gated above
+        if existing and data == existing[0].read_bytes():
             return None
         dest = root / f"{config_path.name}.{reason}.{time.strftime('%Y%m%d-%H%M%S')}"
         if dest.is_symlink() or dest.exists():  # never write through a planted link
             return None
-        shutil.copy2(config_path, dest)  # config-reader: ok — file tooling, gated above
+        _write_copy(config_path, dest, data)
         for stale in [dest, *existing][keep:]:
             stale.unlink(missing_ok=True)
         return dest
     except OSError as exc:
         logger.warning("Could not back up %s (%s): %s", config_path, reason, exc)
         return None
+
+
+def _write_copy(config_path: Path, dest: Path, data: bytes) -> None:
+    """``shutil.copy2`` for a small file, as plain writes of the bytes already read.
+
+    Not ``copy2``/``copyfile``: on Linux it hands the data to ``copy_file_range(2)``, which a
+    filesystem may serve as a block clone. OpenZFS with ``zfs_bclone_wait_dirty=1`` then WAITS for
+    the transaction group holding the just-written source to sync before cloning it. A ``good``
+    backup copies a config that was just edited, under ``config._CONFIG_LOCK`` and often on the
+    event loop, so that wait (10-15 s seen under load) stalled every caller of the config. A plain
+    write does not wait for that sync. Metadata is copied as ``copy2`` does (``shutil.copystat``); that
+    copy is sequential, so a failure part-way can leave the new file with some metadata applied.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(dest, flags, 0o600)  # O_EXCL: never through a planted link
+    try:  # raw writes: this function alone owns fd, so it is closed exactly once
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+    finally:
+        os.close(fd)
+    shutil.copystat(config_path, dest)
 
 
 def load_newest_good_backup(config_path: Path) -> Optional[dict]:

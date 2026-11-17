@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import json
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 
@@ -119,12 +120,37 @@ ACTUAL_LOCAL_NOAUTH_PLACEHOLDER = "dummy-actual-local-api-key"
 CODEX_RATE_LIMITED_CODE = "codex_rate_limited"
 
 
+class DuplicateJsonMember(ValueError):
+    """A JSON object names one member twice: which value counts is a parser accident, so the document
+    is ambiguous. Carries no member name or value."""
+
+
+def unique_json_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """``json.loads(..., object_pairs_hook=unique_json_members)``: raise ``DuplicateJsonMember``
+    instead of silently keeping the last of a repeated member."""
+    obj: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in obj:
+            raise DuplicateJsonMember("a JSON object repeats a member name")
+        obj[key] = value
+    return obj
+
+
+class AuthStoreUnreadable(RuntimeError):
+    """A strict (read-only) auth-store read could not use the store at ``path``. The message names
+    the file and the failure kind only, never its contents."""
+
+    def __init__(self, path: Path, problem: str) -> None:
+        super().__init__(f"{path} {problem}")
+        self.path = path
+
+
 class AuthError(RuntimeError):
     """Structured auth error with UX mapping hints."""
 
     def __init__(
         self, message: str, *, provider: str = "", code: Optional[str] = None, relogin_required: bool = False,
-        retry_after: Optional[float] = None, retryable: Optional[bool] = None,
+        retry_after: Optional[float] = None, retryable: Optional[bool] = None, exhausted: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.provider = provider
@@ -135,6 +161,9 @@ class AuthError(RuntimeError):
         # "retryable, no hint" for transport-shaped errors and as terminal for auth refusals.
         self.retry_after = retry_after
         self.retryable = retryable
+        # The credential source a quota verdict covers: ``"credential_pool"`` when every pool row of
+        # ``provider`` was cooling and no other credential was available; None for one credential.
+        self.exhausted = exhausted
 
 
 def _provider_error_factory(provider: str) -> Callable[..., AuthError]:
@@ -153,14 +182,19 @@ _minimax_err = _provider_error_factory("minimax-oauth")
 _openrouter_err = _provider_error_factory("openrouter")
 
 
-def _decode_jwt_claims(token: Any) -> dict[str, Any]:
+def _decode_jwt_claims(token: Any, *, unique_members: bool = False) -> dict[str, Any]:
+    """The token's claims, or ``{}`` when it is not a readable JWT. With *unique_members* a repeated
+    member name anywhere in the claims raises ``DuplicateJsonMember`` (strict callers must not bind
+    an identity the token states two ways)."""
     if not isinstance(token, str) or token.count(".") != 2:
         return {}
     payload = token.split(".")[1]
     payload += "=" * ((4 - len(payload) % 4) % 4)
     try:
         raw = base64.urlsafe_b64decode(payload.encode("utf-8"))
-        claims = json.loads(raw.decode("utf-8"))
+        claims = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_json_members if unique_members else None)
+    except DuplicateJsonMember:
+        raise
     except Exception:
         return {}
     return claims if isinstance(claims, dict) else {}

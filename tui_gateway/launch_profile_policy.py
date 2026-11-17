@@ -147,9 +147,15 @@ def launch_secret_scope(launch_home: str | Path) -> dict[str, str]:
     two values it sees. Env-only keys (systemd ``Environment=``, ``op run``, Compose) are unaffected:
     nothing in the files shadows them.
     """
-    from agent.secret_scope import _is_global_env, build_profile_secret_scope
+    from agent.secret_scope import build_profile_secret_scope
+    return _over_launch_env(build_profile_secret_scope(Path(launch_home)))
+
+
+def _over_launch_env(files_scope: dict[str, str]) -> dict[str, str]:
+    """The launch env's profile secrets with *files_scope* (the launch home's files) layered on top."""
+    from agent.secret_scope import _is_global_env
     scope = {k: v for k, v in _launch_env().items() if not _is_global_env(k)}
-    scope.update(build_profile_secret_scope(Path(launch_home)))
+    scope.update(files_scope)
     return scope
 
 
@@ -160,11 +166,14 @@ def owner_secret_scope(home: str | Path) -> dict[str, str]:
     no file to rebuild from), else the profile's own files (``build_profile_secret_scope``). Every
     per-home binding point (routed gateway turns, cron fires, kanban ticks) builds through here, so
     the launch profile keeps its env-only credentials when a single-profile gateway starts
-    multiplexing in place."""
-    from agent.secret_scope import _is_process_home, build_profile_secret_scope
-    if _is_process_home(Path(home)):
-        return launch_secret_scope(home)
-    return build_profile_secret_scope(Path(home))
+    multiplexing in place.
+
+    The launch-env credentials are added on the verdict the files were READ under (one opened
+    directory), never on a separate identity check: a home whose files are another profile's
+    cannot come back holding the launch profile's credentials."""
+    from agent.secret_scope import build_profile_secret_scope, read_as_launch_home
+    files_scope = build_profile_secret_scope(Path(home))
+    return _over_launch_env(files_scope) if read_as_launch_home(files_scope) else files_scope
 
 
 @contextlib.contextmanager

@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
+from hermes_cli import kanban_db_retry_policy as _retry_policy
 from toolsets import get_toolset_names
 from utils import unlink_files_older_than
 
@@ -234,7 +235,7 @@ def notify_task_updated(
 # DispatchResult counters whose non-zero value means the tick did something.
 _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
-    "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
+    "timed_out", "auto_blocked", "rate_limited", "owner_restarted", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
     "skipped_nonspawnable",
 )
@@ -1847,11 +1848,9 @@ def _append_event(
     conn: sqlite3.Connection, task_id: str, kind: str, payload: Optional[dict] = None, *,
     run_id: Optional[int] = None,
 ) -> None:
-    """Insert an event row inside the caller's txn; ``run_id`` groups it by attempt (NULL = task-scoped)."""
-    conn.execute(
-        "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
-        "VALUES (?, ?, ?, ?, ?)", (task_id, run_id, kind, _json_or_null(payload), int(time.time())),
-    )
+    """Insert an attributed event inside the caller's transaction."""
+    from hermes_cli.kanban_db_events import append_event
+    append_event(conn, task_id, kind, payload, run_id=run_id)
 
 
 def _end_run(
@@ -2023,7 +2022,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
         "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
-        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
+        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', 'owner_restarted'"
         ") ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
     payload = _json_dict(_row_get(row, "payload"))
@@ -2087,10 +2086,9 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
                         "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
                         (resume_status, task_id),
                     )
-                _append_event(
-                    conn, task_id, "promoted",
-                    {"status": resume_status} if resume_status != "ready" else None,
-                )
+                # ``from``: todo is a dependency release, blocked a breaker park recovering (active_pr).
+                payload = {"status": resume_status} if resume_status != "ready" else {}
+                _append_event(conn, task_id, "promoted", {**payload, "from": cur_status})
                 promoted += 1
     return promoted
 
@@ -2161,10 +2159,10 @@ def _claim_and_open_run(
     )
     run_id = run_cur.lastrowid
     conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, task_id))
-    _append_event(
-        conn, task_id, "claimed",
-        {"lock": lock, "expires": expires, "run_id": run_id, **(event_extra or {})}, run_id=run_id,
-    )
+    # The task's last comment at the claim (ids only grow): the run's worker is owed every later one.
+    floor = conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?", (task_id,)).fetchone()[0]
+    _append_event(conn, task_id, "claimed", {"lock": lock, "expires": expires, "run_id": run_id,
+                  "comment_floor": floor, **(event_extra or {})}, run_id=run_id)
     return run_id
 
 
@@ -2347,7 +2345,7 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = _host_prefix()
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
+        "SELECT id, current_run_id, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
         "       assignee "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
@@ -2368,17 +2366,18 @@ def release_stale_claims(
             _extend_live_stale_claim(conn, row, now)
             continue
 
+        if not _selected_attempt_holds(conn, row, _ELIGIBILITY):
+            continue  # renewed, adopted or replaced since selection: no signal, next tick re-selects
         termination = _terminate_reclaimed_worker(
-            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn, started_at=started_at,
-        )
+            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn, started_at=started_at)
         # A live worker of ours must keep its claim (else a duplicate spawns beside it).
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
                 conn, row["id"], row["claim_lock"], now, termination,
-                reason="ttl_expired_worker_alive",
+                reason="ttl_expired_worker_alive", selected=row,
             )
             continue
-        with write_txn(conn):
+        with _retry_policy.reclaim_transaction(conn, row["id"], write_txn, _append_event, accounting_required=True) as transition:
             # Again under the write lock: an interpreter that bound since the check above
             # changes neither claim_lock nor worker_pid, so the CAS below cannot see it.
             if owner_reclaim_blocked_after_kill(conn, row["id"], signalled=bool(termination.get("termination_attempted"))):
@@ -2395,7 +2394,7 @@ def release_stale_claims(
             )
             if cur.rowcount != 1:
                 continue
-            run_id = _record_reclaim(
+            run_id = transition["run_id"] = _record_reclaim(
                 conn, row["id"], termination,
                 error=error,
                 payload={
@@ -2410,15 +2409,10 @@ def release_stale_claims(
                 },
             )
             reclaimed += 1
-        # Own txn, after the reclaim commit (same shape as ``enforce_max_runtime``):
-        # the run ended without a verdict, so it counts toward the breaker and a
-        # trip flips the task to ``blocked`` + ``gave_up`` on top of ``reclaimed``.
-        _record_task_failure(
-            conn, row["id"], error,
-            outcome="reclaimed", failure_limit=failure_limit,
-            release_claim=False, end_run=False,
-            event_payload_extra={"worker_pid": _opt_int(row["worker_pid"]), "retry_status": retry_status},
-        )
+        # Own txn after the reclaim commit (as ``enforce_max_runtime``): counts toward the breaker; a trip
+        # flips the task to ``blocked`` + ``gave_up`` on top of ``reclaimed`` (never a successor's run).
+        _record_task_failure(conn, row["id"], error, outcome="reclaimed", failure_limit=failure_limit, run_id=run_id,
+                             event_payload_extra={"worker_pid": _opt_int(row["worker_pid"]), "retry_status": retry_status})
         # Post-commit observer; every non-reclaim branch ``continue``d above.
         if _kanban_observer_consumed("on_kanban_worker_stale_claim"):
             _fire_kanban_lifecycle_hook(
@@ -2991,9 +2985,9 @@ def _persist_scratch_completion_artifacts(
 
     if changed:
         metadata["artifacts"] = persisted
-        metadata["_staged_artifacts"] = [
-            path for path in persisted if path.startswith(str(attachment_dir.resolve()))
-        ]
+        # Only this call's own new copies: a registered attachment passed through is not ours to discard.
+        copied = {str(dest.resolve()) for dest in used_destinations}
+        metadata["_staged_artifacts"] = [path for path in persisted if path in copied]
 
 
 def _discard_staged_copies(copies: Iterable[Path], attachment_dir: Path) -> None:
@@ -3045,13 +3039,15 @@ def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> 
     return candidate
 
 
+@_retry_policy.guarded_edit(lambda: (write_txn, _append_event, notify_task_updated))
 def edit_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, priority: Optional[int] = None,
     result: Optional[str] = None, summary: Optional[str] = None,
     metadata: Optional[dict] = None, board: Optional[str] = None,
+    max_retries: Optional[int] = None, expected_terminal_run: Optional[int] = None,
 ) -> bool:
-    """Edit task fields, optionally backfilling a completed task's result."""
+    """Edit task fields; retry tightening is a separate terminal-run-fenced mode."""
     changed_fields = [
         field for field, value in (("title", title), ("body", body), ("priority", priority))
         if value is not None
@@ -3087,17 +3083,16 @@ def edit_task(
             changed_fields.append("summary")
             if metadata is not None:
                 changed_fields.append("metadata")
-            run = conn.execute(
-            """
-            SELECT id FROM task_runs
-             WHERE task_id = ?
-               AND outcome = 'completed'
-             ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC
-             LIMIT 1
-            """,
-            (task_id,),
-        ).fetchone()
-            if run is None:
+            from hermes_cli.kanban_db_settle import settlement_correction
+            # SI-06: a settled assessment is corrected on its own record; no run is rewritten or synthesized.
+            correction = settlement_correction(conn, task_id, handoff_summary, metadata)
+            run = None if correction is not None else conn.execute(
+                "SELECT id FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+                "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1", (task_id,),
+            ).fetchone()
+            if correction is not None:
+                run_id = None
+            elif run is None:
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="completed", summary=handoff_summary, metadata=metadata,
                 )
@@ -3115,6 +3110,7 @@ def edit_task(
                     "fields": ["result", "summary"] + (["metadata"] if metadata is not None else []),
                     "result_len": len(result) if result else 0,
                     "summary": _first_line(handoff_summary, 400) or None,
+                    **({"settlement_correction": correction} if correction is not None else {}),
                 },
                 run_id=run_id,
             )
@@ -3477,20 +3473,20 @@ def request_changes(
 
 def promote_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
-    dry_run: bool = False,
+    dry_run: bool = False, expected_terminal_run: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
-    """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
-    Refused while a parent is unfinished; ``dry_run`` only validates.
-    Returns ``(ok, reason)``."""
+    """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event. Refused while a parent
+    is unfinished; ``dry_run`` only validates. Returns ``(ok, reason)``. ``expected_terminal_run`` instead continues
+    a guarded ``ready`` card or a ``triage`` loop whose input arrived (``kanban_db_active_pr.continue_ready``)."""
+    if expected_terminal_run is not None:
+        from hermes_cli.kanban_db_active_pr import continue_ready
+        return continue_ready(conn, task_id, expected_terminal_run, actor=actor, reason=reason, dry_run=dry_run)
     cur_status = _task_status(conn, task_id)
     if cur_status is None:
         return False, f"task {task_id} not found"
-
     if cur_status not in ("todo", "blocked"):
-        return False, (
-            f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
-        )
+        return False, (f"task {task_id} is {cur_status!r}; promote only applies to 'todo' or 'blocked' "
+                       f"(a guarded 'ready' card or a 'triage' loop: --expected-terminal-run <latest run>)")
 
     # No override: claim_task demotes ready -> todo on an undone parent whichever
     # writer set 'ready', so a forced promotion would only report a success the
@@ -3554,11 +3550,12 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+def unblock_task(conn: sqlite3.Connection, task_id: str, *, expected_terminal_run: Optional[int] = None) -> bool:
+    """Restore the resumable phase; enrolled first-failure releases retain historical counters."""
     now = int(time.time())
     with write_txn(conn):
+        if not _retry_policy.release_is_fenced(conn, task_id, expected_terminal_run):
+            return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"
@@ -3575,14 +3572,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             if landing_status == "ready" and resume_status == "review"
             else landing_status
         )
-        # ``block_kind``/``block_recurrences`` deliberately survive the unblock:
-        # resetting them is the amnesia that let cron-unblock <-> re-block loop
-        # unbounded; only complete_task clears them. ``consecutive_failures``
-        # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
-        # is a fresh start for the retry budget.
+        # Enrolled first-failure releases are explicit new occurrences, not failure-history resets.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = CASE WHEN max_retries=1 THEN consecutive_failures ELSE 0 END, last_failure_error = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
         if cur.rowcount != 1:
@@ -3732,11 +3725,10 @@ def invalidate_descendants_for_parent_reopen(
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
+    automatic: bool = False,
 ) -> bool:
-    """Update title/body/assignee (when given) and move ``triage -> todo`` in one
-    txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
-    gating still applies; the audit comment is written only when a field changed.
-    """
+    """Specify eligible triage atomically, then promote subject to parent gating."""
+    from hermes_cli.kanban_db_graph import automatic_triage_eligible
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
@@ -3745,7 +3737,7 @@ def specify_triage_task(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
         ).fetchone()
-        if existing is None:
+        if existing is None or (automatic and not automatic_triage_eligible(conn, task_id)):
             return False
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
@@ -3780,8 +3772,7 @@ def specify_triage_task(
             conn, task_id, "specified",
             {"changed_fields": changed_fields} if changed_fields else None,
         )
-    # Own IMMEDIATE txn (outside the one above): a parent-free specified task
-    # flips to 'ready' now instead of idling until the next tick.
+    # Separate IMMEDIATE txn: parent-free tasks need not wait for the next tick.
     recompute_ready(conn)
     return True
 
@@ -3903,7 +3894,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         raise ValueError(f"unknown task {task_id}")
     from hermes_cli.kanban_db_context import (
         _ctx_attachments, _ctx_comments, _ctx_header, _ctx_parent_results, _ctx_prior_attempts,
-        _ctx_role_history,
+        _ctx_role_history, kept_correction_ids,
     )
     # One clock reading so every relative age in this rendering agrees.
     now = int(time.time())
@@ -3913,7 +3904,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
     _ctx_role_history(lines, conn, task, now)
-    _ctx_comments(lines, list_comments(conn, task_id), now)
+    _ctx_comments(lines, list_comments(conn, task_id), now, kept_correction_ids(conn, task_id))
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -4011,18 +4002,14 @@ def _retention_seconds(older_than_seconds: int) -> int:
 
 
 def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600) -> int:
-    """Prune old done/archived events, retaining decomposition identity until task deletion.
+    """Prune old done/archived events, retaining decomposition identity until task deletion and
+    a possibly live worker's binding (``kanban_db_workspace._prune_terminal_events``).
 
     ``older_than_seconds=0`` means everything older than now; the CLI maps
     ``--event-retention-days 0`` to "disabled" before calling this.
     """
-    cutoff = int(time.time()) - _retention_seconds(older_than_seconds)
-    with write_txn(conn):
-        cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
-        )
-    return int(cur.rowcount or 0)
+    from hermes_cli.kanban_db_workspace import _prune_terminal_events
+    return _prune_terminal_events(conn, int(time.time()) - _retention_seconds(older_than_seconds))
 
 
 def gc_worker_logs(*, older_than_seconds: int = 30 * 24 * 3600, board: Optional[str] = None) -> int:
@@ -4142,42 +4129,6 @@ def latest_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
     return Run.from_row(row) if row else None
 
 
-def latest_summary(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    """Newest non-empty run summary, or None. Workers hand off via ``summary`` and
-    leave ``tasks.result`` NULL, so views need this or a done task looks empty."""
-    row = conn.execute(
-        "SELECT summary FROM task_runs "
-        "WHERE task_id = ? AND summary IS NOT NULL AND summary != '' "
-        "ORDER BY COALESCE(ended_at, started_at) DESC, id DESC LIMIT 1", (task_id,),
-    ).fetchone()
-    return row["summary"] if row else None
-
-
-def latest_summaries(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, str]:
-    """``{task_id: newest non-empty run summary}`` in one query (window function,
-    SQLite >= 3.25); tasks without a summary are omitted."""
-    ids = list(task_ids)
-    if not ids:
-        return {}
-    placeholders = ",".join("?" for _ in ids)
-    rows = conn.execute(
-        f"""
-        SELECT task_id, summary FROM (
-            SELECT task_id, summary,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY task_id
-                       ORDER BY COALESCE(ended_at, started_at) DESC, id DESC
-                   ) AS rn
-              FROM task_runs
-             WHERE task_id IN ({placeholders})
-               AND summary IS NOT NULL AND summary != ''
-        ) WHERE rn = 1
-        """,
-        ids,
-    ).fetchall()
-    return {r["task_id"]: r["summary"] for r in rows}
-
-
 def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, int]:
     """``{task_id: started_at of the run ``tasks.current_run_id`` points at}``
     in one query; tasks with no active run (NULL or dangling pointer) are omitted."""
@@ -4216,14 +4167,20 @@ from hermes_cli.kanban_db_workspace import (
     _managed_scratch_path_info,
     _scratch_workspace,
 )
+from hermes_cli.kanban_db_summaries import (
+    latest_summaries,
+    latest_summary,
+)
 from hermes_cli.kanban_db_dispatch import (
     DEFAULT_FAILURE_LIMIT,
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     DispatchResult,
     _clear_failure_counter,
+    _ELIGIBILITY,
     _defer_reclaim_for_live_worker,
     _pid_alive,
     _record_task_failure,
+    _selected_attempt_holds,
     _terminate_reclaimed_worker,
     _worker_alive,
     _worker_survived_termination,

@@ -21,6 +21,10 @@ def _mark_unknown(authority, row):
             return current['status']
         if current['status'] != 'started':
             raise RuntimeStoreError('stale_generation')
+        # Terminal settlement may have rolled back its owed-redelivery marker too. Preserve the
+        # qualified owner-stop obligation in THIS fence, not a later scan of arbitrary unknowns.
+        from gateway.session_message_redelivery import owe_failed_owner_stop
+        owe_failed_owner_stop(conn, current, authority.pending_results.get(row['admission_id']))
         conn.execute("UPDATE session_admissions SET status='unknown' WHERE admission_id=?", (row['admission_id'],))
         # A steer it carried is never replayed: interrupted if delivered, else queued again.
         settle_steer_transfers(conn, epoch=authority.epoch, generation=row['generation'],
@@ -114,7 +118,10 @@ def _publish_completion(authority, live, ref, row, settled, response, captured):
     except Exception:
         logger.exception('Terminal control cleanup failed for admission %s', row['admission_id'])
     complete = completion_payload(row, settled, response, captured)
-    notice = owner_stop_notice(captured, settled['outcome'], row)
+    # The settlement's committed notice when it made one (``finish_result``: an owed redelivery says the
+    # message runs again), so the live warning never contradicts the transcript boundary.
+    notice = settled['owner_stop_notice'] if 'owner_stop_notice' in settled else owner_stop_notice(
+        captured, settled['outcome'], row)
     if notice and not complete.get('warning'):
         # ``warning`` is the slot every surface already renders on message.complete (Ink activity
         # line, Desktop toast), so a turn the owner's stop cut short says why (#134889 F1).
@@ -225,8 +232,37 @@ async def settle_with_retry(authority, live, ref, row, response, outcome, captur
             await asyncio.sleep(delay)
 
 
+RESTART_UNCONFIRMED_NOTICE = ('Gateway restarting: this turn was interrupted. Hermes could not confirm whether '
+                              'it will run again; if no answer arrives, send your message again once Hermes '
+                              'reconnects.')
+SHUTDOWN_UNCONFIRMED_NOTICE = ('Gateway shutting down: this turn was interrupted. Hermes could not confirm whether '
+                               'it will run again; if no answer arrives, send your message again once Hermes is '
+                               'back.')
+
+
+def with_committed_notice(authority, settled, captured):
+    """``settled`` carrying the live notice its committed row made (MR-NOTICE-09). A row read back from storage
+    (the fallback after a reported settlement error, a resolved unknown) has none, so derive it from durable state:
+    the stored result's cause, the durable row and the owed-redelivery marker (``committed_owner_stop_notice``).
+    If that read fails, the warning says the outcome is unconfirmed; it never claims the turn will not run."""
+    if 'owner_stop_notice' in settled:
+        return settled
+    from gateway.session_results import committed_owner_stop_notice
+    try:
+        with authority.db._read_ctx() as conn:
+            notice = committed_owner_stop_notice(conn, settled, captured)
+    except Exception:
+        logger.exception('Committed notice of admission %s could not be read', settled.get('admission_id'))
+        stop = owner_stop_notice(captured, settled.get('outcome'), settled)
+        notice = {RESTART_INTERRUPT_NOTICE: RESTART_UNCONFIRMED_NOTICE,
+                  SHUTDOWN_INTERRUPT_NOTICE: SHUTDOWN_UNCONFIRMED_NOTICE}.get(stop, stop)
+    return dict(settled, owner_stop_notice=notice)
+
+
 def publish_terminal(authority, ref, row, settled, response, captured):
-    """Cleanup cannot withhold a committed outcome; publication is attempted once."""
+    """Cleanup cannot withhold a committed outcome; publication is attempted once. Its live warning is the
+    committed one (durable read before the stream lock is taken)."""
+    settled = with_committed_notice(authority, settled, captured)
     live = authority.sessions[ref.session_id]
     with live.event_stream.lock:
         _publish_completion(authority, live, ref, row, settled, response, captured)

@@ -95,6 +95,16 @@ def steer_transfers(authority, session_id, generation):
     return dict(entry[1])
 
 
+def retained_transfers(authority, session_id, generation):
+    """``steer_transfers`` of a claim that is no longer running, read for its resolution: present
+    only when the claim's own settlement could not write them (``None`` once settled and published)."""
+    live = authority.sessions.get(session_id)
+    if live is None:
+        return None
+    with live.event_stream.lock:
+        return steer_transfers(authority, session_id, generation)
+
+
 def _register(authority, session_id, generation, admission_id):
     """``{admission_id: delivered}`` for the claim ``generation``."""
     entry = authority.steer_transfers.get(session_id)
@@ -119,9 +129,42 @@ def _receiving_agent(authority, session_id, generation):
     return agent
 
 
-def _deliver(authority, session_id, generation, agent, admission_id, text):
-    """Hand the committed text to the claim's agent; the caller holds the stream lock. False once the
-    claim stopped executing (its settlement then decides the row) or its agent refused the text."""
+def automation(payload):
+    """The automation descriptor of a text-only producer row: a local session's (``local_automation_v1``)
+    or a messaging route's wake (``native_text_v1.automation``, no media). None for any other row."""
+    if set(payload) == {'text', 'local_automation_v1'}:
+        return payload['local_automation_v1']
+    native = payload.get('native_text_v1')
+    if set(payload) == {'text', 'native_text_v1'} and isinstance(native, dict) and not native.get('media'):
+        return native.get('automation')
+    return None
+
+
+def delivered_by(row):
+    """Who delivered the row's text when it is not the user's own: automation (a Bot Chat delivery, a
+    producer notice, a messaging route's wake) reaches the turn framed with the author its own turn would
+    carry (``turn_author``; ``{}`` for Hermes automation), never as the user's. None for the user's text.
+    Every hand-over of a row reads it here, from the committed row, whoever hands it over."""
+    descriptor = automation(row['payload'])
+    return None if descriptor is None else dict(descriptor.get('turn_author') or {})
+
+
+def steered_text(authority, row):
+    """The text a hand-over gives the turn: a messaging user's own row (native, not automation) keeps its
+    origin, as the messaging busy path steers it (``_steer_text_with_origin``); any other row its text."""
+    payload = row['payload']
+    if 'native_text_v1' not in payload or automation(payload) is not None:
+        return payload['text']
+    from gateway.session_envelope import restore_native
+    runner = authority.runner
+    return runner._steer_text_with_origin(payload['text'].strip(), restore_native(payload, runner))
+
+
+def _deliver(authority, session_id, generation, agent, row):
+    """Hand the committed row's text to the claim's agent, as its own sender's (``delivered_by``); the
+    caller holds the stream lock. False once the claim stopped executing (its settlement then decides
+    the row) or its agent refused the text."""
+    admission_id, text, sender = row['admission_id'], steered_text(authority, row), delivered_by(row)
     entry = authority.steer_transfers.get(session_id)
     if (entry is None or entry[0] != generation or admission_id not in entry[1]
             or _receiving_agent(authority, session_id, generation) is not agent):
@@ -129,7 +172,11 @@ def _deliver(authority, session_id, generation, agent, admission_id, text):
     if not entry[1][admission_id]:
         # Ticketed by its admission id: settlement withdraws exactly it if no drain of the turn consumed it.
         ticketed = callable(getattr(agent, 'withdraw_steer', None))
-        entry[1][admission_id] = bool(agent.steer(text, ticket=admission_id) if ticketed else agent.steer(text))
+        if sender is not None:
+            # Only a ticketed seam records the sender; without one the message runs as its own turn.
+            entry[1][admission_id] = ticketed and bool(agent.steer(text, ticket=admission_id, delivered_by=sender))
+        else:
+            entry[1][admission_id] = bool(agent.steer(text, ticket=admission_id) if ticketed else agent.steer(text))
     return entry[1][admission_id]
 
 
@@ -143,7 +190,7 @@ async def steer_queued(connection, ref, params):
             with authority.sessions[ref.session_id].event_stream.lock:
                 agent = _receiving_agent(authority, ref.session_id, row['generation'])
                 if agent is not None:
-                    _deliver(authority, ref.session_id, row['generation'], agent, admission_id, row['payload']['text'])
+                    _deliver(authority, ref.session_id, row['generation'], agent, row)
         return asdict(receipt)  # an exact retry replays the committed transfer
     if receipt.status != 'queued':
         raise RuntimeStoreError('admission_started')
@@ -152,7 +199,15 @@ async def steer_queued(connection, ref, params):
     handle = authority._handle(ref)
     if handle.execution_state != 'running':
         raise RuntimeStoreError('session_idle')
-    generation, text, live = handle.execution_generation, row['payload']['text'], authority.sessions[ref.session_id]
+    return asdict(authority._receipt(await transfer(authority, ref, row, handle.execution_generation)))
+
+
+async def transfer(authority, ref, row, generation):
+    """Transfer the queued ``row`` to the running claim ``generation`` and hand its text to that claim's
+    agent (as its sender's, ``delivered_by``); returns the committed row. Refuses (``steer_unavailable``)
+    with the row untouched while the claim has no agent, and queues it again in its own place when the
+    claim ended before delivery."""
+    admission_id, live = row['admission_id'], authority.sessions[ref.session_id]
     session_id = ref.session_id
     with live.event_stream.lock:
         agent = _receiving_agent(authority, session_id, generation)
@@ -174,7 +229,7 @@ async def steer_queued(connection, ref, params):
         raise
     if fresh:
         with live.event_stream.lock:
-            delivered = _deliver(authority, session_id, generation, agent, admission_id, text)
+            delivered = _deliver(authority, session_id, generation, agent, row)
         if not delivered:
             # The claim ended first: the text reached nobody, so the admission is queued again.
             await tracked_write(authority, partial(revert_steer_input, authority.db, epoch=authority.epoch,
@@ -186,7 +241,7 @@ async def steer_queued(connection, ref, params):
             raise RuntimeStoreError('steer_unavailable', field='admission_id',
                                     detail='the running turn ended before the steer reached it')
         authority._publish_pending(ref)  # the card leaves the queue: its text is in the running turn
-    return asdict(authority._receipt(committed))
+    return committed
 
 
 def publish_transfers(authority, ref, generation):

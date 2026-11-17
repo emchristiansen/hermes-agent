@@ -35,9 +35,11 @@ from hermes_cli.config import get_hermes_home
 from tools.process_registry_notifications import (
     format_process_notification, heartbeat_output_tail, is_child_process_notification, should_surface_notification)
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
-from tools.process_registry_output_log import ProcessOutputLogMixin, open_output_log, record_exit_command, worker_output_log
+from tools.process_registry_output_log import (
+    ProcessOutputLogMixin, open_output_log, record_exit_command, worker_output_log, worker_spawn_outlives_unit)
 from tools.process_registry_ownership import ProcessOwnershipMixin
 from tools.process_registry_termination import ProcessTerminationMixin
+from tools.process_registry_scope_custody import ProcessScopeCustodyMixin
 from tools.process_registry_results import load_completed_results, save_completed_result
 from tools.process_registry_env_log import log_delta_command
 from tools.process_registry_wsl import _is_wsl_launcher_command
@@ -602,8 +604,8 @@ class ProcessSession:
     # Set by the _move_to_finished call that moved the session out of _running; only that call
     # publishes the completion, so a duplicate finisher must not release waiters early.
     _finish_claimed: bool = field(default=False, repr=False)
-    # The last stop of ``systemd_unit`` failed, so its descendants may still be alive; bulk
-    # cleanup retries the stop even after the session finished.
+    # Scope custody: a stop of ``systemd_unit`` failed, or the root exited while the scope still held
+    # descendants; bulk cleanup stops it even after the session finished (process_registry_scope_custody).
     _scope_stop_pending: bool = field(default=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
@@ -674,7 +676,8 @@ _WSL_CHAIN_NOTE = (
 )
 
 
-class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOutputLogMixin, ProcessOwnershipMixin):
+class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOutputLogMixin, ProcessScopeCustodyMixin,
+                      ProcessOwnershipMixin):
     """In-memory registry of running and finished background processes.
     Thread-safe: accessed from executor threads (terminal_tool, process handlers),
     the gateway asyncio loop (watchers, reset checks) and the cleanup thread."""
@@ -1009,12 +1012,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         if session is None or session.exited or not session.detached or session.pid_scope != "host" or session.output_log:
             return session  # a log-backed adoption's reader collects the recorded exit itself
         fate = self._detached_host_fate(session.pid, session.host_start_time)
-        if fate == "running":
-            return session
-        if fate == "gone":
-            return self._prune_uncollected_detached(session)
-        self._close_reused_detached(session)
-        return session
+        return session if fate == "running" else self._close_detached(session, fate)
 
     def _close_reused_detached(self, session: ProcessSession) -> None:
         """Close an entry whose PID was recycled onto another process.
@@ -1113,19 +1111,17 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         """Login-shell argv for *safe_command* (parity with LocalEnvironment: rc files
         sourced, user tools on PATH), wrapped in a transient systemd scope when we are
         the supervised gateway (own cgroup: an OOM kills only the worker, not the
-        gateway and its messaging control plane)."""
+        gateway and its messaging control plane) or a registered worker sharing a service
+        unit's cgroup (``worker_spawn_outlives_unit``: the unit's stop must not kill it)."""
         argv = [_find_shell(), "-lic", f"set +m; {safe_command}"]
         # This applies to both pipe mode and the PTY path above. See #70716.
-        in_supervised_gateway = _IS_LINUX and _is_supervised_gateway_process()
+        in_supervised_gateway = _IS_LINUX and (_is_supervised_gateway_process() or worker_spawn_outlives_unit())
         if in_supervised_gateway and _systemd_run_user_scope_available():
             session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
             return _build_systemd_scope_argv(argv, unit_suffix=unit_suffix)
-        if in_supervised_gateway:
-            # Under a supervisor but no private cgroup: a worker OOM can still take
-            # the whole gateway down.
-            logger.debug(
-                "%s background executor not isolated in a systemd scope "
-                "(systemd-run --user unavailable); worker shares the gateway cgroup.", label)
+        if in_supervised_gateway:  # no private cgroup: a worker OOM can still take the whole gateway down
+            logger.debug("%s background executor not isolated in a systemd scope "
+                         "(systemd-run --user unavailable); worker shares the gateway cgroup.", label)
         return argv
 
     @staticmethod
@@ -1542,10 +1538,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
     def _finish_exited(self, session: ProcessSession, exit_code, reason: str = "exited", source: str = "") -> None:
         """Mark a reader-observed exit (a raced kill keeps its own code/reason) and finish.
         Under the session lock, like kill_process's commit: otherwise the kill can land between
-        mark_exited's ``killed`` check and its writes, and the reader overwrites the kill."""
-        with session._lock:
-            session.mark_exited(exit_code, reason, source)
-        self._move_to_finished(session)
+        mark_exited's ``killed`` check and its writes, and the reader overwrites the kill.
+        The root's exit does not empty its scope (process_registry_scope_custody)."""
+        self._finish_with_scope(session, lambda: session.mark_exited(exit_code, reason, source))
 
     def _move_to_finished(self, session: ProcessSession) -> bool:
         """Move a session from running to finished.
@@ -1976,13 +1971,12 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                         fcntl.fcntl(fd, fcntl.F_SETFL, flags)
             except Exception as e:
                 logger.debug("Non-blocking drain failed for %s: %s", session.id, e)
-        with session._lock:
-            session.mark_exited(rc)
-        logger.info(
-            "Reconciled session %s: direct child exited with code %s but reader "
-            "was still blocked (orphaned pipe). Flipped to exited.",
-            session.id, rc)
-        self._move_to_finished(session)
+        # The descendant holding the pipe may be in the scope: held through the finish if populated.
+        if self._finish_with_scope(session, lambda: session.mark_exited(rc), block=False):
+            logger.info(
+                "Reconciled session %s: direct child exited with code %s but reader "
+                "was still blocked (orphaned pipe). Flipped to exited.",
+                session.id, rc)
 
     @staticmethod
     def _status_head(session: ProcessSession) -> dict:
@@ -2217,16 +2211,6 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 "termination_source": session.termination_source, **output}
         except Exception as e:
             return {"status": "error", "error": str(e)}
-
-    @staticmethod
-    def _stop_scope(session: ProcessSession) -> bool:
-        """Stop the session's systemd scope: True when it has none or the stop worked. Every kill
-        path stops the scope through here, so a failed stop always leaves it marked for retry."""
-        if not session.systemd_unit:
-            return True
-        stopped = _stop_systemd_unit(session.systemd_unit)
-        session._scope_stop_pending = not stopped
-        return stopped
 
     def _signal_kill(self, session: ProcessSession, session_id: str, consume_output: bool) -> Optional[dict]:
         """Deliver the kill via PTY, local Popen tree, sandbox exec or recovered host
@@ -2485,12 +2469,12 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         return self._any_running(lambda s: True)
 
     def snapshot_running_ids(self, task_id: str) -> frozenset[str]:
-        """Running IDs owned by ``task_id`` — a turn-boundary marker: on timeout
-        only processes absent from the starting snapshot belong to the abandoned
-        turn; older ones intentionally span turns and must survive. Ownership is
-        ``owner_task_id``: ``task_id`` is the container key (``session:<key>``,
-        ``default``), shared across turns and sessions, not the turn's id."""
-        return frozenset(s.id for s in self.running_owned_by(task_id))
+        """IDs ``kill_all(task_id)`` reaches now (running, or finished with its scope in custody): a turn-boundary
+        marker; on timeout only processes absent from it belong to the abandoned turn, older ones must survive.
+        Matched on ``owner_task_id``; ``task_id`` is the container key (``session:<key>``, ``default``), not a turn id."""
+        with self._lock:
+            return frozenset(s.id for s in (*self._running.values(), *self._finished.values())
+                             if s.owner_task_id == task_id and self._sweepable(s))
 
     # Kill sources that are agent-lifecycle cleanup (session end / compression / error
     # recovery / turn abandon), not a deliberate stop: those must skip persist_on_release
@@ -2522,7 +2506,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             targets = [
                 s for s in (*self._running.values(), *self._finished.values())
                 if (task_id is None or s.owner_task_id == task_id)
-                and s.id not in exclude_ids and (not s.exited or s._scope_stop_pending)
+                and s.id not in exclude_ids and self._sweepable(s)
                 and not (lifecycle and s.persist_on_release)
             ]
         results = [self.kill_process(s.id, source=source, consume_output=consume_output) for s in targets]

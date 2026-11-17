@@ -19,8 +19,13 @@ async def test_cancelled_startup_recovery_retains_owner_until_receipt_writer_fin
     watchers = list(getattr(bot.authority, '_bot_receipt_tasks', ()))
     if watchers:
         await asyncio.gather(*watchers)
-    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
     original = session_bot_mailbox._write_receipt
+    # Recovery skips a receipt already written settled, so rehearse the owner dying after the
+    # admission completed but before its settled receipt was written: recovery must write it.
+    _, record = session_bot_mailbox._read_receipt(bot.home, KEY)
+    assert record['status'] == 'settled'
+    assert original(bot.home, {**record, 'status': 'claimed'}) is True
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
 
     def held_write(*args):
         entered.set()

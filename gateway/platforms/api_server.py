@@ -4089,7 +4089,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 await self._runner.cleanup()
                 self._runner = None
         finally:
-            _api_runs._close_run_state(self)  # after site.stop(): no late request re-mints the executor
+            await _api_runs._close_run_state_async(self)  # after site.stop(); queued commits drain off-loop
             self._close_cached_session_dbs()
             self._app = None
         logger.info("[%s] API server stopped", self.name)

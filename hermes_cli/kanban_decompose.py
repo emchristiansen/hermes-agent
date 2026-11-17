@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
-from hermes_cli.kanban_db_graph import decompose_triage_task
+from hermes_cli.kanban_db_graph import automatic_triage_eligible, decompose_triage_task
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import profiles as profiles_mod
 from hermes_cli.kanban_specify import (
@@ -218,7 +218,7 @@ def _load_routing(*, root_assignee: Optional[str] = None) -> _Routing:
     )
 
 
-def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -> DecomposeOutcome:
+def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str, *, automatic: bool) -> DecomposeOutcome:
     """``fanout=false``: single-task spec promotion (same effect as specify)."""
     title_val, body_val = _title_body(parsed)
     assignee_val = None
@@ -231,9 +231,10 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
     with kbc.connect_closing() as conn:
         ok = kb.specify_triage_task(
             conn, task.id, title=title_val, body=body_val, assignee=assignee_val, author=author,
+            automatic=automatic,
         )
     if not ok:
-        return DecomposeOutcome(task.id, False, "task moved out of triage before promotion")
+        return DecomposeOutcome(task.id, False, "task is no longer eligible for this triage promotion")
     return DecomposeOutcome(task.id, True, "single task (no fanout)", fanout=False, new_title=title_val)
 
 
@@ -271,7 +272,7 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
     return children, ""
 
 
-def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) -> DecomposeOutcome:
+def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str, *, automatic: bool) -> DecomposeOutcome:
     raw_tasks = parsed.get("tasks") or []
     if not isinstance(raw_tasks, list) or not raw_tasks:
         return DecomposeOutcome(task_id, False, "decomposer returned fanout=true with empty tasks list")
@@ -287,6 +288,7 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
                 children=children,
                 author=author,
                 auto_promote=routing.auto_promote,
+                automatic=automatic,
             )
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
@@ -294,7 +296,7 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
         logger.exception("decompose: DB error on task %s", task_id)
         return DecomposeOutcome(task_id, False, f"DB error: {type(exc).__name__}")
     if child_ids is None:
-        return DecomposeOutcome(task_id, False, "task already decomposed or moved out of triage")
+        return DecomposeOutcome(task_id, False, "task already decomposed or no longer eligible for triage")
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children", fanout=True, child_ids=child_ids,
     )
@@ -305,6 +307,7 @@ def decompose_task(
     *,
     author: Optional[str] = None,
     timeout: Optional[int] = None,
+    automatic: bool = False,
 ) -> DecomposeOutcome:
     """Decompose a triage task into a graph of child tasks. Expected failures
     (not in triage, no aux client, API error, malformed/empty reply) surface
@@ -312,6 +315,10 @@ def decompose_task(
     task, reason = _load_triage_task(task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
+    if automatic:
+        with kbc.connect_closing() as conn:
+            if not automatic_triage_eligible(conn, task_id):
+                return DecomposeOutcome(task_id, False, "triage requires an explicit owner disposition")
 
     routing = _load_routing(root_assignee=task.assignee)
     raw, reason = _call_aux(
@@ -332,12 +339,12 @@ def decompose_task(
 
     audit_author = author or _profile_author()
     if not parsed.get("fanout"):
-        return _apply_single(task, parsed, routing, audit_author)
-    return _apply_fanout(task_id, parsed, routing, audit_author)
+        return _apply_single(task, parsed, routing, audit_author, automatic=automatic)
+    return _apply_fanout(task_id, parsed, routing, audit_author, automatic=automatic)
 
 
-def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+def list_triage_ids(*, tenant: Optional[str] = None, automatic: bool = False) -> list[str]:
+    """Automatic callers leave loop-breaker triage for explicit owner disposition."""
     with kbc.connect_closing() as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
-    return [row.id for row in rows]
+        return [row.id for row in rows if not automatic or automatic_triage_eligible(conn, row.id)]

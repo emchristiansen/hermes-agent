@@ -9,13 +9,13 @@ that owner is proven.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import sqlite3
 from typing import Any, Optional, Sequence, cast
 
 from gateway.session import SessionEntry
+from gateway.run_notifications_offload import owned_offload
 from hermes_state_errors import StateDbReplacedError
 
 # Log-record parity with the origin module.
@@ -283,7 +283,7 @@ class GatewayNotificationOwnershipMixin:
                 runner._completion_deliveries_delivered.pop(("async_delegation", delegation_id, ""), None)
         for delegation_id in completion_ids:
             try:
-                requeued = await asyncio.to_thread(
+                requeued = await owned_offload(runner,
                     requeue_admitted_completion, delegation_id, process_registry.completion_queue)
             except Exception:
                 logger.debug("Could not requeue admitted completion %s", delegation_id, exc_info=True)

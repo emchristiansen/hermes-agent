@@ -204,8 +204,30 @@ class SessionManager:
         agent = self._make_agent(session_id=new_id, cwd=cwd, model=original.model or None)
         model = getattr(agent, "model", original.model) or original.model
         state = self._install_state(new_id, agent, cwd, model, copy.deepcopy(original.history))
+        self._copy_stored_prompt(original, state)
         logger.info("Forked ACP session %s -> %s", session_id, new_id)
         return state
+
+    def _copy_stored_prompt(self, original: SessionState, fork: SessionState) -> None:
+        """A fork continues its parent's conversation: like every other branch (``hermes_state_mutation_branch``), it
+        starts from the parent's stored prompt, so the fork keeps the decisions that prompt records (its home
+        guidance among them) instead of deciding afresh over the copied history. Best-effort: without a parent
+        prompt, or when the fork has no row yet (an empty history), there is nothing to copy."""
+        db = self._get_db()
+        if db is None:
+            return
+        try:
+            prompt = getattr(original.agent, "_cached_system_prompt", None)
+            if not isinstance(prompt, str) or not prompt:
+                row = db.get_session(original.session_id)
+                prompt = row.get("system_prompt") if isinstance(row, dict) else None
+            if isinstance(prompt, str) and prompt and db.get_session(fork.session_id) is not None:
+                db.update_system_prompt(fork.session_id, prompt)
+                from agent.home_guidance import restore_home_guidance
+                restore_home_guidance(fork.agent, prompt)  # a pre-turn command renders the parent's decisions too
+        except Exception:
+            logger.warning("Failed to copy the stored prompt of ACP session %s to its fork %s",
+                           original.session_id, fork.session_id, exc_info=True)
 
     def list_sessions(self, cwd: str | None = None) -> list[dict[str, Any]]:
         """Return lightweight info dicts for all sessions (memory + database)."""

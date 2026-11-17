@@ -136,18 +136,20 @@ def build_profile_terminal_scope(
     scope = default_terminal_scope()
     default_image = scope.get("TERMINAL_DOCKER_IMAGE")
     env_path = home / ".env"
-    if env_path.exists():
-        # load_env_file swallows OSError by design (secret scope fails soft); an unreadable
-        # profile .env must fail closed here, unless managed scope pins the backend: a sandbox
-        # launcher withholds the .env and pins the backend there, and load_env_file reads it as {}.
-        try:
-            env_path.read_bytes()
-        except Exception as exc:
-            if not isinstance(exc, PermissionError) or managed_scope.pinned_terminal_backend() is None:
-                raise TerminalPolicyUnavailable(f"cannot read {env_path}: {exc}") from exc
-        from agent.secret_scope import load_env_file
+    from agent.secret_scope import read_env_file
 
-        profile_env = load_env_file(env_path)
+    # ONE open/read: absent -> no .env policy; present but unreadable -> fail closed (load_env_file
+    # swallows OSError by design, the secret scope fails soft), unless managed scope pins the backend:
+    # a sandbox launcher withholds the .env and pins the backend there, so it reads as empty.
+    try:
+        profile_env: Optional[dict[str, str]] = read_env_file(env_path)
+    except (FileNotFoundError, NotADirectoryError):
+        profile_env = None
+    except OSError as exc:
+        if not isinstance(exc, PermissionError) or managed_scope.pinned_terminal_backend() is None:
+            raise TerminalPolicyUnavailable(f"cannot read {env_path}: {exc}") from exc
+        profile_env = {}
+    if profile_env is not None:
         scope.update((k, str(v)) for k, v in profile_env.items() if k.startswith("TERMINAL_"))
         # Provenance, not value: an image WRITTEN in the profile's .env is the user's choice even when
         # it spells the default (same rule apply_terminal_config_to_env applies to a set env var).

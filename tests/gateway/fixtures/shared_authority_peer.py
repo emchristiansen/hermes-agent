@@ -179,7 +179,8 @@ async def probe():
                 from hermes_state_runtime import list_session_admissions
                 await adapter.handle_message(MessageEvent(text='BLOCK_FIFO', source=source, message_id='fifo-1'))
                 assert await asyncio.to_thread(peer.blocked.wait, 5)
-                queued_event = MessageEvent(text='FIFO_SECOND', source=source, message_id='fifo-2')
+                # An explicit /queue: an ordinary message steers into the running turn (Eric, 2026-11-04).
+                queued_event = MessageEvent(text='/queue FIFO_SECOND', source=source, message_id='fifo-2')
                 queued_task = asyncio.create_task(adapter.handle_message(queued_event))
                 try:
                     await async_wait_until(lambda: any(r['request_id'] == 'fifo-2' for r in list_session_admissions(
@@ -259,7 +260,7 @@ if __name__ == "__main__":
     Path(os.environ["HERMES_HOME"], "config.yaml").write_text(
         f"model:\n  default: local-wire-stub\n  provider: custom\n  base_url: {base_url}\n"
         f"auxiliary:\n  title_generation:\n    enabled: false\nterminal:\n  cwd: {os.environ['HERMES_HOME']}\n"
-        # The durable-FIFO proof needs queue semantics; interrupt mode redirects the running turn.
+        # The durable-FIFO proof queues explicitly (/queue); interrupt mode would redirect the running turn.
         "display:\n  busy_input_mode: queue\n")
     status = 0
     try:

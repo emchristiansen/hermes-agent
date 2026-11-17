@@ -608,15 +608,39 @@ def heartbeat_current_worker_from_env() -> bool:
 
 # Live operator-note injection: poll the task for new comments and steer them in
 # OUT-OF-BAND, so a user can talk to a running task without block → comment → unblock.
-# Watermarked per task (seeded on first poll: that history is already in the context).
+# Watermarked per task by comment id, never by wall-clock time. The first poll starts after the
+# task's last comment when this worker's run was claimed (``comment_floor`` on the claim event):
+# the context snapshot was built after the claim, so any later comment may be missing from it and
+# is delivered (a duplicate when the snapshot held it; never a gap). With no floor recorded, the
+# first poll delivers the whole thread.
 _COMMENT_POLL_MIN_INTERVAL_SECONDS = 6.0
 _comment_poll_last_attempt: float = 0.0
 _comment_watermark: dict[str, int] = {}
+# (board file, comment id) of every comment ``kanban_comment`` wrote from THIS process: the only
+# notes the injection skips as echoes. Another process under the same profile (a peer worker, the
+# managed owner keeping a correction) shares the author name, and its notes are delivered.
+_own_comment_ids: set[tuple[str, int]] = set()
+
+
+def _board_file(conn) -> str:
+    return os.path.realpath(conn.execute("PRAGMA database_list").fetchone()[2])
+
+
+def _run_comment_floor(kb, conn, tid: str) -> Optional[int]:
+    """The task's last comment id when this worker's run was claimed (its own run id, else the
+    task's current run); None when no run or no recorded floor is known."""
+    run_id = _worker_run_id(tid)
+    if run_id is None:
+        run_id = kb._current_run_id(conn, tid)
+    if run_id is None:
+        return None
+    floor = kb._json_dict(kb._row_get(kb._latest_event(conn, tid, "claimed", run_id), "payload")).get("comment_floor")
+    return floor if type(floor) is int else None
 
 
 def inject_new_comments_from_env(agent: Any) -> bool:
-    """Steer new operator comments on the worker's task into ``agent``; True iff a
-    steer was injected; never raises. Own comments (``_persisted_identity``) are skipped."""
+    """Steer new comments on the worker's task into ``agent``; True iff a steer was
+    injected; never raises. Only comments this process wrote (``_own_comment_ids``) are skipped."""
     global _comment_poll_last_attempt
     # Operator notes address the dispatcher-owned worker; a delegate_task child sharing
     # this process must neither receive them nor advance the shared watermark (#112817).
@@ -629,32 +653,37 @@ def inject_new_comments_from_env(agent: Any) -> bool:
     seen = _comment_watermark.get(tid)
     try:
         with _board(None, quiet_close=True) as (kb, conn):
-            rows = kb.list_comments_after(conn, tid, after_id=seen or 0)
+            if seen is None:
+                seen = _run_comment_floor(kb, conn, tid) or 0
+            rows = kb.list_comments_after(conn, tid, after_id=seen)
+            board_file = _board_file(conn)
     except Exception:
         logger.debug("comment-inject: bridge failed", exc_info=True)
         return False
-    if seen is None:
-        _comment_watermark[tid] = max((c.id for c in rows), default=0)
-    if seen is None or not rows:
+    if not rows:
+        _comment_watermark[tid] = seen
         return False
-    # Advance past everything read (including our own notes) so nothing is re-injected.
-    _comment_watermark[tid] = max(c.id for c in rows)
-    # Same resolution the write side used, so a worker skips its OWN comments even
-    # when the dispatcher did not pin HERMES_PROFILE (echoed notes would otherwise
-    # re-enter the live turn as fake operator steering).
-    own = _persisted_identity()
-    fresh = [c for c in rows if (c.author or "").strip() != own and (c.body or "").strip()]
+    newest = max(c.id for c in rows)
+    # A worker's own notes would re-enter its live turn as fake operator steering. Its own is what
+    # this process wrote, by exact id: the author name is the profile's, which other processes share.
+    fresh = [c for c in rows if (board_file, c.id) not in _own_comment_ids and (c.body or "").strip()]
     if not fresh:
+        _comment_watermark[tid] = newest
         return False
     lines = [f"- {c.author or 'operator'}: {c.body.strip()}" for c in fresh]
     note = ("New note" + ("s" if len(fresh) > 1 else "")
             + " on your kanban task from the operator (delivered mid-run). "
             + "Take it into account for the work you're doing right now:\n" + "\n".join(lines))
     try:
-        return bool(agent.steer(note))
+        injected = bool(agent.steer(note))
     except Exception:
         logger.debug("comment-inject: steer failed", exc_info=True)
-        return False
+        injected = False
+    if injected:
+        # Advance past everything read (own notes included) only once the agent took the note: a
+        # failed injection is retried by the next poll. A note may arrive twice; it is never lost.
+        _comment_watermark[tid] = newest
+    return injected
 
 
 # --- Handlers ---
@@ -795,6 +824,13 @@ def _handle_complete(args: dict, **kw) -> str:
                 raise _Reject(
                     f"could not complete {tid}: unsatisfied parent dependencies: "
                     f"{detail}; complete the parents first (done or archived)")
+            # A state/run refusal is not the card's last_failure_error, which may be an earlier
+            # attempt's (t_234158d0 showed run 6474's quota wall for run 6493's refused completion).
+            own = _worker_run_id(tid)
+            if task and (task.status not in ("running", "ready", "blocked", "review")
+                         or (own is not None and task.current_run_id != own)):
+                raise _Reject(f"could not complete {tid}: status is {task.status}, current run "
+                              f"{task.current_run_id}, this worker's run {own}")
             _check(False, (task.last_failure_error if task else None) or
                    f"could not complete {tid} (unknown id, stale run, or already terminal)")
         run = kb.latest_run(conn, tid)
@@ -970,6 +1006,9 @@ def _handle_comment(args: dict, **kw) -> str:
     author = _persisted_identity()
     with _board(args.get("board")) as (kb, conn):
         cid = kb.add_comment(conn, tid, author=author, body=str(body))
+        # Recorded before the write's result is reported: this process's live board-note injection
+        # skips exactly this comment, never another process's under the same author.
+        _own_comment_ids.add((_board_file(conn), cid))
         return _ok(task_id=tid, comment_id=cid)
 
 

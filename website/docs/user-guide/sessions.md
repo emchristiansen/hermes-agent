@@ -825,6 +825,12 @@ which causes one expected
 repaired session. That warning is the consequence of this explicit repair, not
 evidence of a new corruption.
 
+The stored prompt is also the record of which home-guidance edition (`agent.home_guidance_file`, or a
+complete block in `SOUL.md`) its conversation carries. A repaired conversation that is already under way
+cannot show that edition any more, so it continues without one — with an explicit notice where
+`agent.home_guidance_file` is configured — until you start a new conversation (`/new`). The lost edition
+is not recovered.
+
 Run the repair only after the #122822 root fix is present; otherwise a later
 maintenance compaction can degrade the row again.
 

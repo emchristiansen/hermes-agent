@@ -261,19 +261,26 @@ class SessionProfileRepairMixin:
                 # A pin hash means nothing in this store: re-store the pin, or drop an unresolvable ref.
                 session["tool_names"] = self._store_system_prompt(conn, payload.get("tool_pin"))
             self._insert_row(conn, "sessions", session, skip=frozenset())
+            moved = {}  # source message id -> the id this store assigned
             for message in payload.get("messages") or []:
-                self._insert_row(conn, "messages", {**message, "session_id": session_id}, skip=_MESSAGE_MOVE_SKIP)
+                moved[message["id"]] = self._insert_row(
+                    conn, "messages", {**message, "session_id": session_id}, skip=_MESSAGE_MOVE_SKIP)
+            # A foreign import's boundary is a message id of the source store: renumber it with the rows.
+            from hermes_state_portability import moved_foreign_origin
+            if (origin := moved_foreign_origin(session.get("origin_json"), moved)) is not None:
+                conn.execute("UPDATE sessions SET origin_json = ? WHERE id = ?", (origin, session_id))
             for usage in payload.get("usage") or []:
                 self._insert_row(conn, "session_model_usage", {**usage, "session_id": session_id}, skip=frozenset())
             return "imported"
         return self._execute_write(_do)
 
     @staticmethod
-    def _insert_row(conn, table: str, values: dict[str, Any], *, skip: frozenset) -> None:
+    def _insert_row(conn, table: str, values: dict[str, Any], *, skip: frozenset) -> int:
+        """INSERT *values* (the columns *table* has, minus *skip*); returns the new row's id."""
         columns = [c for c in _table_columns(conn, table) if c in values and c not in skip]
-        conn.execute(
+        return conn.execute(
             f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
-            [values[c] for c in columns])
+            [values[c] for c in columns]).lastrowid
 
     def delete_moved_session(self, session_id: str) -> bool:
         """Remove a session this store no longer owns after the target confirmed it. Children left

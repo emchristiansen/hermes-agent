@@ -8,6 +8,7 @@ import { NEW_CHAT_ROUTE, routeSessionId, sessionRoute } from '@/app/routes'
 import { usePromptActions } from '@/app/session/hooks/use-prompt-actions'
 import { useSessionActions } from '@/app/session/hooks/use-session-actions'
 import { useSessionStateCache } from '@/app/session/hooks/use-session-state-cache'
+import { UncertainCorrection, UnsentCorrection } from '@/lib/uncertain-correction'
 import {
   announceNewSessionDraftKey,
   clearSessionDraft,
@@ -17,9 +18,11 @@ import {
   takeSessionDraft
 } from '@/store/composer'
 import { requestGatewayForAgent, requestGatewayForProfile } from '@/store/gateway'
+import { $notifications } from '@/store/notifications'
 import { $newChatRoute } from '@/store/profile'
 import {
   $activeSessionId,
+  $connection,
   $selectedStoredSessionId,
   _resetSessionOwnerHintsForTests,
   setActiveSessionId,
@@ -99,6 +102,7 @@ interface HarnessProps {
   pendingScope?: string
   suspend?: Promise<void>
   onSubmit?: ChatBarProps['onSubmit']
+  onSteer?: ChatBarProps['onSteer']
 }
 
 function PendingNavigation({ suspend }: Pick<HarnessProps, 'suspend'>) {
@@ -109,7 +113,7 @@ function PendingNavigation({ suspend }: Pick<HarnessProps, 'suspend'>) {
   return null
 }
 
-function Harness({ pendingScope, suspend, onSubmit }: HarnessProps) {
+function Harness({ pendingScope, suspend, onSubmit, onSteer }: HarnessProps) {
   const active = useStore($activeSessionId)
   const selected = useStore($selectedStoredSessionId)
   const attachments = useStore(mainComposerScope.$attachments)
@@ -188,7 +192,7 @@ function Harness({ pendingScope, suspend, onSubmit }: HarnessProps) {
     drainNextQueued: async () => false,
     exitQueuedEdit: () => false,
     onCancel: () => {},
-    onSteer: actions.redirectPrompt,
+    onSteer: onSteer ?? actions.redirectPrompt,
     onSteerHidden: actions.injectHiddenPrompt,
     onSubmit: onSubmit ?? actions.submitText,
     queueCurrentDraft: () => false,
@@ -593,4 +597,118 @@ it('a new identical message never adopts an unconfirmed send; the restored draft
   await act(async () => handles.submit.submitDraft())
   await waitFor(() => expect(ids()).toHaveLength(4))
   expect(ids()[3]).toBe(ids()[2])
+})
+
+// NC15-CLIENT-01: a correction's persistent Send again can be refused (its session changed) long after
+// the steer. Its words go back to their own draft only where nothing is replaced: never into the draft
+// of the session now on screen, never over words typed since; then they stay in a notice instead.
+const unconfirmedNotice = () => $notifications.get().find(n => n.detail === 'B’s correction' && n.action)
+const notSentNotice = () => $notifications.get().find(n => n.detail === 'B’s correction' && !n.action)
+
+async function steerThenLoseAck(retry: () => Promise<boolean>, onSubmit?: ChatBarProps['onSubmit']) {
+  const onSteer = vi.fn(async () => {
+    throw new UncertainCorrection(new Error('lost ACK'), retry)
+  })
+
+  $connection.set({ mode: 'local', connectionId: 'connection-B', wsUrl: 'ws://localhost/api/ws?native_dial=unminted' } as never)
+  $notifications.set([])
+  stashSessionDraft('stored-A', 'A’s own draft', [])
+  stashSessionDraft('stored-B', 'B’s correction', [])
+  seed({ onSteer, onSubmit })
+  await act(async () => handles.submit.steerDraft('steer'))
+  await waitFor(() => expect(unconfirmedNotice()).toBeDefined())
+  expect(editorText()).toBe('')
+
+  return unconfirmedNotice()!
+}
+
+const sendAgain = (notice: { action?: { onClick: () => void } }) =>
+  act(async () => {
+    notice.action!.onClick()
+    await Promise.resolve()
+  })
+
+const refused = () => vi.fn(async (): Promise<boolean> => {
+  throw new UnsentCorrection('its session changed since it was first sent')
+})
+
+it.each([
+  { label: 'after navigating to A', newB: null, at: 'A', notice: false },
+  { label: 'over a newer B draft typed in place', newB: 'B’s newer draft', at: 'B', notice: true },
+  { label: 'over a newer B draft left behind for A', newB: 'B’s newer draft', at: 'A', notice: true },
+  { label: 'into B’s own empty composer', newB: null, at: 'B', notice: false }
+] as const)('a refused correction retry replaces no draft: $label', async ({ newB, at, notice }) => {
+  const retry = refused()
+  const note = await steerThenLoseAck(retry)
+
+  if (newB) {
+    act(() => handles.draft.loadIntoComposer(newB, []))
+  }
+
+  if (at === 'A') {
+    act(() => navigate('A'))
+  }
+
+  const onScreen = at === 'A' ? 'A’s own draft' : (newB ?? '')
+  expect(editorText()).toBe(onScreen)
+  await sendAgain(note)
+  expect(retry).toHaveBeenCalledTimes(1)
+  expect(editorText()).toBe(at === 'B' && !newB ? 'B’s correction' : onScreen)
+  flushDraft()
+  expect(takeSessionDraft('stored-A').text.trim()).toBe('A’s own draft')
+  expect(takeSessionDraft('stored-B').text.trim()).toBe(newB ?? 'B’s correction')
+  expect(Boolean(notSentNotice())).toBe(notice)
+  expect(notSentNotice()?.persistent ?? true).toBe(true)
+  $connection.set(null)
+})
+
+it('a confirmed correction retry restores nothing, and the next ordinary send stays A’s own', async () => {
+  const retry = vi.fn(async () => true)
+  const onSubmit = vi.fn<ChatBarProps['onSubmit']>(async () => true)
+  const note = await steerThenLoseAck(retry, onSubmit)
+  act(() => navigate('A'))
+  await sendAgain(note)
+  await sendAgain(note) // a duplicate is fine: each Send again is the same correction again
+  expect(retry).toHaveBeenCalledTimes(2)
+  expect(editorText()).toBe('A’s own draft')
+  expect(notSentNotice()).toBeUndefined()
+  act(() => handles.submit.submitDraft())
+  expect(onSubmit).toHaveBeenCalledWith(
+    expect.stringContaining('A’s own draft'),
+    expect.objectContaining({ composerScope: 'stored-A' })
+  )
+  flushDraft()
+  expect(takeSessionDraft('stored-B').text.trim()).toBe('')
+  $connection.set(null)
+})
+
+// NC16-CLIENT-02: while a navigation to A is still pending, the queue key already names A but B's draft
+// is the one loaded. Words taken from B's draft and refused unsent go back to B, never into A's draft.
+it.each([
+  { a: '' },
+  { a: 'A’s own draft' }
+])('a refused correction returns to the loaded draft owner during a pending navigation (A: "$a")', async ({ a }) => {
+  const onSteer = vi.fn(async (): Promise<boolean> => {
+    throw new UnsentCorrection()
+  })
+
+  $connection.set({ mode: 'local', connectionId: 'connection-B', wsUrl: 'ws://localhost/api/ws?native_dial=unminted' } as never)
+  $notifications.set([])
+  stashSessionDraft('stored-B', 'B’s correction', [])
+  stashSessionDraft('stored-A', a, [])
+  const rendered = seed({ onSteer })
+  const suspended = new Promise<void>(() => {})
+  await act(async () => {
+    startTransition(() => rendered.rerender(view({ onSteer, pendingScope: 'stored-A', suspend: suspended })))
+  })
+  expect(handles.draft.draftScopeRef.current).toBe('stored-B')
+  expect(handles.draft.activeQueueSessionKeyRef.current).toBe('stored-A')
+  await act(async () => handles.submit.steerDraft('steer'))
+  expect(onSteer).toHaveBeenCalledTimes(1)
+  expect(editorText()).toBe('B’s correction')
+  flushDraft()
+  expect(takeSessionDraft('stored-B').text.trim()).toBe('B’s correction')
+  expect(takeSessionDraft('stored-A').text.trim()).toBe(a)
+  expect(notSentNotice()).toBeUndefined()
+  $connection.set(null)
 })

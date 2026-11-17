@@ -25,21 +25,9 @@ def local_policy(runner, source):
 
 
 def session_busy_mode(runner, live):
-    """The busy mode a local session's next input runs under (what ``config.get busy`` reports)."""
-    value = getattr(live, 'busy_input_mode', None)
-    if value in ('interrupt', 'steer', 'queue'):
-        return value
-    from gateway.session_policy import policy_for_source
-    policy = policy_for_source(runner, live.source)
-    # Main's TUI defaulted to ``queue`` (``ui-tui/src/app/useConfigSync.ts`` TUI_BUSY_DEFAULT): in a
-    # full-screen composer the next prompt is authored while the agent streams, and an unintended
-    # interrupt loses work. Only an explicit ``display.busy_input_mode`` overrides it; every other
-    # surface keeps the framework default ``interrupt``.
-    fallback = 'queue' if policy is not None and getattr(policy, 'source', None) == 'tui' else 'interrupt'
-    if policy is None:
-        return runner._effective_busy_input_mode(live.source)
-    value = (policy.config().get('display') or {}).get('busy_input_mode') or fallback
-    return value if value in ('interrupt', 'steer', 'queue') else fallback
+    """The busy mode a local session's next input runs under (what ``config.get busy`` reports): always
+    ``steer`` (Eric, 2026-11-04: every message steers), whatever a client or profile asks for."""
+    return 'steer'
 
 
 def local_live_for_route(runner, session_key):

@@ -311,6 +311,13 @@ class CanonicalCorrectionAck(Result):
     # Only on a 'rejected' no agent ever saw (none was live): safe to admit as the next prompt. A plain
     # 'rejected' may follow delivery (a Codex steer whose ACK timed out), so clients never re-send it.
     delivered: Literal[False] | None = None
+    # A managed worker keeps each correction durably before this ACK: ``admission_id`` names its kept
+    # copy, a queued admission of the session that settles ``steered`` when the running turn confirms
+    # it consumed the text, and otherwise runs as the session's own next turn.
+    admission_id: str | None = None
+    # A running Kanban card attempt's correction that the attempt did not take: kept on its task as a
+    # comment, which the task's next attempt reads (comes with ``rejected``, ``delivered: false``).
+    kept: Literal['task_comment'] | None = None
 
 
 class CanonicalCorrectionResult(RootModel):

@@ -175,14 +175,71 @@ def _die_with_owner():
     threading.Timer(ORPHAN_GRACE_SECONDS, kill).start()
 
 
+def _control_input_stream():
+    """A private buffer cannot strand the interpreter-owned stdin lock on exit."""
+    descriptor = os.dup(sys.stdin.fileno())
+    return os.fdopen(descriptor, 'rb')
+
+
+# The ``peer_message`` control: one attempt of a private peer message for this exact card attempt.
+_PEER_FRAME = {'type', 'id', 'n', 'text', 'author', 'profile', 'session_id', 'generation', 'board_db', 'task_id', 'run_id'}
+# The destination a peer message must name: this interpreter's bootstrap scope and its bound card attempt.
+_PEER_DESTINATION = ('profile', 'session_id', 'generation', 'board_db', 'task_id', 'run_id')
+
+
+def peer_ticket(delivery_id, n):
+    """The steer ticket of attempt *n* of a peer message. Per attempt, never per id: a resent id is
+    buffered again as its own part, and ``withdraw_steer`` settles every part carrying one ticket at
+    once (and answers False for a ticket it no longer knows), so a shared ticket would let one
+    attempt's settlement decide, or misreport, another's."""
+    return f'peer:{delivery_id}:{n}'
+
+
+def peer_destination(frame):
+    """The private-peer destination of this bootstrap (``frame``): its scope's profile, physical
+    session and generation, and the card attempt ``bind_worker_context`` bound (board, task, run and
+    claim lock). None when it executes no card attempt: such a worker takes no peer message."""
+    kanban = json.loads(frame['policy'].get('kanban_json') or 'null')
+    if kanban is None:
+        return None
+    scope = frame['scope']
+    return {'profile': scope['profile_id'], 'session_id': scope['session_id'], 'generation': scope['generation'],
+            'board_db': kanban['db'], 'db': kanban['db'], 'task_id': kanban['task_id'], 'run_id': kanban['run_id'],
+            'claim_lock': kanban['claim_lock']}
+
+
 class WorkerControls:
-    def __init__(self, channel, route):
+    # The private-peer destination (``peer_destination``) once ``accept_peer_messages`` opts this card
+    # worker in; None takes no peer message.
+    peer = None
+
+    def __init__(self, channel, route, stream=None):
         self.channel, self.route = channel, route
+        # This daemon may still be reading when a failed turn exits. Never hold
+        # the interpreter-owned stdin buffer's lock during Py_Finalize: that
+        # turns an ordinary persistence error into _enter_buffered_busy/ABRT.
+        # main passes the SAME private stream used for bootstrap, preserving
+        # any control frames already read ahead with that bootstrap.
+        self.stream = stream if stream is not None else _control_input_stream()
         self.agent = None
         self.stopped = threading.Event()
         self.finish = threading.Event()
         self.clarifications = {}
         self.lock = threading.Lock()
+        # Owner corrections (``session.steer`` / ``session.redirect``): accepted until ``settle``
+        # closes intake; text that arrives before the agent exists is latched for it (``adopt``).
+        # The owner keeps each one durably before sending it; ``consumed`` names the ones this
+        # execution can confirm it ran, so the owner stops keeping them.
+        self.corrections_open = True
+        self.latched = []
+        self.accepted = []
+        self.unconsumed = False
+        # Private peer messages (``peer_message``): each buffered attempt's ticket -> (delivery id, n),
+        # and, once ``settle`` closes intake, each ticket's fate: True withdrawn unread, False drained
+        # into a turn. They share ``corrections_open`` and ``self.lock`` with the corrections: intake
+        # check, buffering and close are one order.
+        self.peer_tickets = {}
+        self.peer_fates = {}
         self.reader = threading.Thread(target=self.read, name='managed-controls', daemon=True)
         self.reader.start()
 
@@ -200,13 +257,19 @@ class WorkerControls:
         from tools.approval import resolve_gateway_approval
         try:
             while True:
-                frame = read_frame(sys.stdin.buffer)
+                frame = read_frame(self.stream)
                 if frame == {'type': 'stop'}:
                     self.stop()
                     continue
                 if frame == {'type': 'finish'}:
                     self.finish.set()
                     return
+                if frame.get('type') == 'correct':
+                    self.correct(frame)
+                    continue
+                if frame.get('type') == 'peer_message':
+                    self.peer_message(frame)
+                    continue
                 if (set(frame) != {'type', 'prompt_id', 'value'} or frame['type'] not in {'approval', 'clarify'}
                         or not isinstance(frame['prompt_id'], str) or not isinstance(frame['value'], str)
                         or len(frame['value']) > 16384):
@@ -226,6 +289,162 @@ class WorkerControls:
             self.finish.set()
             if not isinstance(exc, ValueError):
                 _die_with_owner()
+        finally:
+            self.stream.close()
+
+    def adopt(self, agent):
+        """The constructed agent takes the controls. Corrections latched while it was being built
+        steer into it now, before its first model call (the owner's ``adopt_agent`` parity)."""
+        with self.lock:
+            self.agent = agent
+            for text in self.latched:
+                agent.steer(text)
+            self.latched.clear()
+
+    def correct(self, frame):
+        """An owner correction, answered with this child's verdict in a ``correction`` frame.
+
+        ``redirected``: only when a redirect cancelled the in-flight model request
+        (``redirect_outcome`` path ``model``); that response is fenced and the same turn rebuilds
+        around the text. ``queued``: the text was taken for the next boundary: a steer, or a
+        redirect that met a tool batch (steered there, tool workers asked to yield), Codex's
+        native turn steer, or no live request. ``rejected``: no agent saw the text (intake closed
+        or the turn was stopped). ``unknown``: the agent raised while taking it. None of these is
+        consumption: the owner keeps the text until ``consumed`` confirms it."""
+        if (set(frame) != {'type', 'id', 'verb', 'text'} or frame['verb'] not in {'steer', 'redirect'}
+                or not isinstance(frame['id'], str) or not frame['id']
+                or not isinstance(frame['text'], str) or not frame['text'].strip()):
+            raise ValueError('invalid_managed_control')
+        try:
+            with self.lock:
+                status = self._apply_correction(frame['verb'], frame['text'])
+                if status in ('queued', 'redirected'):
+                    self.accepted.append(frame['id'])
+        except Exception:
+            # The agent may or may not hold the text: the owner reports the outcome unknown (its
+            # sender resends; a duplicate is acceptable) and this reader keeps serving Stop.
+            logger.exception('managed correction failed')
+            status = 'unknown'
+        self.channel.send('correction', id=frame['id'], status=status)
+
+    def accept_peer_messages(self, destination):
+        """Take private peer messages naming exactly ``destination`` (``peer_destination``), from now on."""
+        with self.lock:
+            self.peer = destination
+
+    def peer_message(self, frame):
+        """One attempt of a private peer message, answered with a ``peer_message.verdict`` frame:
+        ``steered`` once its text is in the agent's steer buffer under its own attempt ticket, else
+        ``rejected`` (nothing was buffered), or ``unknown`` when the agent raised while taking it.
+        ``steered`` is never consumption: ``peer_settlements`` reports that at the turn's end.
+
+        The text reaches the agent only while intake is open, the agent exists, the frame names exactly
+        this interpreter's destination, and the bound claim is the card's live run (the board fence,
+        ``steer_peer_if_bound``); all of it, and the verdict, under ``self.lock``, the lock ``settle``
+        closes intake under, so no attempt is buffered after its settlement was decided, nor answered
+        after it was settled. It is never latched, kept on the board or turned into a prompt."""
+        if (set(frame) != _PEER_FRAME or not isinstance(frame['id'], str) or not frame['id']
+                or type(frame['n']) is not int or frame['n'] < 1
+                or not isinstance(frame['text'], str) or not frame['text'].strip()
+                or not isinstance(frame['author'], dict)):
+            raise ValueError('invalid_managed_control')
+        ticket = peer_ticket(frame['id'], frame['n'])
+        # The verdict is written before ``self.lock`` is released (NC15-PEER-01): ``settle`` closes
+        # intake under it, and the turn thread sends ``peer_settled`` only after that, so on the wire an
+        # attempt's verdict always precedes its settlement. (``self.channel`` takes only its own write
+        # lock, never this one.)
+        with self.lock:
+            try:
+                status = self._take_peer_message(frame, ticket)
+            except Exception:
+                logger.exception('managed peer message failed')
+                status = 'unknown'
+            self.channel.send('peer_message.verdict', id=frame['id'], n=frame['n'], status=status)
+
+    def _take_peer_message(self, frame, ticket):
+        if (self.peer is None or not self.corrections_open or self.stopped.is_set() or self.agent is None
+                or ticket in self.peer_tickets
+                or any(frame[key] != self.peer[key] for key in _PEER_DESTINATION)):
+            return 'rejected'
+        from gateway.session_kanban import steer_peer_if_bound
+        agent = self.agent
+        if not steer_peer_if_bound(self.peer, lambda: agent.steer(frame['text'], ticket=ticket,
+                                                                   delivered_by=dict(frame['author']))):
+            return 'rejected'
+        self.peer_tickets[ticket] = (frame['id'], frame['n'])
+        return 'steered'
+
+    def peer_settlements(self, result):
+        """``(delivery id, n, outcome)`` for each buffered peer attempt, for the ``peer_settled``
+        frames sent before the result. ``unconsumed``: withdrawn unread when intake closed (never run;
+        its sender may resend it). ``consumed``: a turn drained it, and that turn completed, flushed and
+        closed intake with nothing unrun, the same proof ``consumed`` requires. Any other drained
+        attempt gets no settlement: its consumption is unknown."""
+        with self.lock:
+            proven = not (self.unconsumed or self.stopped.is_set() or self.corrections_open
+                          or result.get('completed') is not True or result.get('failed') or result.get('interrupted'))
+            settled = []
+            for ticket, (delivery_id, n) in self.peer_tickets.items():
+                unread = self.peer_fates.get(ticket)
+                if unread is True:
+                    settled.append((delivery_id, n, 'unconsumed'))
+                elif unread is False and proven:
+                    settled.append((delivery_id, n, 'consumed'))
+            return settled
+
+    def _apply_correction(self, verb, text):
+        if not self.corrections_open or self.stopped.is_set():
+            return 'rejected'
+        if self.agent is None:
+            self.latched.append(text)
+            return 'queued'
+        if verb == 'redirect':
+            path = self.agent.redirect_outcome(text)
+            if path == 'model':
+                return 'redirected'
+            if path is not None:
+                return 'queued'
+        return 'queued' if self.agent.steer(text) else 'rejected'
+
+    def settle(self, result, *, may_continue=True):
+        """After each turn: the steer text that turn could not drain (its ``pending_steer``, plus
+        any steer that landed since) for a follow-up turn of this admission, or None.
+
+        A None closes intake: the check and the close are one step under the lock, so no
+        correction lands between the last drain and the result frame. Nothing follows a stopped
+        turn, or one whose caller may not continue (a Kanban attempt whose claim ended). That text
+        is not run here, and this execution then confirms none of its corrections (``consumed``):
+        each stays kept by the owner, durably, for a later turn or attempt."""
+        with self.lock:
+            parts = [result.pop('pending_steer', None) if isinstance(result, dict) else None]
+            if self.agent is not None:
+                drain = getattr(self.agent, '_drain_leftover_steer', None) or self.agent._drain_pending_steer
+                parts.append(drain())
+            text = '\n'.join(part for part in parts if part)
+            if text and may_continue and not self.stopped.is_set():
+                return text
+            self.corrections_open = False
+            self.unconsumed = self.unconsumed or bool(text)
+            # Intake is closed: each peer attempt is withdrawn now if no turn drained it, so none can
+            # be read after its settlement (``withdraw_steer``: True unread, False drained).
+            if self.peer is not None:
+                for ticket in self.peer_tickets:
+                    self.peer_fates[ticket] = self.agent.withdraw_steer(ticket) if self.agent is not None else False
+        if text:
+            logger.warning('Managed worker ended its admission with %d characters of steer text it did not run; '
+                           'the owner keeps its corrections', len(text))
+        return None
+
+    def consumed(self, result):
+        """The corrections this execution ran, for the ``consumed`` frame sent before its result:
+        every one it accepted, but only after a completed turn whose final flush succeeded and
+        whose intake closed with nothing left unrun. Any doubt confirms nothing, and the owner's
+        kept copies then run again (a duplicate, never a loss)."""
+        with self.lock:
+            if (self.unconsumed or self.stopped.is_set() or self.corrections_open
+                    or result.get('completed') is not True or result.get('failed') or result.get('interrupted')):
+                return []
+            return list(self.accepted)
 
     def approval(self, data):
         from tools.approval import ack_gateway_approval
@@ -328,7 +547,7 @@ def tool_frame(call_id, name, args, *result):
     return json.loads(json.dumps(frame, default=str))
 
 
-def execute(frame, channel):
+def execute(frame, channel, *, control_stream=None):
     # The owner RPC below imports gateway/config modules (hermes_cli.config, providers,
     # hermes_cli.plugins) transitively; the policy must already be frozen when they load.
     bind_worker_policy(frame)
@@ -357,7 +576,10 @@ def execute(frame, channel):
     os.environ['HERMES_GATEWAY_SESSION'] = '1'
     from gateway.session_worker_construct import checkpoint_agent_kwargs, construct_kwargs, routing_agent_kwargs
     construct = {'ephemeral_system_prompt': policy.skills_prompt, **construct_kwargs(frame)}
-    controls = WorkerControls(channel, frame['route'])
+    controls = WorkerControls(channel, frame['route'], control_stream)
+    peer = peer_destination(frame)
+    if peer is not None:
+        controls.accept_peer_messages(peer)
     register_gateway_notify(frame['route'], controls.approval)
     agent = None
     try:
@@ -381,7 +603,7 @@ def execute(frame, channel):
                 tool_start_callback=lambda call_id, name, args: channel.send('tool.start', **tool_frame(call_id, name, args)),
                 tool_complete_callback=lambda call_id, name, args, result: channel.send('tool.complete',
                                                                                          **tool_frame(call_id, name, args, result)))
-            controls.agent = agent
+            controls.adopt(agent)
             if controls.stopped.is_set():
                 from agent.interrupt_compat import request_hard_interrupt
                 request_hard_interrupt(agent)
@@ -398,20 +620,31 @@ def execute(frame, channel):
                 frame = {**frame, 'text': content}
             before = (getattr(agent, 'session_prompt_tokens', 0) or 0,
                       getattr(agent, 'session_completion_tokens', 0) or 0)
-            # Most failed results name no provider or model; the owner's error card needs the agent's.
-            result = {'provider': getattr(agent, 'provider', None), 'model': getattr(agent, 'model', None),
-                      **run_worker_turns(agent, frame, history)}
-            result['_turn_input_tokens'] = max(0, (getattr(agent, 'session_prompt_tokens', 0) or 0) - before[0])
-            result['_turn_output_tokens'] = max(0, (getattr(agent, 'session_completion_tokens', 0) or 0) - before[1])
-            retire_agent(agent)
-            agent = None
-            # The auto-title thread bills through this store from a daemon thread; a title landing
-            # after execution.finish is a stale_generation write that fails the close-time flush.
-            from agent.title_generator import wait_for_title_upgrades
-            wait_for_title_upgrades()
-            store.flush_token_counts()
+
+            def finalize(turns):
+                """The turns' result as the owner will hear it, after the final usage flush; a card
+                attempt books its exit from this (``run_worker_turns``), never from ``turns`` alone."""
+                nonlocal agent
+                # Most failed results name no provider or model; the owner's error card needs the agent's.
+                result = {'provider': getattr(agent, 'provider', None), 'model': getattr(agent, 'model', None), **turns}
+                result['_turn_input_tokens'] = max(0, (getattr(agent, 'session_prompt_tokens', 0) or 0) - before[0])
+                result['_turn_output_tokens'] = max(0, (getattr(agent, 'session_completion_tokens', 0) or 0) - before[1])
+                retire_agent(agent)
+                agent = None
+                # The auto-title thread bills through this store from a daemon thread; a title landing
+                # after execution.finish is a stale_generation write that fails the close-time flush.
+                from agent.title_generator import wait_for_title_upgrades
+                wait_for_title_upgrades()
+                return _flushed(store, result)
+            result = run_worker_turns(agent, frame, history, settle=controls.settle, finalize=finalize)
             if result.get('final_response') is None and (result.get('interrupted') or result.get('failed')):
                 result['final_response'] = ''
+            consumed = controls.consumed(result)
+            if consumed:
+                channel.send('consumed', ids=consumed)
+            if peer is not None:
+                for delivery_id, n, outcome in controls.peer_settlements(result):
+                    channel.send('peer_settled', id=delivery_id, n=n, outcome=outcome)
             channel.send('result', result=result_frame(result))
             if not controls.finish.wait(30):
                 raise ValueError('managed_finish_timeout')
@@ -426,6 +659,23 @@ def execute(frame, channel):
         finally:
             with contextlib.suppress(Exception):  # a failing socket close never replaces the turn's outcome
                 rpc.close()
+
+
+def _flushed(store, result):
+    """``result`` after the execution's final usage flush. A failed flush is this turn's
+    persistence failure, reported as the failed result it is (the owner settles it failed, never
+    completed) instead of a lost worker; the owner still decides the execution's final state from
+    ``finished``, which a store that cannot persist never sends."""
+    try:
+        store.flush_token_counts()
+    except Exception as exc:
+        logger.exception('managed worker usage flush failed')
+        from hermes_state_errors import classify_persistence_error
+        return {**result, 'completed': False, 'failed': True,
+                'error': 'session storage could not be written: ' + (str(exc) or type(exc).__name__),
+                'turn_exit_reason': 'session_persistence_failed',
+                'failure_reason': 'session_persistence_failed:' + classify_persistence_error(exc)}
+    return result
 
 
 def _construct_agent(frame, factory, policy, **kwargs):
@@ -461,8 +711,11 @@ def main():
     logger.propagate = False
     try:
         channel.send('hello', **hello())
-        frame = validate_bootstrap(read_frame(sys.stdin.buffer))
-        execute(frame, channel)
+        # Bootstrap and controls share a private buffer, never sys.stdin's
+        # interpreter-finalized buffer. The control reader owns it once started.
+        control_stream = _control_input_stream()
+        frame = validate_bootstrap(read_frame(control_stream))
+        execute(frame, channel, control_stream=control_stream)
     except Exception:
         # Runtime exceptions can contain credentials; the owner gets no raw traceback.
         logger.exception('managed worker failed')

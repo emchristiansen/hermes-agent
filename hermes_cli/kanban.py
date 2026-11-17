@@ -205,10 +205,15 @@ def _profile_author() -> str:
     return current_profile_name("user") or "user"
 
 
+def _audit_author(requested: str | None = None) -> str:
+    from agent.swarm_capabilities import board_actor
+    return board_actor("user", requested)
+
+
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
-    "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
+    "init", "create", "swarm", "assign", "set-skills", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
-    "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
+    "schedule", "unblock", "settle-triage", "settle-delivered", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
     "gc",
@@ -363,7 +368,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(
             conn, title=args.title, body=body, assignee=args.assignee,
-            created_by=args.created_by or _profile_author(),
+            created_by=_audit_author(args.created_by),
             workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
             project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
             parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
@@ -403,7 +408,7 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
         created = ks.create_swarm(
             conn, goal=args.goal, workers=workers, verifier_assignee=args.verifier,
             synthesizer_assignee=args.synthesizer, tenant=args.tenant,
-            created_by=args.created_by or _profile_author(), priority=args.priority,
+            created_by=_audit_author(args.created_by), priority=args.priority,
             idempotency_key=getattr(args, "idempotency_key", None),
         )
     if getattr(args, "json", False):
@@ -598,6 +603,38 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_set_skills(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_db_skills import UNSET, set_task_skills
+    names = list(args.skills or [])
+    if (bool(names) + bool(args.clear) + bool(args.explicit_none)) != 1:
+        return _err("kanban set-skills: pass skill names, --clear or --none (exactly one)", 2)
+    skills = names if names else (None if args.clear else [])
+    expected = UNSET
+    if args.expected is not None:
+        try:
+            expected = json.loads(args.expected)
+        except json.JSONDecodeError as exc:
+            return _err(f"kanban set-skills: --expected: {exc}", 2)
+        if expected is not None and not (isinstance(expected, list) and all(isinstance(s, str) for s in expected)):
+            return _err('kanban set-skills: --expected must be null, [] or a JSON list of names', 2)
+    reason = _stripped_or_none(getattr(args, "reason", None))
+    try:
+        with kbc.connect_closing() as conn:
+            ok, refusal = set_task_skills(conn, args.task_id, skills, expected=expected,
+                                          actor=_audit_author(), reason=reason)
+            task = kb.get_task(conn, args.task_id)
+    except ValueError as exc:
+        return _err(f"kanban set-skills: {exc}", 2)
+    result = {"task_id": args.task_id, "ok": ok, "skills": task.skills if task else None, "error": refusal}
+    if _json_out(args, result):
+        return 0 if ok else 1
+    if not ok:
+        return _err(f"cannot set skills on {args.task_id}: {refusal}")
+    shown = ", ".join(task.skills) if task.skills else ("(none, explicit)" if task.skills == [] else "(default: none)")
+    print(f"Skills on {args.task_id}: {shown} (applies on the next claimed attempt)")
+    return 0
+
+
 def _cmd_reclaim(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         ok = kb.reclaim_task(conn, args.task_id, reason=getattr(args, "reason", None))
@@ -755,7 +792,7 @@ def _cmd_comment(args: argparse.Namespace) -> int:
         if len(body) > args.max_len:
             suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
-    author = args.author or _profile_author()
+    author = _audit_author(args.author)
     with kbc.connect_closing() as conn:
         kb.add_comment(conn, args.task_id, author, body)
     print(f"Comment added to {args.task_id}")
@@ -774,7 +811,7 @@ def _cmd_attach(args: argparse.Namespace) -> int:
     data = src.read_bytes()
     name = args.name or src.name
     content_type = args.content_type or mimetypes.guess_type(name)[0]
-    uploaded_by = args.author or _profile_author()
+    uploaded_by = _audit_author(args.author)
     try:
         with kbc.connect_closing() as conn:
             att_id = kb.store_attachment_bytes(conn, args.task_id, name, data, content_type=content_type,
@@ -951,10 +988,18 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     title = getattr(args, "title", None)
     body = getattr(args, "body", None)
     priority = getattr(args, "priority", None)
+    limit = getattr(args, "max_retries", None)
+    expected_run = getattr(args, "expected_terminal_run", None)
+    policy = limit is not None or expected_run is not None
+    from agent.swarm_capabilities import worker_board_management_enabled
+    denied_worker = os.environ.get("HERMES_KANBAN_TASK") and not worker_board_management_enabled()
+    if policy and (denied_worker or limit != 1 or expected_run is None
+                   or any(value is not None for value in (title, body, priority, result, summary, raw_metadata))):
+        return _err("kanban edit: retry tightening is orchestrator-only, exact-run fenced and cannot mix edits", 2)
     if result is None and (summary is not None or raw_metadata is not None):
         return _err("kanban edit: --summary and --metadata require --result", 2)
-    if all(value is None for value in (title, body, priority, result)):
-        return _err("kanban edit: provide --title, --body, --priority, or --result", 2)
+    if not policy and all(value is None for value in (title, body, priority, result)):
+        return _err("kanban edit: provide --title, --body, --priority, --result or guarded --max-retries", 2)
     metadata, rc = _parse_metadata_flag(raw_metadata)
     if rc:
         return rc
@@ -962,6 +1007,7 @@ def _cmd_edit(args: argparse.Namespace) -> int:
         ok = kb.edit_task(
             conn, args.task_id, title=title, body=body, priority=priority,
             result=result, summary=summary, metadata=metadata,
+            **({"max_retries": limit, "expected_terminal_run": expected_run} if policy else {}),
         )
     return _ok_or_err(
         ok,
@@ -982,7 +1028,7 @@ def _commented(conn, reason: Optional[str], author, prefix: str, op):
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     kind = getattr(args, "kind", None)
-    author = _profile_author()
+    author = _audit_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
@@ -1008,7 +1054,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
-    author = _profile_author()
+    author = _audit_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
@@ -1017,19 +1063,65 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
         return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}", lambda tid: f"cannot schedule {tid}")
 
 
+def _cmd_settle_triage(args: argparse.Namespace) -> int:
+    from agent.swarm_capabilities import worker_board_management_enabled
+    if os.environ.get("HERMES_KANBAN_TASK") and not worker_board_management_enabled():
+        return _err("kanban settle-triage is orchestrator-only; workers must hand off their assigned task")
+    from hermes_cli.kanban_db_graph import settle_triage_task
+    with kbc.connect_closing() as conn:
+        ok, reason = settle_triage_task(
+            conn, args.task_id, expected_terminal_run_id=args.expected_terminal_run,
+            kind=args.kind, owner=args.owner, required_input=args.required_input,
+            event=args.event, author=_audit_author(),
+        )
+    if not ok:
+        return _err(f"cannot settle {args.task_id}: {reason}")
+    print(f"Settled {args.task_id}: {reason}")
+    return 0
+
+
+def _cmd_settle_delivered(args: argparse.Namespace) -> int:
+    from agent.swarm_capabilities import worker_board_management_enabled
+    if os.environ.get("HERMES_KANBAN_TASK") and not worker_board_management_enabled():
+        return _err("kanban settle-delivered is orchestrator-only; workers must hand off their assigned task")
+    metadata, rc = _parse_metadata_flag(getattr(args, "metadata", None))
+    if rc:
+        return rc
+    from hermes_cli.kanban_db_settle import settle_delivered_assessment
+    try:
+        with kbc.connect_closing() as conn:
+            ok, reason = settle_delivered_assessment(
+                conn, args.task_id, expected_terminal_run=args.expected_terminal_run, verdict=args.verdict,
+                result=args.result, author=_audit_author(), metadata=metadata)
+    except ValueError as exc:
+        return _err(f"kanban settle-delivered: {exc}", 2)
+    except kb.ArtifactPreservationError as exc:
+        return _err(f"cannot settle {args.task_id}: {exc} (nothing changed)")
+    if not ok:
+        return _err(f"cannot settle {args.task_id}: {reason} (nothing changed)")
+    print(f"Settled {args.task_id}: {reason}")
+    return 0
+
+
 def _cmd_unblock(args: argparse.Namespace) -> int:
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    from agent.swarm_capabilities import worker_board_management_enabled
+    from hermes_cli.kanban_db_retry_policy import unblock_refusal
+    if os.environ.get("HERMES_KANBAN_TASK") and not worker_board_management_enabled():
         return _err("kanban unblock is orchestrator-only; workers must hand off their assigned task")
     ids, rc = _require_ids(args)
     if rc:
         return rc
+    expected_run = getattr(args, "expected_terminal_run", None)
+    if expected_run is not None and len(ids) != 1:
+        return _err("kanban unblock: an exact terminal-run fence requires one task", 2)
     reason = _stripped_or_none(getattr(args, "reason", None))
-    author = _profile_author() if reason else None
+    author = _audit_author() if reason else None
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
+        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(
+            conn, tid, **({"expected_terminal_run": expected_run} if expected_run is not None else {})))
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
-                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+                           lambda tid: f"cannot unblock {tid}: {unblock_refusal(conn, tid, expected_run)}")
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
@@ -1074,7 +1166,7 @@ def _cmd_reopen_review(args: argparse.Namespace) -> int:
     reason = getattr(args, "reason", None)
     if reason is not None:
         reason = str(kb.redact_review_value(reason.strip())).strip() or None
-    author = _profile_author() if reason else None
+    author = _audit_author() if reason else None
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
         def op(tid):
@@ -1090,17 +1182,22 @@ def _cmd_reopen_review(args: argparse.Namespace) -> int:
 
 def _cmd_promote(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
-    author = _profile_author()
+    author = _audit_author()
     # Dedupe while preserving order; positional task_id always first.
     ids = list(dict.fromkeys(_bulk_ids(args)))
     dry_run = bool(args.dry_run)
+    # An exact-run continuation of a READY card (respawn guard ``active_pr``); one card per fence.
+    expected_run = getattr(args, "expected_terminal_run", None)
+    fence = {} if expected_run is None else {"expected_terminal_run": expected_run}
+    if fence and len(ids) != 1:
+        return _err("kanban promote: an exact terminal-run fence requires one task", 2)
 
     results: list[dict[str, object]] = []
     with kbc.connect_closing() as conn:
         for tid in ids:
-            ok, err = kb.promote_task(conn, tid, actor=author, reason=reason, dry_run=dry_run)
+            ok, err = kb.promote_task(conn, tid, actor=author, reason=reason, dry_run=dry_run, **fence)
             results.append({"task_id": tid, "promoted": ok, "dry_run": dry_run,
-                            "reason": reason, "error": err})
+                            "reason": reason, "error": err, **fence})
 
     failed = [r for r in results if not r["promoted"]]
     if getattr(args, "json", False):
@@ -1109,11 +1206,12 @@ def _cmd_promote(args: argparse.Namespace) -> int:
         return 0 if not failed else 1
 
     tag = " (dry)" if dry_run else ""
-    label = "Would promote" if dry_run else "Promoted"
+    label = ("Would continue" if dry_run else "Continued") if fence else ("Would promote" if dry_run else "Promoted")
+    target = f"ready after terminal run {expected_run}" if fence else "ready"
     suffix = f": {reason}" if reason else ""
     for r in results:
         if r["promoted"]:
-            print(f"{label} {r['task_id']} -> ready{tag}{suffix}")
+            print(f"{label} {r['task_id']} -> {target}{tag}{suffix}")
         else:
             print(f"cannot promote {r['task_id']}: {r['error']}", file=sys.stderr)
     return 0 if not failed else 1
@@ -1254,7 +1352,7 @@ def _run_triage_sweep(args: argparse.Namespace, verb: str, mod, run_one, json_ke
     """Shared driver for ``specify`` / ``decompose``: validate ids (one task id XOR ``--all``), run
     ``run_one(tid, author=...)`` per id, print JSON or human lines, exit code."""
     all_flag = bool(getattr(args, "all_triage", False))
-    author = getattr(args, "author", None) or _profile_author()
+    author = _audit_author(getattr(args, "author", None))
     want_json = bool(getattr(args, "json", False))
     tenant = getattr(args, "tenant", None)
     if args.task_id and all_flag:
@@ -1320,14 +1418,15 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
-    "assign": _cmd_assign, "set-model": _cmd_set_model,
+    "assign": _cmd_assign, "set-model": _cmd_set_model, "set-skills": _cmd_set_skills,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
-    "schedule": _cmd_schedule, "unblock": _cmd_unblock,
+    "schedule": _cmd_schedule, "unblock": _cmd_unblock, "settle-triage": _cmd_settle_triage,
+    "settle-delivered": _cmd_settle_delivered,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,

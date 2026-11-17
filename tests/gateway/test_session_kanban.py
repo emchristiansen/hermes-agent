@@ -54,7 +54,7 @@ def test_claim_freezes_task_policy_and_rejects_forgery(tmp_path, monkeypatch):
         build_policy({'source': 'kanban', 'cwd': str(workspace)}, config)
 
 
-@pytest.mark.parametrize('mode', ['complete', 'timeout', 'rate_limit', 'billing', 'crash'])
+@pytest.mark.parametrize('mode', ['complete', 'timeout', 'rate_limit', 'billing', 'crash', 'redirect', 'flush_failed'])
 def test_real_dispatcher_lifecycle(tmp_path, mode):
     import os
     import subprocess
@@ -62,15 +62,33 @@ def test_real_dispatcher_lifecycle(tmp_path, mode):
     repo = Path(__file__).resolve().parents[2]
     from tests.gateway.fixtures.local_recovery_probe import child_env
     env = child_env()
-    env.update(HOME=str(tmp_path / 'home'), USERPROFILE=str(tmp_path / 'home'), HERMES_HOME=str(tmp_path / 'state'), PYTHONPATH=str(repo), KANBAN_PROBE_MODE=mode)
+    path = str(repo)
+    if mode == 'flush_failed':  # the managed child's final usage flush fails once
+        from tests.gateway.test_managed_worker_correction_durability import _failing_store_site
+        path = os.pathsep.join((str(_failing_store_site(tmp_path)), path))
+    env.update(HOME=str(tmp_path / 'home'), USERPROFILE=str(tmp_path / 'home'), HERMES_HOME=str(tmp_path / 'state'), PYTHONPATH=path, KANBAN_PROBE_MODE=mode)
     result = subprocess.run([sys.executable, str(Path(__file__).parent / 'fixtures' / 'kanban_owner_probe.py')],
         env=env, cwd=repo, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=150, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
     receipt = json.loads((tmp_path / 'state' / 'receipt.json').read_text())
     print(json.dumps(receipt))
-    if mode != 'complete':
+    if mode == 'flush_failed':
+        # The attempt's turn ran, but its final usage flush failed: the owner settles it failed, and
+        # the exit the attempt booked and its spawned worker's exit say so, never a clean success.
+        assert receipt['turn_outcomes'] == [['terminal', 'failed']], receipt
+        assert receipt['booked_exit'] == 1 and receipt['client_exit'] == ['nonzero_exit', 1], receipt
+        return
+    if mode not in {'complete', 'redirect'}:
         assert receipt['task_status'] == 'ready'
         return
+    if mode == 'redirect':
+        # A canonical redirect of the live dispatcher attempt's managed worker, mid provider call: the
+        # model request is cancelled and rebuilt around the correction while the SAME run, claim and
+        # spawned worker keep the task, and that attempt still completes it as one admission.
+        assert receipt['redirect_status'] == 'redirected', receipt
+        assert receipt['claim_kept'] and receipt['correction_before_release'], receipt
+        assert receipt['run_outcome'] == 'completed', receipt
+        assert receipt['correction_comment'] and receipt['correction_in_next_context'], receipt
     assert receipt['task_status'] == 'done' and receipt['source'] == 'kanban'
     assert receipt['tools'] and receipt['task_context'] and receipt['skill_context'] and receipt['hook_effect']
     assert receipt['admissions'] == 1 and receipt['retry_same_session']

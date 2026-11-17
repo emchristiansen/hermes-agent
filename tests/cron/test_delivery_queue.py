@@ -1,4 +1,5 @@
-"""Durable at-most-once delivery handoff for restart-safe cron workers."""
+"""Durable at-least-once delivery handoff for restart-safe cron workers (a send its gateway died in
+is sent again; one its own gateway returned from is not)."""
 
 from __future__ import annotations
 
@@ -127,9 +128,11 @@ def test_legacy_queue_schema_adds_failure_lane_before_enqueue(tmp_path, monkeypa
     assert queue.get_status("exec-migrated")["for_failure"] == 1
 
 
-def test_wait_timeout_marks_inflight_delivery_unknown_without_retry(
+def test_wait_timeout_leaves_inflight_delivery_to_its_live_gateway(
     tmp_path, monkeypatch
 ):
+    """Mid-send in a live gateway: a deferral, never fenced unknown and never sent a second time
+    while that gateway still owns it (msg-retry-on-13f-1; was: marked unknown without retry)."""
     import cron.delivery_queue as queue
 
     monkeypatch.setattr(queue, "DELIVERY_DB", tmp_path / "deliveries.db")
@@ -140,19 +143,19 @@ def test_wait_timeout_marks_inflight_delivery_unknown_without_retry(
         "exec-inflight", {"id": "job-inflight"}, "result", timeout=0
     )
 
-    assert error is not None
-    assert "outcome is unknown" in error
+    assert error is None
     status = queue.get_status("exec-inflight")
     assert status is not None
-    assert status["status"] == "unknown"
+    assert status["status"] == "delivering"
     send = Mock(return_value=None)
     assert queue.drain(send) == 0
     send.assert_not_called()
 
 
-def test_dead_delivery_owner_becomes_unknown_and_is_not_retried(
+def test_dead_delivery_owner_is_queued_again_and_resent(
     tmp_path, monkeypatch
 ):
+    """At least once (msg-retry-on-13f-1; was: unknown and not retried): a duplicate is acceptable."""
     import cron.delivery_queue as queue
 
     monkeypatch.setattr(queue, "DELIVERY_DB", tmp_path / "deliveries.db")
@@ -161,30 +164,39 @@ def test_dead_delivery_owner_becomes_unknown_and_is_not_retried(
     monkeypatch.setattr(queue, "_PROCESS_ID", "replacement-gateway")
     monkeypatch.setattr(queue, "_owner_is_live", lambda _pid, _started: False)
 
-    assert queue.recover_abandoned() == 1
-    send = Mock()
-    assert queue.drain(send) == 0
-    send.assert_not_called()
-    assert queue.get_status("exec-1")["status"] == "unknown"
+    assert queue.recover_abandoned() == 1  # queued again, not fenced
+    monkeypatch.setattr(queue, "_now_seconds", lambda: 10.0 ** 12)  # past its retry backoff
+    send = Mock(return_value=None)
+    assert queue.drain(send) == 1
+    send.assert_called_once_with({"id": "job-1"}, "brief", False)
+    assert queue.get_status("exec-1")["status"] == "delivered"
 
 
-def test_delivery_failure_is_terminal_not_retried_and_redacted(
+def test_delivery_failure_keeps_its_payload_and_is_retried(
     tmp_path, monkeypatch
 ):
+    """msg-retry-on-13f-5 (MR-RETRY-08; recorded contract change, canonical decision ea298f05: "I just want all
+    messages to be delivered at least once."). Was: a returned send error was terminal ``failed``, never
+    retried, payload pruned. Now the payload stays and the send is retried after its backoff; a duplicate is
+    accepted."""
     import cron.delivery_queue as queue
 
     monkeypatch.setattr(queue, "DELIVERY_DB", tmp_path / "deliveries.db")
+    clock = {"now": 1_000_000.0}
+    monkeypatch.setattr(queue, "_now_seconds", lambda: clock["now"])
     queue.enqueue("exec-1", {"id": "job-1"}, "brief")
-    send = Mock(return_value="request failed: https://example.test/?token=TOKEN123")
+    error = "request failed: https://example.test/?token=TOKEN123"
+    send = Mock(side_effect=[error, None])
 
     assert queue.drain(send) == 1
-    assert queue.drain(send) == 0
-    assert send.call_count == 1
     status = queue.get_status("exec-1")
-    assert status is not None
-    assert status["status"] == "failed"
-    assert "TOKEN123" not in status["error"]
-    assert "token=***" in status["error"]
+    assert status["status"] == "pending" and status["content"] == "brief"
+    assert status["job_json"] != "{}" and status["error"] == error
+    assert queue.drain(send) == 0  # waiting out its backoff, never given up
+    clock["now"] += queue.RETRY_BACKOFF_MAX_SECONDS + 1
+    assert queue.drain(send) == 1
+    assert send.call_count == 2
+    assert queue.get_status("exec-1")["status"] == "delivered"
 
 
 def test_wait_timeout_leaves_unclaimed_delivery_queued_for_next_gateway(
@@ -210,9 +222,11 @@ def test_wait_timeout_leaves_unclaimed_delivery_queued_for_next_gateway(
     assert queue.get_status("exec-3")["status"] == "delivered"
 
 
-def test_same_gateway_recovers_terminalization_failure_without_resending(
+def test_same_gateway_resends_a_send_whose_outcome_it_could_not_record(
     tmp_path, monkeypatch
 ):
+    """The send returned but its outcome (delivered or failed) was never recorded: uncertain, so it is
+    sent again after its backoff (msg-retry-on-13f-1; was: unknown, not resent). A duplicate is fine."""
     import cron.delivery_queue as queue
 
     monkeypatch.setattr(queue, "DELIVERY_DB", tmp_path / "deliveries.db")
@@ -229,8 +243,10 @@ def test_same_gateway_recovers_terminalization_failure_without_resending(
         queue.drain(send)
 
     monkeypatch.setattr(queue, "_finish", original_finish)
-    assert queue.drain(send) == 0
+    assert queue.drain(send) == 0  # queued again, waiting out its backoff
     send.assert_called_once()
-    status = queue.get_status("exec-4")
-    assert status["status"] == "unknown"
-    assert "not retried" in status["error"]
+    assert queue.get_status("exec-4")["status"] == "pending"
+    monkeypatch.setattr(queue, "_now_seconds", lambda: 10.0 ** 12)
+    assert queue.drain(send) == 1
+    assert send.call_count == 2
+    assert queue.get_status("exec-4")["status"] == "delivered"

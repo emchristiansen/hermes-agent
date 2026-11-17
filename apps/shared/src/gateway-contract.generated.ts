@@ -2285,7 +2285,7 @@ export interface OnboardingSetRunParams {
   run: boolean
   mark_profile_offered?: boolean
 }
-/** ``rerun``: start a new onboarding chat even when one is in progress (Settings, Run onboarding again; it never claims the welcome trial). ``fresh_launch``: the app's once-per-launch start; a run the app was closed on does not count, so its chat is deleted and the run starts over. ``facts_source``: whether the backend runs on the user's own computer. ``locale``: the desktop's UI language, preferred over the backend OS locale. ``assume_fresh``: as on ``onboarding.state``. A new run on a first install claims the welcome trial before its chat exists; a failed claim is error 5079 and leaves no guest and no chat. A claim that is blocked (another install took the trial) with no trial or provider to run on is error 5080 and opens no chat. */
+/** ``rerun``: start a new onboarding chat even when one is in progress (Settings, Run onboarding again; it never claims the welcome trial). ``fresh_launch``: the app's once-per-launch start; a run the app was closed on does not count, so it ends as ``replaced`` (its chat stays in the history) and the run starts over in a new chat. ``facts_source``: whether the backend runs on the user's own computer. ``locale``: the desktop's UI language, preferred over the backend OS locale. ``assume_fresh``: as on ``onboarding.state``. A new run on a first install claims the welcome trial before its chat exists; a failed claim is error 5079 and leaves no guest and no chat. A claim that is blocked (another install took the trial) with no trial or provider to run on is error 5080 and opens no chat. */
 export interface OnboardingStartParams {
   rerun?: boolean
   fresh_launch?: boolean
@@ -5304,6 +5304,8 @@ export interface CanonicalCorrectionAck {
   execution_generation: number
   authority_epoch: number
   delivered?: false | null
+  admission_id?: string | null
+  kept?: 'task_comment' | null
 }
 /** A bare stop phrase typed while the session's voice chat is on: the chat ended, nothing was admitted (TUI-26). */
 export interface CanonicalVoiceStopped {

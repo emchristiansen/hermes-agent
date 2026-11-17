@@ -30,6 +30,15 @@ from gateway.session_context import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _unbind_session_vars():
+    """``clear_session_vars`` binds every var to ``""`` in the test's own context, which a sync test
+    shares with every later test: an env-driven reader (``HERMES_SESSION_SOURCE``) would then see
+    ``""``. Leave them unbound, as a fresh process has them."""
+    yield
+    reset_session_vars()
+
+
 # ---------------------------------------------------------------------------
 # Capability helper
 # ---------------------------------------------------------------------------

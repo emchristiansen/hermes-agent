@@ -341,6 +341,8 @@ def _build_child_agent(
     from agent.prompt_cache_scope import conversation_id
     child._inherited_conversation_id = conversation_id(parent_agent)
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
+    from agent.home_guidance import for_child as home_guidance_for_child
+    child._home_guidance_inherited = home_guidance_for_child(parent_agent)
     _apply_child_compression_cap(child, delegation_cfg)
     # Ownership chain for action=list/steer/stop; weakref so a finished parent
     # can be collected while a detached child record lingers in the registry.

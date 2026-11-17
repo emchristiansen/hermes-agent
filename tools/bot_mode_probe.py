@@ -387,8 +387,9 @@ def _model_prompt_capability_surface(model_cfg: object) -> dict:
 def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
     """12-hex digest of the capability surface for ``home``'s profile: disabled skills +
     enabled toolsets + MCP config, model capability overrides that change the prompt
-    (``supports_vision``, ``context_length``), SOUL.md bytes, installed skill names, the
-    Bot-Mode roster (+ roles), peers and the relay roster. Deliberately NOT cached — the
+    (``supports_vision``, ``context_length``), the normalized context-file cap override,
+    SOUL.md bytes, installed skill names, the Bot-Mode roster (+ roles), peers and the
+    relay roster. Deliberately NOT cached — the
     point is detecting on-disk drift against a stored prompt's epoch. Never raises
     ("unavailable" on failure)."""
     import hashlib
@@ -400,6 +401,7 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
     try:
         # Canonical loader (managed overlay + env expansion + normalization),
         # scoped to the bot's home via the override the loaders already honor.
+        from agent.prompt_builder import _configured_context_file_max_chars
         from agent.skill_utils import parse_config_string_list
         from hermes_cli.config import load_config_readonly
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -412,6 +414,9 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
         skills_cfg = cfg.get("skills") if isinstance(cfg.get("skills"), dict) else {}
         model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
         surface["model_capabilities"] = _model_prompt_capability_surface(model_cfg)
+        # None means dynamic: the actual window belongs to the session's model,
+        # not this disk probe. Share explicit-cap coercion with the prompt loader.
+        surface["context_file_max_chars"] = _configured_context_file_max_chars(cfg)
         surface["disabled_skills"] = sorted(str(s).lower() for s in (skills_cfg.get("disabled") or []))
         # The live selection is platform_toolsets.<platform> minus agent.disabled_toolsets;
         # tools.enabled_toolsets is written by no surface, so watching it left Bot Chats

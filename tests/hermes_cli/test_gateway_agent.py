@@ -1061,14 +1061,14 @@ def test_a_voice_stopped_correction_is_consumed_not_requeued(make_agent, mode):
     printed = []
     agent._print_fn = printed.append
     shell = object.__new__(HermesCLI)
-    shell.busy_input_mode = mode
+    shell.busy_input_mode = mode  # every message steers: a configured interrupt still reaches session.steer
     shell.agent = agent
     shell._pending_input, shell._interrupt_queue = queue.Queue(), queue.Queue()
     agent._turn_ask_index = 3  # the running turn's ask; a consumed stop must leave it alone
     shell._tui_enter_while_busy("stop", [], "stop")
     assert shell._pending_input.empty() and shell._interrupt_queue.empty(), "consumed stop was re-queued"
     sent = [m for m, _ in client.calls if m.startswith("session.")]
-    assert sent == [{"steer": "session.steer", "interrupt": "session.redirect"}[mode]]
+    assert sent == ["session.steer"]
     assert agent._turn_ask_index == 3, "the running turn's history changed for a consumed stop"
 
 

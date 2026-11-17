@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any, Optional
+from gateway.run_notifications_offload import owned_offload
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +137,11 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
         if source is None:
             raise ValueError("deliver_wake: push-capable adapter requires a SessionSource")
         from gateway.platforms.event import MessageEvent, MessageType
-        runner = getattr(adapter, "gateway_runner", None)
+        # A LocalSessionAdapter belongs to its session authority and is never wired by the runner
+        # (no message handler, no gateway_runner): its handle_message discards every event, so
+        # its wakes must take the authority FIFO through the authority's runner.
+        runner = getattr(adapter, "gateway_runner", None) or getattr(
+            getattr(adapter, "authority", None), "runner", None)
         if runner is not None:
             from gateway.session_automation import admit_route_wake
             from hermes_state_runtime import RuntimeStoreError
@@ -202,7 +207,7 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
         raise ValueError("persist_delegation_delivery: raw session id required to persist "
                          "the completion on the api_server session transcript")
     ensure = getattr(adapter, "_ensure_session_db", None)
-    db: Any = await asyncio.to_thread(ensure) if callable(ensure) else None
+    db: Any = await owned_offload(getattr(adapter, "gateway_runner", None), ensure) if callable(ensure) else None
     if db is None:
         raise RuntimeError("persist_delegation_delivery: api_server SessionDB unavailable — "
                            f"cannot persist completion for session {session_id}")
@@ -215,12 +220,12 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
     resolver = getattr(db, "resolve_resume_session_id", None)
     if callable(resolver):
         try:
-            resolved = await asyncio.to_thread(resolver, session_id)
+            resolved = await owned_offload(getattr(adapter, "gateway_runner", None), resolver, session_id)
             if resolved:
                 session_id = str(resolved)
         except Exception:
             logger.debug("delegation delivery continuation resolve failed for %s", session_id, exc_info=True)
-    await asyncio.to_thread(
+    await owned_offload(getattr(adapter, "gateway_runner", None),
         db.append_delegation_delivery, session_id, text, _delegation_display_metadata(evt or {}),
     )
     logger.info(

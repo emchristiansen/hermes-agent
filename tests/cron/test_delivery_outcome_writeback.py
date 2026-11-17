@@ -52,6 +52,31 @@ def test_drained_delivery_outcome_is_written_back(tmp_path, monkeypatch, transpo
         assert (saved["last_status"], saved["last_delivery_error"]) == ("ok", None)
         assert row["delivery_outcome"] == "delivered"
     else:
-        assert saved["last_status"] == "delivery_failed"
+        # msg-retry-on-13f-6 (ea298f05): a refused attempt is retried; the run says so, with the error.
+        assert saved["last_status"] == "delivery_retrying"
         assert "transport refused" in saved["last_delivery_error"]
-        assert row["delivery_outcome"] == "failed"
+        assert row["delivery_outcome"] == "retrying"
+        # msg-retry-on-13f-7 (MR-ACCOUNT-10): the job carries the exact failed-attempt error the queue recorded,
+        # and the queued payload is kept for the retry.
+        from cron import delivery_queue as queue_now
+        queued_row = queue_now.get_status(row["id"])
+        assert queued_row["status"] == "pending" and queued_row["retry_after"]
+        assert saved["last_delivery_error"] == queued_row["error"]
+        assert "the result" in queued_row["content"] and queued_row["job_json"] != "{}"
+        # The retry delivers: the final outcome is written back over the retrying one.
+        from cron import delivery_queue
+        transport_ok_now = {"ok": True}
+
+        async def send_ok(platform, pconfig, chat_id, text, **kwargs):
+            sent.append(text)
+            return {"success": transport_ok_now["ok"], "message_id": "r2", "error": None}
+
+        monkeypatch.setattr("tools.send_message_tool._send_to_platform", send_ok)
+        later = delivery_queue._now_seconds() + delivery_queue.RETRY_BACKOFF_MAX_SECONDS + 1
+        monkeypatch.setattr(delivery_queue, "_now_seconds", lambda: later)
+        assert scheduler.drain_delivery_queue({}, None) == 1
+        assert len(sent) == 2  # the duplicate attempt is accepted
+        saved = jobs.get_job(job["id"])
+        row = executions.latest_execution(job["id"])
+        assert (saved["last_status"], saved["last_delivery_error"]) == ("ok", None)
+        assert row["delivery_outcome"] == "delivered"

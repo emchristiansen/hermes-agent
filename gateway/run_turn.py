@@ -1195,6 +1195,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             return
         turn_state = self._session_state(session_key).turn
         turn_state.agent, turn_state.ctx = agent_holder[0], turn_ctx
+        self._hm_steer_pending_at_adoption(turn_ctx.source, session_key)  # every message steers (Eric, 2026-11-04)
         if self._draining:
             self._update_runtime_status("draining")
 
@@ -1224,7 +1225,6 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         agent.interrupt(pending_text)
         _interrupt_detected.set()
         # Abort streaming TTS on barge-in.
-        # See #60671.
         # See #60671.
         # See #60671.
         # Finalize the streaming-TTS consumer (#60671). finish() is called from the outer event-loop thread

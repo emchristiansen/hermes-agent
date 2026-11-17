@@ -1194,6 +1194,13 @@ def _repair_prompts_lacks_skill_safety(row) -> bool:
     return bool(prompt and SKILLS_GUIDANCE not in prompt and SKILL_SAFETY_HEADING not in prompt)
 
 
+# A cleared prompt was also the record of its conversation's home-guidance decision (``agent/home_guidance.py``).
+_HOME_GUIDANCE_NOTE = (
+    "A repaired conversation already under way cannot show which home-guidance edition it carried, so it continues "
+    "without one (with an explicit notice where agent.home_guidance_file is configured) until a new conversation "
+    "(/new); its lost edition is not recovered.")
+
+
 def _cmd_repair_prompts(db, args):
     """Report (or clear) stored system prompts degraded to a reduced-toolset build (#122822).
 
@@ -1287,6 +1294,7 @@ def _cmd_repair_prompts(db, args):
         else:
             print(f"\n{len(findings)} stored prompt(s) can be repaired. Re-run with --apply to clear them; "
                   "the next turn rebuilds a healthy prompt (one prefix-cache break per session).")
+            print(_HOME_GUIDANCE_NOTE)
         return 0
 
     # JSON mode is the non-interactive automation surface; --apply is the explicit mutation opt-in.
@@ -1306,6 +1314,7 @@ def _cmd_repair_prompts(db, args):
         print(f"\nCleared {len(cleared)} stored prompt(s); the next turn for each rebuilds and persists "
               "a healthy prompt.")
         print("One 'Stored system prompt ... is null' warning per repaired session is expected on that rebuild.")
+        print(_HOME_GUIDANCE_NOTE)
     return 0
 
 

@@ -20,7 +20,7 @@ from agent.redact_connstr import _KV_CONNSTR_GATE_RE, _redact_kv_connection_stri
 from agent.redact_headers import (
     _COOKIE_HEADER_JSON_RE, _COOKIE_HEADER_JSON_UNTERMINATED_RE, _SECRET_HEADER_JSON_RE,
     _SECRET_HEADER_JSON_UNTERMINATED_RE, json_header_value_is_credential, redact_cookie_assignments,
-    redact_header_credentials,
+    redact_header_credentials, auth_header_sub,
 )
 
 logger = logging.getLogger(__name__)
@@ -1584,7 +1584,7 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         text = _BASIC_PAIR_ASSIGN_RE.sub(_basic_pair, text)
 
     if "uthorization" in text or "UTHORIZATION" in text:  # cheapest gate over every casing
-        text = _AUTH_HEADER_RE.sub(lambda m: m.group(1) + (m.group(2) or "") + _mask_token(m.group(3)), text)
+        text = _AUTH_HEADER_RE.sub(lambda m: auth_header_sub(m, _mask_token), text)  # placeholders stay
 
     if ":" in text:
         text = redact_header_credentials(text)

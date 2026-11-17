@@ -93,7 +93,7 @@ def main():
     with closing(connect(board='owned')) as conn:
         tid = kb.create_task(conn, title='KANBAN_TASK_SENTINEL', body='Acceptance: finish owned card', assignee='default',
             workspace_kind='dir', workspace_path=str(workspace), skills=['owned-skill'],
-            goal_mode=peer.mode == 'complete', goal_max_turns=2,
+            goal_mode=peer.mode in {'complete', 'redirect'}, goal_max_turns=2,
             max_runtime_seconds=3600 if peer.mode == 'timeout' else None)
     env = dict(os.environ)
     receipt, clients = {}, []
@@ -128,6 +128,30 @@ def main():
                     assert peer.blocked.wait(55), 'model never reached'
                     active = kb.get_task(conn, tid)
                     receipt.update(client_pid=clients[0].pid, stored_pid=active.worker_pid, run_id=task.current_run_id)
+                    if peer.mode == 'redirect':
+                        # The live attempt's managed worker is parked in its first provider call: correct it
+                        # through the canonical route; the SAME run, claim and worker must keep the task.
+                        marker = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                                              "AND kind='owner_admitted' ORDER BY id DESC LIMIT 1",
+                                              (tid, task.current_run_id)).fetchone()
+                        sid = json.loads(marker[0])['session_id']
+                        async def correct():
+                            async with websocket(home, desc) as ws:
+                                generation = (await rpc(ws, 'session.resume', session_id=sid))['result']['execution_generation']
+                                return await rpc(ws, 'session.redirect', session_id=sid, execution_generation=generation,
+                                                 text='KANBAN_CORRECTION')
+                        receipt['redirect_status'] = asyncio.run(correct()).get('result', {}).get('status')
+                        wait_for(lambda: 'KANBAN_CORRECTION' in json.dumps(peer.requests))
+                        after = kb.get_task(conn, tid)
+                        receipt['claim_kept'] = ((after.current_run_id, after.claim_lock, after.worker_pid)
+                                                 == (task.current_run_id, task.claim_lock, active.worker_pid))
+                        receipt['correction_before_release'] = not peer.release.is_set()
+                        # Kept on the task before it was sent (the owner's durable receipt), whole and
+                        # captioned as accepted, and in front of any next attempt of this task.
+                        receipt['correction_comment'] = any(
+                            'KANBAN_CORRECTION' in c.body and f'accepted for run {task.current_run_id}' in c.body
+                            for c in kb.list_comments(conn, tid))
+                        receipt['correction_in_next_context'] = 'KANBAN_CORRECTION' in kb.build_worker_context(conn, tid)
                     if peer.mode == 'timeout':
                         # The spawned worker stays the run's handle; the owner's interpreter dies with it.
                         receipt['pid_preserved'] = active.worker_pid == clients[0].pid != receipt['managed_pid']
@@ -155,6 +179,10 @@ def main():
                     run = dict(conn.execute('SELECT * FROM task_runs WHERE id=?', (params['run_id'],)).fetchone())
                     from gateway.session_kanban import worker_exit_code
                     assert worker_exit_code(kb.kanban_db_path(board='owned'), params | {'claim_lock': 'foreign'}) == 1
+                    receipt['booked_exit'] = worker_exit_code(kb.kanban_db_path(board='owned'), params)
+                    import sqlite3
+                    with closing(sqlite3.connect((home / 'state.db').as_uri() + '?mode=ro', uri=True)) as db:
+                        receipt['turn_outcomes'] = db.execute('SELECT status, outcome FROM session_admissions').fetchall()
                     receipt.update(task_status=task.status, failures=task.consecutive_failures, run_outcome=run['outcome'],
                         run_metadata=kb._json_dict(run['metadata']), rate_limited=swept.rate_limited,
                         cooldown=dispatch.check_respawn_guard(conn, tid))
@@ -169,7 +197,7 @@ def main():
                         assert task.status == 'ready' and task.consecutive_failures == 1 and run['outcome'] == 'timed_out', receipt
             finally:
                 subprocess.Popen = original_popen
-            if peer.mode != 'complete':
+            if peer.mode not in {'complete', 'redirect'}:
                 return
             assert receipt['client_exit'] == ('clean_exit', 0), receipt
             async def retry():

@@ -35,9 +35,11 @@ _RESET_CLEANUP_TIMEOUT_S = 30.0
 # chat_type values whose session key is per-user (DM-like), incl. the unknown/blank case.
 _DM_CHAT_TYPES = {"dm", "direct", "private", ""}
 
+# ``display_kind``/``display_metadata`` carry a row's provenance (a failed-turn notice, a delivery mirror, and
+# whether such a row stands for a reply: ``agent.message_metadata.written_without_a_turn``), as the TUI branch keeps.
 _BRANCH_COPIED_FIELDS = ("content", "tool_calls", "tool_call_id", "finish_reason", "reasoning",
                          "reasoning_content", "reasoning_details", "codex_reasoning_items",
-                         "codex_message_items", "timestamp", "data_use")
+                         "codex_message_items", "timestamp", "data_use", "display_kind", "display_metadata")
 
 
 def _sattr(obj, name: str) -> str:

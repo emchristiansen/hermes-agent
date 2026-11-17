@@ -148,7 +148,10 @@ def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
     ok = s.run_one_job({"id": "j3", "name": "morning", "deliver": "telegram"})
 
     assert ok is False
+    assert delivered == []  # acceptance is durable, not an inline transport attempt
+    assert s.drain_delivery_queue(adapters={}, loop=None) == 1
     assert len(delivered) == 1 and delivered[0][0] == "j3"
+    assert s.drain_delivery_queue(adapters={}, loop=None) == 0
     # The notice carries the classifier verdict's gloss from the copy table (whatever its wording),
     # never the raw HTTP code as the lead, plus a retry command.
     from cron.scheduler_failure_copy import _provider_failure_cause, classify_cron_failure_reason
@@ -157,7 +160,8 @@ def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
     assert not delivered[0][1].lstrip("⚠️ ").startswith("Gemini HTTP 503")
     assert "hermes cron run j3" in delivered[0][1]
     assert marked == [
-        (("j3", False, "Gemini HTTP 503 (UNAVAILABLE)"), {"delivery_error": None})
+        (("j3", False, "Gemini HTTP 503 (UNAVAILABLE)"),
+         {"delivery_error": None, "execution_id": "exec-j3"})
     ]
     assert finished == [
         (
@@ -165,14 +169,20 @@ def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
             {
                 "success": False,
                 "error": "Gemini HTTP 503 (UNAVAILABLE)",
-                "delivery_outcome": "delivered",
+                "delivery_outcome": "queued",
             },
         )
     ]
 
 
-def test_run_one_job_exception_records_failure_alert_delivery_error(monkeypatch):
-    """A failed fallback alert must populate last_delivery_error."""
+def test_run_one_job_exception_retains_failure_alert_delivery_error_for_retry(monkeypatch):
+    """A refused queued notice retains its exact error, independently of business failure.
+
+    This unit test mocks run bookkeeping; the real-store counterpart in
+    test_direct_message_retry checks last_delivery_error and failed-business state.
+    """
+    from cron import delivery_queue
+
     marked = []
 
     monkeypatch.setattr(
@@ -194,8 +204,15 @@ def test_run_one_job_exception_records_failure_alert_delivery_error(monkeypatch)
     monkeypatch.setattr(s, "finish_execution", lambda *_a, **_kw: None)
 
     assert s.run_one_job({"id": "j4", "deliver": "telegram"}) is False
+    before = delivery_queue.get_status("exec-j4")
+    assert before["status"] == "pending" and before["attempts"] == 0
+    assert s.drain_delivery_queue(adapters={}, loop=None) == 1
+    row = delivery_queue.get_status("exec-j4")
+    assert row["status"] == "pending" and row["attempts"] == 1
+    assert row["error"] == "send failed: 502" and row["content"] == before["content"]
+    assert s.drain_delivery_queue(adapters={}, loop=None) == 0  # waiting its own backoff
     assert marked == [
-        (("j4", False, "provider failed"), {"delivery_error": "send failed: 502"})
+        (("j4", False, "provider failed"), {"delivery_error": None, "execution_id": "exec-j4"})
     ]
 
 
@@ -248,6 +265,8 @@ def test_escaped_failure_delivery_carries_the_streak_nudge(monkeypatch):
     )
 
     assert ok is False
+    assert delivered == []
+    assert s.drain_delivery_queue(adapters={}, loop=None) == 1
     assert len(delivered) == 1
     assert "cannot import name X" in delivered[0]
     assert "hermes cron pause scout" in delivered[0]
@@ -271,6 +290,8 @@ def test_escaped_failure_delivery_stays_quiet_below_the_threshold(monkeypatch):
     )
 
     assert ok is False
+    assert delivered == []
+    assert s.drain_delivery_queue(adapters={}, loop=None) == 1
     assert len(delivered) == 1
     assert "provider failed" in delivered[0]
     assert "hermes cron pause scout" not in delivered[0]
@@ -317,7 +338,7 @@ def test_run_one_job_exception_after_delivery_does_not_redeliver(monkeypatch):
         "delivery_error": None, "execution_id": "exec-j5", "status": "delivery_queued"})
     assert mark_calls[1] == (
         ("j5", False, "bookkeeping boom"),
-        {"delivery_error": None},
+        {"delivery_error": None, "execution_id": "exec-j5"},
     )
 
 
@@ -357,7 +378,7 @@ def test_run_one_job_keyboard_interrupt_skips_delivery_and_reraises(monkeypatch)
         s.run_one_job({"id": "j6", "name": "interrupt", "deliver": "telegram"})
 
     assert delivered == []
-    assert marked == [(("j6", False, "KeyboardInterrupt"), {})]
+    assert marked == [(("j6", False, "KeyboardInterrupt"), {"execution_id": "exec-j6"})]
     assert finished == [
         (
             ("exec-j6",),

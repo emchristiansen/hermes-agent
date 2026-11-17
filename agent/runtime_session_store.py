@@ -16,6 +16,7 @@ from pathlib import Path
 import queue
 import sys
 import threading
+import time
 from hermes_dir_acl import make_user_dir
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,38 @@ def call_off_event_loop(fn, *args, **kwargs):
     context = contextvars.copy_context()
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix='worker-persist-off-loop') as pool:
         return pool.submit(context.run, fn, *args, **kwargs).result()
+
+
+# What the owner may spend answering a call beyond its receipt write's own lock patience: the claim
+# check, the executor hop and an event loop slowed by in-process compaction work.
+_OWNER_DISPATCH_MARGIN_S = 60.0
+
+
+def receipt_budget_s():
+    """How long a sent owner call waits for its reply before its outcome is unknown.
+
+    The owner answers ``worker.persist`` only after its receipt transaction, which may itself wait
+    ``SessionDB._TRANSCRIPT_WRITE_PATIENCE_S`` for the write lock (``apply_worker_receipt``). A budget
+    inside that window abandons receipts the owner goes on to commit: the lost ACK becomes a sticky
+    ``worker_receipt_timeout`` and interrupts the turn even though every write landed.
+    """
+    from hermes_state import SessionDB
+    return SessionDB._TRANSCRIPT_WRITE_PATIENCE_S + _OWNER_DISPATCH_MARGIN_S
+
+
+# One dial's WebSocket upgrade deadline. A failed dial is retried within ``receipt_budget_s``.
+_OPEN_TIMEOUT_S = 5.0
+
+
+def _dial_failed_before_sending(exc):
+    """True for a dial failure that leaves the owner unreached or merely slow: an owner loop stalled
+    by in-process work answers discovery, identify and the upgrade late (a timeout), a restarting
+    owner refuses or drops the socket, and discovery may briefly find no ready owner. An owner's
+    explicit HTTP refusal (``InvalidStatus``) and a self-RPC are answers, not transport loss."""
+    from websockets.exceptions import InvalidMessage
+    if isinstance(exc, WorkerPersistenceError):
+        return str(exc) == 'owner_unavailable'
+    return isinstance(exc, (TimeoutError, OSError, InvalidMessage))
 
 
 class _OwnerLink:
@@ -155,9 +188,24 @@ class WorkerRPC:
         # The owner is loopback, like connect_gateway's peer: an inherited HTTPS_PROXY must not carry it.
         # No library keepalive: its pong deadline would run independently of (and could fail) a call
         # inside its receipt budget; that budget and the observed close are the liveness checks.
-        self.link = _OwnerLink(connect(url, subprotocols=protocols, open_timeout=5, close_timeout=1,
+        self.link = _OwnerLink(connect(url, subprotocols=protocols, open_timeout=_OPEN_TIMEOUT_S, close_timeout=1,
                                        max_size=8 * 1024 * 1024, proxy=None, ping_interval=None))
         return self.link
+
+    def _dial(self):
+        """``_connection``, redialed while the owner stays unreached. Nothing has been sent, so a
+        redial repeats no request; the patience matches a sent call's wait for its reply."""
+        deadline, pause = time.monotonic() + receipt_budget_s(), 0.25
+        while True:
+            try:
+                return self._connection()
+            except Exception as exc:  # health: allow BLE001 -- classified below; anything else re-raises
+                if not _dial_failed_before_sending(exc) or time.monotonic() + pause >= deadline:
+                    raise
+                logger.warning('owner unreachable before the request was sent (%s: %s); redialing',
+                               type(exc).__name__, exc)
+            time.sleep(pause)
+            pause = min(pause * 2, 2.0)
 
     def _drop(self):
         link, self.link = self.link, None
@@ -184,7 +232,7 @@ class WorkerRPC:
             request_id = self.request_id
             message = json.dumps({'jsonrpc': '2.0', 'id': request_id, 'method': method, 'params': params})
             try:
-                link = self._connection()
+                link = self._dial()
                 try:
                     link.send(request_id, message)
                 except ConnectionClosed:
@@ -192,9 +240,9 @@ class WorkerRPC:
                     # on entry, or the socket write failed): the owner closed the link after the idle
                     # check and never saw this request, so redial and send it once more.
                     self._drop()
-                    link = self._connection()
+                    link = self._dial()
                     link.send(request_id, message)
-                response = link.receive(20)
+                response = link.receive(receipt_budget_s())
             except BaseException:
                 # Outcome unknown once sent: surface the error and never resend; the next call redials.
                 self._drop()

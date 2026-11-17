@@ -877,6 +877,8 @@ def _resolve_delivery_targets(job: dict, *, for_failure: bool = False) -> list[d
     thread_id). ``for_failure=True`` (failure summaries, interrupted-run notices, drift/preflight
     alerts) resolves from ``failure_deliver`` INSTEAD when the job carries one —
     ``failure_deliver: local`` is the structural opt-out; absent, failures follow ``deliver``."""
+    if "_queued_delivery_targets" in job:
+        return [dict(target) for target in job["_queued_delivery_targets"]]
     deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=for_failure))
     if deliver == "local":
         return []
@@ -970,16 +972,22 @@ def _send_media_via_adapter(
                 future.cancel()
                 raise
             raw = getattr(result, "raw_response", None)
-            if result and getattr(result, "success", False) and isinstance(raw, dict) and raw.get("ambiguous"):
-                # Sent but the ack was lost: possibly delivered, so never an error (a re-run
-                # would duplicate it); _live_send_media records the target as unverified.
-                job["_media_ack_lost"] = True
-            elif result and not getattr(result, "success", True):
+            if not result or not getattr(result, "success", True):
+                # No result is no confirmation either (as for text: _confirm_adapter_delivery).
                 _note_target_error(
                     job_ref,
-                    f"media send failed for {media_path}: {getattr(result, 'error', 'unknown')}",
+                    f"media send failed for {media_path}: "
+                    f"{getattr(result, 'error', 'unknown') if result else 'no response from adapter'}",
                     errors,
                 )
+            elif isinstance(raw, dict) and raw.get("ambiguous"):
+                # Sent but the ack was lost: possibly delivered, possibly not. Unconfirmed is not
+                # delivered (at least once: a duplicate is acceptable, a loss is not), so it is an
+                # error that keeps a queued message retryable (MR-DELIVERY-16); _live_send_media also
+                # records the target as unverified.
+                job["_media_ack_lost"] = True
+                _note_target_error(
+                    job_ref, f"media send for {media_path} unconfirmed (acknowledgment lost)", errors)
         except Exception as e:
             # TimeoutError etc. have an empty str(); fall back to the class name.
             _note_target_error(
@@ -1291,8 +1299,8 @@ _LIVE_SEND_CONFIRM_TIMEOUT_SECS = 60
 def _live_send_text(
     t: _TargetDelivery, text_to_send: str, route_thread_id: Optional[str], route_metadata: dict, *,
     target_errors: list, delivery_errors: list, unverified_targets: list,
-) -> tuple[bool, bool, Any]:
-    """Schedule the text send on the gateway loop; returns ``(adapter_ok, timed_out, message_id)``.
+) -> tuple[bool, Any]:
+    """Schedule the text send on the gateway loop; returns ``(adapter_ok, message_id)``.
     Re-raises a real send error so the caller falls through to standalone."""
     from agent.async_utils import safe_schedule_threadsafe
     from gateway.delivery import DeliveryRouter, DeliveryTarget, PartialDeliveryError
@@ -1321,35 +1329,33 @@ def _live_send_text(
     future = safe_schedule_threadsafe(_send_once(), t.loop)
     if future is None:
         target_errors.append("live adapter event loop scheduling failed")
-        return False, False, None
+        return False, None
     try:
         send_result = future.result(timeout=_LIVE_SEND_CONFIRM_TIMEOUT_SECS)
     except TimeoutError:
-        # Slow confirmation != failure. Never started (loop wedged): nothing was sent, so fall through
-        # to standalone or it is silently dropped. Started: in flight (a paced multi-chunk send can
-        # legitimately outlast the wait) — leave it running; a standalone resend would DUPLICATE.
+        # Unconfirmed is not delivered (at least once: a duplicate is acceptable, a loss is not), so
+        # either way this lane did not deliver: fall through to standalone, and if that cannot send
+        # either, the error keeps a queued message retryable (MR-DELIVERY-15). Never started (loop
+        # wedged): abandon it so it never goes out late. Started: in flight (a paced multi-chunk send
+        # can legitimately outlast the wait): leave it running, since cancel() would kill it mid-send.
         with dispatch_lock:
             dispatch["abandoned"] = not dispatch["started"]
         if dispatch["abandoned"]:
             future.cancel()
             msg = f"live adapter send to {t.where} timed out before the coroutine was dispatched"
-            logger.warning("Job '%s': %s, falling back to standalone", job["id"], msg)
-            target_errors.append(msg)
-            return False, False, None
-        logger.warning(
-            "Job '%s': live adapter send to %s:%s timed out "
-            "after 60s; already dispatched (in flight), "
-            "assuming delivered (skipping standalone fallback "
-            "to avoid duplicate)",
-            job["id"], t.platform_name, t.chat_id)
-        return True, True, None
+        else:
+            msg = (f"live adapter send to {t.where} unconfirmed after {_LIVE_SEND_CONFIRM_TIMEOUT_SECS}s "
+                   "(still in flight; sending again, a duplicate is acceptable)")
+        _warn_live_lane_failure(job, msg, t.is_relay)
+        target_errors.append(msg)
+        return False, None
     except PartialDeliveryError as ex:
         # The head of a split send is already on screen: a standalone resend would duplicate it.
         raw = getattr(ex.result, "raw_response", None) or {}
         _note_target_error(
             job, f"live adapter send to {t.where} delivered {raw.get('delivered_chunks', '?')} of "
             f"{raw.get('total_chunks', '?')} chunks, then failed: {ex}", delivery_errors)
-        return True, False, None
+        return True, None
     except Exception as ex:
         # Real send error (not a slow confirmation): fall through to standalone. The router raises
         # a failed SendResult's error string, so this is where send_path_degraded arrives.
@@ -1379,7 +1385,7 @@ def _live_send_text(
         t.live_error = str(err) if err else None
         _warn_live_lane_failure(job, msg, t.is_relay)
         target_errors.append(msg)
-        return False, False, None
+        return False, None
     if send_raw_response and t.thread_id and send_raw_response.get("thread_fallback"):
         requested_thread_id = send_raw_response.get("requested_thread_id") or t.thread_id
         _note_target_error(
@@ -1387,7 +1393,7 @@ def _live_send_text(
             f"configured thread_id {requested_thread_id} for "
             f"{t.where} was not found; delivered without thread_id",
             delivery_errors)
-    return True, False, delivered_message_id
+    return True, delivered_message_id
 
 
 def _resolve_named_dm_topic(t: _TargetDelivery, topic_name: str, metadata: dict, delivery_errors: list,
@@ -1506,7 +1512,7 @@ def _deliver_via_live_adapter(
         # Send cleaned text (MEDIA tags stripped) through the gateway's DeliveryRouter so it gets
         # the same platform routing as live messages (Telegram's three-mode topic routing).
         text_to_send = cleaned_text.strip()
-        adapter_ok, timed_out, delivered_message_id = True, False, None
+        adapter_ok, delivered_message_id = True, None
         if not text_to_send and not media_files:
             # Fail closed so the run reports the empty payload.
             _note_target_error(
@@ -1514,31 +1520,21 @@ def _deliver_via_live_adapter(
                 target_errors)
             adapter_ok = False
         elif text_to_send:
-            adapter_ok, timed_out, delivered_message_id = _live_send_text(
+            adapter_ok, delivered_message_id = _live_send_text(
                 t, text_to_send, route_thread_id, route_metadata,
                 target_errors=target_errors, delivery_errors=delivery_errors,
                 unverified_targets=unverified_targets,
             )
 
-        # Media rides the same DM-topic-aware routing as text. Skipped after a confirmation
-        # timeout (loop contended, text already assumed delivered) — record the drop instead.
         # Send extracted media files as native attachments via the live adapter, using the same
         # DM-topic-aware routing as the text send (#22773 — media previously used a bare thread_id and
-        # landed in the General lane for private DM topics). Skip on an in-flight confirmation timeout: the
-        # gateway loop is contended, so each media send would also block its 30s budget, and the text
-        # payload is already assumed delivered (#38922). Record the skipped attachments so the drop is
-        # visible rather than silently lost.
-        if (topic_name := _named_dm_topic(t)) is not None and adapter_ok and not timed_out:
+        # landed in the General lane for private DM topics). An unconfirmed text send is not delivered,
+        # so its media goes with the standalone fallback instead.
+        if (topic_name := _named_dm_topic(t)) is not None and adapter_ok:
             adapter_ok = _resolve_named_dm_topic(
                 t, topic_name, media_metadata, delivery_errors, len(media_files), refresh=False) or bool(text_to_send)
-        if adapter_ok and not timed_out and media_files:
+        if adapter_ok and media_files:
             _live_send_media(t, media_metadata, media_files, delivery_errors, unverified_targets, topic_name)
-        elif timed_out and media_files:
-            _note_target_error(
-                job,
-                f"{len(media_files)} media attachment(s) not delivered to "
-                f"{t.where} (live adapter confirmation timed out)",
-                delivery_errors)
 
         if adapter_ok:
             # Log WHERE it went: a ghost delivery in the wrong lane is otherwise indistinguishable.

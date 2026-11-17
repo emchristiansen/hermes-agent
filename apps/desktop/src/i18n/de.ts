@@ -3943,6 +3943,13 @@ export const deOverrides = {
     queueStuckTitle: 'Eingereihte Nachricht nicht gesendet',
     queueStuckBody:
       'Ein eingereihter Turn konnte nicht gesendet werden. Er ist noch in der Warteschlange — versuchen Sie, ihn erneut zu senden.',
+    correctionUnconfirmedTitle: 'Korrektur nicht bestätigt',
+    correctionUnconfirmedBody:
+      'Sie hat den Lauf möglicherweise schon erreicht. Senden Sie sie erneut als dieselbe Korrektur; ein Duplikat ist unproblematisch.',
+    correctionSendAgain: 'Erneut senden',
+    correctionNotSentTitle: 'Korrektur nicht gesendet',
+    correctionNotSentBody:
+      'Sie wurde nicht gesendet, und Ihr aktueller Entwurf blieb unverändert. Ihr Text steht unten; senden Sie ihn selbst erneut, falls er noch zutrifft.',
     queueDroppedTitle: 'Eingereihte Eingabe verworfen',
     queueDroppedBody:
       'Dieser Hintergrund-Eintrag wurde verworfen, da seine Sitzung nach wiederholten Versuchen nicht fortgesetzt werden konnte. Die übrige Warteschlange ist unverändert.',

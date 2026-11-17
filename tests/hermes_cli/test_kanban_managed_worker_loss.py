@@ -27,7 +27,6 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_owner_recovery
 
-NOW = int(time.time())
 HOST = kb._claimer_id().split(":", 1)[0]
 FINGERPRINT = "6a232414-2dbf-40ab-a534-d9b71db05658:116|4162240"
 CLAIM_LAPSED = -1800  # claim_expires_in for a claim that expired half an hour ago
@@ -74,24 +73,27 @@ class _Board:
         owner_pid=None,
     ) -> int:
         """A ``running`` card whose managed worker was lost."""
+        # Read now, not at import: a long session reaches this test after a module-level clock
+        # would have let a "live" claim (``claim_expires_in``) lapse.
+        now = int(time.time())
         worker_pid = _absent_pid() if worker_pid is None else int(worker_pid)
         lock = f"{HOST}:{_absent_pid(base=3_900_000)}"
-        started = NOW - dead_seconds
+        started = now - dead_seconds
         run_id = int(self.conn.execute(
             "INSERT INTO task_runs (task_id, profile, status, claim_lock, claim_expires, "
             "worker_pid, started_at) VALUES (?, 'fan', 'running', ?, ?, ?, ?)",
-            (tid, lock, NOW + claim_expires_in, worker_pid if record_worker_pid else None, started),
+            (tid, lock, now + claim_expires_in, worker_pid if record_worker_pid else None, started),
         ).lastrowid)
         self.conn.execute(
             "INSERT INTO tasks (id, title, assignee, status, created_at, claim_lock, claim_expires, "
             "worker_pid, worker_started_at, last_heartbeat_at, current_run_id, started_at, priority) "
             "VALUES (?, ?, 'fan', 'running', ?, ?, ?, ?, ?, ?, ?, ?, 5)",
-            (tid, tid, NOW - 86400, lock, NOW + claim_expires_in,
+            (tid, tid, now - 86400, lock, now + claim_expires_in,
              worker_pid if record_worker_pid else None,
              FINGERPRINT if record_worker_pid else None,
-             (NOW - heartbeat_age) if heartbeat_age is not None else None, run_id, started),
+             (now - heartbeat_age) if heartbeat_age is not None else None, run_id, started),
         )
-        self.event(tid, run_id, "claimed", {"lock": lock, "expires": NOW + claim_expires_in}, started)
+        self.event(tid, run_id, "claimed", {"lock": lock, "expires": now + claim_expires_in}, started)
         self.event(tid, run_id, "spawned",
                    {"pid": worker_pid, "started_at": FINGERPRINT} if record_worker_pid else {}, started)
         if owner:

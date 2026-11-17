@@ -80,6 +80,117 @@ def command_argv(argv: list[str]) -> list[str]:
     return []
 
 
+def is_no_init_command(argv: list[str], *, profile_flag_consumed: bool = False) -> bool:
+    """``hermes auth principals`` whose top-level options leave it unchanged; see ``no_init_command_args``."""
+    return no_init_command_args(argv, profile_flag_consumed=profile_flag_consumed) is not None
+
+
+class _NotInert(Exception):
+    pass
+
+
+def no_init_command_args(argv: list[str], *, profile_flag_consumed: bool = False) -> list[str] | None:
+    """The arguments after ``auth principals`` when *argv* is that command with top-level options that
+    leave it unchanged (``--cli``, ``--yolo``, ``--reas high`` …); otherwise None.
+
+    The command promises no home initialization or writes, so ``hermes_bootstrap`` skips its scratch
+    setup and ``hermes_cli.main`` dispatches it before the profile scratch export and the
+    config/logging imports, all of which create files in the home. Options that change what the
+    full CLI does instead (help, ``--version``, a non-empty ``-z``) or that it rejects are not this command:
+    they take the normal path, which answers them exactly as for every other command.
+
+    *argv* is parsed with the real top-level flags (``_add_top_level_flags``) and a command
+    positional with the full parser's subcommand arity, so which token is the command (abbreviated,
+    ``=``-joined or attached option values, ``--``) is argparse's own decision, not a token scan's.
+    There is no command dispatch: a stray word is never looked up (the "not a command" hints load
+    config, which writes). Before parsing, the first ``-p``/``--profile`` NAME is removed, as
+    ``main._apply_profile_override`` does before argparse; that scanner also skips other options'
+    values and invalid names, so for ``hermes_bootstrap`` this is an approximation. The decisive call
+    (``_startup_fast``) runs on the override's actual result with *profile_flag_consumed* (a remaining
+    ``-p`` is then the parser's error). A session flag that captures a name takes the normal path:
+    whether a name word is the active memory provider's command depends on config."""
+    if not profile_flag_consumed:
+        argv = _without_profile_flag(argv)
+    # main joins a session name before its parse (``-c my session auth principals``), and the active
+    # memory provider's ``hermes <name>`` ends one. Finding that command reads config, which this
+    # classifier must not, so any captured name word (it could be that command) takes the normal path.
+    if _coalesce_session_name_args(argv, provider_commands=False, names_only=True):
+        return None
+    parser = argparse.ArgumentParser(prog="hermes")
+    _add_top_level_flags(parser)
+    parser.add_argument("command", nargs=argparse.PARSER)
+
+    def refuse(*_args, **_kwargs):
+        raise _NotInert
+
+    # Help prints then exits, and every parse error calls error(): refuse both before any output.
+    parser.print_help = parser.print_usage = parser.error = parser.exit = refuse
+    try:
+        args = parser.parse_args(argv)
+    except _NotInert:
+        return None
+    # ``main`` runs ``-z`` only for a non-empty prompt: ``--oneshot= auth principals`` is the command.
+    if args.command[:2] != ["auth", "principals"] or args.version or args.oneshot:
+        return None
+    return args.command[2:]
+
+
+def _coalesce_session_name_args(argv: list, *, provider_commands: bool = True, names_only: bool = False) -> list:
+    """Join unquoted multi-word session names after -c/--continue and -r/--resume: ``hermes -c Pokemon
+    Agent Dev`` → ``['-c', 'Pokemon Agent Dev']``, up to the next flag or known top-level subcommand.
+
+    The active memory provider's ``hermes <name>`` command also ends a name; finding it reads config,
+    so *provider_commands* False (the no-init classifier) skips it. *names_only* returns just the
+    joined names."""
+    _SUBCOMMANDS = {
+        "chat", "model", "gateway", "setup", "whatsapp", "whatsapp-cloud", "login", "logout",
+        "auth", "status", "cron", "doctor", "config", "pairing", "skills", "tools", "mcp",
+        "sessions", "insights", "update", "uninstall", "profile", "dashboard", "serve", "webapp",
+        "desktop", "gui", "claw", "plugins", "security", "acp", "webhook", "peer",
+        "memory", "dump", "debug", "backup", "import", "completion", "logs", "usage",
+    }
+    _SESSION_FLAGS = {"-c", "--continue", "-r", "--resume"}
+    if provider_commands and _SESSION_FLAGS.intersection(argv):  # the active memory provider registers ``hermes <name>``
+        from plugins.memory import active_memory_provider_commands
+        _SUBCOMMANDS |= active_memory_provider_commands()
+
+    result, names = [], []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token in _SESSION_FLAGS:
+            result.append(token)
+            i += 1
+            parts: list = []
+            while (
+                i < len(argv)
+                and not argv[i].startswith("-")
+                and argv[i] not in _SUBCOMMANDS
+            ):
+                parts.append(argv[i])
+                i += 1
+            if parts:
+                result.append(" ".join(parts))
+                names.append(result[-1])
+        else:
+            result.append(token)
+            i += 1
+    return names if names_only else result
+
+
+def _without_profile_flag(argv: list[str]) -> list[str]:
+    """*argv* without its first ``-p NAME`` / ``--profile NAME`` / ``--profile=NAME`` (before ``--``)."""
+    flags = {flag for flag, _takes_value in PRE_ARGPARSE_INHERITED_FLAGS}
+    for i, token in enumerate(argv):
+        if token == "--":
+            break
+        if token.startswith("--") and token.partition("=")[0] in flags and "=" in token:
+            return argv[:i] + argv[i + 1:]
+        if token in flags and i + 1 < len(argv):
+            return argv[:i] + argv[i + 2:]
+    return list(argv)
+
+
 def _inherited_flag(parser, *args, **kwargs):
     """``parser.add_argument`` + tag the Action ``inherit_on_relaunch`` for ``hermes_cli.relaunch``."""
     action = parser.add_argument(*args, **kwargs)
@@ -204,11 +315,11 @@ def _add_top_level_flags(parser: argparse.ArgumentParser) -> None:
     inherited(parser, "--checkpoints", action="store_true", default=False,
               help="Enable filesystem checkpoints before destructive file operations (use /rollback to restore)")
     inherited(parser, "--ignore-user-config", action="store_true", default=False,
-              help=f"Ignore {_cfg_path()} and fall back to built-in defaults (credentials in .env are still loaded)")
+              help=f"Ignore {_cfg_path()} and fall back to built-in defaults (credentials in .env and an administrator-managed agent.home_guidance_file still load)")
     inherited(parser, "--ignore-rules", action="store_true", default=False,
-              help="Skip auto-injection of AGENTS.md, SOUL.md, .cursorrules, memory, and preloaded skills")
+              help="Skip auto-injection of AGENTS.md, SOUL.md, .cursorrules, memory, and preloaded skills (the operating home guidance file set by agent.home_guidance_file still loads)")
     inherited(parser, "--safe-mode", action="store_true", default=False,
-              help="Troubleshooting mode: disable ALL customizations — user config, AGENTS.md/memory injection, plugins, and MCP servers (implies --ignore-user-config and --ignore-rules)")
+              help="Troubleshooting mode: disable customizations — user config, AGENTS.md/SOUL.md/memory injection, plugins, and MCP servers (implies --ignore-user-config and --ignore-rules); an administrator-managed agent.home_guidance_file still loads")
     inherited(parser, "--tui", action="store_true", default=False,
               help="Launch the modern TUI instead of the classic REPL")
     inherited(parser, "--native", "--tui-native", dest="tui_native", action="store_true", default=False,
@@ -312,11 +423,11 @@ def _build_chat_parser(subparsers) -> argparse.ArgumentParser:
     inherited(chat_parser, "--pass-session-id", action="store_true", default=SUPPRESS,
               help="Include the session ID in the agent's system prompt")
     inherited(chat_parser, "--ignore-user-config", action="store_true", default=SUPPRESS,
-              help=f"Ignore {_cfg_path()} and fall back to built-in defaults (credentials in .env are still loaded). Useful for isolated CI runs, reproduction, and third-party integrations.")
+              help=f"Ignore {_cfg_path()} and fall back to built-in defaults (credentials in .env and an administrator-managed agent.home_guidance_file still load). Useful for isolated CI runs, reproduction, and third-party integrations.")
     inherited(chat_parser, "--ignore-rules", action="store_true", default=SUPPRESS,
-              help="Skip auto-injection of AGENTS.md, SOUL.md, .cursorrules, memory, and preloaded skills. Combine with --ignore-user-config for a fully isolated run.")
+              help="Skip auto-injection of AGENTS.md, SOUL.md, .cursorrules, memory, and preloaded skills; the operating home guidance file set by agent.home_guidance_file still loads. Combine with --ignore-user-config to also ignore your config file; an administrator-managed agent.home_guidance_file still loads.")
     inherited(chat_parser, "--safe-mode", action="store_true", default=SUPPRESS,
-              help="Troubleshooting mode: disable ALL customizations — user config, AGENTS.md/memory injection, plugins, and MCP servers (implies --ignore-user-config and --ignore-rules). Use to isolate whether a problem comes from your setup or from Hermes itself.")
+              help="Troubleshooting mode: disable customizations — user config, AGENTS.md/SOUL.md/memory injection, plugins, and MCP servers (implies --ignore-user-config and --ignore-rules); an administrator-managed agent.home_guidance_file still loads. Use to isolate whether a problem comes from your setup or from Hermes itself.")
     add("--source", default=None,
         help="Session source tag for filtering (default: cli). Use 'tool' for third-party integrations that should not appear in user session lists.")
     inherited(chat_parser, "--tui", action="store_true", default=SUPPRESS,

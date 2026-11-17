@@ -28,9 +28,12 @@ def record_unknown_worker_outcome(
         scope_tokens = scheduler._install_fire_secret_scope()
         delivery_error = None
         try:
-            delivery_error, _ = scheduler._deliver_crash_failure(
+            delivery_error, delivery_outcome = scheduler._deliver_crash_failure(
                 job, error, adapters=adapters, loop=loop
             )
+            if delivery_outcome == "queued":
+                from cron.executions import queue_unknown_delivery
+                queue_unknown_delivery(str(job["execution_id"]), job["id"])
         finally:
             scheduler._reset_fire_secret_scope(scope_tokens)
             scheduler.mark_job_run(
@@ -38,10 +41,13 @@ def record_unknown_worker_outcome(
                 False,
                 error,
                 delivery_error=delivery_error,
+                execution_id=str(job["execution_id"]),
                 expected_fire_owner=owner,
                 # A ladder re-run's occurrence already counted toward repeat.
                 **({"ladder_rung": True} if is_retry_run(job) else {}),
             )
+            from cron.delivery_outcome import settle_quietly
+            settle_quietly(job["id"], str(job["execution_id"]))
     return True
 
 

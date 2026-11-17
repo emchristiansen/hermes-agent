@@ -242,8 +242,10 @@ class SessionUsageMixin:
                 groups.append((key, session_id, dict(kwargs)))
         return [(sid, kw) for _, sid, kw in groups]
 
-    def _stop_token_writer(self, join_timeout: float = 10.0) -> None:
-        """Stop the writer thread and drain remaining deltas. Never raises."""
+    def _stop_token_writer(self, join_timeout: float = 10.0) -> bool:
+        """Stop the writer thread and drain remaining deltas. Never raises. False when a writer (the
+        thread, or a concurrent drain) is still live past *join_timeout*: it can still write, so
+        ``close()`` must leave the connection open (SH-01 TOKEN-01)."""
         with self._token_queue_cond:
             self._token_writer_stop = True
             self._token_queue_cond.notify_all()
@@ -255,7 +257,7 @@ class SessionUsageMixin:
                 logger.warning(
                     "async token accounting: writer did not stop within %.0fs; "
                     "%d queued delta(s) not persisted", join_timeout, len(self._token_queue))
-                return
+                return False
         # Writer gone: apply leftovers synchronously under the same busy protocol. Wait out
         # a flush caller-drain that already claimed busy — close() nulls the connection
         # right after this returns and must not yank it mid-batch.
@@ -268,7 +270,7 @@ class SessionUsageMixin:
                         "async token accounting: concurrent drain did not "
                         "finish within %.0fs; %d queued delta(s) not persisted",
                         join_timeout, len(self._token_queue))
-                    return
+                    return False
                 self._token_queue_cond.wait(remaining)
             # busy BEFORE clearing the queue (same ordering as the writer loop).
             batch = list(self._token_queue)
@@ -277,6 +279,7 @@ class SessionUsageMixin:
                 self._token_queue.clear()
         if batch:
             self._apply_claimed_batch(batch)
+        return True
 
     def _drain_token_queue_at_exit(self) -> None:
         with contextlib.suppress(Exception):  # never fatal at interpreter shutdown

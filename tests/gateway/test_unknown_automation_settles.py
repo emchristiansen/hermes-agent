@@ -45,9 +45,11 @@ def _runner(tmp_path, monkeypatch, executed):
     return store, runner
 
 
-async def _lost_head_then_restart(tmp_path, monkeypatch, executed, admit_head):
+async def _lost_head_then_restart(tmp_path, monkeypatch, executed, admit_head, *, tool_step=False):
     """Owner 1 admits a head (via ``admit_head``) and a person's follower, claims the head, dies.
-    Owner 2 starts on the same store. Returns (store, owner2, head_id, follower_id)."""
+    ``tool_step``: the lost turn had reached a tool (a person's such turn is never run again,
+    gateway.session_message_redelivery). Owner 2 starts on the same store.
+    Returns (store, owner2, head_id, follower_id)."""
     store, runner = _runner(tmp_path, monkeypatch, executed)
     db = store._db
     source = SessionSource(platform=Platform.TELEGRAM, chat_id='gw10')
@@ -62,6 +64,10 @@ async def _lost_head_then_restart(tmp_path, monkeypatch, executed, admit_head):
     claimed = claim_session_input(db, epoch=first.epoch, session_id='s')
     assert claimed['admission_id'] == head_id
     db.append_message('s', 'user', 'HEAD')  # the lost turn got as far as its user row
+    if tool_step:
+        db.append_message('s', 'assistant', None, tool_calls=[{'id': 'c1', 'type': 'function', 'function': {
+            'name': 'terminal', 'arguments': '{}'}}])
+        db.append_message('s', 'tool', 'done', tool_call_id='c1', tool_name='terminal')
     second = await initialize_session_authority(runner, profile_id='p', instance_id='owner-2')
     second.sessions['s'] = LiveSession(source, 's')
     return store, second, head_id, follower.admission_id
@@ -125,8 +131,10 @@ async def test_unknown_automation_settles_interrupted_and_fifo_moves_on(tmp_path
 
 @pytest.mark.asyncio
 async def test_a_persons_unknown_turn_still_pauses_the_fifo(tmp_path, monkeypatch):
+    """A person's lost turn that reached a tool (one that did not runs again: test_person_message_redelivery)."""
     executed = []
-    store, authority, head_id, follower_id = await _lost_head_then_restart(tmp_path, monkeypatch, executed, _person_head)
+    store, authority, head_id, follower_id = await _lost_head_then_restart(tmp_path, monkeypatch, executed, _person_head,
+                                                                           tool_step=True)
     try:
         assert _statuses(authority.db)[head_id] == ('unknown', None)
         authority._schedule(SessionRef('p', 's'))
@@ -181,7 +189,8 @@ async def test_messaging_pause_notice_names_discard_and_discard_resumes_the_fifo
     from gateway.session_ingress import pause_notice
     from gateway.slash_commands_session import discard_lost_turns
     executed = []
-    store, authority, head_id, _follower_id = await _lost_head_then_restart(tmp_path, monkeypatch, executed, _person_head)
+    store, authority, head_id, _follower_id = await _lost_head_then_restart(tmp_path, monkeypatch, executed, _person_head,
+                                                                            tool_step=True)
     try:
         notice = pause_notice(authority, SessionRef('p', 's'), 'unknown_execution')
         assert '/discard' in notice and 'restarted' in notice, notice

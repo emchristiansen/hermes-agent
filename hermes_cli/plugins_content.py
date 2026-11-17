@@ -35,8 +35,9 @@ def register_skill(
 ) -> PluginRegistration:
     """Register a read-only skill resolvable as ``'<plugin_name>:<name>'`` via ``skill_view()``,
     listed by ``skills_list`` and in the system prompt's ``<available_skills>`` while the plugin
-    is enabled. Not copied into ``~/.hermes/skills/``. Raises ``ValueError`` (``':'``/invalid
-    chars) or ``FileNotFoundError``."""
+    is enabled. ``path`` may be a skill directory containing ``SKILL.md`` or the index file
+    itself (as a ``Path`` or string); the registry stores the file path. Not copied into
+    ``~/.hermes/skills/``. Raises ``ValueError`` (``':'``/invalid chars) or ``FileNotFoundError``."""
     from agent.skill_utils import _NAMESPACE_RE
     from hermes_cli.plugins_manifest import _portable_slug
     if ":" in name:
@@ -44,11 +45,12 @@ def register_skill(
                          f"plugin name '{self.manifest.name}' automatically).")
     if not name or not _NAMESPACE_RE.match(name):
         raise ValueError(f"Invalid skill name '{name}'. Must match [a-zA-Z0-9_-]+.")
-    # Plugin register() helpers commonly pass the SKILL.md location as str
-    # (PluginManifest.path is stored as str); the registry and find_plugin_skill()
-    # promise a Path downstream.
+    # Normalize plugin skill directories here so every registry consumer receives a file,
+    # and linked-file reads stay confined to the skill directory rather than its parent.
     path = Path(path)
-    if not path.exists():
+    if path.is_dir():
+        path = path / "SKILL.md"
+    if not path.is_file():
         raise FileNotFoundError(f"SKILL.md not found at {path}")
     namespace = _portable_slug(self.manifest.name) if self.manifest.portable else self.manifest.name
     qualified = f"{namespace}:{name}"

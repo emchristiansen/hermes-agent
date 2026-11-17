@@ -162,3 +162,45 @@ it('redirectPrompt still surfaces a refusal that may have reached the turn', asy
     await expect(handle.actions.redirectPrompt('next message')).rejects.toThrow('permission_denied')
   })
 })
+
+// A card attempt's correction its running turn never took: the owner kept it on the card's task
+// (gateway/session_managed_worker KeptCorrection.unreached). Accepted and durable, so the composer
+// must not dispatch it again as a fresh, unbound prompt; the bubble stays as the sent correction.
+it.each([
+  ['steer', 4],
+  ['steer', 5],
+  ['interrupt', 4],
+  ['interrupt', 5]
+] as const)('redirectPrompt accepts a correction kept on its task (%s, generation %i)', async (mode, generation) => {
+  vi.mocked(requestGatewayForAgent).mockResolvedValue({
+    authority_epoch: 1,
+    execution_generation: generation,
+    text: 'next message',
+    status: 'rejected',
+    delivered: false,
+    kept: 'task_comment'
+  })
+  seed()
+
+  await act(async () => {
+    expect(await handle.actions.redirectPrompt('next message', mode)).toBe(true)
+  })
+
+  expect(requestGatewayForAgent).toHaveBeenCalledTimes(1)
+  const messages = handle.cache.sessionStateByRuntimeIdRef.current.get('rt-B')!.messages
+  expect(messages.map(message => message.id)[0]).toBe('history-B')
+  expect(messages.at(-1)?.role).toBe('user')
+  expect(messages).toHaveLength(2)
+})
+
+it.each(['steer', 'interrupt'] as const)('redirectPrompt still hands back an ordinary rejection (%s)', async mode => {
+  vi.mocked(requestGatewayForAgent).mockResolvedValue({ status: 'rejected', text: 'next message' })
+  seed()
+
+  await act(async () => {
+    expect(await handle.actions.redirectPrompt('next message', mode)).toBe(false)
+  })
+
+  const messages = handle.cache.sessionStateByRuntimeIdRef.current.get('rt-B')!.messages
+  expect(messages.map(message => message.id)).toEqual(['history-B'])
+})

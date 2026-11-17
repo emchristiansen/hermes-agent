@@ -449,16 +449,32 @@ def execution_owner_live(execution_id: str, job_id: str) -> bool:
     return row is not None and _row_owner_live(row)
 
 
+def queue_unknown_delivery(execution_id: str, job_id: str) -> bool:
+    """A fenced recovery accepted a notice; the underlying execution stays unknown.
+
+    Call only after persisting that execution's message. A prior/final delivery
+    disposition cannot be overwritten by a delayed recovery observer.
+    """
+    with _transaction() as conn:
+        return conn.execute(
+            "UPDATE executions SET delivery_outcome='queued' "
+            "WHERE id=? AND job_id=? AND status='unknown' AND delivery_outcome IS NULL",
+            (execution_id, job_id),
+        ).rowcount == 1
+
+
 def settle_delivery_outcome(execution_id: str, outcome: str) -> bool:
     """Replace a terminal attempt's ``queued`` delivery outcome with the drain's real one.
 
     The only post-terminal rewrite the ledger allows: the attempt's status is untouched and
-    only a ``queued`` handoff can settle, so a replay or a late caller is a no-op.
+    only a ``queued`` handoff (or a ``retrying`` one, msg-retry-on-13f-6: a failed attempt queued again)
+    can settle, so a replay or a late caller is a no-op. ``retrying`` itself is written by a failed attempt
+    and is replaced by the final outcome once the send resolves.
     """
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE executions SET delivery_outcome=?
-               WHERE id=? AND delivery_outcome='queued'
+               WHERE id=? AND delivery_outcome IN ('queued','retrying')
                  AND status IN ('completed','failed','unknown')""",
             (outcome, execution_id),
         )

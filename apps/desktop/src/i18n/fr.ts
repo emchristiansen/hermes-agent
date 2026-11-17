@@ -3952,6 +3952,13 @@ export const frOverrides = {
     queueStuckTitle: "Message en file d'attente non envoyé",
     queueStuckBody:
       "Un tour en file d'attente a continué à échouer lors de l'envoi. Il est toujours en file d'attente — essayez de l'envoyer à nouveau.",
+    correctionUnconfirmedTitle: 'Correction non confirmée',
+    correctionUnconfirmedBody:
+      'Elle a peut-être déjà atteint l’exécution. Renvoyez-la comme la même correction ; un doublon ne pose pas de problème.',
+    correctionSendAgain: 'Renvoyer',
+    correctionNotSentTitle: 'Correction non envoyée',
+    correctionNotSentBody:
+      'Elle n’a pas été envoyée et votre brouillon actuel est resté tel quel. Son texte figure ci-dessous ; renvoyez-le vous-même s’il s’applique encore.',
     queueDroppedTitle: "Élément en file d'attente abandonné",
     queueDroppedBody:
       "Cette entrée d'arrière-plan a été abandonnée car sa session n'a pas pu être reprise après plusieurs tentatives. Le reste de la file d'attente est inchangé.",

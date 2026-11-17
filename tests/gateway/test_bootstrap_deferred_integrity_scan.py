@@ -104,6 +104,11 @@ def _startup(monkeypatch, tmp_path):
     from gateway import host_rendezvous as hr
     hr.release_host_lock(hr.ROLE_GATEWAY)
     hr.clear_record(hr.ROLE_GATEWAY)
+    # start_gateway's cleanup retains the profile reservation until a stop reports its stores closed
+    # (SH-01 STARTUP-01); this fake runner's stop never does, so drop the process-wide retention.
+    from gateway.runtime_ownership import process_ownership
+    process_ownership.stores_closed()
+    process_ownership.close()
 
 
 @pytest.mark.asyncio

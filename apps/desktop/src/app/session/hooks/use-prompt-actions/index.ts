@@ -13,6 +13,7 @@ import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { triggerHaptic } from '@/lib/haptics'
 import { setMutableRef } from '@/lib/mutable-ref'
 import { normalize } from '@/lib/text'
+import { CorrectionTargetChanged, UncertainCorrection, UnsentCorrection } from '@/lib/uncertain-correction'
 import { transcribeAudioClientDirect } from '@/lib/voice-client-direct'
 import { clearClarifyRequest } from '@/store/clarify'
 import { setSessionCompacting } from '@/store/compaction'
@@ -864,7 +865,22 @@ export function usePromptActions({
         updateSessionState
       })
 
-      if (!text || !target) {
+      if (!text) {
+        return false
+      }
+
+      // The composer's own session, before any capture: on the canonical owner it decides whether a
+      // correction that cannot be sent may still become a prompt.
+      const canonicalOwner = serverOwnsComposerQueue(selectedStoredSessionIdRef.current ?? activeSessionIdRef.current)
+
+      if (!target) {
+        // Navigation disagrees on the target, so nothing is sent. On the canonical owner the
+        // correction is not handed back as the next prompt (that prompt would be task-unbound,
+        // NC13-CLIENT-02): the words return to the composer instead.
+        if (canonicalOwner) {
+          throw new UnsentCorrection()
+        }
+
         return false
       }
 
@@ -879,11 +895,21 @@ export function usePromptActions({
       // stale to catch: the caller deliberately asked for a correction (a
       // rotation gap, a recovery retry) and the gateway authoritatively
       // rejects an idle redirect.
+      //
+      // The canonical owner fences every correction to this session's execution generation, so no
+      // other session's run can take it; handing it back here would instead make it a task-unbound
+      // prompt (NC13-CLIENT-02). There it still goes to the owner, without the bubble: the owner keeps
+      // a Kanban card's correction on its task, and refuses any other session's as undelivered, which
+      // the caller queues as before.
       const liveTurn = $sessionStates.get()[target.sessionId]
+      const turnEnded = busyRef.current && liveTurn !== undefined && !isLiveTurnAwaitingEvents(liveTurn)
 
-      if (busyRef.current && liveTurn && !isLiveTurnAwaitingEvents(liveTurn)) {
+      if (turnEnded && !serverOwnsComposerQueue(target.storedSessionId ?? target.sessionId)) {
         return false
       }
+
+      // Its retries present the generation its first send named (NC13-CLIENT-01).
+      const correctionId = crypto.randomUUID()
 
       // Accepted whether the live turn was redirected in place or queued for
       // the next turn (the build window, before the agent is wired) — either
@@ -893,15 +919,18 @@ export function usePromptActions({
       const send = async (id: string): Promise<boolean> => {
         // Reserve the correction's arrival position, but do not seal the live
         // stream until acceptance: a refusal must leave in-flight deltas intact.
-        const messageId = appendSessionTextMessage(id, 'user', text, target.storedSessionId)
+        // An ended turn gets no bubble (#105176).
+        const messageId = turnEnded ? null : appendSessionTextMessage(id, 'user', text, target.storedSessionId)
 
         const discardOptimisticMessage = () =>
+          messageId !== null &&
           updateSessionState(id, state => ({
             ...state,
             messages: state.messages.filter(message => message.id !== messageId)
           }))
 
         const moveOptimisticMessageToEnd = () =>
+          messageId !== null &&
           updateSessionState(id, state => {
             const message = state.messages.find(candidate => candidate.id === messageId)
 
@@ -913,7 +942,7 @@ export function usePromptActions({
         try {
           const result = await target.requestGateway<SessionRedirectResponse>(
             mode === 'steer' ? 'session.steer' : 'session.redirect',
-            { session_id: id, text }
+            { session_id: id, text, correction_id: correctionId }
           )
 
           // TUI-26: a bare stop phrase typed mid-turn into a LOCAL voice chat ended that chat on
@@ -927,7 +956,7 @@ export function usePromptActions({
           if (result?.status === 'redirected') {
             if (mode === 'interrupt') {
               flushStreamDeltas(id)
-              updateSessionState(id, state => sealAcceptedCorrection(state, messageId))
+              updateSessionState(id, state => sealAcceptedCorrection(state, messageId ?? undefined))
             }
 
             triggerHaptic('submit')
@@ -935,12 +964,15 @@ export function usePromptActions({
             return true
           }
 
-          if (result?.status === 'queued') {
+          // A card attempt's correction its running turn never took is kept on the card's task (the
+          // next attempt reads it): accepted and durable like a queued one, never sent again as a
+          // fresh, unbound prompt.
+          if (result?.status === 'queued' || result?.kept === 'task_comment') {
             // A redirect queued in the build window is the next turn; an
             // accepted steer joins this one after its running tool.
             if (mode === 'steer') {
               flushStreamDeltas(id)
-              updateSessionState(id, state => sealAcceptedCorrection(state, messageId, { keepRunningTools: true }))
+              updateSessionState(id, state => sealAcceptedCorrection(state, messageId ?? undefined, { keepRunningTools: true }))
             } else {
               moveOptimisticMessageToEnd()
             }
@@ -948,6 +980,17 @@ export function usePromptActions({
             triggerHaptic('submit')
 
             return true
+          }
+
+          // Only a refusal the owner confirms undelivered hands the words back (below). On the
+          // canonical owner any other reply proves nothing (a plain 'rejected' can follow delivery;
+          // a missing or unrecognised one says nothing of a kept copy): the outcome is uncertain,
+          // so the correction stays a correction (NC12-CLIENT-01).
+          if (
+            serverOwnsComposerQueue(target.storedSessionId ?? id) &&
+            !(result?.status === 'rejected' && result.delivered === false)
+          ) {
+            throw new Error(`Correction outcome unconfirmed: ${JSON.stringify(result ?? null)}`)
           }
         } catch (err) {
           discardOptimisticMessage()
@@ -966,17 +1009,28 @@ export function usePromptActions({
         return false
       }
 
-      try {
-        // A stale runtime id after reconnect 404s ("session not found"): the
-        // shared resolver resumes the stored session and retries once, so a
-        // correction right after a reconnect isn't lost to the race.
-        const { result } = await withSessionNotFoundResume(target.sessionId, target.storedSessionId, send, target)
+      // One delivery attempt to the captured target. A failure is uncertain (the owner may hold the
+      // correction), so it surfaces with a retry of this same correction to this same session.
+      const attempt = async (): Promise<boolean> => {
+        try {
+          // A stale runtime id after reconnect 404s ("session not found"): the
+          // shared resolver resumes the stored session and retries once, so a
+          // correction right after a reconnect isn't lost to the race.
+          const { result } = await withSessionNotFoundResume(target.sessionId, target.storedSessionId, send, target)
 
-        return result
-      } catch (err) {
-        notifyError(err, copy.promptFailed)
-        throw err
+          return result
+        } catch (err) {
+          // Its session changed under it (a resumed runtime): never sent there; the words go back.
+          if (err instanceof CorrectionTargetChanged) {
+            throw new UnsentCorrection('its session changed since it was first sent')
+          }
+
+          notifyError(err, copy.promptFailed)
+          throw new UncertainCorrection(err, attempt)
+        }
       }
+
+      return attempt()
     },
     [
       activeSessionIdRef,

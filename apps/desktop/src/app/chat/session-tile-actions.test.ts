@@ -5,12 +5,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { UncertainCorrection } from '@/lib/uncertain-correction'
 
 import { MAIN_COMPOSER_SCOPE } from './composer/scope'
 
 const requestGatewayMock = vi.hoisted(() => vi.fn())
 
-const { $activeSessionId, $sessions, setSessions } = await import('@/store/session')
+const { $activeSessionId, $connection, $sessions, setSessions } = await import('@/store/session')
 const { $confirmRequest, settleConfirm } = await import('@/store/confirm')
 
 const { $sessionStates, $sessionTiles, clearAllSessionStates, publishSessionState, setSessionTileDelegate } =
@@ -166,7 +167,67 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
     await act(async () => {
       await expect(result.current.steerPrompt('keep correction', mode)).rejects.toThrow('correction unsupported')
     })
-    expect(requestGatewayMock).toHaveBeenCalledExactlyOnceWith(mode === 'steer' ? 'session.steer' : 'session.redirect', { session_id: RUNTIME_SESSION_ID, text: 'keep correction' })
+    expect(requestGatewayMock).toHaveBeenCalledExactlyOnceWith(mode === 'steer' ? 'session.steer' : 'session.redirect', { session_id: RUNTIME_SESSION_ID, text: 'keep correction', correction_id: expect.any(String) })
+  })
+
+  // NC12-CLIENT-01: a tile correction kept on its card's task is accepted (never re-sent as a
+  // prompt); a failed one stays a correction whose retry goes to this tile's session again.
+  it.each(['interrupt', 'steer'] as const)('accepts a tile %s correction the owner kept on its task', async mode => {
+    requestGatewayMock.mockResolvedValue({
+      authority_epoch: 1,
+      execution_generation: 4,
+      text: 'keep correction',
+      status: 'rejected',
+      delivered: false,
+      kept: 'task_comment'
+    })
+    const { result } = renderTileActions()
+    const ok = await act(async () => result.current.steerPrompt('keep correction', mode))
+    expect(ok).toBe(true)
+    expect(requestGatewayMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('surfaces a failed tile correction with a retry of that correction to the same session', async () => {
+    requestGatewayMock
+      .mockRejectedValueOnce(new Error('ACK lost'))
+      .mockResolvedValueOnce({ status: 'rejected', delivered: false, kept: 'task_comment', text: 'keep correction' })
+    const { result } = renderTileActions()
+    let failure: unknown
+    await act(async () => {
+      failure = await result.current.steerPrompt('keep correction', 'steer').catch(err => err)
+    })
+    expect(failure).toBeInstanceOf(UncertainCorrection)
+    const ok = await act(async () => (failure as UncertainCorrection).retry())
+    expect(ok).toBe(true)
+    // The retry is the same correction: the same id, so the same pinned execution generation.
+    const id = (requestGatewayMock.mock.calls[0]?.[1] as { correction_id?: unknown } | undefined)?.correction_id
+    expect(id).toEqual(expect.any(String))
+    expect(requestGatewayMock.mock.calls).toEqual([
+      ['session.steer', { session_id: RUNTIME_SESSION_ID, text: 'keep correction', correction_id: id }],
+      ['session.steer', { session_id: RUNTIME_SESSION_ID, text: 'keep correction', correction_id: id }]
+    ])
+  })
+
+  it.each([
+    ['plain rejected', { status: 'rejected', text: 'keep correction' }],
+    ['missing', undefined]
+  ])('treats a %s reply on the canonical owner as uncertain, and a confirmed undelivered one as refused', async (_case, reply) => {
+    $connection.set({ mode: 'local', wsUrl: 'ws://localhost/api/ws?native_dial=unminted' } as never)
+
+    try {
+      requestGatewayMock
+        .mockResolvedValueOnce(reply)
+        .mockResolvedValueOnce({ status: 'rejected', delivered: false, text: 'keep correction' })
+      const { result } = renderTileActions()
+      let failure: unknown
+      await act(async () => {
+        failure = await result.current.steerPrompt('keep correction', 'steer').catch(err => err)
+      })
+      expect(failure).toBeInstanceOf(UncertainCorrection)
+      expect(await act(async () => (failure as UncertainCorrection).retry())).toBe(false)
+    } finally {
+      $connection.set(null)
+    }
   })
 
   // #141644: a correction the owner refused before any agent saw it hands the words back (false)
@@ -211,7 +272,7 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
 
     expect(ok).toBe(true)
     expect(calls.map(c => c.method)).toEqual(['session.redirect', 'session.resume', 'session.redirect'])
-    expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID, text: 'actually use Postgres' })
+    expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID, text: 'actually use Postgres', correction_id: calls[0]?.params?.correction_id })
     expect($sessionTiles.get()[0]?.runtimeId).toBe(RECOVERED_SESSION_ID)
   })
 

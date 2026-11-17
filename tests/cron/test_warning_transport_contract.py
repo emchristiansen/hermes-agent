@@ -45,6 +45,7 @@ def test_warning_policy_at_real_transport_boundary(tmp_path, monkeypatch, loop_t
     monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
     sent = []
     fallbacks = []
+    relay_recovered = []  # msg-retry-on-13f-7: the relay accepts once this is non-empty
 
     async def send(chat_id, content, metadata=None):
         sent.append(("discord", chat_id, content))
@@ -54,7 +55,7 @@ def test_warning_policy_at_real_transport_boundary(tmp_path, monkeypatch, loop_t
 
     async def relay_send(platform, chat_id, content, metadata=None):
         sent.append((platform.value, chat_id, content))
-        if lane == "relay-failure":
+        if lane == "relay-failure" and not relay_recovered:
             raise RuntimeError("isolated relay failure")
         return {"success": True, "message_id": "relay-id"}
 
@@ -83,10 +84,25 @@ def test_warning_policy_at_real_transport_boundary(tmp_path, monkeypatch, loop_t
     muted = setting is True and for_failure
     assert sent == ([] if muted or lane.startswith("standalone") else [("discord", "fixture", payload)])
     assert fallbacks == ([] if muted or lane not in ("standalone", "standalone-async", "native-fallback") else [("discord", "fixture", payload)])
-    expected = "suppressed" if muted else "failed" if lane == "relay-failure" else "delivered"
-    assert delivery_queue.get_status("run")["status"] == expected
+    # msg-retry-on-13f-6 (ea298f05, at least once): a refused send is retried, never terminal "failed".
+    expected = "suppressed" if muted else "pending" if lane == "relay-failure" else "delivered"
+    row = delivery_queue.get_status("run")
+    assert row["status"] == expected
+    if expected == "pending":
+        assert row["content"] == payload and row["retry_after"] and "isolated relay failure" in row["error"]
     # Duplicate category and policy changes cannot overwrite durable SQL queue outcomes.
     (tmp_path / "config.yaml").write_text("display: {suppress_warning_notifications: false}\n")
     delivery_queue.enqueue("run", job, payload, for_failure=not for_failure)
     assert scheduler.drain_delivery_queue(adapters, loop_thread) == 0
     assert delivery_queue.get_status("run")["status"] == expected
+    if expected == "pending":
+        # msg-retry-on-13f-7 (MR-TEST-11, ea298f05): the retry actually delivers; the duplicate attempt is
+        # accepted and goes to the same target with the same body.
+        relay_recovered.append(True)
+        later = delivery_queue._now_seconds() + delivery_queue.RETRY_BACKOFF_MAX_SECONDS + 1
+        monkeypatch.setattr(delivery_queue, "_now_seconds", lambda: later)
+        assert scheduler.drain_delivery_queue(adapters, loop_thread) == 1
+        assert delivery_queue.get_status("run")["status"] == "delivered"
+        # The retry runs under the config written above (no wrap_response override), so the body may be wrapped.
+        assert sent[0] == ("discord", "fixture", payload) and len(sent) == 2 and fallbacks == []
+        assert sent[1][:2] == ("discord", "fixture") and payload in sent[1][2]

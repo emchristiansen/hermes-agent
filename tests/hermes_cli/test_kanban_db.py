@@ -2044,11 +2044,10 @@ def test_archive_running_task_terminates_worker(kanban_home, monkeypatch):
         monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: "boot:1|777")
         kbd._set_worker_pid(conn, t, 54321)
 
-        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        state = {"alive": True}  # only a live SAME worker is signalled (tree-13d): gone once SIGTERM'd
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: state["alive"])
         signalled = []
-        assert kb.archive_task(
-            conn, t, signal_fn=lambda pid, sig: signalled.append((pid, sig)),
-        ) is True
+        assert kb.archive_task(conn, t, signal_fn=lambda pid, s: (signalled.append((pid, s)), state.update(alive=False))) is True
 
         assert signalled and signalled[0][0] == 54321
 

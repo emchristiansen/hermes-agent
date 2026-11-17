@@ -34,7 +34,7 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_diagnostics as kd
 from hermes_cli import kanban_owner_recovery
-from hermes_cli.process_identity import worker_birth
+from hermes_cli.process_identity import process_birth, worker_birth
 from hermes_cli.kanban_owner_recovery import (
     bound_interpreter_gone,
     owner_attempt_provably_over,
@@ -191,10 +191,13 @@ def test_dead_attempt_behind_an_unresolved_receipt_is_named_and_reclaimed(board)
     dict(expires_age_seconds=-3600, admission=("started", None)),                            # live claim
     dict(lock_host="some-other-host"),                                                       # foreign host
     dict(owner_pid=os.getpid(), owner_birth=None, admission=("started", None)),               # live owner in flight
+    dict(owner_pid=os.getpid(), owner_birth=worker_birth(psutil.Process()),
+         admission=("unknown", None)),                                                       # live owner, unsettled
+    dict(owner_pid=os.getpid(), owner_birth=worker_birth(psutil.Process()), admission=None),  # live owner, no row
     dict(record_worker_pid=False, admission=("started", None)),                              # no pid recorded
     dict(record_worker_pid=False, expires_age_seconds=-3600),                                # no pid yet, settled
-], ids=["live-worker", "live-bound", "fresh-heartbeat", "live-claim", "foreign-host", "live-owner", "no-pid",
-        "no-pid-live-claim"])
+], ids=["live-worker", "live-bound", "fresh-heartbeat", "live-claim", "foreign-host", "live-owner",
+        "live-owner-unsettled", "live-owner-no-row", "no-pid", "no-pid-live-claim"])
 def test_the_pause_still_holds_every_attempt_that_may_be_alive(board, shape):
     """Missing evidence is never proof: reclaiming beside a possibly-live attempt repeats its effects."""
     board.dead_attempt("t_ghost", **shape)
@@ -225,6 +228,51 @@ def test_a_settled_admission_is_proof_even_while_the_owner_gateway_is_alive(boar
     # Booked against the breaker like any other non-completing attempt (A3).
     assert board.state("t_gateway")["consecutive_failures"] == 1
     assert board.state("t_bound")["status"] == "running"
+
+
+# --- a live owner that settled the attempt no longer holds it -------------------------------
+
+_RELEASE_PATHS = {
+    "ttl": lambda conn: kb.release_stale_claims(conn),
+    "crash": lambda conn: kbd.detect_crashed_workers(conn),
+}
+
+
+@pytest.mark.parametrize("max_retries, landing", [(None, "ready"), (1, "blocked")])
+@pytest.mark.parametrize("path", sorted(_RELEASE_PATHS))
+def test_an_attempt_a_live_owner_settled_terminal_is_released(board, path, max_retries, landing):
+    """2026-11-04, runs 440-446: the owner's managed child died in ``worker.adopt`` before
+    ``worker_bound``, and the owner (still running, same birth) settled the admission
+    ``terminal``/``interrupted``. Its pid stayed alive, so the claim was held with every worker
+    pid dead and no heartbeat for as long as that owner lived. Release books the run as a failure
+    under the card's ordinary retry policy; the owner's interrupted row is left as it was."""
+    run = board.dead_attempt("t_fenced", owner_pid=os.getpid(), owner_birth=worker_birth(psutil.Process()),
+                             admission=("terminal", "interrupted"))
+    board.conn.execute("UPDATE tasks SET max_retries = ? WHERE id = 't_fenced'", (max_retries,))
+    board.conn.commit()
+    assert owner_reclaim_paused(board.conn, "t_fenced") is True
+    assert owner_attempt_provably_over(board.conn, "t_fenced") is True
+
+    assert _RELEASE_PATHS[path](board.conn)
+    row = board.state("t_fenced")
+    assert (row["status"], row["claim_lock"], row["worker_pid"], row["current_run_id"]) == (landing, None, None, None)
+    ended = board.conn.execute("SELECT status, outcome FROM task_runs WHERE id = ?", (run,)).fetchone()
+    assert ended["outcome"] in {"reclaimed", "crashed"}
+    with sqlite3.connect(board.ledger) as store:
+        assert store.execute("SELECT status, outcome FROM session_admissions").fetchall() == [("terminal", "interrupted")]
+
+
+def test_a_live_owners_settled_attempt_waits_for_its_worker(board):
+    """Settlement proves the owner stopped, not that the dispatcher's own worker did. (A live claim
+    no longer holds a settled attempt whose recorded pids are dead: upstream's
+    ``test_a_settled_admission_is_proof_even_while_the_owner_gateway_is_alive``.)"""
+    owner = dict(owner_pid=os.getpid(), owner_birth=worker_birth(psutil.Process()),
+                 admission=("terminal", "interrupted"))
+    board.dead_attempt("t_live_worker", worker_pid=os.getpid(),
+                       worker_fingerprint=kbd._process_fingerprint(os.getpid()), **owner)
+    assert owner_attempt_provably_over(board.conn, "t_live_worker") is False
+    assert kb.release_stale_claims(board.conn) == 0
+    assert kbd.detect_crashed_workers(board.conn) == []
 
 
 # --- the gate is decided under the same write lock as the release ---------------------------
@@ -342,3 +390,257 @@ def test_an_earlier_runs_live_pid_does_not_hide_the_current_dead_run(board):
     board.event("t_ghost", run - 1, "spawned", {"pid": os.getpid()}, NOW - 100_000)
     board.conn.commit()
     assert [d.kind for d in board.diagnostics("t_ghost") if d.kind == "stale_running"] == ["stale_running"]
+
+
+# --- receipts written by an owner from before the boot-tick birth (old base, int-1) ------------
+
+def _epoch_birth(pid=None) -> float:
+    """The birth an owner from before ``worker_birth`` wrote: the epoch ``create_time``."""
+    return process_birth(psutil.Process(os.getpid() if pid is None else pid))
+
+
+def _lapsed_unsettled(board, tid, admission, **owner) -> int:
+    """An attempt only its owner can still be running: the claim lapsed with no heartbeat and
+    every recorded worker pid is dead, but the owner's own admission is not settled."""
+    return board.dead_attempt(tid, admission=admission, **owner)
+
+
+@pytest.mark.platforms("linux")
+def test_the_two_owner_clocks_differ_for_a_live_process():
+    """The precondition of every case below: the old and current receipt births of one process differ."""
+    me = psutil.Process()
+    assert process_birth(me) != worker_birth(me)
+
+
+_OWNER_GATES = {
+    "ttl": lambda conn: kb.release_stale_claims(conn),
+    "crash": lambda conn: kbd.detect_crashed_workers(conn),
+    "stale": lambda conn: kbd.detect_stale_running(conn, stale_timeout_seconds=1, signal_fn=lambda *_: None),
+}
+
+
+@pytest.mark.parametrize("admission", [("unknown", None), ("queued", None)], ids=["unknown", "queued"])
+@pytest.mark.parametrize("path", sorted(_OWNER_GATES))
+@pytest.mark.parametrize("clock", ["epoch-receipt", "boot-receipt"])
+def test_a_live_owner_keeps_its_attempt_whichever_clock_its_receipt_used(board, path, admission, clock):
+    """I1: an owner that admitted the attempt before an update wrote its epoch ``process_birth``.
+    While that owner still runs it may still execute the admission (``unknown``) or start it
+    (``queued``), so no reclaim path may take the card. Read with ``worker_birth`` alone, the receipt
+    made the live owner look like a recycled pid: ``_owner_process_gone`` said gone and every path
+    reclaimed beside it."""
+    birth = _epoch_birth() if clock == "epoch-receipt" else worker_birth(psutil.Process())
+    _lapsed_unsettled(board, "t_old_owner", admission, owner_pid=os.getpid(), owner_birth=birth)
+    assert kanban_owner_recovery._owner_process_gone({"pid": os.getpid(), "birth": birth}) is False
+    assert owner_attempt_provably_over(board.conn, "t_old_owner") is False
+    assert owner_reclaim_blocked(board.conn, "t_old_owner") is True
+    assert not _OWNER_GATES[path](board.conn)
+    row = board.state("t_old_owner")
+    assert (row["status"], row["claim_lock"]) == ("running", f"{HOST}:{os.getpid()}")
+
+
+@pytest.mark.parametrize("clock", ["epoch-receipt", "boot-receipt"])
+def test_a_dead_owners_attempt_is_reclaimed_whichever_clock_its_receipt_used(board, clock):
+    """The owner exited after writing its receipt: nothing can run the attempt, so it is released."""
+    child = subprocess.Popen([sys.executable, "-c", "input()"], stdin=subprocess.PIPE)
+    try:
+        proc = psutil.Process(child.pid)
+        birth = process_birth(proc) if clock == "epoch-receipt" else worker_birth(proc)
+    finally:
+        child.stdin.close()
+        child.wait()
+    assert not psutil.pid_exists(child.pid) or psutil.Process(child.pid).create_time() != proc.create_time()
+    _lapsed_unsettled(board, "t_dead_owner", ("unknown", None), owner_pid=child.pid, owner_birth=birth)
+    assert owner_attempt_provably_over(board.conn, "t_dead_owner") is True
+    assert kb.release_stale_claims(board.conn) == 1
+    assert board.state("t_dead_owner")["status"] == "ready"
+
+
+def test_a_recycled_owner_pid_is_still_detected_from_a_boot_receipt(board):
+    """The receipt's number now belongs to another live process: its boot-relative birth (which no
+    clock step moves) matches on neither clock, so the recorded owner is gone and its unsettled
+    attempt is released."""
+    other = subprocess.Popen([sys.executable, "-c", "input()"], stdin=subprocess.PIPE)
+    try:
+        # This test process's birth stands in for the earlier incarnation that held other.pid.
+        birth = worker_birth(psutil.Process())
+        _lapsed_unsettled(board, "t_recycled", ("unknown", None), owner_pid=other.pid, owner_birth=birth)
+        assert kanban_owner_recovery._owner_process_gone({"pid": other.pid, "birth": birth}) is True
+        assert kb.release_stale_claims(board.conn) == 1
+        assert board.state("t_recycled")["status"] == "ready"
+    finally:
+        other.stdin.close()
+        other.wait()
+
+
+@pytest.mark.platforms("linux")
+def test_a_legacy_epoch_receipt_mismatch_holds_until_the_pid_is_gone(board):
+    """I1-HB-01's availability cost. A legacy epoch receipt whose birth matches neither clock of the
+    live process holding its pid is UNKNOWN, not death: a recycled number and the same owner after a
+    btime re-anchor read alike, so the unsettled attempt is held. It is released as soon as the pid
+    is absent (or the owner settles the admission)."""
+    from hermes_cli.process_identity import Identity
+
+    other = subprocess.Popen([sys.executable, "-c", "input()"], stdin=subprocess.PIPE)
+    try:
+        birth = _epoch_birth()  # this process's epoch birth: other.pid's, if it had been the owner
+        _lapsed_unsettled(board, "t_recycled", ("unknown", None), owner_pid=other.pid, owner_birth=birth)
+        receipt = {"pid": other.pid, "birth": birth}
+        assert kanban_owner_recovery._owner_identity(receipt) is Identity.UNKNOWN
+        assert kanban_owner_recovery._owner_process_gone(receipt) is False
+        assert kb.release_stale_claims(board.conn) == 0
+        assert kbd.detect_crashed_workers(board.conn) == []
+        assert board.state("t_recycled")["status"] == "running"
+    finally:
+        other.stdin.close()
+        other.wait()
+    assert kanban_owner_recovery._owner_identity(receipt) is Identity.GONE
+    assert kb.release_stale_claims(board.conn) == 1
+    assert board.state("t_recycled")["status"] == "ready"
+
+
+@pytest.mark.parametrize("clock", ["epoch-receipt", "boot-receipt"])
+def test_an_owner_whose_birth_cannot_be_read_is_never_proof_of_death(board, monkeypatch, clock):
+    """Permission or other psutil errors on either clock leave the attempt held, as before."""
+    from hermes_cli import process_identity
+
+    birth = _epoch_birth() if clock == "epoch-receipt" else worker_birth(psutil.Process())
+
+    def denied(proc):
+        raise psutil.AccessDenied(proc.pid)
+
+    monkeypatch.setattr(process_identity, "worker_birth", denied)
+    monkeypatch.setattr(process_identity, "process_birth", denied)
+    _lapsed_unsettled(board, "t_unreadable", ("unknown", None), owner_pid=os.getpid(), owner_birth=birth)
+    assert kb.release_stale_claims(board.conn) == 0
+    assert kbd.detect_crashed_workers(board.conn) == []
+    assert board.state("t_unreadable")["status"] == "running"
+
+
+def test_a_live_epoch_receipt_owner_reads_as_the_same_owner_to_the_pause(board):
+    """``owner_reclaim_paused`` applies the same identity rule: an old-format receipt of the live owner
+    with a ``started`` admission reads as that owner, exactly as a current-format one does."""
+    board.dead_attempt("t_epoch", owner_pid=os.getpid(), owner_birth=_epoch_birth(), admission=("started", None))
+    board.dead_attempt("t_boot", owner_pid=os.getpid(), owner_birth=worker_birth(psutil.Process()),
+                       admission=("started", None))
+    board.dead_attempt("t_other", owner_pid=os.getpid(), owner_birth=_epoch_birth() - 1.0,
+                       admission=("started", None))
+    assert owner_reclaim_paused(board.conn, "t_epoch") is False
+    assert owner_reclaim_paused(board.conn, "t_boot") is False
+    assert owner_reclaim_paused(board.conn, "t_other") is True
+
+
+# --- identity that cannot be proven is never proof of death (I1-HB-01, I1-HB-02) --------------
+
+def _reclaim(board, path):
+    def no_live_signal(pid, sig):
+        assert not psutil.pid_exists(pid), ("signal to a live pid", pid, sig)
+        raise ProcessLookupError(pid)
+    if path == "ttl":
+        return kb.release_stale_claims(board.conn, signal_fn=no_live_signal)
+    if path == "crash":
+        return kbd.detect_crashed_workers(board.conn)
+    return kbd.detect_stale_running(board.conn, stale_timeout_seconds=1, signal_fn=no_live_signal)
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("path", ["ttl", "crash", "stale"])
+@pytest.mark.parametrize("clock", ["epoch-receipt", "boot-receipt"])
+def test_a_btime_reanchor_never_makes_a_live_owner_look_dead(board, monkeypatch, path, clock):
+    """I1-HB-01: only psutil's epoch boot anchor moves (WSL2 resume, a clock step). A legacy epoch
+    receipt of the live owner then matches neither clock; that is UNKNOWN, and the unsettled
+    attempt is held on every reclaim path. A boot-relative receipt still reads SAME."""
+    from hermes_cli.process_identity import Identity
+
+    pid = os.getpid()
+    birth = _epoch_birth() if clock == "epoch-receipt" else worker_birth(psutil.Process())
+    _lapsed_unsettled(board, "t_clock", ("unknown", None), owner_pid=pid, owner_birth=birth)
+    real_boot_time = psutil._pslinux.boot_time
+    monkeypatch.setattr(psutil._pslinux, "boot_time", lambda: real_boot_time() + 1)
+    expected = Identity.UNKNOWN if clock == "epoch-receipt" else Identity.SAME
+    assert kanban_owner_recovery._owner_identity({"pid": pid, "birth": birth}) is expected
+    assert kanban_owner_recovery._owner_process_gone({"pid": pid, "birth": birth}) is False
+    assert owner_attempt_provably_over(board.conn, "t_clock") is False
+    assert not _reclaim(board, path)
+    assert board.state("t_clock")["status"] == "running"
+
+
+@pytest.mark.parametrize("path", ["ttl", "crash"])
+@pytest.mark.parametrize("unreadable", [False, True], ids=["readable", "unreadable"])
+def test_an_unreadable_worker_identity_is_not_proof_of_death(board, monkeypatch, path, unreadable):
+    """I1-HB-02: a live recorded worker whose start time cannot be read now is UNKNOWN. The settled
+    admission's death proof needs every recorded worker GONE, so the attempt is held, and nothing
+    is signalled."""
+    from gateway import status
+    from hermes_cli.process_identity import Identity
+
+    pid = os.getpid()
+    fingerprint = kbd._process_fingerprint(pid)
+    run = board.dead_attempt("t_read", worker_pid=pid, worker_fingerprint=fingerprint, owner_pid=pid,
+                             owner_birth=worker_birth(psutil.Process()), admission=("terminal", "interrupted"))
+    assert kbd.heartbeat_worker(board.conn, "t_read", expected_run_id=run)
+    with kb.write_txn(board.conn):
+        board.conn.execute("UPDATE tasks SET claim_expires=? WHERE id=?", (int(time.time()) - 1, "t_read"))
+    if unreadable:
+        monkeypatch.setattr(status, "get_process_start_time", lambda _pid: None)
+    assert kbd._worker_identity(pid, fingerprint) is (Identity.UNKNOWN if unreadable else Identity.SAME)
+    assert kbd._worker_alive(pid, fingerprint) is True
+    assert kbd._pid_recycled(pid, fingerprint) is unreadable  # never signalled while unproven
+    assert owner_attempt_provably_over(board.conn, "t_read") is False
+    assert not _reclaim(board, path)
+    assert board.state("t_read")["status"] == "running"
+
+
+def test_worker_identity_verdicts(monkeypatch):
+    """GONE only on positive evidence; an unreadable reading or an unusable record is UNKNOWN."""
+    from gateway import status
+    from hermes_cli.process_identity import Identity
+
+    me = os.getpid()
+    fingerprint = kbd._process_fingerprint(me)
+    start = status.get_process_start_time(me)
+    epoch = fingerprint.rsplit("|", 1)[0]
+    assert kbd._worker_identity(_absent_pid(), fingerprint) is Identity.GONE
+    assert kbd._worker_identity(me, fingerprint) is Identity.SAME
+    assert kbd._worker_identity(me, None) is Identity.UNKNOWN  # no record: existence proves nothing
+    assert kbd._worker_identity(_absent_pid(), None) is Identity.GONE
+    assert kbd._worker_identity(me, start) is Identity.SAME  # legacy integer start time
+    assert kbd._worker_identity(me, f"{epoch}|{start + 1}") is Identity.GONE  # recycled number
+    assert kbd._worker_identity(me, start + 1000) is Identity.GONE
+    assert kbd._worker_identity(me, kbd.UNVERIFIED_WORKER_FINGERPRINT) is Identity.UNKNOWN
+    assert kbd._worker_identity(me, "junk") is Identity.UNKNOWN
+    monkeypatch.setattr(status, "get_process_start_time", lambda _pid: None)
+    assert kbd._worker_identity(me, fingerprint) is Identity.UNKNOWN
+    assert kbd._worker_identity(me, start) is Identity.UNKNOWN
+    assert kbd._worker_identity(_absent_pid(), fingerprint) is Identity.GONE
+
+
+def test_an_unreadable_worker_identity_is_held_and_never_signalled_by_termination(board, monkeypatch):
+    """The signal paths: an UNKNOWN live identity is refused a signal and reported as surviving, so
+    the reclaim defers instead of releasing beside it; enforce_max_runtime neither signals nor
+    releases it."""
+    from gateway import status
+
+    pid = os.getpid()
+    fingerprint = kbd._process_fingerprint(pid)
+    lock = f"{HOST}:{pid}"
+    signalled = []
+
+    def sig(p, s):
+        signalled.append((p, s))
+
+    tid = kb.create_task(board.conn, title="job", assignee="worker", max_runtime_seconds=1)
+    kb.claim_task(board.conn, tid)
+    kbd._set_worker_pid(board.conn, tid, pid)
+    old = int(time.time()) - 3600
+    with kb.write_txn(board.conn):
+        board.conn.execute("UPDATE tasks SET started_at = ? WHERE id = ?", (old, tid))
+        board.conn.execute(
+            "UPDATE task_runs SET started_at = ? WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+            (old, tid))
+    monkeypatch.setattr(status, "get_process_start_time", lambda _pid: None)
+    info = kbd._terminate_reclaimed_worker(pid, lock, signal_fn=sig, started_at=fingerprint)
+    assert info["signal_refused"] is True and info["terminated"] is False
+    assert kbd._worker_survived_termination(info) is True
+    assert kbd.enforce_max_runtime(board.conn, signal_fn=sig) == []
+    assert signalled == []
+    assert kb.get_task(board.conn, tid).status == "running"

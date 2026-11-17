@@ -93,6 +93,10 @@ export interface SessionSteerResponse {
 export interface SessionRedirectResponse {
   status?: 'redirected' | 'queued' | 'rejected'
   text?: string
+  /** With ``kept``: the running turn never took the text. */
+  delivered?: boolean
+  /** ``task_comment``: a card attempt's correction, kept durably on its task for the next attempt. */
+  kept?: 'task_comment' | null
   /** TUI-26: the text was a bare stop phrase that ended the LOCAL voice chat; no turn saw it. */
   voice_stopped?: boolean
 }

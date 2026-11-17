@@ -29,9 +29,13 @@ def _anchors_current_turn(messages: Any, idx: Any, user_message: Any) -> bool:
     if not isinstance(idx, int) or not 0 <= idx < len(messages):
         return False
     msg = messages[idx]
-    if not (isinstance(msg, dict) and msg.get("role") == "user"):
+    from agent.prompt_builder import STEER_DISPLAY_KIND
+    from agent.turn_context import holds_merged_turn
+
+    # A /steer row is never this turn's row (same rule as ``reanchor_current_turn_user_idx``).
+    if not (isinstance(msg, dict) and msg.get("role") == "user") or msg.get("display_kind") == STEER_DISPLAY_KIND:
         return False
-    if msg.get("content") == user_message:
+    if msg.get("content") == user_message or holds_merged_turn(msg, user_message):
         return True
     from agent.context_compressor import user_originated_turn_view
 
@@ -178,7 +182,10 @@ def prepare_iteration(
     # break the prompt cache — same contract as apply_pending_steer_to_tool_results).
     _pre_api_steer = agent._drain_pending_steer()
     if _pre_api_steer:
-        _inject_steer_after_newest_tool_result(agent, messages, _pre_api_steer)
+        _inject_steer_after_newest_tool_result(
+            agent, messages, _pre_api_steer,
+            turn_start=_current_turn_start(messages, current_turn_user_idx, user_message),
+        )
 
     # One-shot run-budget wrap-up notice at 80% of agent.run_budget_seconds, appended to the
     # newest tool result; off with no budget.
@@ -281,10 +288,24 @@ def _previous_tool_round(messages: Any) -> list:
     return []
 
 
-def _inject_steer_after_newest_tool_result(agent: Any, messages: Any, steer_text: str) -> None:
-    """Append the steer marker as a standalone user row after the newest tool message; with no
-    tool message, put the text back so the post-tool-execution drain delivers it later."""
-    for _si in range(len(messages) - 1, -1, -1):
+def _current_turn_start(messages: Any, idx: Any, user_message: Any) -> int:
+    """Index of this turn's user row before this iteration's repair, or -1 when no row provably holds
+    it (no fallback guess). Read-only: the persist-override index moves only in the re-anchors."""
+    if _anchors_current_turn(messages, idx, user_message):
+        return idx
+    return next((i for i in range(len(messages) - 1, -1, -1) if _anchors_current_turn(messages, i, user_message)), -1)
+
+
+def _inject_steer_after_newest_tool_result(agent: Any, messages: Any, steer_text: str, *, turn_start: int) -> None:
+    """Insert the steer marker as a standalone user row after the newest tool message of THIS turn
+    (after ``turn_start``, this turn's user row). With none — the first iteration, e.g. a steer
+    accepted during turn-start compression — or an unproven ``turn_start``, put the text back, with
+    its tickets, for the post-tool-batch drain or the turn-end settlement. A tool row of an earlier
+    turn is history: a steer spliced there is past context the model is told is already handled,
+    so the drain would book a delivery that never happened."""
+    if not isinstance(turn_start, int) or turn_start < 0:
+        turn_start = len(messages)
+    for _si in range(len(messages) - 1, turn_start, -1):
         _sm = messages[_si]
         if isinstance(_sm, dict) and _sm.get("role") == "tool":
             from agent.prompt_builder import steer_user_row

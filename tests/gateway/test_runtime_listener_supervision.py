@@ -27,6 +27,14 @@ def _dump_every_thread_on_hang(request):
         os.close(real_stderr)
 
 
+@pytest.fixture(autouse=True)
+def _restore_gateway_runner_ref(monkeypatch):
+    """Each test's GatewayRunner publishes itself as the process's runner (``gateway.run._gateway_runner_ref``)
+    and outlives its stop, so later in-process API servers would answer 503 ``gateway_draining``."""
+    from gateway import run
+    monkeypatch.setattr(run, '_gateway_runner_ref', run._gateway_runner_ref)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize('listener_failure', [False, True])
 async def test_runtime_wait_observes_listener_exit(tmp_path, listener_failure):

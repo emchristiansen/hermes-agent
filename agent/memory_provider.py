@@ -141,9 +141,24 @@ class MemoryProvider(ABC):
         """STATIC system-prompt text; "" to skip. Recalled context goes through prefetch(), not here."""
         return ""
 
+    @property
+    def prefetch_timeout(self) -> Optional[float]:
+        """Optional finite positive budget for current-query synchronous recall, in seconds.
+
+        None preserves the host's short cached-prefetch timeout. Opting in also requires
+        ``prefetch(..., deadline=...)``: the host passes an absolute ``time.monotonic()``
+        deadline, including thread startup. The provider must bound all attempts by that
+        deadline and cancel local async work on expiry. The host retains its stuck-call
+        guard and allows only a short bounded epilogue, not more recall time.
+        """
+        return None
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Formatted recall context for the upcoming turn ("" if none). Must be fast — recall
-        in the background and return cached results; ``session_id`` scopes concurrent sessions."""
+        """Formatted recall context for the upcoming turn ("" if none).
+
+        Normally consumes cached background recall quickly; ``session_id`` scopes concurrent
+        sessions. Current-query synchronous providers opt in through ``prefetch_timeout``.
+        """
         return ""
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:

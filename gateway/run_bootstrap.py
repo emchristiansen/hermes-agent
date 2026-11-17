@@ -896,7 +896,9 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
             # sentinel for this life. After the PID-file claim so a --replace loser can't clobber it.
             # The store scan that report used to run here is deferred: see below.
             from gateway.lifecycle_ledger import record_startup
-            return record_startup()
+            from hermes_startup_watchdog import startup_phase
+            with startup_phase("lifecycle_record_startup"):  # attribution only, no lease
+                return record_startup()
 
         def _start_keepalive() -> None:
             from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
@@ -945,6 +947,12 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
     finally:
         try:
             if runner is not None:
+                if getattr(runner, "_stop_task", None) is None:
+                    # SH-01 STARTUP-01: no stop has taken the stores' retention yet. Take it before this
+                    # cleanup's first await, so a drain that is cancelled or raises (skipping the stop
+                    # below) cannot reach the release with a writer of startup still live.
+                    from gateway.run_shutdown_budget import retain_open_stores
+                    retain_open_stores("startup cleanup has not closed the stores")
                 from gateway.run_runtime import drain_gateway_runtime
                 await drain_gateway_runtime(runner)
                 # Startup may have opened adapters before an exception or an early exit verdict. The

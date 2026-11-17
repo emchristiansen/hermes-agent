@@ -3,6 +3,7 @@ import asyncio
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import sqlite3
 import threading
@@ -55,12 +56,14 @@ class CorrectionModel(BaseHTTPRequestHandler):
 
 
 @contextmanager
-def owner(tmp_path, config=None):
+def owner(tmp_path, config=None, handler=CorrectionModel, site=None):
+    """A real owner daemon; ``site`` (a directory, e.g. holding a test ``sitecustomize.py``) goes first
+    on its and its workers' ``PYTHONPATH``. ``peer.owner_pid`` is the daemon's pid."""
     root = Path(__file__).resolve().parents[2]
     home, user = tmp_path / 'state', tmp_path / 'user'
     home.mkdir(mode=0o700)
     user.mkdir()
-    peer = ThreadingHTTPServer(('127.0.0.1', 0), CorrectionModel)
+    peer = ThreadingHTTPServer(('127.0.0.1', 0), handler)
     peer.requests = []
     peer.blocked, peer.release = threading.Event(), threading.Event()
     thread = threading.Thread(target=peer.serve_forever, daemon=True)
@@ -78,11 +81,12 @@ def owner(tmp_path, config=None):
         **(config or {}),
     }))
     env = child_env()
-    env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=str(root),
+    env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=os.pathsep.join([*([str(site)] if site else []), str(root)]),
         OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url, PYTHONUNBUFFERED='1',
         HERMES_DASHBOARD_SESSION_TOKEN='other-controls-actor')
     try:
-        with daemon(root, home, env, barrier=False) as (_, desc):
+        with daemon(root, home, env, barrier=False) as (proc, desc):
+            peer.owner_pid = proc.pid
             yield home, peer, desc
     finally:
         peer.release.set()
@@ -113,14 +117,19 @@ def test_busy_policy_is_authorized_session_scoped_and_not_inference(tmp_path):
                 config_before = (home / 'config.yaml').read_bytes()
                 result = await rpc(ws, 'config.get', session_id=ids[0], key='busy')
                 assert result.get('result', {}).get('value') == 'steer', result
+                # Every message steers (Eric, 2026-11-04): a client asking for ``queue`` is accepted as the
+                # session-scoped negotiation it is and told ``steer``; it never selects deferred delivery.
                 result = await rpc(ws, 'config.set', session_id=ids[0], key='busy', value='queue')
-                assert result.get('result', {}).get('scope') == 'session', result
+                assert result.get('result') == {'key': 'busy', 'value': 'steer', 'scope': 'session'}, result
                 async with websocket(home, desc) as viewer:
-                    assert (await rpc(viewer, 'config.get', session_id=ids[0], key='busy'))['result']['value'] == 'queue'
+                    assert (await rpc(viewer, 'config.get', session_id=ids[0], key='busy'))['result']['value'] == 'steer'
                 assert (await rpc(ws, 'config.get', session_id=ids[1], key='busy'))['result']['value'] == 'steer'
+                result = await rpc(ws, 'config.set', session_id=ids[0], key='busy', value='interrupt')
+                assert result.get('result') == {'key': 'busy', 'value': 'steer', 'scope': 'session'}, result
                 for method, params, reason in [
                     ('config.get', {'session_id': ids[0], 'key': 'busy', 'profile': 'foreign'}, 'profile_mismatch'),
                     ('config.set', {'key': 'busy', 'value': 'queue'}, 'invalid_params'),
+                    ('config.set', {'session_id': ids[0], 'key': 'busy', 'value': 'later'}, 'invalid_params'),
                     ('config.set', {'session_id': ids[0], 'key': 'model', 'value': 'other'}, 'use_session_mutation_model'),
                     # The Desktop picker's legacy shape: refused with the same actionable code.
                     ('config.set', {'session_id': ids[0], 'key': 'model', 'value': 'other --provider custom --session',
@@ -135,8 +144,8 @@ def test_busy_policy_is_authorized_session_scoped_and_not_inference(tmp_path):
                         result = await rpc(other, method, session_id=ids[0], key='busy', **params)
                         # This configured dashboard token is another verified operator.
                         assert result.get('result') == {
-                            'key': 'busy', 'value': 'queue', 'scope': 'session'}, result
-                assert (await rpc(ws, 'config.get', session_id=ids[0], key='busy'))['result']['value'] == 'queue'
+                            'key': 'busy', 'value': 'steer', 'scope': 'session'}, result
+                assert (await rpc(ws, 'config.get', session_id=ids[0], key='busy'))['result']['value'] == 'steer'
                 assert (await rpc(ws, 'config.get', session_id=ids[1], key='busy'))['result']['value'] == 'steer'
                 # /verbose is the same kind of session-scoped display negotiation.
                 result = await rpc(ws, 'config.set', session_id=ids[0], key='verbose', value='cycle')

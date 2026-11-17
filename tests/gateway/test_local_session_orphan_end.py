@@ -153,6 +153,7 @@ async def test_an_orphan_end_leaves_an_unknown_turn_for_its_user(tmp_path, monke
     admit_session_input(first.db, epoch=first.epoch, principal_id=first.sessions[sid].source.user_id,
                         session_id=sid, request_id='r1', payload={'text': 'mid-turn'})
     row = claim_session_input(first.db, epoch=first.epoch, session_id=sid)
+    first.db.append_message(sid, 'tool', 'done', tool_call_id='c1', tool_name='terminal')  # it ran a tool: a business turn, never run again
     authority, finalized = await _owner(tmp_path, monkeypatch)  # SIGKILL, then the next owner
     assert get_session_admission(authority.db, admission_id=row['admission_id'])['status'] == 'unknown'
 
@@ -442,3 +443,18 @@ async def test_a_watch_match_after_close_and_restart_is_noted_on_the_ended_sessi
         assert authority.db.get_session(target)['end_reason'] == 'cli_close'
     finally:
         authority.db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_hard_killed_turn_that_ran_no_tool_is_queued_again_for_its_user(tmp_path, monkeypatch):
+    """msg-retry contract change (was: ``unknown`` for its user): the lost turn ran no tool, so the next
+    owner delivers the message again instead of leaving it for a Discard."""
+    from hermes_state_runtime import admit_session_input, claim_session_input, get_session_admission
+    _capture_timers(monkeypatch)
+    first, _ = await _owner(tmp_path, monkeypatch)
+    sid = _create(first).session_id
+    admit_session_input(first.db, epoch=first.epoch, principal_id=first.sessions[sid].source.user_id,
+                        session_id=sid, request_id='r1', payload={'text': 'mid-turn'})
+    row = claim_session_input(first.db, epoch=first.epoch, session_id=sid)
+    authority, _finalized = await _owner(tmp_path, monkeypatch)
+    assert get_session_admission(authority.db, admission_id=row['admission_id'])['status'] == 'queued'

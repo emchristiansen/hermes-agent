@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import * as sessionOwnerUtils from '@/app/session/hooks/use-session-actions/utils'
 import { PaneVisibleContext } from '@/components/pane-shell/pane-visibility'
+import { UncertainCorrection } from '@/lib/uncertain-correction'
 import { $clarifyRequests } from '@/store/clarify'
 import {
   clearComposerTerminalSelections,
@@ -203,6 +204,54 @@ describe('useComposerSubmit external request routing', () => {
       $connection.set(null)
       $queuedPromptsBySession.set({})
     }
+  })
+
+  // NC12-CLIENT-01: on the canonical owner an uncertain correction stays a correction. It is never
+  // admitted as an ordinary prompt; its explicit retry is the same correction. Only the owner's
+  // confirmed undelivered refusal (false) re-admits the words as the next prompt.
+  it.each([
+    ['accepted', true],
+    ['refused undelivered', false]
+  ])('keeps an uncertain canonical correction a correction until its retry is %s', async (_case, retried) => {
+    $connection.set({ mode: 'local', wsUrl: 'ws://localhost/api/ws?native_dial=unminted' } as never)
+    $queuedPromptsBySession.set({})
+    $notifications.set([])
+    const h = renderSubmitHook({ busy: true, busyInputMode: 'steer', text: 'keep guidance' })
+    const retry = vi.fn(async () => retried)
+    h.onSteer.mockRejectedValueOnce(new UncertainCorrection(new Error('ACK lost'), retry))
+
+    try {
+      act(() => h.hook.result.current.submitDraft())
+      await waitFor(() => expect($notifications.get()).toHaveLength(1))
+      const [note] = $notifications.get()
+      expect(note).toMatchObject({ kind: 'warning', persistent: true, detail: 'keep guidance' })
+      expect(h.onSubmit).not.toHaveBeenCalled()
+      expect(getQueuedPrompts('stored-session')).toEqual([])
+
+      await act(async () => note!.action!.onClick())
+      expect(retry).toHaveBeenCalledTimes(1)
+      expect(h.onSteer).toHaveBeenCalledTimes(1)
+
+      if (retried) {
+        expect(h.onSubmit).not.toHaveBeenCalled()
+      } else {
+        await waitFor(() => expect(h.onSubmit).toHaveBeenCalledWith('keep guidance', expect.objectContaining({ fromQueue: true, storedSessionId: 'stored-session' })))
+      }
+    } finally { $connection.set(null); $queuedPromptsBySession.set({}); $notifications.set([]) }
+  })
+
+  it('returns a canonical correction failure without a captured retry to the composer, not to a prompt', async () => {
+    $connection.set({ mode: 'local', wsUrl: 'ws://localhost/api/ws?native_dial=unminted' } as never)
+    $queuedPromptsBySession.set({})
+    const h = renderSubmitHook({ busy: true, text: 'keep guidance' })
+    h.onSteer.mockRejectedValueOnce(new Error('request timed out: session.redirect'))
+
+    try {
+      act(() => h.hook.result.current.steerDraft())
+      await waitFor(() => expect(h.loadIntoComposer).toHaveBeenCalledWith('keep guidance', []))
+      expect(h.stashAt).toHaveBeenCalledWith('stored-session', 'keep guidance', [])
+      expect(h.onSubmit).not.toHaveBeenCalled()
+    } finally { $connection.set(null); $queuedPromptsBySession.set({}) }
   })
 
   it.each([true, false])('steers a busy external visible submit and queues only on rejection (%s)', async accepted => {

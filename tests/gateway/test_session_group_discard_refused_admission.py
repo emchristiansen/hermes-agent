@@ -33,9 +33,9 @@ def _member_admits_through_its_authority(gateway, monkeypatch, admission):
             session_authority=object(), session_authorities=SimpleNamespace(active=lambda: None)))
     monkeypatch.setattr(adapter, '_admit_to_live_bot_chat', no_live_owner)
 
-    async def admit_then_unbind(*args):
+    async def admit_then_unbind(*args, **kwargs):
         try:
-            return await admission(*args)
+            return await admission(*args, **kwargs)
         finally:
             monkeypatch.setattr(adapter, 'gateway_runner', None)
     monkeypatch.setattr(api_server_runs, '_admit_run_to_authority', admit_then_unbind)
@@ -52,11 +52,11 @@ async def test_discard_after_a_refused_overlapping_admission_settles_the_turn(
     async def refuse(*_a, **_kw):
         raise RuntimeStoreError('permission_denied')
 
-    async def discard_then_refuse(adapter, launch, run_id, *args):
+    async def discard_then_refuse(adapter, launch, run_id, *args, **kwargs):
         # Retry's POST reserved the key; Discard finds that reservation before admission ends.
         overlapped.append((run_id, await call(gateway.owner, 'groups.discard', **control)))
         monkeypatch.setattr('gateway.session_api_turn.admit_api_turn_async', refuse)
-        return await admit(adapter, launch, run_id, *args)
+        return await admit(adapter, launch, run_id, *args, **kwargs)
 
     _member_admits_through_its_authority(gateway, monkeypatch, discard_then_refuse)
     assert await call(gateway.owner, 'groups.retry', **control) == 'peer_unreachable'
@@ -94,10 +94,10 @@ async def test_disband_after_a_refused_overlapping_admission_finishes(gateway, m
     async def refuse(*_a, **_kw):
         raise RuntimeStoreError('permission_denied')
 
-    async def discard_then_refuse(adapter, launch, run_id, *args):
+    async def discard_then_refuse(adapter, launch, run_id, *args, **kwargs):
         assert await call(gateway.owner, 'groups.discard', **control) == 'session_busy'
         monkeypatch.setattr('gateway.session_api_turn.admit_api_turn_async', refuse)
-        return await admit(adapter, launch, run_id, *args)
+        return await admit(adapter, launch, run_id, *args, **kwargs)
 
     _member_admits_through_its_authority(gateway, monkeypatch, discard_then_refuse)
     assert await call(gateway.owner, 'groups.retry', **control) == 'peer_unreachable'
@@ -119,10 +119,10 @@ async def test_retry_checks_the_saved_run_before_trusting_it(gateway, monkeypatc
         raise RuntimeStoreError('permission_denied')
 
     with monkeypatch.context() as overlap:
-        async def discard_then_refuse(adapter, launch, run_id, *args):
+        async def discard_then_refuse(adapter, launch, run_id, *args, **kwargs):
             assert await call(gateway.owner, 'groups.discard', **control) == 'session_busy'
             overlap.setattr('gateway.session_api_turn.admit_api_turn_async', refuse)
-            return await admit(adapter, launch, run_id, *args)
+            return await admit(adapter, launch, run_id, *args, **kwargs)
 
         _member_admits_through_its_authority(gateway, overlap, discard_then_refuse)
         assert await call(gateway.owner, 'groups.retry', **control) == 'peer_unreachable'

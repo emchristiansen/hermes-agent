@@ -90,7 +90,7 @@ def _job():
             "origin": {"platform": "slack", "chat_id": CHAT}}
 
 
-def test_dropped_attachment_fails_the_queued_cron_delivery(live_relay, tmp_path):
+def test_dropped_attachment_fails_the_queued_cron_delivery(live_relay, tmp_path, monkeypatch):
     connector, adapter, loop = live_relay
     pdf = tmp_path / "q3-report.pdf"
     pdf.write_bytes(b"%PDF-1.4 q3")
@@ -102,8 +102,21 @@ def test_dropped_attachment_fails_the_queued_cron_delivery(live_relay, tmp_path)
     sends = connector.ops("send")
     assert sends and sends[0]["content"].startswith("Q3 numbers are in.")  # the text still went out
     assert connector.ops("send_media") == []
-    assert row["status"] == "failed", row
+    # msg-retry-on-13f-6 (ea298f05): the dropped attachment is retried, never terminal "failed".
+    assert row["status"] == "pending", row
     assert "q3-report.pdf" in row["error"] and "403" in row["error"]
+    assert row["content"].startswith("Q3 numbers are in.") and row["retry_after"], row
+    # msg-retry-on-13f-7 (MR-TEST-11, ea298f05): once the upload is accepted, the retry delivers the report and
+    # its attachment; the duplicate text send is accepted.
+    from cron import delivery_queue
+    connector.media_script = []
+    later = delivery_queue._now_seconds() + delivery_queue.RETRY_BACKOFF_MAX_SECONDS + 1
+    monkeypatch.setattr(delivery_queue, "_now_seconds", lambda: later)
+    row = _drain(_job(), f"Q3 numbers are in.\n\nMEDIA:{pdf}", adapter, loop, "exec-q3-1")
+    assert row["status"] == "delivered", row
+    assert len(connector.ops("send_media")) == 1
+    reports = [op["content"] for op in connector.ops("send") if op["content"].startswith("Q3 numbers are in.")]
+    assert len(reports) == 2  # the first attempt's text and the retry's (duplicate accepted)
 
 
 def test_transient_upload_403_still_delivers_the_report(live_relay, tmp_path):

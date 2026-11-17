@@ -218,6 +218,9 @@ def _import(db, conn, session_id, payload):
             skipped.append(sid)
             continue
         db._import_session_row(conn, raw, item['messages'], sid)
+        if 'imported_from' in raw:  # a foreign transcript (hermes_cli/foreign_sessions.py): its home-guidance boundary
+            from hermes_state_portability import record_foreign_import_meta
+            record_foreign_import_meta(conn, sid, raw['imported_from'])
         if raw.get('parent_session_id'):
             parents.append((sid, raw['parent_session_id']))
         imported.append(sid)
