@@ -2,9 +2,10 @@
 
 - A transfer is ``terminal/steering`` bound to a claim. When its owner restarts before the claim
   settled it, only a transfer whose text its managed child confirmed consumed
-  (``confirm_steer_transfer``) settles ``interrupted``; every other one is queued again in its own
-  FIFO place and runs as its own turn once the lost claim is resolved: a duplicate, never a loss.
-  The lost claim itself is never replayed.
+  (``confirm_steer_transfer``) settles ``interrupted``; every other one is delivered again as its own
+  turn, in FIFO order with the input behind it: a duplicate, never a loss. The unknown lost claim
+  does not hold it back (at least once, no head-of-line blocking: it may already have run by the
+  time the new owner is up, or run once the claim is resolved). The lost claim itself is never replayed.
 - A refused ``prompt.resolve_unknown`` (the claim is still running) leaves the running agent's
   buffered steer and the transfer registration untouched: the running turn still drains it.
 
@@ -42,8 +43,10 @@ def _state(db, admission):
                                       'commit-then-error', 'not-consumed'])
 async def test_a_transfer_the_lost_claim_never_settled_survives_an_owner_restart(tmp_path, monkeypatch, handover):
     """The child's correction transfer, its claim lost and its settlement write failed, then the owner
-    restarts: confirmed consumed and recorded so, it never runs again; otherwise it runs once the lost
-    turn is resolved, before the turn queued behind it. A confirmation whose own write failed is not
+    restarts: confirmed consumed and recorded so, it never runs again; otherwise it runs again as its
+    own turn, before the turn queued behind it, without waiting for the unknown lost turn to be
+    resolved (no head-of-line blocking: by the restart it is either still queued or already
+    delivered, never stranded or settled undelivered). A confirmation whose own write failed is not
     recorded, so it runs again (a duplicate); one that committed before its reply was lost counts.
     The lost turn's own input never runs again."""
     db, authority = _authority(tmp_path, monkeypatch)
@@ -113,7 +116,11 @@ async def test_a_transfer_the_lost_claim_never_settled_survives_an_owner_restart
         fresh = await initialize_session_authority(runner, profile_id='owned', instance_id='fresh-owner', db=db)
         fresh.sessions['s'] = LiveSession(authority.sessions['s'].source, 'route')
         recorded = handover in ('confirmed', 'confirmation-reply-lost')
-        assert _state(db, correction) == (('terminal', 'interrupted') if recorded else ('queued', None))
+        if recorded:
+            assert _state(db, correction) == ('terminal', 'interrupted')
+        else:
+            # Eligible for delivery, never stranded behind the unknown head: queued, or already run.
+            assert _state(db, correction) in (('queued', None), ('terminal', 'completed'))
         assert db._read_one('SELECT 1 FROM state_meta WHERE key=?', (CONFIRMED_STEER_PREFIX + correction_id,)) is None
         await fresh.resolve_unknown(ACTOR, REF, head.admission_id, row['generation'])
         await asyncio.wait_for(fresh.sessions['s'].task, 10)
