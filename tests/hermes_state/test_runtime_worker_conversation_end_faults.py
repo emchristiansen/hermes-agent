@@ -31,7 +31,7 @@ def test_lost_ack_exact_replay_preserves_new_rows(worker):
     seed(db)
     rpc = store.rpc
     def lose_ack(method, **params):
-        result = rpc(method, **params)
+        rpc(method, **params)  # the owner commits; only the acknowledgement is lost
         raise TimeoutError('injected lost ack after commit')
     store.rpc = lose_ack
     with pytest.raises(TimeoutError):
