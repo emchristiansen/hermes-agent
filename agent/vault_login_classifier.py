@@ -273,12 +273,14 @@ def build_inspection_js(nonce: str) -> str:
 
 def build_clear_stamps_js(nonce: str) -> str:
     """Remove the slot stamps of the inspection ``nonce`` (and only those), in the document and open
-    shadow roots. No values are read."""
+    shadow roots, and retire that inspection's node registry. No values are read."""
     return _render_js(_CLEAR_STAMPS_JS_TEMPLATE, nonce=nonce)
 
 
 _CLEAR_STAMPS_JS_TEMPLATE = """(() => {
   const prefix = __NONCE__ + ":";
+  const registry = window["hermesVaultSlots:" + __NONCE__];
+  if (registry) { registry.observer.disconnect(); delete window["hermesVaultSlots:" + __NONCE__]; }
   const roots = [];
   (function walk(root) { roots.push(root); for (const e of root.querySelectorAll("*")) if (e.shadowRoot) walk(e.shadowRoot); })(document);
   let removed = 0;
@@ -298,7 +300,9 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   // would leave its controls ungrouped (formIndex null) and merge split OTP boxes across forms.
   const elements = [];
   const forms = [];
+  const roots = [];
   (function walk(root) {
+    roots.push(root);
     for (const e of root.querySelectorAll("*")) {
       if (e.tagName === "INPUT" || e.tagName === "SELECT") elements.push(e);
       else if (e.tagName === "FORM") forms.push(e);
@@ -306,6 +310,24 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
     }
   })(document);
   elements.forEach((element, index) => element.setAttribute("data-hermes-vault-slot", nonce + ":" + index));
+  // The exact stamped nodes, and which of them have since left the tree: the fill writes only into the
+  // same node, connected throughout (a stamp copied by cloneNode, or a node detached and reinserted,
+  // is not the inspected control). Held in a non-enumerable window property for the fill script of
+  // this inspection, which retires it (as does the stamp cleanup).
+  const nodes = new Map(elements.map((element, index) => [index, element]));
+  const left = new Set();
+  const within = (node, el) => {
+    for (let n = el; n; n = (n instanceof ShadowRoot) ? n.host : n.parentNode) if (n === node) return true;
+    return false;
+  };
+  const note = (records) => records.forEach((r) => r.removedNodes.forEach((node) => nodes.forEach((el, index) => {
+    if (within(node, el)) left.add(index);
+  })));
+  const observer = new MutationObserver(note);
+  roots.forEach((root) => observer.observe(root, { childList: true, subtree: true }));
+  const previous = window["hermesVaultSlots:" + nonce];
+  if (previous) previous.observer.disconnect();
+  Object.defineProperty(window, "hermesVaultSlots:" + nonce, { value: { nodes, left, note, observer }, configurable: true });
   const out = elements.flatMap((element, index) => {
     if (element.disabled || element.readOnly) return [];
     if (["hidden", "submit", "button", "reset", "file", "image", "checkbox", "radio"].includes(element.type)) return [];
@@ -358,7 +380,14 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
     connected, enabled password control on the expected origin) and, with ``require_empty``, its
     emptiness are checked again after it and immediately before the write; a change refuses
     (``target_changed`` / ``field_not_empty``) with nothing written. Every exit, including a refusal or an
-    exception, removes this inspection's stamps (only those). Values are rendered by :func:`_render_js`,
+    exception, removes this inspection's stamps (only those).
+
+    A target must be the very node this inspection stamped and must not have left the tree since (the
+    inspection registers its nodes and a MutationObserver): a stamped node detached and reinserted, or a
+    clone carrying the stamp, refuses with ``target_changed`` before and after focus. A
+    ``current-password`` write must leave the field holding exactly the stored value (an input strips
+    CR/LF, a page may rewrite it); otherwise what was written is cleared and the script refuses with
+    ``value_mismatch``. Neither refusal is ever reported as filled. Values are rendered by :func:`_render_js`,
     so they reach the page unchanged whatever they contain.
     """
     return _render_js(
@@ -379,6 +408,13 @@ _FILL_JS_TEMPLATE = """(() => {
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
   const current = (el) => String((el.tagName !== "SELECT" && setter && setter.get) ? setter.get.call(el) : (el.value || ""));
   const slotOf = (f) => find('[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]')[0];
+  const registry = window["hermesVaultSlots:" + nonce];
+  // The stamped node is the very node this inspection stamped, and it never left the tree since.
+  const original = (f, el) => {
+    if (!registry) return false;
+    registry.note(registry.observer.takeRecords());
+    return registry.nodes.get(f.index) === el && !registry.left.has(f.index) && el.isConnected;
+  };
   try {
     if (window.location.origin !== expectedOrigin) {
       return JSON.stringify({ refused: "origin_changed", found: window.location.origin });
@@ -394,6 +430,7 @@ _FILL_JS_TEMPLATE = """(() => {
     for (const f of fills) {
       const el = slotOf(f);
       if (!el || (f.token === "current-password" && el.type !== "password")) continue;
+      if (!original(f, el)) return JSON.stringify({ refused: "target_changed" });
       try {
         if (el.tagName === "SELECT") {
           const want = norm(f.value);
@@ -404,11 +441,11 @@ _FILL_JS_TEMPLATE = """(() => {
         el.focus();
         // Focus listeners have just run page code synchronously: re-establish the target and, with
         // requireEmpty, its emptiness; nothing runs between these checks and the write.
-        const still = el.isConnected && window.location.origin === expectedOrigin && !el.disabled && !el.readOnly
+        const still = el.isConnected && original(f, el) && window.location.origin === expectedOrigin && !el.disabled && !el.readOnly
           && el.getAttribute("data-hermes-vault-slot") === nonce + ":" + f.index
           && !(f.token === "current-password" && el.type !== "password");
         if (!still) {
-          if (requireEmpty) return JSON.stringify({ refused: "target_changed" });
+          if (requireEmpty || !original(f, el)) return JSON.stringify({ refused: "target_changed" });
           continue;
         }
         if (requireEmpty && current(el).length > 0) return JSON.stringify({ refused: "field_not_empty" });
@@ -417,11 +454,20 @@ _FILL_JS_TEMPLATE = """(() => {
         // composed: a component listening on its shadow host must see the value change too.
         el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" }));
         el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+        // A password must land exactly: an input that strips CR/LF (or a page that rewrites the value)
+        // leaves something else, which is cleared and refused rather than reported as filled.
+        if (f.token === "current-password" && current(el) !== f.value) {
+          if (setter && setter.set) { setter.set.call(el, ""); } else { el.value = ""; }
+          el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "deleteContent" }));
+          el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+          return JSON.stringify({ refused: "value_mismatch" });
+        }
         if (current(el).length > 0) filled += 1;
       } catch (e) { /* skip */ }
     }
     return JSON.stringify({ filled });
   } finally {
+    if (registry) { registry.observer.disconnect(); delete window["hermesVaultSlots:" + nonce]; }
     find("[data-hermes-vault-slot]").forEach((n) => {
       if (String(n.getAttribute("data-hermes-vault-slot")).startsWith(nonce + ":")) n.removeAttribute("data-hermes-vault-slot");
     });

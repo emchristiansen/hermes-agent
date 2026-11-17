@@ -705,10 +705,15 @@ def _inspect_fill_targets(task_id: str, nonce: str, meta: Any, require_empty: bo
     return classified, None
 
 
-# What the fill script reports when it wrote nothing because the page changed under it.
+# What the fill script reports when the page changed under it (nothing written) or did not keep the exact
+# value (what was written was cleared).
 _IN_PAGE_REFUSALS = {
     "field_not_empty": "Refused: the field gained a value before the fill ran. Nothing was written.",
-    "target_changed": "Refused: the password field changed before the fill ran. Nothing was written.",
+    "target_changed": ("Refused: the password field changed, or was removed, reinserted or replaced, before "
+                       "the fill ran. Nothing was written."),
+    "value_mismatch": ("Refused: the password field did not keep the exact stored value (the field or the page "
+                       "changed it, e.g. a line break a single-line input drops). What was written was cleared; "
+                       "nothing is filled."),
 }
 
 
