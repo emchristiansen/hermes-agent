@@ -167,7 +167,8 @@ def test_profile_whose_default_is_an_alias_takes_the_alias_route(two_profiles):
     assert (route.creds["model"], route.creds["base_url"]) == ("qwen3-27b", "http://127.0.0.1:8099/v1")
 
 
-def test_named_custom_profile_child_leases_its_own_account_on_a_shared_url(two_profiles):
+@pytest.mark.parametrize("pin", [None, "coder-sol"])
+def test_named_custom_profile_child_leases_its_own_account_on_a_shared_url(two_profiles, pin):
     from tools.delegate_tool_routes import _route_to_task_route
 
     _, coder = two_profiles
@@ -182,7 +183,8 @@ def test_named_custom_profile_child_leases_its_own_account_on_a_shared_url(two_p
         "claude-ai": [entry("a", "pool-key-a")], "open-ai": [entry("b", "pool-key-b")]}}), encoding="utf-8")
 
     parent = _parent()
-    child, _ = _build(_route_to_task_route({"profile": "coder"}, parent, {}), parent)
+    child, built = _build(_route_to_task_route({"profile": "coder", "model": pin}, parent, {}), parent)
+    assert built["model"] == (pin or "coder-model")
     assert [e.access_token for e in child._credential_pool.entries()] == ["pool-key-b"]
 
 
@@ -502,6 +504,103 @@ def test_routed_childs_session_grant_stays_in_its_profile_and_ends_with_the_sess
     approval.clear_session(session_key)
     with delegated_profile_scope(coder):
         assert not approval.is_approved(session_key, pattern_key)
+
+
+def test_profile_model_pin_uses_profile_credentials_reasoning_and_fallback(two_profiles):
+    from tools.delegate_tool_routes import resolve_task_routes
+
+    launch, coder = two_profiles
+    own_fallback = [{"provider": "custom", "model": "coder-backup", "base_url": "https://backup.invalid/v1"}]
+    _set_config(coder, fallback_providers=own_fallback,
+                agent={"reasoning_effort": "low", "reasoning_overrides": {"coder-sol": False}})
+    parent = _parent()
+    parent.fallback_providers = [{"provider": "openrouter", "model": "parent-backup"}]
+    (route,), error = resolve_task_routes([{"goal": "use selected child model"}],
+                                         {"profile": "coder", "model": "coder-sol"}, parent)
+    assert error is None and route.error is None
+    assert route.profile_home == coder
+    assert route.creds["model"] == "coder-sol"
+    assert (route.creds["provider"], route.creds["base_url"], route.creds["api_key"]) == (
+        "custom", "https://coder.invalid/v1", "coder-key")
+    assert route.routing_cfg == {"fallback_providers": own_fallback}
+    _, built = _build(route, parent)
+    assert built["model"] == "coder-sol" and built["reasoning_config"] == {"enabled": False}
+    assert _snapshot() == {"home": str(launch), "secret": "launch-secret", "model": "launch-model"}
+    assert yaml.safe_load((coder / "config.yaml").read_text())["model"]["default"] == "coder-model"
+
+
+@pytest.mark.parametrize("pin", [17, False, [], {}, " ", " coder-sol", "coder sol", "custom:coder-sol", "custom/coder-sol"])
+def test_profile_model_pin_refuses_malformed_or_qualified_values(two_profiles, pin):
+    from tools.delegate_tool_routes import resolve_task_routes
+
+    (route,), error = resolve_task_routes([{"goal": "must not launch"}], {"profile": "coder", "model": pin}, _parent())
+    assert error is None and route.error and route.creds == {}
+
+
+@pytest.mark.parametrize("field,value", [
+    ("provider", "openrouter"), ("base_url", "https://other.invalid/v1"), ("api_key", "other-key"),
+    ("api_mode", "responses"), ("request_overrides", {"headers": {"X-Other": "value"}}),
+    ("reasoning_effort", "high"), ("service_tier", "fast"),
+    ("fallback_providers", [{"provider": "openrouter", "model": "parent-backup"}]),
+])
+def test_profile_model_pin_refuses_other_route_overrides(two_profiles, field, value):
+    from tools.delegate_tool_routes import resolve_task_routes
+
+    requested = {"profile": "coder", "model": "coder-sol", field: value}
+    # service_tier is a backend-only field: the default config backend intentionally drops it.
+    with patch.object(_ProfileProvider, "route_task", return_value=requested), \
+            patch("tools.delegate_tool_routes._active_provider", return_value=_ProfileProvider()):
+        (route,), error = resolve_task_routes([{"goal": "must not launch"}], {}, _parent())
+    assert error is None and route.error and route.creds == {}
+
+
+def test_profile_model_pin_refuses_alias_without_resolving_its_credentials(two_profiles):
+    from tools.delegate_tool_routes import resolve_task_routes
+
+    _, coder = two_profiles
+    _set_config(coder, model_aliases={"sol": {"model": "coder-sol", "base_url": "https://other.invalid/v1"}})
+    with patch("hermes_cli.model_switch.direct_alias_runtime_request", side_effect=AssertionError("alias resolved")):
+        (route,), error = resolve_task_routes([{"goal": "must not launch"}],
+                                             {"profile": "coder", "model": "sol"}, _parent())
+    assert error is None and route.error and route.creds == {}
+
+
+@pytest.mark.parametrize("provider", [None, "", "auto"])
+def test_profile_model_pin_never_reinfers_an_automatic_provider(two_profiles, provider):
+    from tools.delegate_tool_routes import resolve_task_routes
+
+    _, coder = two_profiles
+    _set_config(coder, model={"default": "coder-model", "provider": provider})
+    (route,), error = resolve_task_routes([{"goal": "must not launch"}],
+                                         {"profile": "coder", "model": "coder-sol"}, _parent())
+    assert error is None and route.creds == {} and "explicit profile-owned provider" in route.error
+
+
+def test_profile_model_pin_preserves_empty_fallback_and_provider_failure_refusal(two_profiles):
+    from tools.delegate_tool_routes import resolve_task_routes
+
+    config = {"profile": "coder", "model": "coder-sol", "fallback_providers": []}
+    parent = _parent()
+    parent.fallback_providers = [{"provider": "openrouter", "model": "parent-backup"}]
+    (route,), error = resolve_task_routes([{"goal": "selected model"}], config, parent)
+    assert error is None and route.error is None and route.routing_cfg == {"fallback_providers": []}
+    with patch("hermes_cli.runtime_provider.resolve_runtime_provider", side_effect=RuntimeError("provider unavailable")):
+        (refused,), error = resolve_task_routes([{"goal": "must not launch"}], config, parent)
+    assert error is None and refused.creds == {} and "no usable model provider" in refused.error
+
+
+def test_profile_model_pin_preserves_worker_snapshot_refusal(two_profiles, monkeypatch):
+    import os
+    from agent import safe_worker_policy
+    from tools.delegate_tool_routes import resolve_task_routes
+
+    launch, _ = two_profiles
+    frozen = yaml.safe_load((launch / "config.yaml").read_text())
+    monkeypatch.setattr(safe_worker_policy, "_policy", safe_worker_policy._SafeWorkerPolicy(
+        os.getpid(), False, False, json.dumps(frozen)))
+    (route,), error = resolve_task_routes([{"goal": "must not launch"}],
+                                         {"profile": "coder", "model": "coder-sol"}, _parent())
+    assert error is None and route.creds == {} and "managed worker" in route.error
 
 
 def test_child_routed_back_to_the_launch_profile_uses_the_launch_profiles_container(two_profiles):

@@ -74,6 +74,8 @@ class LoginControl:
     name: str
     type: str
     max_length: Optional[int] = None
+    # Whether the control already holds a value (a boolean from the page; the value itself is never read).
+    has_value: bool = False
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> LoginControl:
@@ -87,6 +89,7 @@ class LoginControl:
             name=str(raw.get("name") or ""),
             type=str(raw.get("type") or ""),
             max_length=int(max_length) if max_length is not None else None,
+            has_value=bool(raw.get("hasValue", raw.get("has_value", False))),
         )
 
 
@@ -153,6 +156,15 @@ def classify_otp_controls(controls: list[LoginControl]) -> list[ClassifiedLoginC
     return out
 
 
+def best_password_control(classified: list[ClassifiedLoginControl]) -> Optional[ClassifiedLoginControl]:
+    """The ``current-password`` control a login fill targets: an actual ``type=password`` input (the fill
+    script writes a password nowhere else, so an ``autocomplete=current-password`` text box is never a
+    target), highest score, ties broken by DOM order. Inspection already drops disabled, read-only and
+    invisible controls."""
+    passwords = [c for c in classified if c.token == "current-password" and c.control.type == "password"]
+    return min(passwords, key=lambda c: (-c.score, c.control.index)) if passwords else None
+
+
 def select_password_fill(
     classified: list[ClassifiedLoginControl],
     password: str,
@@ -165,10 +177,9 @@ def select_password_fill(
     order) and returns ``[{"index": int, "token": "current-password",
     "value": password}]`` or ``[]`` when no password field exists.
     """
-    passwords = [c for c in classified if c.token == "current-password"]
-    if not passwords or not password:
+    best_password = best_password_control(classified)
+    if best_password is None or not password:
         return []
-    best_password = min(passwords, key=lambda c: (-c.score, c.control.index))
     return [
         {
             "index": best_password.control.index,
@@ -240,8 +251,42 @@ def build_otp_fills(otp_controls: list[ClassifiedLoginControl], code: str) -> li
     return [{"index": best.control.index, "token": "one-time-code", "value": code}]
 
 
+_PLACEHOLDER = re.compile(r"__([A-Z][A-Z_]*)__")
+
+
+def _render_js(template: str, **values: Any) -> str:
+    """Substitute each ``__NAME__`` placeholder with ``values[name]`` as a JSON literal, in ONE pass over
+    the template: substituted data is never scanned again, so a value that itself contains a placeholder
+    (a password such as ``x__NONCE__y``) reaches the page byte for byte. ``json.dumps`` escapes quotes,
+    backslashes and every non-ASCII character (including U+2028/U+2029), so each literal is a valid JS
+    expression. A placeholder without a value, or a value without a placeholder, is a template defect."""
+    names = set(_PLACEHOLDER.findall(template))
+    if names != {k.upper() for k in values}:
+        raise ValueError(f"JS template placeholders {sorted(names)} do not match values {sorted(values)}")
+    literals = {k.upper(): json.dumps(v) for k, v in values.items()}
+    return _PLACEHOLDER.sub(lambda m: literals[m.group(1)], template)
+
+
 def build_inspection_js(nonce: str) -> str:
-    return _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE.replace("__NONCE__", json.dumps(nonce))
+    return _render_js(_LOGIN_CONTROL_INSPECTION_JS_TEMPLATE, nonce=nonce)
+
+
+def build_clear_stamps_js(nonce: str) -> str:
+    """Remove the slot stamps of the inspection ``nonce`` (and only those), in the document and open
+    shadow roots. No values are read."""
+    return _render_js(_CLEAR_STAMPS_JS_TEMPLATE, nonce=nonce)
+
+
+_CLEAR_STAMPS_JS_TEMPLATE = """(() => {
+  const prefix = __NONCE__ + ":";
+  const roots = [];
+  (function walk(root) { roots.push(root); for (const e of root.querySelectorAll("*")) if (e.shadowRoot) walk(e.shadowRoot); })(document);
+  let removed = 0;
+  roots.forEach((r) => r.querySelectorAll("[data-hermes-vault-slot]").forEach((n) => {
+    if (String(n.getAttribute("data-hermes-vault-slot")).startsWith(prefix)) { n.removeAttribute("data-hermes-vault-slot"); removed += 1; }
+  }));
+  return removed;
+})()"""
 
 
 _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
@@ -286,13 +331,15 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
       ].join(" "),
       name: [element.name, element.id].join(" "),
       type: element.tagName === "SELECT" ? "select" : (element.type || ""),
+      hasValue: String(element.value || "").length > 0,
     }];
   });
   return JSON.stringify(out);
 })()"""
 
 
-def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str = "") -> str:
+def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str = "", *,
+                  require_empty: bool = False) -> str:
     """Build a JS expression that fills the selected controls and reports only a count. The
     returned expression never echoes the values back.
 
@@ -300,54 +347,94 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
     evaluated script, immediately before any write. If the page navigated between inspection and fill
     (TOCTOU), the script writes nothing and returns ``{"refused": "origin_changed", "found": <actual>}``:
     proof scope equals mutation scope (#88706). Targets resolve by the ``<nonce>:<index>`` stamp of
-    THIS inspection; a ``current-password`` fill additionally requires ``type=password``; ``<select>``
-    controls (country, state, expiry month) match an option by value or visible text. No marker is
-    left on filled controls so later model-driven DOM reads cannot address them deterministically.
+    THIS inspection, in the document or any open shadow root; a ``current-password`` fill additionally
+    requires ``type=password``; ``<select>`` controls (country, state, expiry month) match an option by
+    value or visible text. No marker is left on filled controls so later model-driven DOM reads cannot
+    address them deterministically.
+
+    With ``require_empty`` a target control that already holds a value makes the script write nothing and
+    return ``{"refused": "field_not_empty"}``, checked in the same evaluation before any write.
+    ``el.focus()`` runs the page's focus listeners synchronously, so the target (still this inspection's
+    connected, enabled password control on the expected origin) and, with ``require_empty``, its
+    emptiness are checked again after it and immediately before the write; a change refuses
+    (``target_changed`` / ``field_not_empty``) with nothing written. Every exit, including a refusal or an
+    exception, removes this inspection's stamps (only those). Values are rendered by :func:`_render_js`,
+    so they reach the page unchanged whatever they contain.
     """
-    payload = json.dumps(
-        [{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"]} for f in fills]
+    return _render_js(
+        _FILL_JS_TEMPLATE,
+        expected_origin=expected_origin,
+        fills=[{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"]} for f in fills],
+        nonce=nonce,
+        require_empty=bool(require_empty),
     )
-    return (_FILL_JS_TEMPLATE.replace("__EXPECTED_ORIGIN__", json.dumps(expected_origin))
-            .replace("__FILLS__", payload).replace("__NONCE__", json.dumps(nonce)))
 
 
 _FILL_JS_TEMPLATE = """(() => {
   const expectedOrigin = __EXPECTED_ORIGIN__;
-  if (window.location.origin !== expectedOrigin) {
-    return JSON.stringify({ refused: "origin_changed", found: window.location.origin });
-  }
   const fills = __FILLS__;
   const nonce = __NONCE__;
-  // Stamped controls may live inside a shadow root (see the inspection script's walk): collect the
-  // document and every open shadow root once, then look each stamp up in those roots.
-  const roots = [];
-  (function walk(root) {
-    roots.push(root);
-    for (const e of root.querySelectorAll("*")) if (e.shadowRoot) walk(e.shadowRoot);
-  })(document);
-  const find = (selector) => roots.flatMap((r) => Array.from(r.querySelectorAll(selector)));
-  let filled = 0;
-  const norm = (t) => String(t || "").trim().toLowerCase();
-  for (const f of fills) {
-    const el = find('[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]')[0];
-    if (!el || (f.token === "current-password" && el.type !== "password")) continue;
-    try {
-      if (el.tagName === "SELECT") {
-        const want = norm(f.value);
-        const opt = Array.from(el.options).find((o) => [o.value, o.textContent].some((t) => norm(t) === want || norm(t) === want.replace(/^0/, "")));
-        if (opt) { el.value = opt.value; el.dispatchEvent(new Event("change", { bubbles: true, composed: true })); filled += 1; }
-        continue;
-      }
-      el.focus();
-      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
-      // one-time-code split into single-character boxes: f.value is the slice for THIS box (see build_otp_fills)
-      if (setter && setter.set) { setter.set.call(el, f.value); } else { el.value = f.value; }
-      // composed: a component listening on its shadow host must see the value change too.
-      el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" }));
-      el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-      if (el.value.length > 0) filled += 1;
-    } catch (e) { /* skip */ }
+  const requireEmpty = __REQUIRE_EMPTY__;
+  // The native accessors, so a value is read and written without page-defined element properties.
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+  const current = (el) => String((el.tagName !== "SELECT" && setter && setter.get) ? setter.get.call(el) : (el.value || ""));
+  const slotOf = (f) => find('[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]')[0];
+  try {
+    if (window.location.origin !== expectedOrigin) {
+      return JSON.stringify({ refused: "origin_changed", found: window.location.origin });
+    }
+    if (requireEmpty && fills.some((f) => {
+      const el = slotOf(f);
+      return el && current(el).length > 0;
+    })) {
+      return JSON.stringify({ refused: "field_not_empty" });
+    }
+    let filled = 0;
+    const norm = (t) => String(t || "").trim().toLowerCase();
+    for (const f of fills) {
+      const el = slotOf(f);
+      if (!el || (f.token === "current-password" && el.type !== "password")) continue;
+      try {
+        if (el.tagName === "SELECT") {
+          const want = norm(f.value);
+          const opt = Array.from(el.options).find((o) => [o.value, o.textContent].some((t) => norm(t) === want || norm(t) === want.replace(/^0/, "")));
+          if (opt) { el.value = opt.value; el.dispatchEvent(new Event("change", { bubbles: true, composed: true })); filled += 1; }
+          continue;
+        }
+        el.focus();
+        // Focus listeners have just run page code synchronously: re-establish the target and, with
+        // requireEmpty, its emptiness; nothing runs between these checks and the write.
+        const still = el.isConnected && window.location.origin === expectedOrigin && !el.disabled && !el.readOnly
+          && el.getAttribute("data-hermes-vault-slot") === nonce + ":" + f.index
+          && !(f.token === "current-password" && el.type !== "password");
+        if (!still) {
+          if (requireEmpty) return JSON.stringify({ refused: "target_changed" });
+          continue;
+        }
+        if (requireEmpty && current(el).length > 0) return JSON.stringify({ refused: "field_not_empty" });
+        // one-time-code split into single-character boxes: f.value is the slice for THIS box (see build_otp_fills)
+        if (setter && setter.set) { setter.set.call(el, f.value); } else { el.value = f.value; }
+        // composed: a component listening on its shadow host must see the value change too.
+        el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" }));
+        el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+        if (current(el).length > 0) filled += 1;
+      } catch (e) { /* skip */ }
+    }
+    return JSON.stringify({ filled });
+  } finally {
+    find("[data-hermes-vault-slot]").forEach((n) => {
+      if (String(n.getAttribute("data-hermes-vault-slot")).startsWith(nonce + ":")) n.removeAttribute("data-hermes-vault-slot");
+    });
   }
-  find("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
-  return JSON.stringify({ filled });
+  // Declared last (hoisted) so the origin check precedes every DOM lookup. Stamped controls may live
+  // inside a shadow root (see the inspection script's walk): look in the document and every open
+  // shadow root, walked afresh on each call since focus listeners may have changed the tree.
+  function find(selector) {
+    const roots = [];
+    (function walk(root) {
+      roots.push(root);
+      for (const e of root.querySelectorAll("*")) if (e.shadowRoot) walk(e.shadowRoot);
+    })(document);
+    return roots.flatMap((r) => Array.from(r.querySelectorAll(selector)));
+  }
 })()"""

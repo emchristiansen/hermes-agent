@@ -206,7 +206,8 @@ class TestClassifier:
     def test_select_password_fill_picks_best_password(self):
         user = ClassifiedLoginControl(_ctrl(index=0, form_index=0, autocomplete="username"), 100, "username")
         pw_heur = ClassifiedLoginControl(_ctrl(index=1, form_index=0, type="password"), 90, "current-password")
-        pw_exact = ClassifiedLoginControl(_ctrl(index=3, form_index=0, autocomplete="current-password"), 100, "current-password")
+        pw_exact = ClassifiedLoginControl(_ctrl(index=3, form_index=0, autocomplete="current-password", type="password"),
+                                          100, "current-password")
         fills = select_password_fill([user, pw_heur, pw_exact], "p")
         # Password only — the identifier field is never filled by the vault.
         assert [(f["index"], f["token"]) for f in fills] == [(3, "current-password")]

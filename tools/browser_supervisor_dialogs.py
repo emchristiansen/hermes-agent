@@ -156,7 +156,10 @@ class DialogSupervisionMixin:
         """Install the dialog-bridge init script + Fetch interceptor on a session. Idempotent at
         the CDP level (Chromium de-dupes identical add-script calls; Fetch.enable replaces prior
         patterns); the final Runtime.evaluate injects into the already-loaded document so
-        existing pages pick up the override on reconnect."""
+        existing pages pick up the override on reconnect. A supervisor with ``dialog_bridge=False``
+        installs nothing."""
+        if not getattr(self, "dialog_bridge", True):
+            return
         sid = (session_id or "")[:16]
         steps = (
             ("Page.addScriptToEvaluateOnNewDocument", {"source": _DIALOG_BRIDGE_SCRIPT, "runImmediately": True},
@@ -172,6 +175,8 @@ class DialogSupervisionMixin:
     # ── Capture ──────────────────────────────────────────────────────────────
 
     async def _on_dialog_opening(self, params: dict[str, Any], session_id: Optional[str]) -> None:
+        if not getattr(self, "dialog_bridge", True):
+            return  # no automatic dialog choice: a native dialog stays with whoever is at the browser
         self._admit_dialog(
             type=str(params.get("type") or ""), message=str(params.get("message") or ""),
             default_prompt=str(params.get("defaultPrompt") or ""), session_id=session_id, frame_id=params.get("frameId"),
