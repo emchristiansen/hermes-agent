@@ -410,7 +410,8 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
     ``current-password`` write must leave the field holding exactly the stored value (an input strips
     CR/LF, a page may rewrite it); otherwise what was written is cleared and the script refuses with
     ``value_mismatch``. The clearing's own input/change notifications run page code synchronously, so the
-    refusal carries ``cleared``: whether the field is empty after them (a page may put a value back).
+    refusal carries ``intact`` (the original node is still connected and never left the tree) and ``cleared``
+    (``intact`` and the field is empty after them; a page may put a value back or replace the field).
     Neither refusal is ever reported as filled. Values are rendered by :func:`_render_js`, so they reach the
     page unchanged whatever they contain.
     """
@@ -484,9 +485,11 @@ _FILL_JS_TEMPLATE = """(() => {
           if (setter && setter.set) { setter.set.call(el, ""); } else { el.value = ""; }
           el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "deleteContent" }));
           el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-          // Those notifications ran page code synchronously: the field counts as cleared only if it is
-          // empty after them.
-          return JSON.stringify({ refused: "value_mismatch", cleared: current(el).length === 0 });
+          // Those notifications ran page code synchronously: the field counts as cleared only if it is still
+          // the original node, connected and never removed since inspection (not detached, reinserted or
+          // replaced), and empty after them. ``intact`` says whether the original is still that field.
+          const intact = original(f, el);
+          return JSON.stringify({ refused: "value_mismatch", intact, cleared: intact && current(el).length === 0 });
         }
         if (current(el).length > 0) filled += 1;
       } catch (e) { /* skip */ }

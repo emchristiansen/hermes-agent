@@ -715,17 +715,18 @@ _IN_PAGE_REFUSALS = {
                        "changed it, e.g. a line break a single-line input drops). What was written was cleared; "
                        "nothing is filled."),
 }
-# A value_mismatch whose clearing the page's own input/change handlers undid ("cleared": false), or whose final
-# state the fill script did not report: the field is not claimed to be empty.
+# A value_mismatch the fill script did not report as cleared: the page's own input/change handlers put a value
+# back into the original field ("intact": true), or removed, moved or replaced the original, or the state was
+# not reported (either way the field the page now shows is not claimed to be empty).
 _MISMATCH = ("Refused: the password field did not keep the exact stored value (the field or the page changed it, "
              "e.g. a line break a single-line input drops). ")
 _VALUE_MISMATCH_NOT_CLEARED = {
     False: _MISMATCH + ("The fill emptied the field, but the page's own input/change handlers then put a value "
                         "back: the field is not empty, and what it holds is not established. It is not filled; "
                         "do not submit this form."),
-    None: _MISMATCH + ("The fill emptied the field, but its state after the page's own input/change handlers "
-                       "was not reported: that the field is empty is not established. It is not filled; do not "
-                       "submit this form."),
+    None: _MISMATCH + ("The fill emptied the field, but the page's own input/change handlers then removed, "
+                       "moved or replaced it, or its state was not reported: that the password field on the page "
+                       "is empty is not established. It is not filled; do not submit this form."),
 }
 
 
@@ -748,10 +749,11 @@ def _fill_outcome(parsed: Any, backend: Any, meta: Any, page_origin: str, fills:
             }
         )
     if refused == "value_mismatch":
-        cleared = parsed.get("cleared")
-        error = (_IN_PAGE_REFUSALS[refused] if cleared is True
-                 else _VALUE_MISMATCH_NOT_CLEARED[False if cleared is False else None])
-        return json.dumps({"success": False, "error_type": refused, "field_cleared": cleared is True, "error": error})
+        cleared = parsed.get("cleared") is True and parsed.get("intact") is True
+        refilled = parsed.get("cleared") is False and parsed.get("intact") is True
+        error = (_IN_PAGE_REFUSALS[refused] if cleared
+                 else _VALUE_MISMATCH_NOT_CLEARED[False if refilled else None])
+        return json.dumps({"success": False, "error_type": refused, "field_cleared": cleared, "error": error})
     if refused in _IN_PAGE_REFUSALS:
         return json.dumps({"success": False, "error_type": refused, "error": _IN_PAGE_REFUSALS[refused]})
     filled = parsed.get("filled", 0) if isinstance(parsed, dict) else 0

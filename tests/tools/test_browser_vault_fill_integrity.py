@@ -207,8 +207,8 @@ _FAKE_PW = {"autocomplete": "current-password", "formIndex": 0, "index": 0, "nam
         ([_EMAIL, _PW], {"refused": "field_not_empty"}, "field_not_empty", True),  # value appeared in the page
         ([_EMAIL, _PW], {"refused": "target_changed"}, "target_changed", True),
         ([_EMAIL, _PW], {"refused": "origin_changed", "found": "https://other.example"}, "origin_changed", True),
-        ([_EMAIL, _PW], {"refused": "value_mismatch", "cleared": True}, "value_mismatch", True),
-        ([_EMAIL, _PW], {"refused": "value_mismatch", "cleared": False}, "value_mismatch", True),
+        ([_EMAIL, _PW], {"refused": "value_mismatch", "intact": True, "cleared": True}, "value_mismatch", True),
+        ([_EMAIL, _PW], {"refused": "value_mismatch", "intact": True, "cleared": False}, "value_mismatch", True),
         ([_EMAIL, _PW], {"filled": 0}, None, True),
         ([_EMAIL, _PW], {"filled": 1}, None, True),
     ],
@@ -233,8 +233,11 @@ def test_every_exit_after_inspection_removes_its_stamps(item, controls, fill_res
 
 @pytest.mark.parametrize(
     "fill_result, field_cleared",
-    [({"refused": "value_mismatch", "cleared": True}, True),
-     ({"refused": "value_mismatch", "cleared": False}, False),
+    [({"refused": "value_mismatch", "intact": True, "cleared": True}, True),
+     ({"refused": "value_mismatch", "intact": True, "cleared": False}, False),  # the page refilled the field
+     ({"refused": "value_mismatch", "intact": False, "cleared": False}, False),  # original removed or replaced
+     ({"refused": "value_mismatch", "intact": False, "cleared": True}, False),  # inconsistent: never trusted
+     ({"refused": "value_mismatch", "cleared": True}, False),  # no intact report: not established
      ({"refused": "value_mismatch"}, False)],  # no report of the final state: not established
 )
 def test_a_mismatch_says_nothing_is_filled_only_when_the_page_reported_the_field_empty(item, fill_result,
@@ -247,7 +250,8 @@ def test_a_mismatch_says_nothing_is_filled_only_when_the_page_reported_the_field
     assert ("nothing is filled" in out["error"]) is field_cleared
     if not field_cleared:
         assert "not established" in out["error"]
-        assert ("the field is not empty" in out["error"]) is (fill_result.get("cleared") is False)
+        refilled = fill_result.get("cleared") is False and fill_result.get("intact") is True
+        assert ("the field is not empty" in out["error"]) is refilled
     assert _PASSWORD not in json.dumps(out)
 
 
@@ -657,3 +661,42 @@ def test_mismatch_from_an_insertion_listener_is_cleared_and_says_so(browser, sto
     assert out["field_cleared"] is True and "nothing is filled" in out["error"]
     assert _mismatch_state(browser) == {"slots": 0, "email": "human@example.invalid", "pw": "",
                                         "submits": 0, "registries": 0}
+
+
+# ── a rollback that invalidates the original field never claims that nothing is filled (review23329) ──────
+
+_REPLACE_ON_ROLLBACK_CHANGE = ("window.old=document.getElementById('p');window.events=[];old.addEventListener('change',"
+                               "function(){events.push(this.value);if(this.value===''){const replacement=this.cloneNode(true);"
+                               "replacement.value=%s;this.replaceWith(replacement)}})")
+
+
+@_integration
+def test_rollback_change_replaces_original_with_nonempty_clone(browser, store, capsys):
+    """review23329's repro: the rollback's change listener replaces the emptied original with a clone that
+    holds a value. The original is empty but no longer the field, so emptiness is not established."""
+    _evaluate(browser.page, _REPLACE_ON_ROLLBACK_CHANGE % "'REVIEW-REPLACEMENT'")
+    code, out, _ = _cli_fill(browser, store, "before\nafter", capsys)
+    state = _state(browser)
+    observed = {"result": out, "state": state, "original": _evaluate(browser.page, "old.value"),
+                "events": json.loads(_evaluate(browser.page, "JSON.stringify(events)"))}
+    assert code == 1 and out["error_type"] == "value_mismatch" and "next" not in out, out
+    assert state["submits"] == 0 and state["slots"] == 0, state
+    assert not (out["field_cleared"] and state["pw"] != ""), observed
+    assert not ("nothing is filled" in out["error"] and state["pw"] != ""), observed
+    assert out["field_cleared"] is False and "not established" in out["error"], observed
+    assert state["pw"] == "REVIEW-REPLACEMENT" and observed["original"] == "", observed
+
+
+@_integration
+def test_rollback_change_replacing_original_with_an_empty_clone_is_still_not_established(browser, store, capsys):
+    """The replacement is empty too, but the original was detached during the rollback: what the page now
+    shows is not the field the fill cleared, so emptiness is still not established."""
+    _evaluate(browser.page, _REPLACE_ON_ROLLBACK_CHANGE % "''")
+    code, out, _ = _cli_fill(browser, store, "before\nafter", capsys)
+    state = _state(browser)
+    assert code == 1 and out["error_type"] == "value_mismatch" and "next" not in out, out
+    assert out["field_cleared"] is False and "nothing is filled" not in out["error"], out
+    assert "not established" in out["error"], out
+    assert _evaluate(browser.page, "old.isConnected") is False
+    assert state == {"slots": 0, "email": "human@example.invalid", "pw": "", "submits": 0}
+    assert _evaluate(browser.page, f"{_REGISTRIES}.length") == 0
