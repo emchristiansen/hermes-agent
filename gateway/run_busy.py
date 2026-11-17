@@ -943,12 +943,14 @@ class GatewayBusySessionMixin:
         # Gateway wakes have no external user identity. Admit them before auth/drain/approval
         # handling, without merging their text into an already queued human message.
         if event.internal and event.allow_gateway_control:
+            # Every message steers (Eric, 2026-11-04), even past an earlier event still waiting in
+            # the pending slot: order never blocks a send (IL465010, GW-ORDER-01).
+            if self._hm_steer_delivered(event, session_key):
+                event._gateway_accepted = True
+                return True
             adapter = self._delivery_adapter_for(event.source)
             if adapter and session_key in getattr(adapter, "_pending_messages", {}):
                 self._queue_or_replace_pending_event(session_key, event)
-                return True
-            if self._hm_steer_delivered(event, session_key):  # every message steers (Eric, 2026-11-04)
-                event._gateway_accepted = True
                 return True
             return False  # base adapter queues silently behind the active turn
 

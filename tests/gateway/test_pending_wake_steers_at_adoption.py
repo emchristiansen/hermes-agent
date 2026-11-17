@@ -3,12 +3,12 @@ agent (Eric, 2026-11-04: "I want literally every message to always be a steering
 
 A wake that reaches a busy session goes to the runner's busy branch (``_hm_handle_running_session_message``):
 it steers into the running agent at once, but while the turn is still building its agent it waits in the
-adapter's pending slot, and every later wake waits behind it to keep arrival order, so all of them ran
-as their own turns after the running one. Now the turn's agent adoption (``_run_agent_track_agent``)
-hands the waiting wakes to it in arrival order, exactly as on arrival, and later wakes again steer on
-arrival. The first waiting event the turn does not take keeps its place with everything behind it: a
-plugin's payload, a command or user text. A draining gateway, or a retiring owner of the routed profile
-(reviewer WAKE-01), steers nothing.
+adapter's pending slot (and its overflow). The turn's agent adoption (``_run_agent_track_agent``) hands
+every waiting wake to it in arrival order, exactly as on arrival, and later wakes again steer on arrival.
+A waiting event the turn does not take (a plugin's payload, a command or user text) keeps its own place
+and provenance, and never holds a later wake back: order never blocks a send (IL465010, review
+t_42a8d5e2 GW-ORDER-01). A draining gateway, or a retiring owner of the routed profile (reviewer
+WAKE-01), steers nothing.
 
 Real GatewayRunner, DiscordAdapter, SessionAuthority, admission ledger and drain over SQLite; the wakes
 are the loop-tick fallback's own events (``_synthetic_prompt_event``) through ``adapter.handle_message``;
@@ -107,10 +107,10 @@ async def test_wakes_waiting_for_the_agent_steer_into_it_at_adoption_and_later_o
 
 
 @pytest.mark.asyncio
-async def test_a_plugin_payload_waiting_first_keeps_its_place_and_the_wake_behind_it(monkeypatch):
-    """A plugin's untrusted payload (the standalone injection's event) is never taken from the slot; the
-    wake that arrived after it stays behind it: the payload runs as its own turn after A, and the wake
-    still waits behind it, as before."""
+async def test_a_plugin_payload_waiting_first_keeps_its_place_and_the_wake_behind_it_still_steers(monkeypatch):
+    """GW-ORDER-01: a plugin's untrusted payload (the standalone injection's event) is never taken from
+    the slot, but it does not hold back the wake that arrived after it: that wake steers into A at
+    adoption as Hermes automation, and the payload, with its own provenance, runs as its own turn after A."""
     from gateway.platforms.event import MessageEvent, MessageType
     payload, wake = 'plugin payload', '[Kanban task completed] t_3 ready'
 
@@ -118,10 +118,29 @@ async def test_a_plugin_payload_waiting_first_keeps_its_place_and_the_wake_behin
         return MessageEvent(text=payload, message_type=MessageType.TEXT, source=source, internal=True,
                             allow_gateway_control=False,
                             metadata={'hermes_plugin_id': 'fixture', 'hermes_plugin_injection': True})
-    executed, taken, waiting = await _late_adoption(monkeypatch, [plugin, wake])
+    executed, [content], waiting = await _late_adoption(monkeypatch, [plugin, wake])
 
-    assert taken == [None], 'nothing reached the running turn'
-    assert executed == ['A', payload] and waiting == [wake], 'arrival order kept'
+    assert content is not None and wake in content and AUTOMATION_MARKER in content and USER_MARKER not in content
+    assert payload not in content, 'the plugin payload is never steered'
+    assert executed == ['A', payload] and waiting == [], 'the payload keeps its own turn; the wake is not stranded'
+
+
+@pytest.mark.asyncio
+async def test_a_wake_arriving_after_adoption_steers_past_a_waiting_plugin_payload(monkeypatch):
+    """GW-ORDER-01 on arrival: the plugin payload still waits in the slot when a later wake arrives after
+    A adopted its agent; the wake steers into A at once instead of queueing behind the payload."""
+    from gateway.platforms.event import MessageEvent, MessageType
+    payload, wake = 'plugin payload', '[Kanban task completed] t_5 ready'
+
+    def plugin(source):
+        return MessageEvent(text=payload, message_type=MessageType.TEXT, source=source, internal=True,
+                            allow_gateway_control=False,
+                            metadata={'hermes_plugin_id': 'fixture', 'hermes_plugin_injection': True})
+    executed, [content], waiting = await _late_adoption(monkeypatch, [plugin], [wake])
+
+    assert content is not None and wake in content and AUTOMATION_MARKER in content
+    assert payload not in content
+    assert executed == ['A', payload] and waiting == []
 
 
 @pytest.mark.asyncio
