@@ -20,7 +20,8 @@ from typing import Any, Iterator, Mapping, Optional
 from agent.delegation_provider import (
     RESERVED_TASK_PARAMETERS, ROUTE_KEYS, DelegationProvider, DelegationRouteError,
 )
-from tools.delegate_tool_config import _resolve_delegation_credentials
+from tools.delegate_tool_config import ResolvedReasoning, _resolve_delegation_credentials
+from tools.delegate_tool_inherit import inherited_route
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
 
@@ -203,7 +204,7 @@ def _profile_route(home: Path) -> TaskRoute:
     from hermes_cli.config import load_config_readonly
     from hermes_cli.runtime_provider import resolve_runtime_provider
     from hermes_constants import resolve_reasoning_config
-    from tools.delegate_tool_config import ResolvedReasoning, _credential_bundle, _require_pinned_command
+    from tools.delegate_tool_config import _credential_bundle, _require_pinned_command
     _refuse_under_worker_snapshot(home)
     with delegated_profile_scope(home):
         cfg = load_config_readonly() or {}
@@ -336,8 +337,14 @@ def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, An
             route = _route_one(provider, declared, i, task, config)
             _check_backend_effort(i, route, config)
             request = {name: task[name] for name in declared if task.get(name) is not None}
-            routes.append(replace(_route_to_task_route(route, parent_agent, cache, config, provider.name),
-                                  request=request))
+            inherited = inherited_route(route, config, parent_agent, provider.name)
+            if inherited is None:
+                resolved = _route_to_task_route(route, parent_agent, cache, config, provider.name)
+            else:
+                child_route, reasoning = inherited
+                resolved = replace(_route_to_task_route(child_route, parent_agent, cache, config, provider.name),
+                                   reasoning_effort=ResolvedReasoning(reasoning))
+            routes.append(replace(resolved, request=request))
         except ValueError as exc:  # DelegationRouteError, the credential resolver's and the tier check's refusals
             routes.append(TaskRoute({}, {}, backend=provider.name, error=str(exc)))
     return routes, None
