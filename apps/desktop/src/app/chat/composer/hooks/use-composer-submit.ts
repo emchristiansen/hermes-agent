@@ -274,9 +274,10 @@ export function useComposerSubmit({
 
             unsent()
           } else {
-            // Kept durably with the destination its first send pinned, so a renderer restart offers it
-            // again (to that destination only) rather than losing it (UI-02). Until then this page's own
-            // retry closure sends it, with the same id and generation, and settles through this composer.
+            // Kept durably with its destination (the pinned session, profile and generation, or, when no
+            // preparation pinned it, the session it was captured for), so a renderer restart offers it
+            // again, to that destination only, rather than losing it (UI-02). Until then this page's own
+            // retry closure sends it, with the same id, and settles through this composer.
             const durable = err.correction ? keepUnresolvedCorrection(err.correction, displayText) : undefined
 
             notify({

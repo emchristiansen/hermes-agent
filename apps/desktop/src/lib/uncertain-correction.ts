@@ -25,6 +25,8 @@ export interface UnresolvedCorrectionIdentity {
   id: string
   mode: 'interrupt' | 'steer'
   text: string
+  /** The session its first send was captured for: its destination when no preparation pinned one. */
+  sessionId: string
 }
 
 /**

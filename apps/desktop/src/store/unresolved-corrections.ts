@@ -1,8 +1,10 @@
 import { correctionPin } from '@/api/canonical-protocol'
 import { translateNow } from '@/i18n'
 import type { UnresolvedCorrectionIdentity } from '@/lib/uncertain-correction'
-import { requestGatewayForProfile } from '@/store/gateway'
+import { activeGatewayRoute, requestGatewayForProfile } from '@/store/gateway'
 import { notify } from '@/store/notifications'
+import { profileScopeForSessionOwner } from '@/store/session-request-router'
+import { knownOwnerForSession } from '@/store/session-states'
 
 // A correction whose outcome is unknown (its reply lost, or a failure after the owner may have taken it)
 // stays a correction the user can send again to the destination it was captured for (NC12-CLIENT-01).
@@ -11,7 +13,10 @@ import { notify } from '@/store/notifications'
 // id, with the exact destination its first preparation pinned: owner session, profile and execution
 // generation. A restarted renderer offers each again with a Send again that presents that same id and
 // generation to that same session, through that profile's gateway; the owner refuses or keeps it for
-// that execution, never a newer one. It is never re-sent on its own, never becomes an ordinary prompt
+// that execution, never a newer one. A correction that failed before any preparation pinned it (a
+// readiness wait that timed out) is kept too, with the session it was captured for and that session's
+// owner profile; its Send again prepares a fresh pin for that session (Eric's at-least-once directive:
+// an undelivered message is never silently discarded). It is never re-sent on its own, never becomes an ordinary prompt
 // (a prompt would carry no card binding, NC13-CLIENT-02), and never goes to whichever session the
 // composer shows now. Other sends are not held behind it: it is only an offer. An entry leaves when its
 // outcome is known (accepted, or refused undelivered) or the user discards it; there is no expiry, since
@@ -23,7 +28,9 @@ export interface UnresolvedCorrection extends UnresolvedCorrectionIdentity {
   displayText: string
   sessionId: string
   profile: string
-  generation: number
+  /** The pinned execution generation; null when no preparation pinned one (its first send never got
+   * that far): a Send again then pins the session's current generation, for this session only. */
+  generation: number | null
   /** When it was first kept (ms): the order restored notices appear in. */
   at: number
 }
@@ -43,7 +50,7 @@ function read(storageKey: string): UnresolvedCorrection | undefined {
       typeof entry.displayText === 'string' &&
       typeof entry.sessionId === 'string' &&
       typeof entry.profile === 'string' &&
-      typeof entry.generation === 'number' &&
+      (typeof entry.generation === 'number' || entry.generation === null) &&
       typeof entry.at === 'number'
       ? entry
       : undefined
@@ -52,29 +59,37 @@ function read(storageKey: string): UnresolvedCorrection | undefined {
   }
 }
 
+/** The profile that owns a session (its exact owner route when known, else the active route's). */
+function ownerProfile(sessionId: string): string {
+  const scope = profileScopeForSessionOwner(knownOwnerForSession(sessionId))
+
+  return (typeof scope === 'string' ? scope : scope?.profile) || activeGatewayRoute().profile
+}
+
 /**
- * Keep an unresolved correction durably. Only a correction whose destination is pinned (its first
- * preparation reached the canonical protocol) can be: without a pin there is no generation to present,
- * and a restored send must never take the latest one. Returns the kept entry (the existing one when
- * already kept), or undefined when it cannot be kept.
+ * Keep an unresolved correction durably. A pinned one (its first preparation reached the canonical
+ * protocol) keeps the pinned session, profile and generation; an unpinned one keeps the session it was
+ * captured for and that session's owner profile, with no generation. A pin made by a later attempt
+ * replaces an unpinned record. Returns the kept entry, or undefined when storage refuses it (the
+ * in-memory notice then still holds it, as before).
  */
 export function keepUnresolvedCorrection(
   correction: UnresolvedCorrectionIdentity,
   displayText: string
 ): UnresolvedCorrection | undefined {
   const existing = read(key(correction.id))
+  const pin = correctionPin(correction.id)
 
-  if (existing) {
+  if (existing && (existing.generation !== null || !pin)) {
     return existing
   }
 
-  const pin = correctionPin(correction.id)
-
-  if (!pin) {
-    return undefined
+  const entry: UnresolvedCorrection = {
+    ...correction,
+    displayText,
+    ...(pin ?? { sessionId: correction.sessionId, profile: ownerProfile(correction.sessionId), generation: null }),
+    at: existing?.at ?? Date.now()
   }
-
-  const entry: UnresolvedCorrection = { ...correction, displayText, ...pin, at: Date.now() }
 
   try {
     window.localStorage.setItem(key(correction.id), JSON.stringify(entry))
@@ -116,8 +131,8 @@ export function unresolvedCorrections(): UnresolvedCorrection[] {
 }
 
 /**
- * Send a kept correction again, as the same correction (its id and pinned generation) to the session
- * it was captured for. Resolves true when the owner took or kept it, false when the owner confirms it
+ * Send a kept correction again, as the same correction (its id, and its pinned generation when it has
+ * one) to the session it was captured for. Resolves true when the owner took or kept it, false when the owner confirms it
  * undelivered; any other reply is still uncertain and rejects.
  */
 export async function resendUnresolvedCorrection(
@@ -131,7 +146,7 @@ export async function resendUnresolvedCorrection(
       session_id: entry.sessionId,
       text: entry.text,
       correction_id: entry.id,
-      execution_generation: entry.generation
+      ...(entry.generation === null ? {} : { execution_generation: entry.generation })
     })
   } catch (err) {
     // The owner's typed refusal of a correction no agent saw (the run it named has ended).
