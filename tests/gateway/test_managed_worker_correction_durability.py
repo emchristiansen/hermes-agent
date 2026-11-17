@@ -196,9 +196,10 @@ def test_a_failed_final_flush_settles_failed_and_confirms_no_correction(tmp_path
                 assert (row['status'], row['outcome']) == ('terminal', 'interrupted'), row
             else:
                 assert (row['status'], row['outcome']) == ('terminal', 'failed'), row
+                from hermes_state_terminal import RESULT_PREFIX
                 with sqlite3.connect(f'file:{home / "state.db"}?mode=ro', uri=True) as db:
-                    stored = db.execute("SELECT value FROM state_meta WHERE key LIKE ? ",
-                                        ('%' + row['admission_id'],)).fetchone()
+                    stored = db.execute("SELECT value FROM state_meta WHERE key=?",
+                                        (RESULT_PREFIX + row['admission_id'],)).fetchone()
                 assert stored and 'session_persistence_failed' in stored[0], stored
             assert receipt['outcome'] == row['outcome'], receipt
             # The steer reached the model inside the turn (its follow-up), but the turn's persistence
