@@ -24,7 +24,7 @@ def homes(tmp_path, monkeypatch):
     alias = tmp_path / "alias"
     alias.symlink_to(other, target_is_directory=True)
     monkeypatch.setattr(hermes_constants, "get_routing_process_hermes_home", lambda: launch)
-    monkeypatch.setattr(managed_scope, "load_managed_env", lambda: {})
+    monkeypatch.setattr(managed_scope, "load_managed_env", dict)
     monkeypatch.setattr(managed_scope, "get_managed_dir", lambda: None)
     monkeypatch.setattr(env_loader, "get_secret_source_values", lambda home: {})
     monkeypatch.setattr(config_loader, "bridged_allow_all_users", lambda: None)
