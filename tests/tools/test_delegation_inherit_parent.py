@@ -150,6 +150,15 @@ def test_explicit_child_selection_keeps_its_route(homes, field, value):
     assert inherited_route(route, {**route, **INHERIT}, parent, "default") is None
 
 
+def test_explicit_profile_model_pin_still_resolves_on_the_profile(homes):
+    parent = _parent("astra-model", "low")
+    (route,) = _resolve({"profile": "worker", "model": "pinned-model", **INHERIT}, parent)
+    assert route.profile_home is not None
+    built = _build(route, parent)
+    assert (built["model"], built["base_url"], built["api_key"], built["reasoning_config"]) == (
+        "pinned-model", "https://worker.invalid/v1", "worker-key", {"enabled": True, "effort": "high"})
+
+
 def test_another_profile_keeps_its_own_route(homes):
     _, _, other = homes
     parent = _parent("astra-model", "low")
