@@ -1021,7 +1021,7 @@ class _PersonAtTheBrowser:
 
         def run():
             if self.wait_open(30):
-                _time.sleep(delay)  # health: a person reading the dialog
+                _time.sleep(delay)  # health: allow HX013 -- how long a person keeps the dialog open is the behaviour under test (within vs past the page-clock budget)
                 self.close_dialog()
 
         thread = threading.Thread(target=run, daemon=True)
