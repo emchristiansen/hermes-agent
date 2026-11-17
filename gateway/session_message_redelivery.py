@@ -95,7 +95,7 @@ def _unresolved_execution(conn, row) -> bool:
     it, and the delegated children of each. Claim scope that cannot be read is unresolved, never
     "no worker". A worker row reaches ``terminal`` only by its own ``execution.finish``, its owner's
     loss fence or retirement: this never writes it."""
-    from hermes_state_runtime_workers import descendant_range
+    from hermes_state_runtime_workers import ChildOwnership, child_ownership, descendant_range
     keys = row.keys()
     try:
         lineage = json.loads(row['lineage_json']) if 'lineage_json' in keys else None
@@ -118,9 +118,11 @@ def _unresolved_execution(conn, row) -> bool:
     roots = [*roots, *((key, status) for key, status, _generation in admission_worker_rows(conn, row['admission_id']))]
     if any(status != 'terminal' for _execution_id, status in roots):
         return True
-    return any(conn.execute("SELECT 1 FROM worker_executions WHERE execution_id>=? AND execution_id<? "
-                            "AND status IS NOT 'terminal' LIMIT 1", descendant_range(execution_id)).fetchone()
-               for execution_id, _status in roots)
+    return any(child_ownership(conn, child[0], execution_id) is not ChildOwnership.FOREIGN
+               for execution_id, _status in roots
+               for child in conn.execute("SELECT execution_id FROM worker_executions WHERE execution_id>=? "
+                                         "AND execution_id<? AND status IS NOT 'terminal'",
+                                         descendant_range(execution_id)).fetchall())
 
 
 def redeliverable(conn, row) -> bool:

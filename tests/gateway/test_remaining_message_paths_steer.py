@@ -415,14 +415,17 @@ async def test_a_legacy_wake_during_a_drain_is_never_steered(monkeypatch, guarde
         finally:
             handled.set()
     monkeypatch.setattr(runner, '_hm_handle_running_session_message', observe)
-    await deliver_wake(adapter, text='wake-during-drain', source=source)
-    if not guarded:
-        await asyncio.wait_for(handled.wait(), 10)
-    content = _boundary(agent)
-    finish.set()
-    if not guarded:
-        runner._session_state(key).turn.agent = None
-    assert content is None
+    from gateway.wake import WakeNotAccepted
+    try:
+        with pytest.raises(WakeNotAccepted) as refused:
+            await deliver_wake(adapter, text='wake-during-drain', source=source)
+        assert refused.value.reason == 'runtime_draining'
+        assert not handled.is_set()  # refused before either legacy busy path can run
+        assert _boundary(agent) is None
+    finally:
+        finish.set()
+        if not guarded:
+            runner._session_state(key).turn.agent = None
 
 
 @pytest.mark.asyncio

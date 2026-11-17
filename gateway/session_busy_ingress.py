@@ -19,6 +19,7 @@ turn's own result. A messaging user's own text steers through the messaging busy
 import asyncio
 import logging
 
+from gateway.run_notifications_offload import owned_offload
 from gateway.session_contract import SessionRef
 from hermes_state_runtime import RuntimeStoreError, list_session_admissions
 
@@ -79,7 +80,8 @@ async def _pass(authority, ref, live):
             agent = None if generation is None else _receiving_agent(authority, ref.session_id, generation)
         if agent is None or ref.session_id in getattr(authority, '_managed_workers', {}):
             return  # idle (the drain runs them), no agent yet (adoption runs this again), or a managed worker
-        rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=ref.session_id)
+        # Claim completion or pass cancellation cannot relinquish a physical DB read.
+        rows = await owned_offload(authority.runner, list_session_admissions, authority.db, session_id=ref.session_id)
         # A mark goes only on evidence about its own row (claimed by the drain, or handed to a transfer):
         # this read may predate an admission whose mark was recorded while it was in flight.
         live.adoption_steers -= {row['admission_id'] for row in rows if row['status'] != 'queued'}
