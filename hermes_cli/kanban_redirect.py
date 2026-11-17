@@ -24,9 +24,15 @@ def _print(payload) -> None:
     print(json.dumps(payload, sort_keys=True))
 
 
+#: The owner reasons that say a correction may or may not have been applied. Every other owner refusal
+#: (``unknown_method``, ``invalid_timeout``, authorization, stale, validation, ...) is definitive and the text
+#: was not retained. A transport timeout or lost connection is not an owner reason: it is a plain
+#: ``GatewayClientError`` and is exit 4 (unreachable).
+AMBIGUOUS_REASONS = frozenset({"correction_outcome_unknown"})
+
+
 def _ambiguous(reason: str) -> bool:
-    """An owner answer that says the correction may or may not have been applied."""
-    return reason == "correction_outcome_unknown" or "unknown" in reason or "timeout" in reason
+    return reason in AMBIGUOUS_REASONS
 
 
 async def _send(task_id: str, board: str, run_id: int, verb: str, text: str) -> tuple[int, dict]:

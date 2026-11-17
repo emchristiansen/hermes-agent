@@ -120,11 +120,31 @@ async def test_real_owner_verdict_timeout_is_ambiguous_exit_4(monkeypatch):
     assert payload['session_id'] == 'the-original-session' and payload['execution_generation'] == 7
 
 
-@pytest.mark.parametrize('reason', ['correction_outcome_unknown', 'correction_timeout', 'outcome_unknown'])
-def test_ambiguous_owner_answers_are_exit_4(monkeypatch, reason):
-    _wire(monkeypatch, error=gc.GatewayRPCError(reason))
+def test_unanswered_outcome_is_ambiguous_exit_4(monkeypatch):
+    _wire(monkeypatch, error=gc.GatewayRPCError('correction_outcome_unknown'))
     code, payload = asyncio.run(_send('card', 'default', 12, 'steer', 'A'))
-    assert code == 4 and payload['status'] == 'ambiguous' and payload['reason'] == reason
+    assert code == 4 and payload['status'] == 'ambiguous' and payload['reason'] == 'correction_outcome_unknown'
+    assert payload['note'] == 'ambiguous; text retained; resend allowed'
+
+
+@pytest.mark.parametrize('error', [gc.GatewayRPCError('unknown_method', -32601),
+                                   gc.GatewayRPCError('request_failed', -32601, {'reason': 'unknown_method'}),
+                                   gc.GatewayRPCError('invalid_timeout'),
+                                   gc.GatewayRPCError('correction_timeout'),
+                                   gc.GatewayRPCError('outcome_unknown')])
+def test_definitive_refusals_that_merely_resemble_ambiguity_are_exit_3_and_not_retained(monkeypatch, error):
+    _wire(monkeypatch, error=error)
+    code, payload = asyncio.run(_send('card', 'default', 12, 'redirect', 'A'))
+    assert code == 3 and payload['status'] == 'refused' and 'note' not in payload, (code, payload)
+    assert payload['reason'] == str(error)
+
+
+@pytest.mark.parametrize('message', ['Gateway did not answer session.redirect within 30 s',
+                                     'Gateway disconnected; turn outcome is unknown.'])
+def test_transport_timeout_and_connection_loss_are_exit_4(monkeypatch, message):
+    _wire(monkeypatch, error=gc.GatewayClientError(message))
+    code, payload = asyncio.run(_send('card', 'default', 12, 'redirect', 'A'))
+    assert code == 4 and payload['status'] == 'unreachable', (code, payload)
 
 
 @pytest.mark.parametrize('reason', ['permission_denied', 'stale_kanban_claim', 'stale_execution_generation',
