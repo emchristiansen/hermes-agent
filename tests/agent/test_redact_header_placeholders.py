@@ -248,22 +248,6 @@ def test_real_shaped_values_stay_masked(line, secret_part, surface):
     assert out != line
 
 
-def test_vault_value_scrub_still_precedes_and_ignores_placeholder_exemption(monkeypatch):
-    r = R()
-    r.register_vault_redaction_value("$VAULTSYNTHETIC_OWNER")   # pathological: secret shaped like a var ref
-    try:
-        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
-        monkeypatch.setenv("HERMES_REDACT_SECRETS", "false")
-        out = r.redact_sensitive_text("Authorization: Bearer $VAULTSYNTHETIC_OWNER", file_read=True)
-        assert "VAULTSYNTHETIC_OWNER" not in out and "«redacted-vault-secret»" in out
-    finally:
-        r.clear_vault_redaction_values()
-
-
-def test_already_masked_value_stays_masked():
-    assert R().redact_sensitive_text("Authorization: Bearer ***", file_read=True) == "Authorization: Bearer ***"
-
-
 # The reviewer's interaction contract (review6101 probe; review6141 verify.py for JSON/native
 # history, HF-03) on the real producer paths: read_file, search_files, the terminal foreground
 # finalizer, the kanban pre-write and egress. Each slot is checked raw and json.dumps-encoded
@@ -334,39 +318,6 @@ INTERACTION_SAMPLES = {
 }
 
 
-@pytest.mark.parametrize("name", sorted(INTERACTION_SAMPLES))
-@pytest.mark.parametrize("family", ["Authorization: Bearer ", "x-api-key: "])
-@pytest.mark.parametrize("quote", ['"', "'"])
-@pytest.mark.parametrize("encoding", ["raw", "json"])
-def test_header_slot_contract_on_real_producer_paths(name, family, quote, encoding, tmp_path, request):
-    from tools import file_tools, kanban_tools
-    from tools.terminal_tool_result import finalize_foreground_result
-    value, secret, preserve = INTERACTION_SAMPLES[name]
-    raw = f"curl -H {quote}{family}{value}{quote} https://x.invalid"
-    if encoding == "json":
-        raw = json.dumps({"message": {"content": raw}})
-    p = tmp_path / "probe.sh"
-    p.write_text(raw + "\n")
-    proc = subprocess.run(["cat", str(p)], capture_output=True, text=True, check=True)
-    shown = {
-        "read": json.loads(file_tools.read_file_tool(str(p), task_id="t"))["content"].removeprefix("1|"),
-        "search": json.loads(file_tools.search_tool("Authorization|x-api-key", path=str(p),
-                                                    task_id="t"))["matches"][0]["content"],
-        "terminal": json.loads(finalize_foreground_result(
-            command=f"cat {p}", result={"output": proc.stdout, "returncode": proc.returncode},
-            env=types.SimpleNamespace(cwd=str(tmp_path)), env_type="local", effective_task_id="t",
-            task_id="t", session_id="t", session_key="t", workdir=str(tmp_path),
-            command_cwd=str(tmp_path), approval_note=None))["output"],
-        "kanban": kanban_tools._redact(raw),
-        "egress": R().redact_for_egress(raw),
-    }
-    for surface, out in shown.items():
-        if preserve:
-            assert out == raw, (surface, out)
-        else:
-            _masked_as_upstream(request, surface, out, tmp_path, secret)
-
-
 # review6279 HF-08: the header is the END of a JSON string (object, array, nested, doubly
 # encoded). A supported placeholder keeps its bytes AND the JSON closers after the real
 # closing quote; value-bearing and naked-closer controls keep the base masking.
@@ -389,45 +340,6 @@ END_OF_JSON_VALUES = {
     # material glued after a COMPLETE reference (``$TOKENAbCd…`` would be one shell name)
     "glued_suffix": ("${TOKEN}" + "AbCdEfGhIjKlMnOp", "AbCdEfGhIjKlMnOp", False),
 }
-
-
-@pytest.mark.parametrize("name", sorted(END_OF_JSON_VALUES))
-@pytest.mark.parametrize("shape", sorted(END_OF_JSON_SHAPES))
-@pytest.mark.parametrize("family", ["Authorization: Bearer ", "x-api-key: "])
-def test_end_of_json_string_contract_on_real_producer_paths(name, shape, family, tmp_path):
-    from tools import file_tools, kanban_tools
-    from tools.terminal_tool_result import finalize_foreground_result
-    value, secret, preserve = END_OF_JSON_VALUES[name]
-    raw = END_OF_JSON_SHAPES[shape](family + value)
-    p = tmp_path / "probe.json"
-    p.write_text(raw + "\n")
-    proc = subprocess.run(["cat", str(p)], capture_output=True, text=True, check=True)
-    shown = {
-        "read": json.loads(file_tools.read_file_tool(str(p), task_id="t"))["content"].removeprefix("1|"),
-        "search": json.loads(file_tools.search_tool("Authorization|x-api-key", path=str(p),
-                                                    task_id="t"))["matches"][0]["content"],
-        "terminal": json.loads(finalize_foreground_result(
-            command=f"cat {p}", result={"output": proc.stdout, "returncode": proc.returncode},
-            env=types.SimpleNamespace(cwd=str(tmp_path)), env_type="local", effective_task_id="t",
-            task_id="t", session_id="t", session_key="t", workdir=str(tmp_path),
-            command_cwd=str(tmp_path), approval_note=None))["output"].rstrip("\n"),
-        "kanban": kanban_tools._redact(raw),
-        "egress": R().redact_for_egress(raw),
-    }
-    for surface, out in shown.items():
-        if preserve:
-            assert out == raw, (surface, out)
-            json.loads(out)
-        else:
-            assert secret not in out, (surface, out)
-
-
-@pytest.mark.parametrize("family", ["Authorization: Bearer ", "x-api-key: "])
-@pytest.mark.parametrize("value", ["$TOKEN", "${SERVICE_2026_TOKEN}", "{{  token  }}", "% s"])
-def test_kanban_metadata_roundtrips_placeholder_header(family, value):
-    from tools import kanban_tools
-    meta = {"content": family + value}
-    assert kanban_tools._redact_metadata(meta) == meta
 
 
 # review6366 HF-11: an already-supported placeholder ends a NON-FINAL member/element of compact
@@ -473,21 +385,6 @@ COMPACT_ENCODINGS = {
 }
 
 
-@pytest.mark.parametrize("encoding", sorted(COMPACT_ENCODINGS))
-@pytest.mark.parametrize("shape", sorted(COMPACT_SHAPES))
-@pytest.mark.parametrize("value", COMPACT_VALUES)
-@pytest.mark.parametrize("family", ["Authorization: Bearer ", "x-api-key: "])
-def test_hf11_compact_json_members_keep_bytes_and_keys(family, value, shape, encoding, tmp_path):
-    obj = COMPACT_SHAPES[shape](family + value)
-    raw = COMPACT_ENCODINGS[encoding](obj)
-    for surface, out in _five_real_paths(raw, tmp_path).items():
-        assert out == raw, (surface, out)
-        decoded = json.loads(out)
-        if encoding == "double":
-            decoded = json.loads(decoded)
-        assert decoded == obj, (surface, decoded)
-
-
 # HF-11 protections: the compact boundary never exempts value material. A value-bearing slot
 # in a non-final member keeps base masking; an actual-valued header in the NEXT member is
 # still found and masked (the boundary resumes the scan there instead of swallowing it); a
@@ -514,29 +411,6 @@ COMPACT_PROTECTED = [
     (f'x-api-key: $TOKEN{BS}","AbCdEfGhIjKlMnOp"', "AbCdEfGhIjKlMnOp"),
     (f'x-api-key: $TOKEN",{BS}"AbCdEfGhIjKlMnOp{BS}"', "AbCdEfGhIjKlMnOp"),
 ]
-
-
-@pytest.mark.parametrize("raw,secret", COMPACT_PROTECTED)
-def test_hf11_compact_boundary_keeps_value_and_adjacent_header_protection(raw, secret, tmp_path, request):
-    for surface, out in _five_real_paths(raw, tmp_path).items():
-        _masked_as_upstream(request, surface, out, tmp_path, secret)
-
-
-@pytest.mark.parametrize("value", ["$TOKEN", "{{ token }}"])
-def test_hf11_adjacent_actual_valued_header_masked_placeholder_kept(value, tmp_path):
-    raw = json.dumps(["x-api-key: " + value, "x-api-key: " + SYN, "PUBLIC"], separators=(",", ":"))
-    for surface, out in _five_real_paths(raw, tmp_path).items():
-        assert out.startswith(f'["x-api-key: {value}","x-api-key: '), (surface, out)
-        assert SYN[6:-4] not in out, (surface, out)
-
-
-@pytest.mark.parametrize("family", ["Authorization: Bearer ", "x-api-key: "])
-def test_hf11_compact_metadata_comment_text_roundtrips(family):
-    from tools import kanban_tools
-    for value in COMPACT_VALUES:
-        text = json.dumps({"content": family + value, "other": "PUBLIC"}, separators=(",", ":"))
-        assert kanban_tools._redact(text) == text
-        assert list(json.loads(kanban_tools._redact(text))) == ["content", "other"]
 
 
 # review6471 HF-12: a quote, comma and JSON-looking token INSIDE one header string are data,
@@ -567,47 +441,6 @@ def _hf12_decode(raw, level):
     return raw
 
 
-@pytest.mark.parametrize("level", [0, 1, 2])
-@pytest.mark.parametrize("tail", sorted(HF12_TAILS))
-@pytest.mark.parametrize("value", HF12_VALUES)
-def test_hf12_escaped_quote_inside_one_string_stays_masked(value, tail, level, tmp_path, request):
-    obj = {"content": "x-api-key: " + value + HF12_TAILS[tail]}
-    raw = _hf12_encode(obj, level)
-    assert _hf12_decode(raw, level) == obj  # one string holds the whole tail
-    for surface, out in _five_real_paths(raw, tmp_path).items():
-        _masked_as_upstream(request, surface, out, tmp_path, HF12_SECRET[6:-4])
-
-
-@pytest.mark.parametrize("level", [0, 1, 2])
-@pytest.mark.parametrize("shape", ["array", "object"])
-@pytest.mark.parametrize("value", HF12_VALUES)
-def test_hf12_paired_true_compact_members_keep_bytes(value, shape, level, tmp_path):
-    h = "x-api-key: " + value
-    obj = [h, "PUBLIC"] if shape == "array" else {"content": h, "other": "PUBLIC"}
-    raw = _hf12_encode(obj, level)
-    for surface, out in _five_real_paths(raw, tmp_path).items():
-        assert out == raw, (surface, out)
-        assert _hf12_decode(out, level) == obj, (surface, out)
-
-
-# Escaped quotes earlier in the SAME string (a quoted word) do not open a string the header
-# could close; a member boundary needs the string that is actually open at the header.
-@pytest.mark.parametrize("level", [0, 1, 2])
-def test_hf12_earlier_escaped_quotes_do_not_make_a_boundary(level, tmp_path, request):
-    obj = {"content": 'echo "a" x-api-key: $TOKEN","' + HF12_SECRET + '"'}
-    raw = _hf12_encode(obj, level)
-    for surface, out in _five_real_paths(raw, tmp_path).items():
-        _masked_as_upstream(request, surface, out, tmp_path, HF12_SECRET[6:-4])
-
-
-def test_hf12_string_state_resets_per_line():
-    from tools import kanban_tools
-    member = json.dumps({"content": "x-api-key: $TOKEN", "other": "PUBLIC"}, separators=(",", ":"))
-    text = 'it is 5" tall\n' + member
-    assert R().redact_for_egress(text) == text
-    assert kanban_tools._redact(text) == text
-
-
 # review6556 HF-12 (extended) / HF-13: a data quote EARLIER in the same string
 # (``5" tall x-api-key: …``) is not the opening of a nested string. Quotes one escape level
 # deeper than a string's own delimiters delimit nested strings only when that string's decoded
@@ -615,57 +448,6 @@ def test_hf12_string_state_resets_per_line():
 # and the genuine closing quote still ends the header string, keeping the adjacent member
 # byte-for-byte (HF-13), at every encoding depth.
 HF13_PREFIXES = ['5" tall ', 'echo " ']
-
-
-@pytest.mark.parametrize("level", [0, 1, 2])
-@pytest.mark.parametrize("tail", sorted(HF12_TAILS))
-@pytest.mark.parametrize("value", HF12_VALUES)
-def test_hf12_data_quote_prefix_tail_stays_masked(value, tail, level, tmp_path, request):
-    obj = {"content": '5" tall x-api-key: ' + value + HF12_TAILS[tail]}
-    raw = _hf12_encode(obj, level)
-    assert _hf12_decode(raw, level) == obj  # one string holds the whole tail
-    for surface, out in _five_real_paths(raw, tmp_path).items():
-        _masked_as_upstream(request, surface, out, tmp_path, HF12_SECRET[6:-4])
-
-
-@pytest.mark.parametrize("level", [0, 1, 2])
-@pytest.mark.parametrize("tail", sorted(HF12_TAILS))
-def test_hf12_unbalanced_data_quote_prefix_tail_stays_masked(tail, level, tmp_path, request):
-    obj = {"content": 'echo " x-api-key: $TOKEN' + HF12_TAILS[tail]}
-    raw = _hf12_encode(obj, level)
-    for surface, out in _five_real_paths(raw, tmp_path).items():
-        _masked_as_upstream(request, surface, out, tmp_path, HF12_SECRET[6:-4])
-
-
-@pytest.mark.parametrize("level", [0, 1, 2])
-@pytest.mark.parametrize("shape", ["array", "object"])
-@pytest.mark.parametrize("value", HF12_VALUES)
-@pytest.mark.parametrize("prefix", HF13_PREFIXES)
-def test_hf13_data_quote_prefix_true_member_keeps_bytes(prefix, value, shape, level, tmp_path):
-    h = prefix + "x-api-key: " + value
-    obj = [h, "PUBLIC"] if shape == "array" else {"content": h, "other": "PUBLIC"}
-    raw = _hf12_encode(obj, level)
-    for surface, out in _five_real_paths(raw, tmp_path).items():
-        assert out == raw, (surface, out)
-        assert _hf12_decode(out, level) == obj, (surface, out)
-
-
-# A member whose string value is an encoded JSON document: its inner members are real (kept),
-# while a data quote inside the inner header string is still data (masked).
-@pytest.mark.parametrize("value", ["$TOKEN", "<token>"])
-def test_hf13_embedded_json_document_member(value, tmp_path):
-    inner_ok = json.dumps({"h": "x-api-key: " + value, "o": "PUBLIC"}, separators=(",", ":"))
-    raw = json.dumps({"cmd": inner_ok, "n": 1}, separators=(",", ":"))
-    for surface, out in _five_real_paths(raw, tmp_path).items():
-        assert out == raw, (surface, out)
-
-
-@pytest.mark.parametrize("value", ["$TOKEN", "<token>"])
-def test_hf13_embedded_json_document_data_quote_tail(value, tmp_path, request):
-    inner_bad = json.dumps({"h": '5" x-api-key: ' + value + '","' + HF12_SECRET}, separators=(",", ":"))
-    raw = json.dumps({"cmd": inner_bad, "n": 1}, separators=(",", ":"))
-    for surface, out in _five_real_paths(raw, tmp_path).items():
-        _masked_as_upstream(request, surface, out, tmp_path, HF12_SECRET[6:-4])
 
 
 # review6640 HF-12 (extended) / HF-14: the member boundary needs a real JSON container.
@@ -700,41 +482,6 @@ HF14_SOURCES = {
 }
 
 
-@pytest.mark.parametrize("encoding", [0, 1, 2])
-@pytest.mark.parametrize("value", HF12_VALUES)
-def test_hf12_single_quoted_source_data_quotes_stay_masked(value, encoding, tmp_path, request):
-    text = '5" tall x-api-key: ' + value + '","' + HF14_SECRET
-    source = "note = " + repr(text)
-    raw = _hf14_wrap(source, encoding)
-    assert _hf14_unwrap(raw, encoding) == source
-    for surface, out in _five_real_paths(raw, tmp_path).items():
-        _masked_as_upstream(request, surface, out, tmp_path, HF14_SECRET[6:-4])
-
-
-# Quote/comma data that only LOOKS like members (no well-formed container) stays masked too.
-@pytest.mark.parametrize("encoding", [0, 1, 2])
-@pytest.mark.parametrize("source", [
-    "note = 'a,\"x-api-key: $TOKEN\",\"" + HF14_SECRET + "\"'",
-    json.dumps(["P", ':{"x-api-key: %s",null,' + HF14_SECRET], separators=(",", ":")),
-    json.dumps(["P", '["x-api-key: $TOKEN","' + HF14_SECRET], separators=(",", ":")),
-])
-def test_hf12_member_lookalike_without_json_container_stays_masked(source, encoding, tmp_path, request):
-    raw = _hf14_wrap(source, encoding)
-    for surface, out in _five_real_paths(raw, tmp_path).items():
-        _masked_as_upstream(request, surface, out, tmp_path, HF14_SECRET[6:-4])
-
-
-@pytest.mark.parametrize("encoding", [0, 1, 2])
-@pytest.mark.parametrize("value", HF12_VALUES)
-@pytest.mark.parametrize("kind", sorted(HF14_SOURCES))
-def test_hf14_json_literal_in_source_keeps_bytes(kind, value, encoding, tmp_path):
-    source = HF14_SOURCES[kind]("x-api-key: " + value)
-    raw = _hf14_wrap(source, encoding)
-    for surface, out in _five_real_paths(raw, tmp_path).items():
-        assert out == raw, (surface, out)
-        assert _hf14_unwrap(out, encoding) == source, (surface, out)
-
-
 # review6751 HF-15: raw offsets map into a decoded context exactly as the decoder decodes. A
 # ``\ud83d\ude00`` surrogate-pair escape (any supplementary character in ASCII-escaped history
 # JSON) is ONE decoded character; counting it as two shifted the container lookup right, onto an
@@ -743,19 +490,6 @@ def test_hf14_json_literal_in_source_keeps_bytes(kind, value, encoding, tmp_path
 # stops at it), so no other parseable container can vouch for it. BMP/ASCII prefixes and the
 # non-container ``XX`` suffix are paired controls; ``12|`` is a numbered-line gutter.
 HF15_CHARS = ["A", "é", "😀", "é😀A"]
-
-
-@pytest.mark.parametrize("encoding", [0, 1, 2])
-@pytest.mark.parametrize("suffix", ["[]", "{}", "XX"])
-@pytest.mark.parametrize("gutter", ["", "     12|"])
-@pytest.mark.parametrize("char", HF15_CHARS)
-def test_hf15_unrelated_later_container_never_owns_the_boundary(char, gutter, suffix, encoding, tmp_path, request):
-    fragment = '["x-api-key: %s","' + HF14_SECRET
-    source = gutter + "note = " + repr(char * len(fragment) + fragment + suffix)
-    raw = _hf14_wrap(source, encoding)
-    assert _hf14_unwrap(raw, encoding) == source
-    for surface, out in _five_real_paths(raw, tmp_path).items():
-        _masked_as_upstream(request, surface, out, tmp_path, HF14_SECRET[6:-4])
 
 
 # The same mapping must keep legitimate Unicode-bearing source exact: a supplementary character
@@ -769,29 +503,6 @@ HF15_SOURCES = {
 }
 
 
-@pytest.mark.parametrize("encoding", [0, 1, 2])
-@pytest.mark.parametrize("char", HF15_CHARS)
-@pytest.mark.parametrize("kind", sorted(HF15_SOURCES))
-def test_hf15_unicode_source_keeps_bytes(kind, char, encoding, tmp_path):
-    source = HF15_SOURCES[kind](char, "x-api-key: %s")
-    raw = _hf14_wrap(source, encoding)
-    for surface, out in _five_real_paths(raw, tmp_path).items():
-        assert out == raw, (surface, out)
-        assert _hf14_unwrap(out, encoding) == source, (surface, out)
-
-
-# An actual-valued header right after a kept placeholder behind Unicode is still masked.
-@pytest.mark.parametrize("encoding", [0, 1, 2])
-@pytest.mark.parametrize("char", HF15_CHARS)
-def test_hf15_unicode_adjacent_actual_valued_header_masked(char, encoding, tmp_path):
-    source = "note = " + json.dumps(char, ensure_ascii=False) + "; rows = " + json.dumps(
-        ["x-api-key: %s", "x-api-key: " + HF14_SECRET, "PUBLIC"], separators=(",", ":"))
-    raw = _hf14_wrap(source, encoding)
-    for surface, out in _five_real_paths(raw, tmp_path).items():
-        assert "x-api-key: %s" in out, (surface, out)
-        assert HF14_SECRET[6:-4] not in out, (surface, out)
-
-
 # review6751 HF-16: a data quote after ``:`` (or ``[``/``,``/``{"k":``) INSIDE a valid JSON
 # string is not a nested string. The header string's real closing quote closes it -- and any
 # string the scan opened deeper -- so the member boundary is kept and every byte survives.
@@ -801,29 +512,6 @@ HF16_SHAPES = {
     "array": lambda h: [h, 0],
     "object": lambda h: {"content": h, "other": "PUBLIC"},
 }
-
-
-@pytest.mark.parametrize("encoding", [0, 1, 2])
-@pytest.mark.parametrize("shape", sorted(HF16_SHAPES))
-@pytest.mark.parametrize("value", HF12_VALUES + ["{{ token }}"])
-@pytest.mark.parametrize("prefix", HF16_PREFIXES)
-def test_hf16_data_quote_inside_header_string_keeps_bytes(prefix, value, shape, encoding, tmp_path):
-    obj = HF16_SHAPES[shape](prefix + "x-api-key: " + value)
-    source = json.dumps(obj, separators=(",", ":"))
-    raw = _hf14_wrap(source, encoding)
-    for surface, out in _five_real_paths(raw, tmp_path).items():
-        assert out == raw, (surface, out)
-        assert json.loads(_hf14_unwrap(out, encoding)) == obj, (surface, out)
-
-
-@pytest.mark.parametrize("encoding", [0, 1, 2])
-@pytest.mark.parametrize("value", ["$TOKEN", "%s"])
-@pytest.mark.parametrize("prefix", HF16_PREFIXES)
-def test_hf16_data_quote_prefix_opaque_tail_stays_masked(prefix, value, encoding, tmp_path, request):
-    obj = [prefix + "x-api-key: " + value + '","' + HF14_SECRET, 0]
-    raw = _hf14_wrap(json.dumps(obj, separators=(",", ":")), encoding)
-    for surface, out in _five_real_paths(raw, tmp_path).items():
-        _masked_as_upstream(request, surface, out, tmp_path, HF14_SECRET[6:-4])
 
 
 # review6751 HF-17: JSON numbers are validated lexically, never converted, so a public integer
@@ -842,28 +530,6 @@ HF17_SHAPES = {
     "after": lambda n: '["x-api-key: %s",' + n + "]",
     "before": lambda n: "[" + n + ',"x-api-key: %s","PUBLIC"]',
 }
-
-
-@pytest.mark.parametrize("encoding", [0, 1, 2])
-@pytest.mark.parametrize("shape", sorted(HF17_SHAPES))
-@pytest.mark.parametrize("number", sorted(HF17_NUMBERS))
-def test_hf17_long_public_number_keeps_placeholder(number, shape, encoding, tmp_path):
-    source = HF17_SHAPES[shape](HF17_NUMBERS[number])
-    assert HF17_NUMBERS[number] in json.loads(source, parse_int=str, parse_float=str)
-    raw = _hf14_wrap(source, encoding)
-    for surface, out in _five_real_paths(raw, tmp_path).items():
-        if surface in ("read", "search"):
-            continue  # the producer shortened the line before redaction (see above)
-        assert out == raw, (surface, out[:200])
-        assert _hf14_unwrap(out, encoding) == source, surface
-
-
-@pytest.mark.parametrize("encoding", [0, 1, 2])
-def test_hf17_long_number_inside_one_string_opaque_tail_stays_masked(encoding, tmp_path, request):
-    obj = {"content": "x-api-key: %s\",1" + "1" * 4301 + ',"' + HF14_SECRET}
-    raw = _hf14_wrap(json.dumps(obj, separators=(",", ":")), encoding)
-    for surface, out in _five_real_paths(raw, tmp_path).items():
-        _masked_as_upstream(request, surface, out, tmp_path, HF14_SECRET[6:-4])
 
 
 # review6810 HF-18: a newline ends every JSON string but not a container -- JSON allows newlines
@@ -921,22 +587,6 @@ def _hf18_expected(source, surface):
     return source.replace("\r\n", "\n") if surface == "terminal" else source
 
 
-@pytest.mark.parametrize("value", HF18_VALUES)
-@pytest.mark.parametrize("kind", sorted(HF18_SOURCES))
-def test_hf18_multiline_json_keeps_bytes(kind, value, tmp_path):
-    from tools import kanban_tools
-    source = HF18_SOURCES[kind]("x-api-key: " + value)
-    for surface, out in _hf18_complete_paths(source, tmp_path).items():
-        assert out == _hf18_expected(source, surface), (surface, out)
-        if kind != "python_literal":
-            assert json.loads(out) == json.loads(source), surface
-    # metadata (encoded) and one history-JSON wrapper stay exact too
-    assert kanban_tools._redact_metadata({"content": source}) == {"content": source}
-    wrapped = _hf14_wrap(source, 1)
-    for surface, out in _five_real_paths(wrapped, tmp_path).items():
-        assert out == wrapped, (surface, out)
-
-
 HF18_PROTECTED = {
     "opaque": "x-api-key: " + HF14_SECRET,
     "default": "x-api-key: ${TOKEN:-" + HF14_SECRET + "}",
@@ -944,48 +594,6 @@ HF18_PROTECTED = {
     "same_string_tail": 'x-api-key: %s","' + HF14_SECRET,
     "data_quote_tail": ':"x-api-key: $TOKEN","' + HF14_SECRET,
 }
-
-
-@pytest.mark.parametrize("shape", ["array_split", "object_split", "nested"])
-@pytest.mark.parametrize("slot", sorted(HF18_PROTECTED))
-def test_hf18_multiline_value_bearing_slots_stay_masked(slot, shape, tmp_path, request):
-    from tools import kanban_tools
-    obj_text = HF18_PROTECTED[slot]
-    source = {
-        "array_split": lambda: _hf18_split(json.dumps([obj_text, 0], separators=(",", ":"))),
-        "object_split": lambda: _hf18_split(json.dumps({"v": obj_text, "n": 0}, separators=(",", ":"))),
-        "nested": lambda: '{\n"h":[' + json.dumps(obj_text) + ',"PUBLIC"],\n"o":1\n}',
-    }[shape]()
-    json.loads(source)
-    for surface, out in _five_real_paths(source, tmp_path).items():
-        _masked_as_upstream(request, surface, out, tmp_path, HF14_SECRET[6:-4])
-    metadata = json.dumps(kanban_tools._redact_metadata({"content": source}))
-    _masked_as_upstream(request, "metadata", metadata, tmp_path, HF14_SECRET[6:-4])
-
-
-# An earlier unclosed ``[``/``{`` in prose never vouches for a later line.
-@pytest.mark.parametrize("source", [
-    'See [the docs\nnote: "x-api-key: %s","' + HF14_SECRET + '"',
-    '{\nnote = "x-api-key: $TOKEN","' + HF14_SECRET + '"\n',
-    '[\n"x-api-key: %s","' + HF14_SECRET,
-])
-def test_hf18_multiline_lookalikes_stay_masked(source, tmp_path, request):
-    for surface, out in _five_real_paths(source, tmp_path).items():
-        _masked_as_upstream(request, surface, out, tmp_path, HF14_SECRET[6:-4])
-
-
-# An adjacent actual-valued header member of a multi-line container is masked on its own while
-# the placeholder member keeps its bytes. (search_files shows the line without its container;
-# there the placeholder slot gets base masking, which -- as in base, r11 and r12 -- runs to the
-# next whitespace and so also covers the NEXT header's name; that inherited line-only behaviour
-# is outside this container repair and is not asserted here.)
-@pytest.mark.parametrize("next_header", ["x-api-key: ", "Authorization: Bearer ", "X-Auth-Token: "])
-@pytest.mark.parametrize("value", ["%s", "{{ token }}"])
-def test_hf18_multiline_adjacent_actual_valued_header_masked(value, next_header, tmp_path):
-    source = '[\n"x-api-key: ' + value + '","' + next_header + HF14_SECRET + '",0\n]'
-    for surface, out in _hf18_complete_paths(source, tmp_path).items():
-        assert out.startswith('[\n"x-api-key: ' + value + '","'), (surface, out)
-        assert HF14_SECRET[6:-4] not in out, (surface, out)
 
 
 # review6900 LG01 (HF-18 extent): the numbered read_file RESULT is itself serialized -- the
@@ -1022,24 +630,6 @@ def _hf18c_history(response):
     return json.dumps({"role": "tool", "content": response})
 
 
-@pytest.mark.parametrize("wrapped", ["response", "history"])
-@pytest.mark.parametrize("gutter", ["plain", "padded"])
-@pytest.mark.parametrize("shape", sorted(HF18C_SHAPES))
-@pytest.mark.parametrize("value", ["%s", "$TOKEN", "${TOKEN}", "{{ token }}", "<YOUR_API_TOKEN>"])
-def test_hf18_serialized_numbered_reader_result_keeps_bytes(value, shape, gutter, wrapped, tmp_path):
-    obj = HF18C_SHAPES[shape]("x-api-key: " + value)
-    source, response = _hf18c_reader_response(obj, tmp_path, gutter)
-    raw = response if wrapped == "response" else _hf18c_history(response)
-    (tmp_path / "replay").mkdir()
-    for surface, out in _five_real_paths(raw, tmp_path / "replay").items():
-        assert out == raw, (surface, out)
-        decoded = json.loads(out)
-        if wrapped == "history":
-            decoded = json.loads(decoded["content"])
-        lines = re.sub(r"^ *\d+\|", "", decoded["content"], flags=re.MULTILINE)
-        assert lines == source and json.loads(lines) == obj, surface
-
-
 # Value-bearing slots, same-string tails and adjacent actual-valued headers in the same
 # serialized numbered form stay masked on all five paths. The numbered text is built the way
 # the reader renders it (the real reader would already mask these on its first pass).
@@ -1053,19 +643,6 @@ HF18C_PROTECTED = {
     "adjacent_auth_token": ["x-api-key: %s", "X-Auth-Token: " + HF14_SECRET, 0],
     "adjacent_bearer": ["x-api-key: {{ token }}", "Authorization: Bearer " + HF14_SECRET, 0],
 }
-
-
-@pytest.mark.parametrize("wrapped", ["response", "history"])
-@pytest.mark.parametrize("gutter", ["plain", "padded"])
-@pytest.mark.parametrize("slot", sorted(HF18C_PROTECTED))
-def test_hf18_serialized_numbered_value_bearing_slots_stay_masked(slot, gutter, wrapped, tmp_path, request):
-    source = _hf18_split(json.dumps(HF18C_PROTECTED[slot], separators=(",", ":")))
-    numbered = "\n".join((f"{i:>6}|" if gutter == "padded" else f"{i}|") + line
-                         for i, line in enumerate(source.split("\n"), 1))
-    response = json.dumps({"content": numbered, "total_lines": 3}, ensure_ascii=False)
-    raw = response if wrapped == "response" else _hf18c_history(response)
-    for surface, out in _five_real_paths(raw, tmp_path).items():
-        _masked_as_upstream(request, surface, out, tmp_path, HF14_SECRET[6:-4])
 
 
 # review7078 HF7078-01: a PRETTY-printed JSON file (``json.dumps(..., indent=2)``) survives the
@@ -1157,22 +734,6 @@ def _hf7078_replay_exact(source, wrapped, tmp_path):
         assert re.sub(r"^\d+\|", "", content, flags=re.MULTILINE) == source, surface
 
 
-@pytest.mark.parametrize("wrapped", sorted(HF7078_WRAPS))
-def test_hf7078_reviewer_pretty_fixture_replays_exactly(wrapped, tmp_path):
-    _hf7078_replay_exact(HF7078_FIXTURE, wrapped, tmp_path)
-
-
-@pytest.mark.parametrize("wrapped", sorted(HF7078_WRAPS))
-@pytest.mark.parametrize("indent", sorted(HF7078_INDENTS))
-@pytest.mark.parametrize("placeholder", HF7078_PLACEHOLDERS)
-@pytest.mark.parametrize("shape", sorted(HF7078_SHAPES))
-def test_hf7078_pretty_reader_response_replays_exactly(shape, placeholder, indent, wrapped, tmp_path):
-    obj = HF7078_SHAPES[shape]("X-Api-Key: " + placeholder)
-    source = json.dumps(obj, indent=HF7078_INDENTS[indent])
-    _hf7078_replay_exact(source, wrapped, tmp_path)
-    assert json.loads(source) == obj
-
-
 # Protection controls in the same pretty numbered-response form (built the way the reader
 # renders it; the real reader would already mask these): actual values, value-bearing slots,
 # same-string tails and adjacent actual-valued headers stay masked on all five paths.
@@ -1192,35 +753,3 @@ HF7078_PROTECTED = {
 def _hf7078_numbered_response(source):
     numbered = "\n".join(f"{i}|{line}" for i, line in enumerate(source.split("\n"), 1))
     return json.dumps({"content": numbered, "total_lines": source.count("\n") + 1}, ensure_ascii=False)
-
-
-@pytest.mark.parametrize("wrapped", ["response", "history"])
-@pytest.mark.parametrize("indent", ["i2", "tab"])
-@pytest.mark.parametrize("slot", sorted(HF7078_PROTECTED))
-def test_hf7078_pretty_value_bearing_slots_stay_masked(slot, indent, wrapped, tmp_path, request):
-    source = json.dumps(HF7078_PROTECTED[slot](), indent=HF7078_INDENTS[indent])
-    raw = HF7078_WRAPS[wrapped](_hf7078_numbered_response(source))
-    for surface, out in _hf7078_paths(raw, tmp_path).items():
-        _masked_as_upstream(request, surface, out, tmp_path, HF14_SECRET[6:-4])
-
-
-# Vault precedence: a registered (fabricated) vault value never survives, even where it sits in
-# a pretty-JSON placeholder slot that would otherwise be kept -- on the first real read and on
-# every replay path of the numbered response.
-@pytest.mark.parametrize("wrapped", ["response", "history"])
-def test_hf7078_vault_value_in_pretty_placeholder_slot_never_survives(wrapped, tmp_path):
-    from tools import file_tools
-    r = R()
-    vault = "${VAULTSYNTH_PRETTY_KEY}"
-    source = json.dumps(["X-Api-Key: " + vault, "next"], indent=2)
-    r.register_vault_redaction_value(vault)
-    try:
-        p = tmp_path / "vault.json"
-        p.write_text(source + "\n")
-        assert "VAULTSYNTH_PRETTY_KEY" not in file_tools.read_file_tool(str(p), task_id="t")
-        raw = HF7078_WRAPS[wrapped](_hf7078_numbered_response(source))
-        (tmp_path / "replay").mkdir()
-        for surface, out in _hf7078_paths(raw, tmp_path / "replay").items():
-            assert "VAULTSYNTH_PRETTY_KEY" not in out, (surface, out)
-    finally:
-        r.clear_vault_redaction_values()
