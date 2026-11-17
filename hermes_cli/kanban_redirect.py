@@ -25,9 +25,10 @@ def _print(payload) -> None:
 
 
 #: The owner reasons that say a correction may or may not have been applied. Every other owner refusal
-#: (``unknown_method``, ``invalid_timeout``, authorization, stale, validation, ...) is definitive and the text
-#: was not retained. A transport timeout or lost connection is not an owner reason: it is a plain
-#: ``GatewayClientError`` and is exit 4 (unreachable).
+#: (``unknown_method``, ``invalid_timeout``, authorization, stale, validation, ...) is a definitive refusal of
+#: this request and exits 3; it says nothing about retention, because the owner may already have kept the
+#: text on the card before refusing. A transport timeout or lost connection is not an owner reason: it is a
+#: plain ``GatewayClientError`` and is exit 4 (unreachable).
 AMBIGUOUS_REASONS = frozenset({"correction_outcome_unknown"})
 
 
