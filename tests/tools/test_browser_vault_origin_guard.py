@@ -162,15 +162,22 @@ class TestOneTimeCode:
         assert asked == ["elsewhere.example"] and backend.resolved == []
 
 
-    @pytest.mark.parametrize("report, error_type", [
-        ({"refused": "target_changed"}, "target_changed"),
-        ({"refused": "field_not_empty"}, "field_not_empty"),
-        ({"refused": "expired", "written": 0}, "expired"),
-        ({"filled": 0}, None),
+    @pytest.mark.parametrize("report, error_type, says", [
+        ({"refused": "target_changed", "written": 0, "roles": []}, "target_changed", "Nothing was written"),
+        ({"refused": "field_not_empty", "written": 0, "roles": []}, "field_not_empty", "Nothing was written"),
+        ({"refused": "expired", "written": 0, "roles": []}, "expired", "Nothing was written"),
+        # FB-1: a refusal after an earlier box was written says so, by role, never "Nothing was written"
+        ({"refused": "target_changed", "written": 1, "roles": ["one-time-code"]}, "target_changed",
+         "1 field was written before this and was not cleared: a one-time-code box."),
+        ({"refused": "target_changed"}, "target_changed", "Whether anything was written is not established"),
+        ({"filled": 0, "written": 0, "roles": []}, None, "No code field was written"),
+        # written, then emptied by the page: written is not held
+        ({"filled": 0, "written": 1, "roles": ["one-time-code"]}, None,
+         "1 code box was written, but none held a value after the page's own events"),
     ])
-    def test_a_code_write_that_wrote_nothing_never_asks_to_submit(self, vault, report, error_type):
+    def test_a_code_write_that_wrote_nothing_never_asks_to_submit(self, vault, report, error_type, says):
         """enter_code maps every fill-script refusal through the same truthful outcome as the password fill:
-        no success, no Submit hint, and it says that nothing was written."""
+        no success, no Submit hint, and it says what was written, from the script's own count."""
         from tools import browser_vault_tool
 
         store, backend, _ = vault
@@ -180,7 +187,8 @@ class TestOneTimeCode:
         with _on_page(page):
             out = json.loads(browser_vault_tool.browser_vault_enter_code(meta.id, task_id="t"))
         assert out["success"] is False and "next" not in out and out.get("error_type") == error_type, out
-        assert ("Nothing was written" in out["error"]) if error_type else ("No code field was written" in out["error"])
+        assert says in out["error"], out
+        assert "Nothing was written" not in out["error"] or report.get("written") == 0
         assert len(page.writes) == 1 and backend.resolved == ["otp"]
 
 

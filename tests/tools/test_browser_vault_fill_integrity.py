@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import urllib.request
@@ -108,7 +109,9 @@ def test_fill_script_rechecks_after_focus_before_the_write():
     focus = js.index("el.focus();")
     write = js.index("setter.set.call(el, f.value)")
     assert focus < js.index("const still = el.isConnected", focus) < write
-    assert focus < js.index('if (requireEmpty && current(el).length > 0) return JSON.stringify({ refused: "field_not_empty" });', focus) < write
+    # N-d: each field's budget gate also runs before its focus listeners
+    assert js.rindex('if (late()) return report({ refused: "expired" });', 0, focus) > js.index("for (const f of fills)")
+    assert focus < js.index('if (requireEmpty && current(el).length > 0) return report({ refused: "field_not_empty" });', focus) < write
     assert js.index("} finally {") > write
     assert js.index("retireInspection(nonce);", js.index("} finally {")) > write and "startsWith(prefix)" in js
 
@@ -590,7 +593,9 @@ def test_cleanup_retains_detached_node_reference(browser, mode):
         out = json.loads(_evaluate(browser.page, build_fill_js(
             [{"index": 1, "token": "current-password", "value": "DETACHED-SECRET"}], browser.origin, nonce,
             require_empty=True)))
-        assert out == {"refused": "not_established"}, out  # FA-1: the field left the page (was {"filled": 1})
+        # FA-1: the field left the page (was {"filled": 1}); FB-1: the report says what was written
+        assert out == {"refused": "not_established", "exposed_cleared": 0, "written": 1,
+                       "roles": ["current-password"]}, out
     else:
         _evaluate(browser.page, "window.old=document.getElementById('p');old.remove()")
         _evaluate(browser.page, build_clear_stamps_js(nonce))
@@ -744,7 +749,10 @@ def test_rollback_invalidations(browser,mutation):
     observed=json.loads(_evaluate(browser.page,"(()=>{const result="+fill+";return JSON.stringify({result:JSON.parse(result),original:old.value,connected:old.isConnected,current:live.value,slots:[old,live].filter(x=>x.hasAttribute('data-hermes-vault-slot')).length,submits:window.submits,registries:Object.getOwnPropertyNames(window).filter(x=>x.startsWith('hermesVaultSlots:')).length})})()"))
     out=json.loads(_fill_outcome(observed['result'],None,None,browser.origin,[]))
     print('IDENTITY_OBSERVATION='+json.dumps(dict(observed,mutation=mutation,tool=out)))
-    assert observed['result']=={'refused':'value_mismatch','intact':False,'cleared':False}
+    # FB-1 (this round): every report now also carries written/roles; the reviewer's exact dict is checked on the
+    # other keys, and nothing is left written (the password was cleared again).
+    assert {k:v for k,v in observed['result'].items() if k not in ('written','roles')}=={'refused':'value_mismatch','intact':False,'cleared':False}
+    assert observed['result']['written']==0 and observed['result']['roles']==[]
     assert out['success'] is False and out['error_type']=='value_mismatch' and out['field_cleared'] is False
     assert 'not established' in out['error'] and 'nothing is filled' not in out['error'] and 'next' not in out
     assert observed['slots']==observed['submits']==observed['registries']==0
@@ -768,7 +776,8 @@ def test_finally_cleanup_preserves_report_truth_at_script_return(browser,mutatio
     assert out['error_type']=='value_mismatch' and out['success'] is False and 'next' not in out
     assert out['field_cleared'] is False and 'nothing is filled' not in out['error'], observed
     # The report is built after cleanup: a refilled original is "not empty", a replaced one "not established".
-    assert observed['result']=={'refused':'value_mismatch','intact':mutation=='refill','cleared':False}, observed
+    assert observed['result']=={'refused':'value_mismatch','intact':mutation=='refill','cleared':False,
+                                'written':0,'roles':[]}, observed
     assert ('the field is not empty' if mutation=='refill' else 'not established') in out['error'], out
     assert 'REVIEW-CLEANUP' not in json.dumps(out)
 
@@ -822,10 +831,16 @@ def test_success_counts_only_an_intact_field_holding_the_value(browser, store, c
     else:
         assert code == 1 and out["success"] is False and out["error_type"] == "not_established", out
         assert "next" not in out and "not established" in out["error"], out
+        assert "1 field was written before this and was not cleared: the password field." in out["error"], out
     assert page["pw"] == page_field and page["stamps"] == 0 and page["registries"] == 0 and page["submits"] == 0, page
+    if "type='text'" in listener:  # N-a: the retyped original no longer shows the stored value, and the result says so
+        assert _evaluate(browser.page, "old.isConnected && old.type==='text' && old.value===''") is True
+        assert out["exposed_cleared"] is True and "it was emptied without page events" in out["error"], out
+    elif listener != "void 0":
+        assert out["exposed_cleared"] is False, out
 
 
-# ── a fill script cannot write late: page-clock budget and passive dialog awareness (Fable FA-2) ───────────
+# ── a fill script released late: page-clock budget and passive dialog awareness (Fable FA-2) ──────────────
 
 def test_the_page_budget_is_strictly_shorter_than_the_reply_wait():
     """The script's page-clock budget ends well before the command stops waiting for its reply, so a script
@@ -850,10 +865,10 @@ def test_the_budget_is_the_last_gate_before_the_write():
                        require_empty=True, anchor=anchor)
     assert f"const anchor = {json.dumps(anchor)};" in js and f"const budgetMs = {FILL_PAGE_BUDGET_S * 1000.0};" in js
     focus, write = js.index("el.focus();"), js.index("setter.set.call(el, f.value)")
-    gate = js.index('if (late()) return JSON.stringify({ refused: "expired", written: filled });', focus)
-    assert js.index('if (requireEmpty && current(el).length > 0) return JSON.stringify({ refused: "field_not_empty" });',
+    gate = js.index('if (late()) return report({ refused: "expired" });', focus)
+    assert js.index('if (requireEmpty && current(el).length > 0) return report({ refused: "field_not_empty" });',
                     focus) < gate < write
-    assert js.index('if (late()) return JSON.stringify({ refused: "expired", written: 0 });') < focus  # and at start
+    assert js.index('if (late()) return report({ refused: "expired" });') < js.index("for (const f of fills)")  # at start
     assert "const anchor = null;" in build_fill_js([], "https://m.example", "n")  # direct use without a clock
 
 
@@ -894,16 +909,20 @@ class _BlockedPage(_Page):
             return {"ok": False, "error": "TimeoutError: "}
         if "expectedOrigin" in expression and self.fill_error:
             self.writes.append(expression)
-            return {"ok": False, "error": self.fill_error}
+            return {"ok": False, "error": self.fill_error, "timed_out": True}
         return super().evaluate_runtime(expression, **kw)
 
 
 def test_a_dialog_open_before_the_fill_refuses_before_anything_is_inspected(item):
+    """N-b: the passive dialog record is consulted before the origin probes (no tab focusing or URL reads that
+    would each wait on a blocked renderer)."""
     page, backend = _BlockedPage([_EMAIL, _PW], dialog={"type": "alert"}), _Recording()
+    focused = []
+    page.focus_page = lambda origin, accept=None: focused.append(origin) or {"ok": True, "url": _ORIGIN + "/login"}
     out = _fill(item, page, backend)
     assert out["error_type"] == "dialog_open" and out["success"] is False and "next" not in out
-    assert "alert dialog is open" in out["error"] and "nothing was inspected, resolved, sent or written" in out["error"]
-    assert page.inspections == [] and backend.resolved == [] and page.writes == []
+    assert "alert dialog is open" in out["error"] and "nothing was resolved, sent or written" in out["error"]
+    assert focused == [] and page.inspections == [] and backend.resolved == [] and page.writes == []
 
 
 def test_a_dialog_opening_during_resolution_means_the_value_is_never_sent(item):
@@ -941,13 +960,32 @@ def test_a_page_that_does_not_answer_the_clock_read_never_gets_the_value(item):
     assert clock_reads == [2.0, 2.0] and backend.resolved == [item.id] and page.writes == []
 
 
-def test_an_unanswered_fill_script_reports_the_truth_not_a_bare_timeout(item):
+@pytest.mark.parametrize("can_terminate", [False, True])
+def test_an_unanswered_fill_script_reports_the_truth_not_a_bare_timeout(item, can_terminate):
+    """DEADLINE-R01: an unanswered script may still complete later on the tab; the result says so, asks for the
+    tab to be checked, and reports only that a termination request was sent, never that it worked."""
     page, backend = _BlockedPage([_EMAIL, _PW], fill_error="TimeoutError: "), _Recording()
+    terminations = []
+    if can_terminate:
+        page.terminate_execution = lambda **kw: terminations.append(kw) or {"ok": True}
     out = _fill(item, page, backend)
     assert out["error_type"] == "fill_timeout" and out["success"] is False and "next" not in out
-    assert out["error"] != "TimeoutError: " and "not established" in out["error"]
-    assert "no dialog was recorded open" in out["error"] and "cannot write later" in out["error"]
+    assert out["error"] != "TimeoutError: " and "not established" in out["error"] and "check the tab" in out["error"]
+    assert "may still complete later" in out["error"] and out["may_complete_later"] is True
+    assert "cannot write" not in out["error"] and "no dialog was recorded open" in out["error"]
+    assert out["termination_requested"] is can_terminate and len(terminations) == int(can_terminate)
+    assert ("whether it took effect is not established" in out["error"]) is can_terminate
     assert len(page.writes) == 1 and len(page.cleared) == 1
+
+
+def test_a_timeout_is_classified_by_the_supervisors_marker_not_by_text():
+    from tools.browser_supervisor import _err
+    from tools.browser_vault_tool import _timed_out
+
+    assert _err(TimeoutError())["timed_out"] is True
+    assert "timed_out" not in _err(RuntimeError("navigation timeout in page"))
+    assert _timed_out({"success": False, "error": "x", "timed_out": True}) is True
+    assert _timed_out({"success": False, "error": "TimeoutError: navigation timeout"}) is False
 
 
 @_integration
@@ -962,7 +1000,8 @@ def test_a_script_run_later_than_its_budget_writes_nothing(browser, case):
         "another-document": "({timeOrigin: performance.timeOrigin + 1, now: performance.now()})",
         "within-the-budget": "({timeOrigin: performance.timeOrigin, now: performance.now()})",
     }[case]
-    expected = {"filled": 1} if case == "within-the-budget" else {"refused": "expired", "written": 0}
+    expected = ({"filled": 1, "written": 1, "roles": ["current-password"]} if case == "within-the-budget"
+                else {"refused": "expired", "written": 0, "roles": []})
     nonce = "budget"
     _evaluate(browser.page, "document.getElementById('p').value=''")
     _evaluate(browser.page, build_inspection_js(nonce))
@@ -1154,10 +1193,11 @@ def test_a_dialog_held_past_the_budget_inside_the_script_writes_nothing(browser,
 
 @_integration
 @pytest.mark.parametrize("kind", ["alert", "confirm"])
-def test_a_dialog_closed_after_the_command_exits_cannot_cause_a_late_write(browser, store, capsys, kind):
-    """The dialog opens inside the fill script and is closed only after the command has given up waiting:
-    the command says what it knows (no bare TimeoutError), and when the script finally resumes it is past its
-    budget, so nothing is written and it retires its inspection."""
+def test_a_dialog_before_the_last_gate_closed_after_exit_is_caught_by_the_budget(browser, store, capsys, kind):
+    """The dialog opens inside the fill script BEFORE its last gate (a focus listener) and is closed only after
+    the command has given up waiting: the command says the script may still complete (no bare TimeoutError);
+    when the script resumes, the last gate is past its budget, so nothing is written and it retires its
+    inspection. A dialog held AFTER the last gate is not caught: see the setter-alert witness below."""
     _evaluate(browser.page, "document.getElementById('e').focus();document.getElementById('p').value='';"
                             f"document.getElementById('p').addEventListener('focus',function(){{{kind}('late')}},{{once:true}})")
     person = _PersonAtTheBrowser(browser.page)
@@ -1165,10 +1205,285 @@ def test_a_dialog_closed_after_the_command_exits_cannot_cause_a_late_write(brows
         code, out, _ = _cli_fill(browser, store, "FA2-late-value", capsys)
         assert code == 1 and out["success"] is False and out["error_type"] == "fill_timeout" and "next" not in out, out
         assert f"{kind} dialog is open" in out["error"] and "not established" in out["error"], out
-        assert "cannot write later" in out["error"] and out["error"] != "TimeoutError: "
+        assert "may still complete later" in out["error"] and out["error"] != "TimeoutError: "
+        assert "cannot write" not in out["error"] and out["termination_requested"] is True, out
         assert person.wait_open(1)
         person.close_dialog()
         state = _page_after(browser, person)
         assert state == {"pw": "", "stamps": 0, "registries": 0, "submits": 0}, state
     finally:
         person.close()
+
+
+# ── refusals after earlier writes say what was written (Fable FB-1) ─────────────────────────────────────────
+
+_CODE_BOXES = ("const f=document.querySelector('form');for(const id of ['b0','b1']){const b=document.createElement('input');"
+               "b.id=id;b.name=id;b.type='text';b.maxLength=1;b.autocomplete='one-time-code';f.appendChild(b)}")
+
+
+def _inspect(browser, nonce):
+    return [LoginControl.from_dict(c) for c in json.loads(_evaluate(browser.page, build_inspection_js(nonce)))]
+
+
+@_integration
+def test_a_code_box_change_after_the_first_box_was_written_says_one_was_written(browser):
+    """Split code boxes: box 0 is written; its input listener detaches and reattaches box 1, so box 1 is no
+    longer the inspected node. The refusal reports that one box was written (and left), not 'Nothing'."""
+    from agent.vault_login_classifier import build_otp_fills, classify_otp_controls
+    from tools.browser_vault_tool import _code_write_outcome
+
+    _evaluate(browser.page, _CODE_BOXES + ";document.getElementById('b0').addEventListener('input',function(){"
+                            "const b1=document.getElementById('b1'),p=b1.parentNode;b1.remove();p.appendChild(b1)},{once:true})")
+    fills = build_otp_fills(classify_otp_controls(_inspect(browser, "fb1otp")), "12")
+    assert [f["value"] for f in fills] == ["1", "2"]
+    raw = json.loads(_evaluate(browser.page, build_fill_js(fills, browser.origin, "fb1otp")))
+    assert raw == {"refused": "target_changed", "written": 1, "roles": ["one-time-code"]}, raw
+    out = _code_write_outcome(raw, browser.origin, "user")
+    assert out["success"] is False and out["error_type"] == "target_changed" and "next" not in out, out
+    assert "1 field was written before this and was not cleared: a one-time-code box." in out["error"], out
+    assert "Nothing was written" not in out["error"] and "1" not in out["error"].replace("1 field", "")
+    assert _evaluate(browser.page, "[document.getElementById('b0').value,document.getElementById('b1').value].join('|')") == "1|"
+    assert _evaluate(browser.page, f"{_STAMPS_ANYWHERE}") == 0
+
+
+@_integration
+def test_an_identifier_change_after_the_password_was_written_says_the_password_was_written(browser):
+    """with_identifier: the password is written first; its input listener then replaces the identifier field.
+    The refusal says the password field was written (no value), not 'Nothing was written'."""
+    from tools.browser_vault_tool import _in_page_refusal
+
+    _evaluate(browser.page, "document.getElementById('p').value='';document.getElementById('p').addEventListener('input',"
+                            "function(){const e=document.getElementById('e');e.replaceWith(e.cloneNode(true))},{once:true})")
+    controls = _inspect(browser, "fb1id")
+    pw = next(c for c in controls if c.type == "password")
+    ident = next(c for c in controls if c.type == "email")
+    fills = [{"index": pw.index, "token": "current-password", "value": "FB1-password"},
+             {"index": ident.index, "token": "email", "value": "fb1@example.invalid"}]
+    raw = json.loads(_evaluate(browser.page, build_fill_js(fills, browser.origin, "fb1id")))
+    assert raw == {"refused": "target_changed", "written": 1, "roles": ["current-password"]}, raw
+    out = _in_page_refusal(raw, browser.origin)
+    assert out["error_type"] == "target_changed" and out["success"] is False, out
+    assert "1 field was written before this and was not cleared: the password field." in out["error"], out
+    assert "FB1-password" not in json.dumps(out) and "Nothing was written" not in out["error"]
+    assert _state(browser) == {"slots": 0, "email": "human@example.invalid", "pw": "FB1-password", "submits": 0}
+
+
+@_integration
+def test_a_code_box_written_then_emptied_by_the_page_is_written_but_not_held(browser):
+    from agent.vault_login_classifier import build_otp_fills, classify_otp_controls
+    from tools.browser_vault_tool import _code_write_outcome
+
+    _evaluate(browser.page, "const f=document.querySelector('form');const b=document.createElement('input');b.id='otp';"
+                            "b.name='otp';b.type='text';b.autocomplete='one-time-code';f.appendChild(b);"
+                            "b.addEventListener('input',function(){this.value=''})")
+    fills = build_otp_fills(classify_otp_controls(_inspect(browser, "fb1held")), "482913")
+    raw = json.loads(_evaluate(browser.page, build_fill_js(fills, browser.origin, "fb1held")))
+    assert raw == {"filled": 0, "written": 1, "roles": ["one-time-code"]}, raw
+    out = _code_write_outcome(raw, browser.origin, "user")
+    assert out["success"] is False and "next" not in out and "482913" not in json.dumps(out), out
+    assert "1 code box was written, but none held a value after the page's own events" in out["error"], out
+
+
+# ── the deadline is not an execution fence (DEADLINE-R01, t_ce72d12b/run23376) ──────────────────────────────
+# Production `hermes vault fill` (_cmd_fill) runs in a separate OS process; only the vault store is a dummy.
+
+_CLI_CHILD = """
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+from agent.vault_store import VaultStore
+from hermes_cli.vault import _cmd_fill
+store = VaultStore(base_dir=Path(sys.argv[3]))
+meta = store.add_item('login', 'Deadline dummy', {'identifier_type': 'email', 'identifier': 'a@x.invalid',
+                                                  'password': 'DEADLINE-DUMMY'}, origin=sys.argv[4])
+with patch('agent.vault_store.get_vault_store', return_value=store):
+    _cmd_fill(SimpleNamespace(handle=meta.id, cdp=sys.argv[1], target_id=sys.argv[2], backend='local'))
+"""
+
+
+def _cli_process(browser, tmp_path):
+    env = dict(os.environ, PYTHONPATH=str(Path.cwd()))
+    return subprocess.Popen([sys.executable, "-c", _CLI_CHILD, browser.http, browser.page["id"], str(tmp_path / "vault"),
+                             browser.origin], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+
+
+def _cli_result(proc):
+    out, err = proc.communicate(timeout=60)
+    return proc.returncode, json.loads(out.strip().splitlines()[-1]), err
+
+
+class _Cdp:
+    """A separate CDP connection to the tab (here: the DevTools debugger a person might have open)."""
+
+    def __init__(self, page):
+        from websockets.sync.client import connect
+
+        self.ws, self.next_id = connect(page["webSocketDebuggerUrl"], open_timeout=5), 0
+
+    def recv(self, timeout=30):
+        return json.loads(self.ws.recv(timeout=timeout))
+
+    def call(self, method, params=None, timeout=30):
+        self.next_id += 1
+        call_id = self.next_id
+        self.ws.send(json.dumps({"id": call_id, "method": method, "params": params or {}}))
+        while True:
+            msg = self.recv(timeout)
+            if msg.get("id") == call_id:
+                assert "error" not in msg, msg
+                return msg["result"]
+
+    def paused(self, timeout=30):
+        while True:
+            msg = self.recv(timeout)
+            if msg.get("method") == "Debugger.paused":
+                return msg["params"]
+
+
+def _truthful_timeout(code, out):
+    assert code == 1 and out["success"] is False and out["error_type"] == "fill_timeout" and "next" not in out, out
+    assert out["may_complete_later"] is True and "may still complete later" in out["error"], out
+    assert "check the tab" in out["error"] and "not established" in out["error"] and "cannot write" not in out["error"]
+    assert out["termination_requested"] is True and "whether it took effect is not established" in out["error"], out
+    assert "DEADLINE-DUMMY" not in json.dumps(out)
+
+
+@_integration
+def test_a_debugger_pause_after_the_last_gate_is_reported_truthfully(browser, tmp_path):
+    """DEADLINE-R01 witness A: a debugger pauses the production fill script on its write, after its last
+    budget check. The command must not claim that the script cannot write later."""
+    d = _Cdp(browser.page)
+    proc = None
+    try:
+        d.call("Debugger.enable")
+        entry = d.call("Debugger.setInstrumentationBreakpoint", {"instrumentation": "beforeScriptExecution"})["breakpointId"]
+        proc = _cli_process(browser, tmp_path)
+        while True:  # stop each script at entry until the secret-bearing fill script appears
+            frame = d.paused()["callFrames"][0]
+            source = d.call("Debugger.getScriptSource", {"scriptId": frame["location"]["scriptId"]})["scriptSource"]
+            if "const fills =" in source and "DEADLINE-DUMMY" in source:
+                line = next(i for i, s in enumerate(source.splitlines()) if "setter.set.call(el, f.value)" in s)
+                bp = d.call("Debugger.setBreakpoint", {"location": {"scriptId": frame["location"]["scriptId"],
+                                                                    "lineNumber": line}})["breakpointId"]
+                d.call("Debugger.removeBreakpoint", {"breakpointId": entry})
+                d.call("Debugger.resume")
+                d.paused()
+                break
+            d.call("Debugger.resume")
+        code, out, _ = _cli_result(proc)
+        _truthful_timeout(code, out)
+        d.call("Debugger.removeBreakpoint", {"breakpointId": bp})
+        d.call("Debugger.resume")
+        after = _settled_after(browser)
+        print("DEADLINE_A=" + json.dumps({"result": out, "after": after}))
+        assert after["submits"] == 0, after
+        # Measured: Runtime.terminateExecution, sent while the script was paused (not acknowledged), took effect
+        # on resume: no write. That is all these tests show; the result itself never claims it.
+        assert after["pw"] == "" and after["stamps"] == 0, after
+    finally:
+        try:
+            d.call("Debugger.disable", timeout=5)
+        finally:
+            d.ws.close()
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+
+
+@_integration
+def test_a_page_clock_that_blocks_at_the_last_gate_is_reported_truthfully(browser, tmp_path):
+    """DEADLINE-R01 witness B: page code replaces performance.now and blocks synchronously inside the call the
+    script makes at its last gate before the write, then returns an in-budget time."""
+    _evaluate(browser.page, """(() => {
+      const realNow = performance.now.bind(performance); let calls = 0;
+      window.clockCalls = []; window.pwWrites = [];
+      document.getElementById('p').addEventListener('input', () => window.pwWrites.push(Date.now()));
+      performance.now = function () {
+        const snap = realNow(); calls++; window.clockCalls.push(calls);
+        // calls: clock read before inspection, before sending, script start, before focus, last gate
+        if (calls === 5) { const until = Date.now() + 18000; while (Date.now() < until) {} }
+        return snap;
+      };
+    })()""")
+    proc = _cli_process(browser, tmp_path)
+    code, out, _ = _cli_result(proc)
+    _truthful_timeout(code, out)
+    after = _settled_after(browser, extra="clock:window.clockCalls,writes:window.pwWrites")
+    print("DEADLINE_B=" + json.dumps({"result": out, "after": after}))
+    assert after["submits"] == 0 and after["clock"][:5] == [1, 2, 3, 4, 5], after
+    # Measured: Runtime.terminateExecution stopped the blocked script before its write (no input event at all).
+    assert after["pw"] == "" and after["writes"] == [] and after["stamps"] == 0, after
+
+
+@_integration
+def test_a_page_setter_that_blocks_before_the_write_is_reported_truthfully(browser, tmp_path):
+    """DEADLINE-R01 witness C (page clock untouched): page code wraps HTMLInputElement.prototype.value's setter,
+    which the script reads as its "native" setter, and blocks inside it before calling the real one. Our
+    writes go through page-reachable setters, so page code can always sit between the last check and the write."""
+    _evaluate(browser.page, """(() => {
+      const native = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+      window.pwWrites = [];
+      document.getElementById('p').addEventListener('input', () => window.pwWrites.push(Date.now()));
+      Object.defineProperty(HTMLInputElement.prototype, 'value', {...native, set(value) {
+        if (value === 'DEADLINE-DUMMY') { const until = Date.now() + 18000; while (Date.now() < until) {} }
+        native.set.call(this, value);
+      }});
+    })()""")
+    proc = _cli_process(browser, tmp_path)
+    code, out, _ = _cli_result(proc)
+    _truthful_timeout(code, out)
+    after = _settled_after(browser, extra="writes:window.pwWrites")
+    print("DEADLINE_C=" + json.dumps({"result": out, "after": after}))
+    assert after["submits"] == 0, after
+    # Measured: Runtime.terminateExecution stopped the blocked setter before the real one ran.
+    assert after["pw"] == "" and after["writes"] == [] and after["stamps"] == 0, after
+
+
+
+
+@_integration
+def test_a_page_setter_that_opens_a_dialog_before_the_write_is_reported_truthfully(browser, tmp_path):
+    """DEADLINE-R01, the limit: the page's wrapped setter opens an alert (instead of spinning) after the last gate
+    and before the real write. Runtime.terminateExecution does not reach a script held by a native dialog, so
+    when the person closes it, the write happens after the command has returned. The command never claims
+    otherwise: it reports the dialog, that the script may still complete, and that the tab must be checked."""
+    _evaluate(browser.page, """(() => {
+      const native = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+      window.pwWrites = [];
+      document.getElementById('p').addEventListener('input', () => window.pwWrites.push(Date.now()));
+      Object.defineProperty(HTMLInputElement.prototype, 'value', {...native, set(value) {
+        if (value === 'DEADLINE-DUMMY') alert('setter');
+        native.set.call(this, value);
+      }});
+    })()""")
+    person = _PersonAtTheBrowser(browser.page)
+    try:
+        proc = _cli_process(browser, tmp_path)
+        code, out, _ = _cli_result(proc)
+        _truthful_timeout(code, out)
+        assert "alert dialog is open" in out["error"] and "did not acknowledge" in out["error"], out
+        assert person.wait_open(1)
+        person.close_dialog()
+        after = wait_until(lambda: _settled(browser), timeout=15, what="the page settling after the dialog closed")
+        print("DEADLINE_SETTER_ALERT=" + json.dumps({"result": out, "after": after}))
+        # Measured: the write happens after the command returned (the documented limit); the script's own
+        # finally then removes its stamps and registry.
+        assert after == {"pw": "DEADLINE-DUMMY", "stamps": 0, "registries": 0, "submits": 0}, after
+    finally:
+        person.close()
+
+
+def _settled_after(browser, extra=""):
+    """The page state once the page answers again (a separate connection with a long wait)."""
+    from websockets.sync.client import connect
+
+    expression = ("JSON.stringify({pw:document.getElementById('p').value,submits:window.submits,"
+                  f"stamps:{_STAMPS_ANYWHERE}" + ("," + extra if extra else "") + "})")
+    with connect(browser.page["webSocketDebuggerUrl"], open_timeout=5) as ws:
+        ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": expression,
+                                                                             "returnByValue": True}}))
+        while True:
+            msg = json.loads(ws.recv(timeout=30))
+            if msg.get("id") == 1:
+                return json.loads(msg["result"]["result"]["value"])

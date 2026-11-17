@@ -78,7 +78,10 @@ def _fail(error: str) -> dict[str, Any]:
 
 
 def _err(exc: BaseException) -> dict[str, Any]:
-    return _fail(f"{type(exc).__name__}: {exc}")
+    out = _fail(f"{type(exc).__name__}: {exc}")
+    if isinstance(exc, TimeoutError):  # typed: the page did not answer in time (asyncio/futures timeouts alias it)
+        out["timed_out"] = True
+    return out
 
 
 class SupervisorTargetError(RuntimeError):
@@ -295,6 +298,28 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             # Non-serializable (functions, DOM nodes…) — give the model the browser's description.
             value = result_obj.get("description") or result_obj.get("unserializableValue")
         return {"ok": True, "result": value, "result_type": result_type}
+
+    def terminate_execution(self, *, timeout: float = 1.0) -> dict[str, Any]:
+        """Best effort: ask the attached page to terminate its current (or next) JavaScript execution
+        (``Runtime.terminateExecution``), waiting at most about ``timeout`` for the reply. Measured in Chromium
+        157: it stops a script that is executing JavaScript (a synchronous spin); it does not reach anything held
+        by a native dialog (the reply is queued until the dialog closes, then nothing is terminated). Whether it
+        stopped a given script is for the caller to establish, not this."""
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return _fail("supervisor loop is not running")
+        with self._state_lock:
+            session_id = self._page_session_id
+        if not session_id:
+            return _fail("supervisor has no attached page session")
+        try:
+            _schedule(self._cdp("Runtime.terminateExecution", session_id=session_id, timeout=timeout), loop,
+                      timeout=timeout + 0.5)
+        except TimeoutError:  # the request went out; the page did not acknowledge it in time (e.g. paused)
+            return {"ok": False, "sent": True, "acknowledged": False, "error": "not acknowledged in time"}
+        except Exception as exc:
+            return _err(exc)
+        return {"ok": True, "sent": True, "acknowledged": True}
 
     def set_driven_target(self, target_id: Optional[str]) -> None:
         """Record the CDP target the task's browser_exec session drives (None: unknown)."""
