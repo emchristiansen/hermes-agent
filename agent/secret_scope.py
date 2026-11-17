@@ -421,7 +421,13 @@ def _read_env_file(env_path: Path, dir_fd: Optional[int] = None, *,
                    want_stat: bool = False) -> tuple[dict[str, str], Optional[os.stat_result]]:
     """:func:`read_env_file`, plus (*want_stat*) the ``fstat`` of the file the bytes were read from,
     so a caller can name the exact file that supplied them (:func:`_path_read_profile_home`)."""
-    key = str(env_path)
+    raw, file_stat = _read_env_bytes(env_path, dir_fd, want_stat=want_stat)
+    return _parsed_env_bytes(env_path, raw), file_stat
+
+
+def _read_env_bytes(env_path: Path, dir_fd: Optional[int] = None, *,
+                    want_stat: bool = False) -> tuple[bytes, Optional[os.stat_result]]:
+    """The one open/read behind :func:`_read_env_file`: the file's bytes (and its ``fstat``)."""
     opener = None if dir_fd is None else (lambda name, flags: os.open(name, flags, dir_fd=dir_fd))
     try:
         with open(env_path.name if dir_fd is not None else env_path, "rb", buffering=0, opener=opener) as handle:
@@ -431,26 +437,35 @@ def _read_env_file(env_path: Path, dir_fd: Optional[int] = None, *,
         # Gone or unreadable: drop any entry so a stale map cannot outlive the file.
         invalidate_env_file_cache(env_path)
         raise
+    return raw, file_stat
+
+
+def _parsed_env_bytes(env_path: Path, raw: bytes) -> dict[str, str]:
+    """*raw* (read from *env_path*) tokenized, memoised per path on those exact bytes."""
+    key = str(env_path)
 
     with _ENV_FILE_CACHE_LOCK:
         cached = _ENV_FILE_CACHE.get(key)
         if cached is not None and cached[0] == raw:
             _ENV_FILE_CACHE.move_to_end(key)
-            return dict(cached[1]), file_stat
+            return dict(cached[1])
     secrets = _parse_env_text(_decode_env_bytes(raw))
     with _ENV_FILE_CACHE_LOCK:
         _ENV_FILE_CACHE[key] = (raw, dict(secrets))
         _ENV_FILE_CACHE.move_to_end(key)
         while len(_ENV_FILE_CACHE) > _ENV_FILE_CACHE_MAX:
             _ENV_FILE_CACHE.popitem(last=False)
-    return secrets, file_stat
+    return secrets
 
 
 class _ProfileHomeRead(NamedTuple):
-    """A profile home's ``.env`` mapping and its launch-home verdict, taken from ONE directory."""
+    """A profile home's ``.env`` mapping and its launch-home verdict, taken from ONE directory, with
+    the exact bytes that mapping was parsed from (None when no ``.env`` was read): ``${VAR}``
+    expansion resolves those bytes under that verdict, never the path read again."""
 
     env: dict[str, str]
     is_process_home: bool
+    dotenv_bytes: Optional[bytes] = None
 
 
 # Directory descriptors + ``dir_fd`` opens (POSIX). Elsewhere (Windows) the home is resolved afresh.
@@ -496,13 +511,15 @@ def _path_read_profile_home(home: Path) -> _ProfileHomeRead:
     files are returned without launch authority. A path resolved only after the read (92f9d132's
     order inverted) would pair a file read from one home with whatever the path names next."""
     env_path = home / ".env"
-    if not _resolved_is_process_home(home):
-        return _ProfileHomeRead(load_env_file(env_path), False)
+    launch_before = _resolved_is_process_home(home)
     try:
-        env, env_stat = _read_env_file(env_path, want_stat=True)
+        raw, env_stat = _read_env_bytes(env_path, want_stat=launch_before)
     except OSError:
-        env, env_stat = {}, None
-    return _ProfileHomeRead(env, _resolved_is_process_home(home) and _is_launch_env_file(env_stat))
+        raw, env_stat = None, None
+    env = {} if raw is None else _parsed_env_bytes(env_path, raw)
+    if not launch_before:
+        return _ProfileHomeRead(env, False, raw)
+    return _ProfileHomeRead(env, _resolved_is_process_home(home) and _is_launch_env_file(env_stat), raw)
 
 
 def _read_profile_home(hermes_home: Path) -> _ProfileHomeRead:
@@ -530,12 +547,13 @@ def _read_profile_home(hermes_home: Path) -> _ProfileHomeRead:
     try:
         home_stat = os.fstat(fd)
         try:
-            env = read_env_file(home / ".env", dir_fd=fd)
+            raw, _stat = _read_env_bytes(home / ".env", dir_fd=fd)
         except OSError:
-            env = {}
+            raw = None
     finally:
         os.close(fd)
-    return _ProfileHomeRead(env, _same_directory(home_stat))
+    env = {} if raw is None else _parsed_env_bytes(home / ".env", raw)
+    return _ProfileHomeRead(env, _same_directory(home_stat), raw)
 
 
 class ProfileSecretScope(dict):
@@ -600,7 +618,7 @@ def build_profile_secret_scope(hermes_home: Path) -> ProfileSecretScope:
 
     managed = {k: v for k, v in load_managed_env().items() if not _is_global_env(k)}
     secrets.update(managed)
-    _expand_dotenv_templates(secrets, hermes_home, {**dotenv, **managed})
+    _expand_dotenv_templates(secrets, home_read, {**dotenv, **managed})
     return ProfileSecretScope(secrets, home_read.is_process_home)
 
 
@@ -612,7 +630,7 @@ def _resolved_is_process_home(hermes_home: Path) -> bool:
         return False
 
 
-def _expand_dotenv_templates(secrets: dict[str, str], hermes_home: Path, raw: dict[str, str]) -> None:
+def _expand_dotenv_templates(secrets: dict[str, str], home_read: _ProfileHomeRead, raw: dict[str, str]) -> None:
     """Resolve ``${VAR}`` / ``${VAR:-default}`` in values that came from the dotenv layers, with
     ``load_hermes_dotenv``'s own resolver, so the scope and ``os.environ`` agree on what a file says:
     ``TELEGRAM_HOME_CHANNEL=${TELEGRAM_USER_ID}`` otherwise reached cron delivery as the literal
@@ -620,13 +638,19 @@ def _expand_dotenv_templates(secrets: dict[str, str], hermes_home: Path, raw: di
 
     Another profile's references resolve against process-global vars only: the launch process's
     shell exports and external secrets are the launch profile's, and ``${OPENAI_API_KEY:-default}``
-    in a satellite must take its default, never the gateway's key."""
+    in a satellite must take its default, never the gateway's key.
+
+    Both the input and the lookup authority come from *home_read*, the ONE read the mapping came from:
+    its ``.env`` bytes are expanded under its launch-home verdict. Re-deciding identity or reopening
+    ``<home>/.env`` by path here would let a home retargeted after that read put another home's file,
+    resolved with the launch env's values, into a scope whose verdict says it is not the launch home
+    (review22815 MERGE-FLAGS-2)."""
     templated = {k: v for k, v in raw.items() if "${" in v and secrets.get(k) == v}
     if not templated:
         return
-    from hermes_cli.env_loader import resolve_home_dotenv
-    lookup = None if _is_process_home(hermes_home) else {k: v for k, v in os.environ.items() if _is_global_env(k)}
-    resolved = resolve_home_dotenv(Path(hermes_home), lookup_env=lookup)
+    from hermes_cli.env_loader import managed_dotenv_bytes, resolve_dotenv_layers
+    lookup = None if home_read.is_process_home else {k: v for k, v in os.environ.items() if _is_global_env(k)}
+    resolved = resolve_dotenv_layers([home_read.dotenv_bytes, managed_dotenv_bytes()], lookup_env=lookup)
     secrets.update((k, resolved[k]) for k in templated if k in resolved)
 
 

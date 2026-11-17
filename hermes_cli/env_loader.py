@@ -402,7 +402,11 @@ def _sanitize_loaded_credentials() -> None:
 
 def _parse_dotenv_file(path: Path) -> list[tuple[str, str | None]]:
     """``(name, raw value)`` assignments of one dotenv file, uninterpolated, in file order."""
-    raw = path.read_bytes()
+    return _parse_dotenv_bytes(path.read_bytes())
+
+
+def _parse_dotenv_bytes(raw: bytes) -> list[tuple[str, str | None]]:
+    """:func:`_parse_dotenv_file` for bytes a caller already read (from the directory it identified)."""
     try:
         # utf-8-sig strips a leading BOM (PowerShell 5.1 / Notepad); plain utf-8 would keep U+FEFF on the
         # first key name and silently drop it from os.environ under its canonical name.
@@ -453,22 +457,43 @@ def resolve_home_dotenv(home: Path, *, lookup_env: dict[str, str] | None = None)
     same rules against the process's own environment (this process's dotenv output peeled back), each
     layer seeing the one before. External secret sources and the project ``.env`` are not included.
     *lookup_env* replaces that environment: another profile's file must not resolve against this one's."""
+    def read(path: Path) -> bytes | None:
+        try:
+            return path.read_bytes()
+        except OSError:
+            return None
+
+    return resolve_dotenv_layers([read(home / ".env"), managed_dotenv_bytes()], lookup_env=lookup_env)
+
+
+def managed_dotenv_bytes() -> bytes | None:
+    """The administrator-managed ``.env``'s bytes, or None when there is none (or it cannot be read)."""
     from hermes_cli import managed_scope
 
     managed_dir = managed_scope.get_managed_dir()
-    layers = [home / ".env", *([managed_dir / ".env"] if managed_dir is not None else [])]
+    if managed_dir is None:
+        return None
+    try:
+        return (managed_dir / ".env").read_bytes()
+    except OSError:
+        return None
+
+
+def resolve_dotenv_layers(layers: list[bytes | None], *, lookup_env: dict[str, str] | None = None) -> dict[str, str]:
+    """:func:`resolve_home_dotenv` over dotenv layers the caller already read (None: a layer with no
+    file), in order, each with override and seeing the one before. A caller that read a home's
+    ``.env`` from a directory it identified passes those exact bytes, so the values expanded are the
+    ones it read, never a path re-resolved later (``build_profile_secret_scope``)."""
     if lookup_env is not None:
         lookup_env = dict(lookup_env)
     else:
         with _DOTENV_LOCK:
             lookup_env = _dotenv_lookup_env(None)
     out: dict[str, str] = {}
-    for path in layers:
-        try:
-            assignments = _parse_dotenv_file(path)
-        except OSError:
+    for raw in layers:
+        if raw is None:
             continue
-        for name, value in _resolve_dotenv_assignments(assignments, lookup_env, override=True).items():
+        for name, value in _resolve_dotenv_assignments(_parse_dotenv_bytes(raw), lookup_env, override=True).items():
             if value is not None:
                 lookup_env[name] = out[name] = value
     return out
