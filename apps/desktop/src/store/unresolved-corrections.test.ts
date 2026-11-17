@@ -144,11 +144,13 @@ test('C fails before it is pinned, the renderer restarts, B sends at once, C is 
 test('journaled before its first request, delivered unattended through its own route at its first prepared generation', async () => {
   const first = await renderer()
   let answered = false
+
   const pending = first.store.sendJournaledCorrection(
     { id: 'D', mode: 'steer', text: 'D words', sessionId: 'x-session' },
     X,
     () => new Promise<boolean>(() => {}) // its readiness wait never ends in this renderer
   )
+
   void pending.then(() => (answered = true))
   expect(first.store.unresolvedCorrections()).toEqual([
     expect.objectContaining({ id: 'D', owner: X, sessionId: 'x-session', generation: null })

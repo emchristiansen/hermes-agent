@@ -12,9 +12,10 @@ import { $connection, $gatewayState, $sessionsLoading } from '@/store/session'
 import { $sessionStates } from '@/store/session-states'
 
 import { requestComposerSubmit } from './focus'
-import { ChatBar } from './index'
 import { ComposerSurfaceProvider } from './scope'
 import type { ChatBarProps, ChatBarState } from './types'
+
+import { ChatBar } from './index'
 
 // A canonical correction through every composer entry that steers, on the full mounted ChatBar: its
 // input handler (which mirrors the editor into the draft on the next animation frame), draft loader,

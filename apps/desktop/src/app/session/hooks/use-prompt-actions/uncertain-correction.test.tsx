@@ -312,7 +312,8 @@ it('keeps a correction whose retry is uncertain again, and lets it be sent once 
   await send('TASK_BOUND_RETRY')
   await sendAgain()
 
-  expect(retained()).toHaveLength(2)
+  // Still uncertain: the same correction keeps its one notice and stays in delivery (review22815 UI-R4).
+  expect(retained()).toHaveLength(1)
   await sendAgain()
 
   expect(calls().map(([method]) => method)).toEqual(['session.steer', 'session.steer', 'session.steer'])
@@ -461,8 +462,8 @@ it.each([
     ])
     expect(wire.every(([, params]) => params.session_id === 'rt-B' && !('correction_id' in params))).toBe(true)
     expect(promptSubmits()).toEqual([])
-    // Only the original notice (its UI dismisses it on click): the retry raised no new uncertainty.
-    expect(retained()).toHaveLength(1)
+    // Its outcome is known (kept for the card task): its notice is gone (review22815 UI-R4).
+    expect(retained()).toEqual([])
   }
 )
 
@@ -481,7 +482,8 @@ it('an explicit retry another session refuses stale is queued for its own sessio
   // Confirmed undelivered (#141644): the words become rt-B's next prompt, as before NC13.
   expect(promptSubmits()).toHaveLength(1)
   expect(promptSubmits()[0]![1]).toMatchObject({ session_id: 'rt-B', text: 'TASK_BOUND_RETRY', queued: true })
-  expect(retained()).toHaveLength(1)
+  // Its outcome is known (refused undelivered): its notice is gone (review22815 UI-R4).
+  expect(retained()).toEqual([])
 })
 
 function endPane() {

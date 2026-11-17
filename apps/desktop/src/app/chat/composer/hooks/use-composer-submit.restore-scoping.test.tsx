@@ -668,8 +668,9 @@ it('a confirmed correction retry restores nothing, and the next ordinary send st
   const note = await steerThenLoseAck(retry, onSubmit)
   act(() => navigate('A'))
   await sendAgain(note)
-  await sendAgain(note) // a duplicate is fine: each Send again is the same correction again
-  expect(retry).toHaveBeenCalledTimes(2)
+  // Confirmed: its delivery is over (review22815 UI-R4), so a stale Send again sends nothing more.
+  await sendAgain(note)
+  expect(retry).toHaveBeenCalledTimes(1)
   expect(editorText()).toBe('A’s own draft')
   expect(notSentNotice()).toBeUndefined()
   act(() => handles.submit.submitDraft())
