@@ -155,8 +155,10 @@ def test_retarget_between_the_verdict_and_the_read_cannot_split_files_from_autho
     _activate_with_bridged_allow_all()
     alias = tmp_path / "alias"
     alias.symlink_to(launch, target_is_directory=True)
-    # The .env reader the producer calls (``read_env_file``; before it existed, ``load_env_file``).
-    reader = "read_env_file" if hasattr(ss, "read_env_file") else "load_env_file"
+    # The .env reader the producer calls: ``_read_env_bytes`` since the one read also carries the
+    # bytes template expansion resolves (review22815 MERGE-FLAGS-2); before it, ``read_env_file``;
+    # before that, ``load_env_file``.
+    reader = next(name for name in ("_read_env_bytes", "read_env_file", "load_env_file") if hasattr(ss, name))
     real_read = getattr(ss, reader)
     swapped = []
 
