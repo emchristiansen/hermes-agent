@@ -93,6 +93,8 @@ export function captureSteeringSession(deps: SteeringSessionDeps) {
   return {
     sessionId,
     storedSessionId,
+    // The owner route every request of this correction uses, kept with it for a later delivery (UI-R3).
+    owner,
     requestGateway,
     resolveProfile: owner ? async () => (typeof owner === 'string' ? owner : owner.profile) : undefined,
     onRecovered: (recoveredId: string) => {

@@ -30,6 +30,7 @@ import { clearAllPrompts } from '@/store/prompts'
 import { $sessions, knownSessionOwner, ownerLookupSessionRows, sessionMatchesStoredId } from '@/store/session'
 import {
   requestForSessionProfile,
+  type SessionOwnerRoute,
   type SessionOwnerScope,
   type SessionProfileRoute
 } from '@/store/session-request-router'
@@ -42,6 +43,7 @@ import {
   sessionTileOwnerRoute
 } from '@/store/session-states'
 import { broadcastSessionsChanged } from '@/store/session-sync'
+import { sendJournaledCorrection } from '@/store/unresolved-corrections'
 import { flushStreamDeltas } from '@/store/stream-delta-flush'
 import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
@@ -195,19 +197,20 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
 
   // Tile session RPCs must follow the tile's composite owner even when the
   // active gateway has moved to a same-named profile on another source.
+  const tileOwnerRoute = useCallback((): SessionOwnerRoute | null => {
+    const knownOwner: SessionOwnerScope =
+      sessionTileOwnerRoute(storedIdRef.current) ?? knownSessionOwner(ownerLookupSessionRows(), storedIdRef.current)
+
+    // A bare profile is the legacy/unknown tile shape. Preserve its ambient
+    // behavior; only a composite route is strong enough to retarget a tile
+    // across same-named sources.
+    return knownOwner && typeof knownOwner === 'object' ? knownOwner : null
+  }, [])
+
   const requestSessionGateway = useCallback(
-    <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal) => {
-      const knownOwner: SessionOwnerScope =
-        sessionTileOwnerRoute(storedIdRef.current) ?? knownSessionOwner(ownerLookupSessionRows(), storedIdRef.current)
-
-      // A bare profile is the legacy/unknown tile shape. Preserve its ambient
-      // behavior; only a composite route is strong enough to retarget a tile
-      // across same-named sources.
-      const owner: SessionOwnerScope = knownOwner && typeof knownOwner === 'object' ? knownOwner : undefined
-
-      return requestForSessionProfile<T>(owner, requestGateway, method, params ?? {}, timeoutMs, signal)
-    },
-    [requestGateway]
+    <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal) =>
+      requestForSessionProfile<T>(tileOwnerRoute() ?? undefined, requestGateway, method, params ?? {}, timeoutMs, signal),
+    [requestGateway, tileOwnerRoute]
   )
 
   // A ⌘T tab's session is unlisted until its first turn persists — seed the
@@ -547,9 +550,13 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
         return false
       }
 
-      return attempt()
+      // On the canonical owner the correction is journaled with this tile's owner route before its first
+      // request leaves (review22815 UI-R2/R3): a restart while that request is pending still delivers it.
+      return serverOwnsComposerQueue(storedIdRef.current ?? sessionId)
+        ? sendJournaledCorrection({ id: correctionId, mode, text, sessionId }, tileOwnerRoute(), attempt)
+        : attempt()
     },
-    [bindRecoveredRuntime, copy.promptFailed, requestSessionGateway]
+    [bindRecoveredRuntime, copy.promptFailed, requestSessionGateway, tileOwnerRoute]
   )
 
   // Rewind primitive (interrupt-first for live turns, busy-retry) — shared with

@@ -146,7 +146,7 @@ it.each(['refused retry', 'first failure'] as const)(
 // NC16-CLIENT-03: an external request (the review pane's ship bar, the plugin SDK) that steers a busy
 // turn settles like a typed correction: never an ordinary queued prompt unless the owner confirmed it
 // undelivered.
-it('an external correction whose reply was lost stays the same correction; Send again retries it, A and B both', async () => {
+it('an external correction whose reply was lost stays the same correction, delivered again on its own, A and B both', async () => {
   canonicalOwner()
   const retries = { A: vi.fn(async () => true), B: vi.fn(async () => true) }
 
@@ -161,10 +161,10 @@ it('an external correction whose reply was lost stays the same correction; Send 
   await act(async () => void requestComposerSubmit('EXTERNAL_B', { target: 'main' }))
   await waitFor(() => expect(onSteer).toHaveBeenCalledTimes(2))
   expect(onSteer.mock.calls.map(([text]) => text)).toEqual(['EXTERNAL_A', 'EXTERNAL_B'])
-  await act(async () => notice('EXTERNAL_A', true)!.action!.onClick())
-  await act(async () => notice('EXTERNAL_A', true)!.action!.onClick()) // a duplicate is fine
-  await act(async () => notice('EXTERNAL_B', true)!.action!.onClick())
-  expect([retries.A.mock.calls.length, retries.B.mock.calls.length]).toEqual([2, 1])
+  expect(notice('EXTERNAL_A', true)).toBeDefined()
+  // Nobody clicks: each is sent again on its own (review22815 UI-R4), neither waiting for the other.
+  await waitFor(() => expect([retries.A.mock.calls.length, retries.B.mock.calls.length]).toEqual([1, 1]), { timeout: 5_000 })
+  await waitFor(() => expect(notice('EXTERNAL_A', true)).toBeUndefined())
   view.rerender(<Harness busy={false} onSteer={onSteer} onSubmit={onSubmit} />)
   await act(async () => {
     await new Promise(resolve => setTimeout(resolve, 20))

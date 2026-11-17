@@ -25,12 +25,7 @@ import { notify } from '@/store/notifications'
 import { isOnboardingChat } from '@/store/onboarding-session'
 import { answerParkedCard, skipParkedCards, yieldParkedCardsToMessage } from '@/store/parked-card-answers'
 import { hasBlockingPromptRequest } from '@/store/prompts'
-import {
-  forgetUnresolvedCorrection,
-  keepUnresolvedCorrection,
-  restoreUnresolvedCorrections,
-  unresolvedCorrectionNoticeId
-} from '@/store/unresolved-corrections'
+import { deliverUncertainCorrection, restoreUnresolvedCorrections } from '@/store/unresolved-corrections'
 
 import { cloneAttachments, type QueueEditState } from '../composer-utils'
 import { onComposerSubmitRequest } from '../focus'
@@ -239,9 +234,11 @@ export function useComposerSubmit({
   // request alike). A refusal the owner confirmed undelivered (`accepted === false`) takes `keep`. On
   // the canonical owner a correction whose outcome is unknown (its reply lost, or a failure after the
   // owner may have taken it or kept it on a Kanban card's task) stays a correction: queued as an
-  // ordinary prompt it would carry no card binding (NC12-CLIENT-01, NC16-CLIENT-03). The user sends it
-  // again as the same correction to the session it was captured for; a duplicate is fine. Any other
-  // failure there (an UnsentCorrection never left) takes `unsent`, never a prompt.
+  // ordinary prompt it would carry no card binding (NC12-CLIENT-01, NC16-CLIENT-03). It is kept durably
+  // with its destination and delivered again on its own, as the same correction to the session it was
+  // captured for, until its outcome is known (review22815 UI-R4); a duplicate is fine, and nothing else
+  // waits for it. A later known refusal takes `keep`; a retry its session no longer accepts (an
+  // UnsentCorrection never left) takes `unsent`, never a prompt.
   const settleCorrection = (
     outcome: Promise<boolean>,
     {
@@ -251,60 +248,22 @@ export function useComposerSubmit({
       unsent
     }: { canonical: boolean; displayText: string; keep: () => void; unsent: () => void }
   ) => {
-    // `kept`: the id under which an earlier attempt of this correction was kept durably (UI-02); a
-    // known outcome forgets it.
-    const settle = (attempt: Promise<boolean>, kept?: string): Promise<void> =>
-      attempt.then(
-        accepted => {
-          if (kept) {
-            forgetUnresolvedCorrection(kept)
-          }
-
-          if (!accepted) {
-            keep()
-          }
-        },
-        (err: unknown) => {
-          if (!canonical) {
-            keep()
-          } else if (!(err instanceof UncertainCorrection)) {
-            if (kept) {
-              forgetUnresolvedCorrection(kept)
-            }
-
-            unsent()
-          } else {
-            // Kept durably with its destination (the pinned session, profile and generation, or, when no
-            // preparation pinned it, the session it was captured for), so a renderer restart offers it
-            // again, to that destination only, rather than losing it (UI-02). Until then this page's own
-            // retry closure sends it, with the same id, and settles through this composer.
-            const durable = err.correction ? keepUnresolvedCorrection(err.correction, displayText) : undefined
-
-            notify({
-              ...(durable ? { id: unresolvedCorrectionNoticeId(durable.id), durationMs: 0 } : {}),
-              kind: 'warning',
-              persistent: true,
-              title: translateNow('composer.correctionUnconfirmedTitle'),
-              message: translateNow('composer.correctionUnconfirmedBody'),
-              detail: displayText,
-              action: {
-                label: translateNow('composer.correctionSendAgain'),
-                onClick: () => void settle(err.retry(), durable?.id)
-              },
-              ...(durable
-                ? {
-                    secondaryAction: {
-                      label: translateNow('statusStack.dismiss'),
-                      onClick: () => forgetUnresolvedCorrection(durable.id)
-                    }
-                  }
-                : {})
-            })
-          }
+    void outcome.then(
+      accepted => {
+        if (!accepted) {
+          keep()
         }
-      )
-
-    void settle(outcome)
+      },
+      (err: unknown) => {
+        if (!canonical) {
+          keep()
+        } else if (!(err instanceof UncertainCorrection)) {
+          unsent()
+        } else {
+          deliverUncertainCorrection(err, displayText, { refused: keep, unsent })
+        }
+      }
+    )
   }
 
   // External "submit this prompt" requests (e.g. the review pane's agent-ship
@@ -318,8 +277,8 @@ export function useComposerSubmit({
   // if the turn has already ended, or a steer is not possible, queue it so it
   // runs next. This holds for hidden setup notes and for visible messages a
   // button sends on the user's behalf alike.
-  // A correction a previous renderer left unresolved is offered again once per page, each to its own
-  // pinned destination (UI-02). Only an offer: nothing here waits for it or sends it on its own.
+  // A correction a previous renderer left unresolved is delivered again once per page, each to its own
+  // kept destination, unattended (UI-02, review22815 UI-R4). Nothing here waits for it.
   useLayoutEffect(() => restoreUnresolvedCorrections(), [])
 
   const externalSubmitRef = useRef({ busy, dispatchSubmit, onSteer, onSteerHidden, settleCorrection })

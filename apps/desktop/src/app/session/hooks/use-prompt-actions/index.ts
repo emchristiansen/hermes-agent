@@ -47,6 +47,7 @@ import { pruneFinishedSessionSubagents } from '@/store/subagents'
 import { runGatewayRestart } from '@/store/system-actions'
 import { clearSessionTodos } from '@/store/todos'
 import { setSessionDraftingTool } from '@/store/tool-drafting'
+import { sendJournaledCorrection } from '@/store/unresolved-corrections'
 
 import type {
   ClientSessionState,
@@ -1027,11 +1028,17 @@ export function usePromptActions({
           }
 
           notifyError(err, copy.promptFailed)
-          throw new UncertainCorrection(err, attempt, { id: correctionId, mode, text, sessionId: target.sessionId })
+          throw new UncertainCorrection(err, attempt, identity)
         }
       }
 
-      return attempt()
+      const identity = { id: correctionId, mode, text, sessionId: target.sessionId }
+
+      // On the canonical owner the correction is journaled with its owner route before its first request
+      // leaves (review22815 UI-R2/R3): a restart while that request is pending still delivers it.
+      return serverOwnsComposerQueue(target.storedSessionId ?? target.sessionId)
+        ? sendJournaledCorrection(identity, target.owner ?? null, attempt)
+        : attempt()
     },
     [
       activeSessionIdRef,

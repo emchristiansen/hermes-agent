@@ -269,6 +269,16 @@ export function correctionPin(correctionId: string): { sessionId: string; profil
   return typeof sessionId === 'string' ? { sessionId, profile, generation: pin.generation } : undefined
 }
 
+// Told synchronously when a correction's first preparation pins its destination, before that request
+// leaves: the durable record of an unresolved correction takes the pin then, so a crash during the
+// request (or during a restored retry's request) cannot lose the generation it was prepared for (UI-R1).
+let correctionPinned: ((correctionId: string, pin: { sessionId: string; profile: string; generation: number }) => void) | undefined
+
+/** Register the one listener for newly established correction pins (the unresolved-corrections store). */
+export function onCorrectionPinned(listener: typeof correctionPinned): void {
+  correctionPinned = listener
+}
+
 export class CanonicalDesktopProtocol {
   private creates = new Map<string, string>()
   private revisions = new Map<string, number>()
@@ -438,7 +448,12 @@ export class CanonicalDesktopProtocol {
 
     if (typeof generation !== 'number') { throw new Error('Session execution identity unavailable; reconnect before controlling this turn') }
 
-    if (typeof correction === 'string' && !pinned) { correctionPins.set(correction, { owner, generation }) }
+    if (typeof correction === 'string' && !pinned) {
+      correctionPins.set(correction, { owner, generation })
+      const pin = correctionPin(correction)
+
+      if (pin) { correctionPinned?.(correction, pin) }
+    }
 
     return { ...control, session_id: control.session_id, execution_generation: generation }
   }
