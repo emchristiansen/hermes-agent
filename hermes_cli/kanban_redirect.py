@@ -9,9 +9,11 @@ owner could not hand to a live agent is kept on the card's task and answered as 
 correction again may duplicate it, never lose it: this verb never waits on an earlier send.
 
 Exit 0: delivered, or kept on the card and not delivered (the owner's rejected-but-kept answer). 3: refused
-(stale run, denied, validation, rejected and not kept). 4: the owner could not be reached or could not say
-whether the text was applied (unreachable, timeout, correction_outcome_unknown; the text is retained and a resend
-is safe, a message resend only and never a business replay).
+(stale run, denied, validation, rejected); a refusal makes no claim about retention, because the owner may
+already have kept the text on the card before refusing. 4: the owner could not be reached or could not say
+whether the text was applied (unreachable, timeout, correction_outcome_unknown). Only
+correction_outcome_unknown says the owner retained the text; a transport failure may have happened before
+the owner received it. In every exit-4 case a resend is safe: a message resend only, never a business replay.
 """
 from __future__ import annotations
 
