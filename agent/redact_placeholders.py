@@ -530,16 +530,6 @@ class PlaceholderSlots:
         tail = self.kept_tail(start)
         return tail is not None and not self.text[tail:end].strip()
 
-    def glued_end(self, start: int) -> int | None:
-        """For a placeholder-led value that is NOT kept (``$TOKEN"AbCd``, ``{{ token }}AbCd``,
-        ``% sAbCd``): the end of the placeholder plus the non-whitespace material glued to it,
-        which the caller masks whole (base r15 masked the run; passes that stop at a quote or
-        backslash would leave the glued tail readable). None when no placeholder leads."""
-        p = self.placeholder(start)
-        if p is None:
-            return None
-        return max(_SLOT_RUN_RE.match(self.text, start).end(), _SLOT_RUN_RE.match(self.text, p.end()).end())
-
 
 def slots_for(cache: list, text: str) -> PlaceholderSlots:
     """The ``PlaceholderSlots`` for ``text``, reused while a substitution pass works on it."""

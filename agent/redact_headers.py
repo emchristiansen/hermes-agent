@@ -172,32 +172,6 @@ def _redact_header_line_value(m: re.Match) -> str:
     return m.group(1) + "***"
 
 
-# Any credential-bearing header name: a glued-tail mask (below) never runs into the next header.
-_ANY_HEADER_NAME_RE = re.compile(
-    rf"(?:{_SECRET_HEADER_NAMES}|(?:Proxy-)?Authorization|(?:Set-)?Cookie)[ \t]*:", re.IGNORECASE)
-_SECRET_HEADER_SLOT_RE = re.compile(rf"{_SECRET_HEADER_NAMES}\s*:\s*", re.IGNORECASE)
-
-
-def _mask_glued_placeholder_slots(text: str) -> str:
-    """Mask whole a secret-header value that starts with a placeholder but is not kept, with the
-    material glued to it (``$TOKEN"AbCd``, ``$TOKEN\\AbCd``, ``{{ token }}AbCd``), up to whitespace
-    or the next header name. The passes below stop at a quote or backslash, which would leave such
-    a tail readable; r15 masked it with the slot. Kept placeholders and other values are untouched."""
-    out, last, pos, cache = [], 0, 0, []
-    while (m := _SECRET_HEADER_SLOT_RE.search(text, pos)) is not None:
-        start = pos = m.end()
-        slots = slots_for(cache, text)
-        end = slots.glued_end(start)
-        if end is None or slots.kept_tail(start) is not None:
-            continue
-        nxt = _ANY_HEADER_NAME_RE.search(text, start, end)
-        end = nxt.start() if nxt else end
-        if end > start:
-            out += [text[last:start], "***"]
-            last = pos = end
-    return "".join(out) + text[last:]
-
-
 def _keep_placeholder(m: re.Match, group: int, cache: list) -> bool:
     """True when the value group ``group`` of a secret-header match is a kept placeholder
     (agent/redact_placeholders.py): the match is then emitted unchanged."""
@@ -210,7 +184,6 @@ def redact_header_credentials(text: str) -> str:
     wholly a value-free placeholder (``$OWNER_TOKEN``, ``${VAR}``, ``{{ token }}``) stays
     readable; anything else is masked as before."""
     cache: list = []
-    text = _mask_glued_placeholder_slots(text)
     text = _SECRET_HEADER_LINE_RE.sub(
         lambda m: m.group(0) if _keep_placeholder(m, 2, cache) else _redact_header_line_value(m),
         text,
