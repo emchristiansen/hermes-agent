@@ -86,9 +86,11 @@ async def recover_probe(runner, adapter, source, peer):
     authority = runner.session_authority
     before = json.loads(Path(os.environ['HERMES_HOME'], 'crash-ready.json').read_text())
     safe_sid, blocked_sid = before['safe_sid'], before['blocked_sid']
+    peer.release.set()  # the redelivered lost turn runs again: its model call must not wait on the crash gate
     safe_source = replace(source, chat_id='recover-chat', thread_id='recover-thread')
     binding = (safe_sid, safe_source, adapter)
     initial = rows(authority, safe_sid)
+    initial_blocked = rows(authority, blocked_sid)
     # Current authorization, not yesterday's accepted boolean, must gate claim.
     os.environ['TELEGRAM_ALLOWED_USERS'] = 'different-user'
     denied = await authority.recover_native_sessions([binding])
@@ -110,24 +112,45 @@ async def recover_probe(runner, adapter, source, peer):
     assert rows(authority, safe_sid) == initial
     assert not peer.requests
     recovered = await authority.recover_native_sessions([binding, (blocked_sid, source, adapter)])
-    assert recovered[blocked_sid] == 'unknown_execution', recovered
-    task = authority.sessions[safe_sid].task
-    if task is not None:
-        await asyncio.wait_for(task, 35)
+    # At-least-once (gateway/session_message_redelivery.py): the lost person's message, which reached no tool,
+    # is queued again in its own FIFO place and runs again (a duplicate answer is acceptable; a lost message
+    # is not), and the input queued behind it is not stranded: the session is ready, not blocked.
+    assert recovered[blocked_sid] == 'ready', recovered
+    for sid in (safe_sid, blocked_sid):
+        task = authority.sessions[sid].task
+        if task is not None:
+            await asyncio.wait_for(task, 35)
     safe = rows(authority, safe_sid)
     blocked = rows(authority, blocked_sid)
     assert safe[0]['status'] == 'terminal' and safe[0]['outcome'] == 'completed', safe
     assert safe[0]['payload'] == before['safe'][0]['payload']
-    assert next(r for r in blocked if r['request_id'] == 'crash-started')['status'] == 'unknown'
-    assert next(r for r in blocked if r['request_id'] == 'unknown-follower')['status'] == 'queued'
+    lost = next(r for r in blocked if r['request_id'] == 'crash-started')
+    assert (lost['status'], lost['outcome']) == ('terminal', 'completed'), lost  # same admission, a new claim
+    assert lost['admission_id'] == next(r for r in before['blocked'] if r['request_id'] == 'crash-started')['admission_id']
+    assert lost['seq'] < next(r for r in blocked if r['request_id'] == 'unknown-follower')['seq']
+    follower = next(r for r in blocked if r['request_id'] == 'unknown-follower')
+    assert (follower['status'], follower['outcome']) == ('terminal', 'completed'), follower
+    assert follower['payload'] == next(r for r in before['blocked'] if r['request_id'] == 'unknown-follower')['payload']
     assert authority.sessions[safe_sid].source.platform == source.platform
-    assert authority.agent(SessionRef('default', blocked_sid)) is None
+    # (The blocked session's agent now exists because its redelivered turn ran; that it ran once, not twice, is
+    # the asked() count below.)
     already_completed = initial[0]['status'] == 'terminal'
-    assert len(peer.requests) == (0 if already_completed else 1), peer.requests
+    def settled(request_id):
+        return next(r for r in initial_blocked if r['request_id'] == request_id)['status'] == 'terminal'
+
+    def asked(text):  # model calls whose newest user message is ``text``
+        return sum(next((m.get('content', '') for m in reversed(request['messages']) if m.get('role') == 'user'), '') == text
+                   for request in peer.requests)
+
+    redelivered, follower_done = settled('crash-started'), settled('unknown-follower')
+    assert len(peer.requests) == (0 if already_completed else 1) + (0 if redelivered else 1) + (0 if follower_done else 1), peer.requests
+    assert asked('BLOCK_FIFO_CRASH') == (0 if redelivered else 1) and asked('UNKNOWN_FOLLOWER') == (0 if follower_done else 1)
     if not already_completed:
-        assert 'RECOVER_EXACTLY_ONCE' in json.dumps(peer.requests[0])
-        assert adapter.deliveries and all(d['chat_id'] == 'recover-chat' for d in adapter.deliveries)
-        assert any('LOCAL_ACK' in d['content'] for d in adapter.deliveries)
+        assert asked('RECOVER_EXACTLY_ONCE') == 1
+        safe_deliveries = [d for d in adapter.deliveries if d['chat_id'] == 'recover-chat']
+        assert safe_deliveries and any('LOCAL_ACK' in d['content'] for d in safe_deliveries)
+        # The other session's redelivered and follower turns answer in its own chat, never the safe row's.
+        assert {d['chat_id'] for d in adapter.deliveries} <= {'recover-chat', 'fixture-chat'}
     evidence = {'safe': safe, 'blocked': blocked, 'model_calls': len(peer.requests),
                 'deliveries': adapter.deliveries, 'recovery': recovered}
     Path(os.environ['HERMES_HOME'], 'recovery-receipt.json').write_text(json.dumps(evidence, indent=2))
