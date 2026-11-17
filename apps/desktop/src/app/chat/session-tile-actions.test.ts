@@ -10,6 +10,13 @@ import { UncertainCorrection } from '@/lib/uncertain-correction'
 import { MAIN_COMPOSER_SCOPE } from './composer/scope'
 
 const requestGatewayMock = vi.hoisted(() => vi.fn())
+// The registry-connection leaf of an exact owner route: records which connection each request used.
+const requestGatewayForAgentMock = vi.hoisted(() => vi.fn())
+
+vi.mock('@/store/gateway', async importOriginal => ({
+  ...(await importOriginal<object>()),
+  requestGatewayForAgent: requestGatewayForAgentMock
+}))
 
 const { $activeSessionId, $connection, $sessions, setSessions } = await import('@/store/session')
 const { $confirmRequest, settleConfirm } = await import('@/store/confirm')
@@ -120,6 +127,7 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
     setSessions([])
     $sessionTiles.set([])
     requestGatewayMock.mockReset()
+    requestGatewayForAgentMock.mockReset()
     vi.restoreAllMocks()
   })
 
@@ -228,6 +236,43 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
     } finally {
       $connection.set(null)
     }
+  })
+
+  // review22981 UI-R5: a tile correction is for the exact owner it was sent to. Registry connections X
+  // and Y both expose profile "work" with the same session and generation, so the canonical pin cannot
+  // tell them apart: the retry itself must go through X even after the tile's owner lookup moved to Y.
+  // A later correction typed after the move goes to Y at once, not held behind the uncertain one.
+  it('retries a tile correction through the owner it was sent for after the tile owner moves from X to Y', async () => {
+    const X = { connectionId: 'X', profile: 'work', targetProfile: 'work' }
+    const Y = { connectionId: 'Y', profile: 'work', targetProfile: 'work' }
+    $sessionTiles.set([{ runtimeId: RUNTIME_SESSION_ID, storedSessionId: STORED_SESSION_ID, ownerRoute: X }])
+    requestGatewayForAgentMock
+      .mockRejectedValueOnce(new Error('ACK lost'))
+      .mockResolvedValue({ status: 'queued' })
+    const { result } = renderTileActions()
+    let failure: unknown
+    await act(async () => {
+      failure = await result.current.steerPrompt('tile words', 'steer').catch(err => err)
+    })
+    expect(failure).toBeInstanceOf(UncertainCorrection)
+
+    $sessionTiles.set([{ runtimeId: RUNTIME_SESSION_ID, storedSessionId: STORED_SESSION_ID, ownerRoute: Y }])
+    expect(await act(async () => result.current.steerPrompt('B words', 'steer'))).toBe(true)
+    expect(await act(async () => (failure as UncertainCorrection).retry())).toBe(true)
+
+    const sent = requestGatewayForAgentMock.mock.calls.map(([connectionId, profile, method, params]) => [
+      connectionId,
+      profile,
+      method,
+      (params as { text?: string }).text
+    ])
+
+    expect(sent).toEqual([
+      ['X', 'work', 'session.steer', 'tile words'],
+      ['Y', 'work', 'session.steer', 'B words'],
+      ['X', 'work', 'session.steer', 'tile words']
+    ])
+    expect(requestGatewayMock).not.toHaveBeenCalled()
   })
 
   // #141644: a correction the owner refused before any agent saw it hands the words back (false)
@@ -362,6 +407,7 @@ describe('useSessionTileActions reloadFromMessage failed-submit rollback (#95745
     $sessionTiles.set([])
     clearAllSessionStates()
     requestGatewayMock.mockReset()
+    requestGatewayForAgentMock.mockReset()
     vi.restoreAllMocks()
   })
 

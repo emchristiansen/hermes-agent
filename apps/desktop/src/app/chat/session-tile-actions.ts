@@ -445,6 +445,18 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
       // randomUuid, not crypto.randomUUID: that exists only in secure contexts (a plain-HTTP Webapp has none).
       const correctionId = randomUuid()
 
+      // The exact owner this correction is for, captured once, here, at the intent: every attempt (the
+      // first, each same-page retry, its session-not-found resume) goes through this route, never the
+      // tile's owner as later re-read (review22981 UI-R5: a tile whose owner lookup moved from registry
+      // connection X to Y must not retry on Y, whose same-named profile, session and generation would
+      // pass the canonical pin). The journal keeps the same route for a restored retry.
+      const owner = tileOwnerRoute()
+      const storedId = storedIdRef.current
+      const canonical = serverOwnsComposerQueue(storedId ?? sessionId)
+
+      const ownerRequest = <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal) =>
+        requestForSessionProfile<T>(owner ?? undefined, requestGateway, method, params ?? {}, timeoutMs, signal)
+
       // One delivery attempt to this tile's session; a failure retries this same correction there.
       const attempt = async (): Promise<boolean> => {
         const messageId = `user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
@@ -478,14 +490,14 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
         try {
           const { result } = await withSessionNotFoundResume(
             sessionId,
-            storedIdRef.current,
+            storedId,
             liveId =>
-              requestSessionGateway<{ delivered?: boolean; kept?: 'task_comment' | null; status?: string }>(
+              ownerRequest<{ delivered?: boolean; kept?: 'task_comment' | null; status?: string }>(
                 mode === 'steer' ? 'session.steer' : 'session.redirect',
                 { session_id: liveId, text, correction_id: correctionId }
               ),
             {
-              requestGateway: requestSessionGateway,
+              requestGateway: ownerRequest,
               onRecovered: bindRecoveredRuntime
             }
           )
@@ -521,10 +533,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
 
           // Only an owner-confirmed undelivered refusal hands the words back; on the canonical owner
           // any other reply is uncertain and the correction stays a correction (NC12-CLIENT-01).
-          if (
-            serverOwnsComposerQueue(storedIdRef.current ?? sessionId) &&
-            !(result?.status === 'rejected' && result.delivered === false)
-          ) {
+          if (canonical && !(result?.status === 'rejected' && result.delivered === false)) {
             throw new Error(`Correction outcome unconfirmed: ${JSON.stringify(result ?? null)}`)
           }
         } catch (err) {
@@ -552,11 +561,9 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
 
       // On the canonical owner the correction is journaled with this tile's owner route before its first
       // request leaves (review22815 UI-R2/R3): a restart while that request is pending still delivers it.
-      return serverOwnsComposerQueue(storedIdRef.current ?? sessionId)
-        ? sendJournaledCorrection({ id: correctionId, mode, text, sessionId }, tileOwnerRoute(), attempt)
-        : attempt()
+      return canonical ? sendJournaledCorrection({ id: correctionId, mode, text, sessionId }, owner, attempt) : attempt()
     },
-    [bindRecoveredRuntime, copy.promptFailed, requestSessionGateway, tileOwnerRoute]
+    [bindRecoveredRuntime, copy.promptFailed, requestGateway, tileOwnerRoute]
   )
 
   // Rewind primitive (interrupt-first for live turns, busy-retry) — shared with
