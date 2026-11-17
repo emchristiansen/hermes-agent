@@ -3535,6 +3535,24 @@
       }
     },
     {
+      "name": "session.kanban_run",
+      "summary": "Read-only: the live finite session and execution generation of one card's CURRENT run (``stale_kanban_claim`` for an ended, replaced or unclaimed run); carry both into ``session.steer`` / ``session.redirect``.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SessionKanbanRunParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionKanbanRunResult"
+        }
+      }
+    },
+    {
       "name": "session.list",
       "summary": "Human-facing stored sessions, most recent first (sub-agent / kanban sources denied).",
       "params": [
@@ -39481,6 +39499,104 @@
           "status"
         ],
         "title": "SessionInterruptResult",
+        "type": "object"
+      },
+      "SessionKanbanRunOwner": {
+        "additionalProperties": false,
+        "properties": {
+          "profile_id": {
+            "title": "Profile Id",
+            "type": "string"
+          },
+          "instance_id": {
+            "title": "Instance Id",
+            "type": "string"
+          },
+          "epoch": {
+            "title": "Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "profile_id",
+          "instance_id",
+          "epoch"
+        ],
+        "title": "SessionKanbanRunOwner",
+        "type": "object"
+      },
+      "SessionKanbanRunParams": {
+        "additionalProperties": false,
+        "properties": {
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "board": {
+            "title": "Board",
+            "type": "string"
+          },
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "board",
+          "task_id",
+          "run_id"
+        ],
+        "title": "SessionKanbanRunParams",
+        "type": "object"
+      },
+      "SessionKanbanRunResult": {
+        "additionalProperties": false,
+        "properties": {
+          "board": {
+            "title": "Board",
+            "type": "string"
+          },
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "integer"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "execution_generation": {
+            "title": "Execution Generation",
+            "type": "integer"
+          },
+          "owner": {
+            "$ref": "#/components/schemas/SessionKanbanRunOwner"
+          }
+        },
+        "required": [
+          "board",
+          "task_id",
+          "run_id",
+          "session_id",
+          "execution_generation",
+          "owner"
+        ],
+        "title": "SessionKanbanRunResult",
         "type": "object"
       },
       "SessionListParams": {

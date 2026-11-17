@@ -297,6 +297,13 @@ _SPECS = [
         _arg("--author", help="Author name (default: $HERMES_PROFILE or 'user')"),
         _arg("--max-len", type=int, help="Trim the stored comment body to this many characters"),
     ], help="Append a comment"),
+    *[_cmd(verb, [
+        _TASK_ID,
+        _arg("text", nargs="+", help="The correction"),
+        _arg("--run", type=int, help="The run to correct (default: the task's current run)"),
+    ], help=help) for verb, help in (
+        ("redirect", "Redirect the live attempt of a running task (refused if that run is no longer current)"),
+        ("steer", "Inject text into the live attempt of a running task at its next tool result"))],
     _cmd("attach", [
         _TASK_ID,
         _arg("path", help="Path to the local file to attach"),

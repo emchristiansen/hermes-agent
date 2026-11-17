@@ -273,6 +273,8 @@ class AuthorityConnection:
         handlers['session.account_usage'] = partial(account_usage, self)
         from gateway.session_active_list import active_list
         handlers['session.active_list'] = partial(active_list, self)
+        from gateway.session_kanban_discovery import kanban_run
+        handlers['session.kanban_run'] = partial(kanban_run, self)
         from gateway.session_viewer_automation import automation
         handlers['session.automation'] = partial(automation, self)
         from gateway.session_reactions import react

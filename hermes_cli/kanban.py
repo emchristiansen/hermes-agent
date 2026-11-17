@@ -213,7 +213,7 @@ def _audit_author(requested: str | None = None) -> str:
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "set-skills", "reclaim", "reassign", "link", "unlink",
-    "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
+    "claim", "comment", "redirect", "steer", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "settle-triage", "settle-delivered", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
@@ -798,6 +798,13 @@ def _cmd_comment(args: argparse.Namespace) -> int:
         kb.add_comment(conn, args.task_id, author, body)
     print(f"Comment added to {args.task_id}")
     return 0
+
+
+def _cmd_redirect(args: argparse.Namespace) -> int:
+    """``redirect`` / ``steer``: correct a card's live attempt through its owning gateway."""
+    from hermes_cli.kanban_redirect import cmd_redirect
+
+    return cmd_redirect(args)
 
 
 def _cmd_attach(args: argparse.Namespace) -> int:
@@ -1459,6 +1466,7 @@ _HANDLERS = {
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
     "comment": _cmd_comment, "attach": _cmd_attach,
+    "redirect": _cmd_redirect, "steer": _cmd_redirect,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock, "settle-triage": _cmd_settle_triage,
