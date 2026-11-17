@@ -15,6 +15,7 @@ from unittest.mock import patch
 import pytest
 
 from hermes_cli import kanban as cli
+from hermes_cli.kanban_attachments import copies as attachment_copies
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as dispatch
@@ -704,12 +705,14 @@ def test_si12_an_apostrophe_name_without_a_prefix_file_is_preserved(board, capsy
 def test_si11_a_copy_that_does_not_match_its_report_refuses_with_nothing_changed(board, capsys, tmp_path, monkeypatch):
     """Cleanup needs proof: if a staged copy's bytes differ from the referenced report, the settlement
     refuses inside its transaction; no row, no copy, the workspace and report retained."""
-    real = kb._copy_capped
+    real = attachment_copies._copy_capped
 
     def corrupting(src, dest, artifact):
         real(src, dest, artifact)
         dest.write_bytes(b"NOT THE REPORT\n")
-    monkeypatch.setattr(kb, "_copy_capped", corrupting)
+    # Patched where the copy lives and is looked up (review22981 KB-EXTRACT-01): the settlement
+    # really copies through this, so the refusal below is caused by the corrupted copy.
+    monkeypatch.setattr(attachment_copies, "_copy_capped", corrupting)
     workspace, report, _digest = scratch_report(tmp_path / "home", "miscopied")
     tid, _first, reviewer = delivered_after_stale_schedule(
         board, workspace_kind="scratch", workspace_path=str(workspace))
@@ -780,7 +783,8 @@ def test_si13_a_bare_spaced_name_beside_a_prefix_file_refuses(board, capsys, tmp
 def test_si13_an_attachment_under_another_name_is_not_proof(board, capsys, tmp_path, monkeypatch):
     """Cleanup needs reference identity, not just bytes: a copy holding the report's bytes under a name
     other than the referenced one refuses with nothing changed."""
-    monkeypatch.setattr(kb, "_unique_attachment_path", lambda directory, filename, used: directory / "OTHER.md")
+    monkeypatch.setattr(attachment_copies, "_unique_attachment_path",
+                        lambda directory, filename, used: directory / "OTHER.md")
     assert settle_naming(board, capsys, tmp_path, "renamed-copy", "REVIEW.md", "`{}`") == "refused"
 
 

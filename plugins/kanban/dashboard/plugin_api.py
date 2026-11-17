@@ -36,7 +36,8 @@ from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_diagnostics as kd
-from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_path, _safe_attachment_name
+from hermes_cli.kanban_attachments import KANBAN_ATTACHMENT_MAX_BYTES
+from hermes_cli.kanban_db import _collision_free_path, _safe_attachment_name
 
 log = logging.getLogger(__name__)
 

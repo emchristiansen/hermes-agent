@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_attachments import ArtifactPreservationError
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
@@ -1109,7 +1110,7 @@ def _cmd_settle_delivered(args: argparse.Namespace) -> int:
                 result=args.result, author=_audit_author(), metadata=metadata)
     except ValueError as exc:
         return _err(f"kanban settle-delivered: {exc}", 2)
-    except kb.ArtifactPreservationError as exc:
+    except ArtifactPreservationError as exc:
         return _err(f"cannot settle {args.task_id}: {exc} (nothing changed)")
     if not ok:
         return _err(f"cannot settle {args.task_id}: {reason} (nothing changed)")

@@ -31,15 +31,9 @@ from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
-from hermes_cli.kanban_attachments.copies import (
-    KANBAN_ATTACHMENT_MAX_BYTES,
-    ArtifactPreservationError,
-    VettedArtifact,
-    _copy_capped,
-    _copy_vetted_artifact,
-    _discard_staged_copies,
-    _unique_attachment_path,
-)
+# The completion-artifact copies live in their own module (review22981 KB-EXTRACT-01): every use below
+# reads it there, so a patch of that module is the one the completion path sees.
+from hermes_cli.kanban_attachments import copies as _attachments
 from hermes_cli import kanban_db_retry_policy as _retry_policy
 from toolsets import get_toolset_names
 from utils import unlink_files_older_than
@@ -1763,7 +1757,7 @@ def store_attachment_bytes(
     metadata row. Raises :class:`AttachmentTooLarge` / ``ValueError``; a blob
     whose row insert fails is removed before re-raising. Returns the new id."""
     if max_bytes is None:
-        max_bytes = KANBAN_ATTACHMENT_MAX_BYTES
+        max_bytes = _attachments.KANBAN_ATTACHMENT_MAX_BYTES
     if len(data) > max_bytes:
         raise AttachmentTooLarge(f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit")
     safe_name = _safe_attachment_name(filename)
@@ -2641,7 +2635,7 @@ def complete_task(
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
-    vetted_artifacts: Mapping[str, VettedArtifact] = MappingProxyType({}),
+    vetted_artifacts: Mapping[str, _attachments.VettedArtifact] = MappingProxyType({}),
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2811,7 +2805,7 @@ def _gate_empty_completion(
 def _stage_completion_artifacts(
     conn: sqlite3.Connection, task_id: str, metadata: dict, now: int, *,
     uploaded_by: str = "kanban_complete",
-    vetted: Mapping[str, VettedArtifact] = MappingProxyType({}),
+    vetted: Mapping[str, _attachments.VettedArtifact] = MappingProxyType({}),
 ) -> list[Path]:
     """Copy scratch artifacts to the attachments dir and record each as an
     attachment row; returns the copies so the caller can discard them if its
@@ -2952,7 +2946,7 @@ def external_completion_artifacts(conn: sqlite3.Connection, task_id: str, metada
 
 def _persist_scratch_completion_artifacts(
     conn: sqlite3.Connection, task_id: str, metadata: dict, *,
-    vetted: Mapping[str, VettedArtifact] = MappingProxyType({}),
+    vetted: Mapping[str, _attachments.VettedArtifact] = MappingProxyType({}),
 ) -> None:
     """Copy declared completion artifacts into the task's attachments before cleanup removes
     them: every one inside the managed scratch workspace, and each outside one the caller vetted
@@ -2987,7 +2981,7 @@ def _persist_scratch_completion_artifacts(
     changed = False
 
     def _discard_copies() -> None:
-        _discard_staged_copies(used_destinations, attachment_dir)
+        _attachments._discard_staged_copies(used_destinations, attachment_dir)
 
     for item in raw_artifacts:
         artifact = str(item).strip() if isinstance(item, str) else ""
@@ -3014,32 +3008,32 @@ def _persist_scratch_completion_artifacts(
             problem = None
             if not src.is_file():
                 problem = f"declared scratch artifact is unavailable or not a regular file: {artifact}"
-            elif resolved_src.stat().st_size > KANBAN_ATTACHMENT_MAX_BYTES:
+            elif resolved_src.stat().st_size > _attachments.KANBAN_ATTACHMENT_MAX_BYTES:
                 problem = (
                     f"declared scratch artifact exceeds the "
-                    f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
+                    f"{_attachments.KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
                 )
             if problem:
                 _discard_copies()
-                raise ArtifactPreservationError(problem)
+                raise _attachments.ArtifactPreservationError(problem)
             source = resolved_src
 
         dest: Optional[Path] = None
         try:
             attachment_dir.mkdir(parents=True, exist_ok=True)
-            dest = _unique_attachment_path(attachment_dir, source.name, used_destinations)
+            dest = _attachments._unique_attachment_path(attachment_dir, source.name, used_destinations)
             if vetted_artifact is not None:
-                _copy_vetted_artifact(vetted_artifact, dest, artifact)
+                _attachments._copy_vetted_artifact(vetted_artifact, dest, artifact)
             else:
-                _copy_capped(source, dest, artifact)
+                _attachments._copy_capped(source, dest, artifact)
         except Exception as exc:
             if dest is not None:
                 with contextlib.suppress(OSError):
                     dest.unlink(missing_ok=True)
             _discard_copies()
-            if isinstance(exc, ArtifactPreservationError):
+            if isinstance(exc, _attachments.ArtifactPreservationError):
                 raise
-            raise ArtifactPreservationError(
+            raise _attachments.ArtifactPreservationError(
                 f"could not preserve declared artifact {artifact}: {exc}"
             ) from exc
         used_destinations.add(dest)
@@ -3290,7 +3284,7 @@ def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
     expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
-    vetted_artifacts: Mapping[str, VettedArtifact] = MappingProxyType({}),
+    vetted_artifacts: Mapping[str, _attachments.VettedArtifact] = MappingProxyType({}),
 ):
     """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
 
@@ -3414,7 +3408,7 @@ def request_review(
             _append_event(conn, task_id, "review_requested", payload, run_id=run_id)
     except Exception:
         if staged_copies:
-            _discard_staged_copies(staged_copies, staged_copies[0].parent)
+            _attachments._discard_staged_copies(staged_copies, staged_copies[0].parent)
         raise
     return _ret(True)
 

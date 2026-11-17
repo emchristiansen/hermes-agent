@@ -18,6 +18,7 @@ from typing import Any, Callable, Optional
 from agent.delegation_context import owned_kanban_task
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
+from hermes_cli.kanban_attachments import KANBAN_ATTACHMENT_MAX_BYTES, ArtifactPreservationError, VettedArtifact
 from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
@@ -803,7 +804,7 @@ def _vet_external_artifacts(
     reading it. Returns ``{declared: VettedArtifact}``; the first refusal rejects the handoff
     naming the path before anything changes, so no handoff reads as delivered without its files."""
     from agent.file_safety import get_read_block_error
-    from hermes_cli.kanban_db import VettedArtifact, external_completion_artifacts
+    from hermes_cli.kanban_db import external_completion_artifacts
     from tools.connectors.gateway.files import FileInputError, _readable_file
 
     def refuse(declared: str, reason: Any) -> _Reject:
@@ -824,7 +825,7 @@ def _vet_external_artifacts(
             raise refuse(declared, blocked)
         try:
             vetted[declared] = VettedArtifact.bind(readable)
-        except kb.ArtifactPreservationError as exc:
+        except ArtifactPreservationError as exc:
             raise refuse(declared, exc)
     return vetted
 
@@ -858,7 +859,7 @@ def _handle_complete(args: dict, **kw) -> str:
                 conn, tid, result=result, summary=summary, metadata=metadata,
                 created_cards=created_cards, expected_run_id=_worker_run_id(tid),
                 vetted_artifacts=vetted)
-        except kb.ArtifactPreservationError as artifact_err:
+        except ArtifactPreservationError as artifact_err:
             # Structured rejection — surface the phantom ids so the worker can retry with a corrected list
             # or drop the field. Audit event already landed in the DB. The task itself was NOT mutated (the
             # gate runs before the write txn), so the worker can simply call kanban_complete again. Spell
@@ -1017,7 +1018,7 @@ def _handle_request_review(args: dict, **kw) -> str:
             ok, fail_reason = kb.request_review(
                 conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
                 expected_run_id=_worker_run_id(tid), with_reason=True, vetted_artifacts=vetted)
-        except kb.ArtifactPreservationError as artifact_err:
+        except ArtifactPreservationError as artifact_err:
             # Same contract as kanban_complete (#22923): the transition rolled
             # back, the task is untouched and retryable — say so explicitly or
             # the model treats the tool_error as terminal.
@@ -1161,7 +1162,6 @@ def _download_url_with_cap(url: str, max_bytes: int) -> tuple[bytes, Optional[st
 @_kanban_handler("kanban_attach_url")
 def _handle_attach_url(args: dict, **kw) -> str:
     """Attach a file fetched server-side from an http(s) URL (shared size cap)."""
-    from hermes_cli import kanban_db as kb
     tid = _worker_guard("kanban_attach_url", args)
     url = str(_require_text(args, "url")).strip()
     filename = args.get("filename") or args.get("title")
@@ -1170,7 +1170,7 @@ def _handle_attach_url(args: dict, **kw) -> str:
         from urllib.parse import unquote, urlparse
         filename = unquote(urlparse(url).path.rsplit("/", 1)[-1]).strip() or "download"
     try:
-        data, fetched_ct = _download_url_with_cap(url, kb.KANBAN_ATTACHMENT_MAX_BYTES)
+        data, fetched_ct = _download_url_with_cap(url, KANBAN_ATTACHMENT_MAX_BYTES)
     except ValueError as e:
         return tool_error(f"kanban_attach_url: {e}")
     except Exception as e:

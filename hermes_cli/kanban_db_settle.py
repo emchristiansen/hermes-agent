@@ -27,6 +27,7 @@ import sqlite3
 import time
 from pathlib import Path
 
+from hermes_cli.kanban_attachments.copies import ArtifactPreservationError, _discard_staged_copies
 from hermes_cli.kanban_db_retry_policy import _last_event_payload, terminal_run_refusal
 
 # A delivered NEGATIVE assessment only: there is deliberately no passing verdict here.
@@ -128,7 +129,7 @@ def settle_delivered_assessment(conn, task_id, *, expected_terminal_run, verdict
     try:  # cleanup only once the committed attachments are proven to hold every report (SI-11)
         _require_held(reports, [row[0] for row in conn.execute(
             'SELECT stored_path FROM task_attachments WHERE task_id=?', (task_id,))])
-    except (_kb.ArtifactPreservationError, sqlite3.Error) as exc:
+    except (ArtifactPreservationError, sqlite3.Error) as exc:
         kept = f'; scratch workspace kept: {exc}'
     else:
         _kb._cleanup_workspace(conn, task_id)
@@ -153,7 +154,7 @@ def _discard_uncommitted_copies(conn, copies):
             [str(path) for path in copies])}
     except sqlite3.Error:
         return
-    _kb._discard_staged_copies([path for path in copies if str(path) not in held], copies[0].parent)
+    _discard_staged_copies([path for path in copies if str(path) not in held], copies[0].parent)
 
 
 # A reference opened by one of these is quoted: its name is exactly the text up to the closer.
@@ -320,7 +321,7 @@ def _named_scratch_reports(conn, task_id, result, metadata):
         if kind == 'file':
             found.append(str(named))
         elif kind == 'refuse':
-            raise _kb.ArtifactPreservationError(
+            raise ArtifactPreservationError(
                 f'the result names {named[:300]!r} under the scratch workspace, but it is not a regular file named '
                 'exactly and unambiguously (as plain words, or in closed backticks/quotes), so it cannot be proven '
                 'attached before cleanup; name the report exactly')
@@ -346,7 +347,7 @@ def _scratch_sources(conn, task_id, metadata):
         try:
             path = Path(item).expanduser().resolve()
         except (OSError, RuntimeError, ValueError) as exc:
-            raise _kb.ArtifactPreservationError(f'cannot resolve declared artifact {item[:300]!r}: {exc}') from exc
+            raise ArtifactPreservationError(f'cannot resolve declared artifact {item[:300]!r}: {exc}') from exc
         if path.is_relative_to(root):
             sources.append(path)
     return sources
@@ -381,9 +382,9 @@ def _require_held(sources, held):
         try:
             copies = digests.get(_digest(source), [])
         except OSError as exc:
-            raise _kb.ArtifactPreservationError(f'cannot read report {str(source)[:300]!r}: {exc}') from exc
+            raise ArtifactPreservationError(f'cannot read report {str(source)[:300]!r}: {exc}') from exc
         if not any(_attached_as(source, copy) for copy in copies):
-            raise _kb.ArtifactPreservationError(
+            raise ArtifactPreservationError(
                 f'no attachment holds {str(source)[:300]!r} under its own name with its exact bytes')
 
 
