@@ -386,6 +386,12 @@ async def connect_gateway(endpoint=None, subject=None, ready_timeout=None, *, ma
             detail = exc.bounded_detail(500)
             raise GatewayUnavailableError(f"Gateway inaccessible: {exc.reason}" + (f" ({detail})" if detail else ""),
                                           "inaccessible", exc.reason) from exc
+        except TimeoutError as exc:
+            # The owner's control socket took the request but answered nothing within the mint's bound:
+            # the verdict the ensure gives a control timeout (``starting``/deadline), not a refusal.
+            # Nothing was submitted, so a caller may wait for the owner (``kanban_worker_client``).
+            raise GatewayUnavailableError("Gateway starting: control_timeout (session ticket unanswered)",
+                                          "starting", "control_timeout") from exc
         url, protocols = gateway_ws_target(endpoint, ticket)
     try:
         # The gateway is a loopback (or explicitly named) peer, never something to route through the
