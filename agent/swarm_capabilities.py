@@ -31,6 +31,16 @@ def board_actor(fallback: str, requested: str | None = None) -> str:
     return requested or profile
 
 
+def bound_session_actor() -> str | None:
+    """The session-qualified actor this call stamps on board records, or ``None`` without the grant.
+
+    Under the grant every board record this session writes (task ``created_by``, event ``actor``)
+    carries exactly this string, so it identifies one session, never just its profile."""
+    if not worker_board_management_enabled():
+        return None
+    return board_actor("worker")
+
+
 def peer_session_author() -> dict | None:
     """An explicit swarm sender is a session, not its profile's standing Bot Chat."""
     if not worker_board_management_enabled():

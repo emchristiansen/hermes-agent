@@ -35,6 +35,7 @@ from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 # reads it there, so a patch of that module is the one the completion path sees.
 from hermes_cli.kanban_attachments import copies as _attachments
 from hermes_cli import kanban_db_retry_policy as _retry_policy
+from hermes_cli.kanban_provenance import created_by_completing_session
 from toolsets import get_toolset_names
 from utils import unlink_files_older_than
 
@@ -2528,17 +2529,24 @@ def _verify_created_cards(
 ) -> tuple[list[str], list[str]]:
     """Partition ``claimed_ids`` into (verified, phantom). Verified = the row
     exists AND ``created_by`` is the completing task's assignee or id, OR the
-    card is linked as its child (created elsewhere, attached by the worker).
+    card is linked as its child (created elsewhere, attached by the worker),
+    OR the session the owner admitted for the current run created it
+    (:func:`hermes_cli.kanban_provenance.created_by_completing_session`).
     Never mutates."""
     ordered = list(dict.fromkeys(str(x).strip() for x in (claimed_ids or []) if str(x).strip()))
     if not ordered:
         return [], []
 
-    row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (completing_task_id,)).fetchone()
+    row = conn.execute(
+        "SELECT assignee, current_run_id FROM tasks WHERE id = ?", (completing_task_id,),
+    ).fetchone()
     if row is None:
         # Completing task not found — nothing resolves.
         return [], ordered
     completing_assignee = row["assignee"]
+    session_created = created_by_completing_session(
+        conn, completing_task_id, completing_assignee, row["current_run_id"], ordered,
+    )
 
     # Batch-fetch existence + created_by in one query.
     placeholders = ",".join(["?"] * len(ordered))
@@ -2559,6 +2567,7 @@ def _verify_created_cards(
             (completing_assignee and created_by == completing_assignee)
             or created_by == completing_task_id
             or cid in linked_children
+            or cid in session_created
         )
         (verified if trusted else phantom).append(cid)
     return verified, phantom
