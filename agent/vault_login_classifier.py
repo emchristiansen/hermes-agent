@@ -282,14 +282,15 @@ def build_clear_stamps_js(nonce: str) -> str:
 # inspection's registry holds the exact nodes it stamped, so a stamped node that is detached when cleanup
 # runs (a page listener may remove a field and reinsert it later) still loses this inspection's stamp; the
 # walk of the document and open shadow roots also reaches a stamp copied onto a clone. A stamp of another
-# inspection stays.
+# inspection stays. Removing a stamp can run page code synchronously (a customized built-in element observing
+# the attribute), so the observer's pending records are noted into the registry only after every removal,
+# then it is disconnected: a caller holding the registry sees a node that left the tree during cleanup too.
 _RETIRE_INSPECTION_JS = """
   function retireInspection(nonce) {
     const prefix = nonce + ":";
     const registry = window["hermesVaultSlots:" + nonce];
     const stamped = new Set();
     if (registry) {
-      registry.observer.disconnect();
       delete window["hermesVaultSlots:" + nonce];
       registry.nodes.forEach((n) => stamped.add(n));
     }
@@ -304,6 +305,7 @@ _RETIRE_INSPECTION_JS = """
       const stamp = n.getAttribute("data-hermes-vault-slot");
       if (stamp !== null && stamp.startsWith(prefix)) { n.removeAttribute("data-hermes-vault-slot"); removed += 1; }
     });
+    if (registry) { registry.note(registry.observer.takeRecords()); registry.observer.disconnect(); }
     return removed;
   }"""
 
@@ -409,9 +411,11 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
     clone carrying the stamp, refuses with ``target_changed`` before and after focus. A
     ``current-password`` write must leave the field holding exactly the stored value (an input strips
     CR/LF, a page may rewrite it); otherwise what was written is cleared and the script refuses with
-    ``value_mismatch``. The clearing's own input/change notifications run page code synchronously, so the
-    refusal carries ``intact`` (the original node is still connected and never left the tree) and ``cleared``
-    (``intact`` and the field is empty after them; a page may put a value back or replace the field).
+    ``value_mismatch``. The clearing's own input/change notifications, and the stamp cleanup after them, run
+    page code synchronously, so the refusal is built last, after the cleanup: ``intact`` (the original node
+    is still connected and never left the tree, checked after the rollback and again after the cleanup) and
+    ``cleared`` (``intact`` and the field is empty at that point; a page may put a value back or replace the
+    field).
     Neither refusal is ever reported as filled. Values are rendered by :func:`_render_js`, so they reach the
     page unchanged whatever they contain.
     """
@@ -440,7 +444,11 @@ _FILL_JS_TEMPLATE = """(() => {
     registry.note(registry.observer.takeRecords());
     return registry.nodes.get(f.index) === el && !registry.left.has(f.index) && el.isConnected;
   };
-  try {
+  // A value_mismatch's report waits for the cleanup: no emptiness claim is computed before our own DOM
+  // mutations (events, stamp removal) that can run page code.
+  let mismatch = null;
+  let early;
+  try { early = (() => {
     if (window.location.origin !== expectedOrigin) {
       return JSON.stringify({ refused: "origin_changed", found: window.location.origin });
     }
@@ -485,19 +493,25 @@ _FILL_JS_TEMPLATE = """(() => {
           if (setter && setter.set) { setter.set.call(el, ""); } else { el.value = ""; }
           el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "deleteContent" }));
           el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-          // Those notifications ran page code synchronously: the field counts as cleared only if it is still
-          // the original node, connected and never removed since inspection (not detached, reinserted or
-          // replaced), and empty after them. ``intact`` says whether the original is still that field.
-          const intact = original(f, el);
-          return JSON.stringify({ refused: "value_mismatch", intact, cleared: intact && current(el).length === 0 });
+          // Those notifications ran page code synchronously, and so will the stamp cleanup: keep the identity
+          // evidence now; the report itself is built after the cleanup (below the finally).
+          mismatch = { f, el, intact: original(f, el) };
+          return null;
         }
         if (current(el).length > 0) filled += 1;
       } catch (e) { /* skip */ }
     }
     return JSON.stringify({ filled });
-  } finally {
+  })(); } finally {
     retireInspection(nonce);
   }
+  if (!mismatch) return early;
+  // Built last: the original is the field only if it was intact after the rollback and, after the cleanup's
+  // own callbacks, is still the registered node, never left the tree and connected; cleared only if it is
+  // also empty now.
+  const intact = mismatch.intact && registry.nodes.get(mismatch.f.index) === mismatch.el
+    && !registry.left.has(mismatch.f.index) && mismatch.el.isConnected;
+  return JSON.stringify({ refused: "value_mismatch", intact, cleared: intact && current(mismatch.el).length === 0 });
   // Declared last (hoisted) so the origin check precedes every DOM lookup. Stamped controls may live
   // inside a shadow root (see the inspection script's walk): look in the document and every open
   // shadow root, walked afresh on each call since focus listeners may have changed the tree.

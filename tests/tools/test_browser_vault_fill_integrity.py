@@ -700,3 +700,81 @@ def test_rollback_change_replacing_original_with_an_empty_clone_is_still_not_est
     assert _evaluate(browser.page, "old.isConnected") is False
     assert state == {"slots": 0, "email": "human@example.invalid", "pw": "", "submits": 0}
     assert _evaluate(browser.page, f"{_REGISTRIES}.length") == 0
+
+
+# ── the mismatch report is built after the cleanup's own synchronous page callbacks (review23339) ──────────
+# The reviewer's probes (test_review_rollback_identity.py, SHA256 692f12b7…f45f4e), carried verbatim, plus
+# marked extra assertions on the exact report. A customized built-in input observing the stamp attribute runs
+# page code synchronously when the cleanup removes the stamp, after the rollback's notifications.
+
+from tools.browser_vault_tool import _fill_outcome  # noqa: E402
+
+
+@_integration
+@pytest.mark.parametrize('mutation', ['move','shadow-replace','clone-reinsert','ancestor-move','shadow-host-reinsert'])
+def test_rollback_invalidations(browser,mutation):
+    setup = "window.old=document.getElementById('p');window.live=old;"
+    if mutation in ['shadow-replace','shadow-host-reinsert']:
+        setup += "window.host=document.createElement('div');document.body.append(host);window.root=host.attachShadow({mode:'open'});root.append(old);"
+    else:
+        setup += "window.dest=document.createElement('div');document.body.append(dest);"
+    body = {
+        'move': 'dest.append(this);',
+        'shadow-replace': "live=this.cloneNode(true);live.value='REVIEW-REPLACEMENT';this.replaceWith(live);",
+        'clone-reinsert': "live=this.cloneNode(true);live.value='REVIEW-REPLACEMENT';this.replaceWith(live);live.after(this);",
+        'ancestor-move': 'dest.append(this.parentNode);',
+        'shadow-host-reinsert': 'host.remove();document.body.append(host);',
+    }[mutation]
+    setup += "old.addEventListener('change',function(){if(this.value===''){"+body+"}});"
+    _evaluate(browser.page,setup)
+    nonce='identity23339'
+    controls=json.loads(_evaluate(browser.page,build_inspection_js(nonce)))
+    index=next(x['index'] for x in controls if x['type']=='password')
+    fill=build_fill_js([{'index':index,'token':'current-password','value':'before\nafter'}],browser.origin,nonce,require_empty=True)
+    observed=json.loads(_evaluate(browser.page,"(()=>{const result="+fill+";return JSON.stringify({result:JSON.parse(result),original:old.value,connected:old.isConnected,current:live.value,slots:[old,live].filter(x=>x.hasAttribute('data-hermes-vault-slot')).length,submits:window.submits,registries:Object.getOwnPropertyNames(window).filter(x=>x.startsWith('hermesVaultSlots:')).length})})()"))
+    out=json.loads(_fill_outcome(observed['result'],None,None,browser.origin,[]))
+    print('IDENTITY_OBSERVATION='+json.dumps(dict(observed,mutation=mutation,tool=out)))
+    assert observed['result']=={'refused':'value_mismatch','intact':False,'cleared':False}
+    assert out['success'] is False and out['error_type']=='value_mismatch' and out['field_cleared'] is False
+    assert 'not established' in out['error'] and 'nothing is filled' not in out['error'] and 'next' not in out
+    assert observed['slots']==observed['submits']==observed['registries']==0
+    assert 'REVIEW-REPLACEMENT' not in json.dumps(out)
+
+@_integration
+@pytest.mark.parametrize('mutation',['refill','replace'])
+def test_finally_cleanup_preserves_report_truth_at_script_return(browser,mutation):
+    effect = "this.value='REVIEW-CLEANUP';" if mutation=='refill' else "const clone=document.createElement('input');clone.id='p';clone.type='password';clone.value='REVIEW-CLEANUP';this.replaceWith(clone);"
+    setup = "customElements.define('review-password',class extends HTMLInputElement {static get observedAttributes(){return ['data-hermes-vault-slot'];} attributeChangedCallback(name,oldValue,newValue){if(oldValue!==null && newValue===null){"+effect+"}}},{extends:'input'});const old=document.getElementById('p');const custom=document.createElement('input',{is:'review-password'});custom.id='p';custom.name=old.name;custom.type='password';custom.autocomplete='current-password';old.replaceWith(custom);window.reviewOriginal=custom;"
+    _evaluate(browser.page,setup)
+    nonce='finally23339'
+    controls=json.loads(_evaluate(browser.page,build_inspection_js(nonce)))
+    index=next(x['index'] for x in controls if x['type']=='password')
+    fill=build_fill_js([{'index':index,'token':'current-password','value':'before\nafter'}],browser.origin,nonce,require_empty=True)
+    observed=json.loads(_evaluate(browser.page,"(()=>{const result="+fill+";return JSON.stringify({result:JSON.parse(result),original:window.reviewOriginal.value,connected:window.reviewOriginal.isConnected,current:document.getElementById('p').value,submits:window.submits,registries:Object.getOwnPropertyNames(window).filter(x=>x.startsWith('hermesVaultSlots:')).length})})()"))
+    out=json.loads(_fill_outcome(observed['result'],None,None,browser.origin,[]))
+    print('FINALLY_OBSERVATION='+json.dumps(dict(observed,mutation=mutation,tool=out)))
+    assert observed['current']=='REVIEW-CLEANUP',observed
+    assert observed['submits']==observed['registries']==0
+    assert out['error_type']=='value_mismatch' and out['success'] is False and 'next' not in out
+    assert out['field_cleared'] is False and 'nothing is filled' not in out['error'], observed
+    # The report is built after cleanup: a refilled original is "not empty", a replaced one "not established".
+    assert observed['result']=={'refused':'value_mismatch','intact':mutation=='refill','cleared':False}, observed
+    assert ('the field is not empty' if mutation=='refill' else 'not established') in out['error'], out
+    assert 'REVIEW-CLEANUP' not in json.dumps(out)
+
+@_integration
+@pytest.mark.parametrize('mutation',['refill','replace'])
+def test_cli_finally_cleanup_report(browser,store,capsys,mutation):
+    from tests.tools.test_browser_vault_fill_integrity import _cli_fill
+    effect = "this.value='REVIEW-CLEANUP';" if mutation=='refill' else "const clone=document.createElement('input');clone.id='p';clone.type='password';clone.value='REVIEW-CLEANUP';this.replaceWith(clone);"
+    setup = "customElements.define('review-password',class extends HTMLInputElement {static get observedAttributes(){return ['data-hermes-vault-slot'];} attributeChangedCallback(name,oldValue,newValue){if(oldValue!==null && newValue===null){"+effect+"}}},{extends:'input'});const old=document.getElementById('p');const custom=document.createElement('input',{is:'review-password'});custom.id='p';custom.name=old.name;custom.type='password';custom.autocomplete='current-password';old.replaceWith(custom);window.reviewOriginal=custom;"
+    _evaluate(browser.page,setup)
+    code,out,_=_cli_fill(browser,store,'before\nafter',capsys)
+    state=json.loads(_evaluate(browser.page,"JSON.stringify({original:window.reviewOriginal.value,connected:window.reviewOriginal.isConnected,current:document.getElementById('p').value,slots:document.querySelectorAll('[data-hermes-vault-slot]').length,submits:window.submits})"))
+    print('CLI_FINALLY_OBSERVATION='+json.dumps(dict(state,result=out)))
+    assert code==1 and out['success'] is False and out['error_type']=='value_mismatch' and 'next' not in out
+    assert state['current']=='REVIEW-CLEANUP' and state['slots']==state['submits']==0,state
+    assert out['field_cleared'] is False and 'nothing is filled' not in out['error'],out
+    # Maintained addition: the tool's wording matches the report built after cleanup.
+    assert ('the field is not empty' if mutation=='refill' else 'not established') in out['error'], out
+    assert 'REVIEW-CLEANUP' not in json.dumps(out)
