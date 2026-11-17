@@ -1,5 +1,5 @@
 import type { AppendMessage, ThreadMessage } from '@assistant-ui/react'
-import { isUndeliveredCorrectionRefusal, JsonRpcGatewayError } from '@hermes/shared'
+import { isUndeliveredCorrectionRefusal, JsonRpcGatewayError, randomUuid } from '@hermes/shared'
 import { stripAnsi } from '@hermes/shared/ansi'
 import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
@@ -909,7 +909,8 @@ export function usePromptActions({
       }
 
       // Its retries present the generation its first send named (NC13-CLIENT-01).
-      const correctionId = crypto.randomUUID()
+      // randomUuid, not crypto.randomUUID: that exists only in secure contexts (a plain-HTTP Webapp has none).
+      const correctionId = randomUuid()
 
       // Accepted whether the live turn was redirected in place or queued for
       // the next turn (the build window, before the agent is wired) — either

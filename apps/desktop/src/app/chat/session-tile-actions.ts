@@ -9,7 +9,7 @@
  */
 
 import type { AppendMessage, ThreadMessage } from '@assistant-ui/react'
-import { isUndeliveredCorrectionRefusal } from '@hermes/shared'
+import { isUndeliveredCorrectionRefusal, randomUuid } from '@hermes/shared'
 import { useCallback, useMemo, useRef } from 'react'
 
 import type { ClientSessionState } from '@/app/types'
@@ -439,7 +439,8 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
       }
 
       // Its retries present the execution generation its first send named (NC13-CLIENT-01).
-      const correctionId = crypto.randomUUID()
+      // randomUuid, not crypto.randomUUID: that exists only in secure contexts (a plain-HTTP Webapp has none).
+      const correctionId = randomUuid()
 
       // One delivery attempt to this tile's session; a failure retries this same correction there.
       const attempt = async (): Promise<boolean> => {
