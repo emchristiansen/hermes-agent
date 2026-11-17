@@ -3,9 +3,10 @@
 - A transfer is ``terminal/steering`` bound to a claim. When its owner restarts before the claim
   settled it, only a transfer whose text its managed child confirmed consumed
   (``confirm_steer_transfer``) settles ``interrupted``; every other one is delivered again as its own
-  turn, in FIFO order with the input behind it: a duplicate, never a loss. The unknown lost claim
-  does not hold it back (at least once, no head-of-line blocking: it may already have run by the
-  time the new owner is up, or run once the claim is resolved). The lost claim itself is never replayed.
+  turn: a duplicate, never a loss. The unknown lost claim does not hold it back (at least once, no
+  head-of-line blocking: it may already have run by the time the new owner is up, or run once the
+  claim is resolved). Order with the input behind it is not required: order is a minor concern and
+  never gates a send (IL465010). The lost claim itself is never replayed.
 - A refused ``prompt.resolve_unknown`` (the claim is still running) leaves the running agent's
   buffered steer and the transfer registration untouched: the running turn still drains it.
 
@@ -44,7 +45,7 @@ def _state(db, admission):
 async def test_a_transfer_the_lost_claim_never_settled_survives_an_owner_restart(tmp_path, monkeypatch, handover):
     """The child's correction transfer, its claim lost and its settlement write failed, then the owner
     restarts: confirmed consumed and recorded so, it never runs again; otherwise it runs again as its
-    own turn, before the turn queued behind it, without waiting for the unknown lost turn to be
+    own turn, in either order with the turn queued behind it, without waiting for the unknown lost turn to be
     resolved (no head-of-line blocking: by the restart it is either still queued or already
     delivered, never stranded or settled undelivered). A confirmation whose own write failed is not
     recorded, so it runs again (a duplicate); one that committed before its reply was lost counts.
@@ -128,7 +129,9 @@ async def test_a_transfer_the_lost_claim_never_settled_survives_an_owner_restart
     assert _state(db, follower) == ('terminal', 'completed')
     assert _state(db, correction) == ('terminal', 'interrupted' if recorded else 'completed')
     assert heads == ['ORIGINAL']
-    assert executed == (['FOLLOWER'] if recorded else ['CORRECTION', 'FOLLOWER'])
+    # Every message delivered, each exactly as often as its outcome requires; order is not asserted
+    # (IL465010: order never blocks a send, so the follower may run before the re-delivered correction).
+    assert sorted(executed) == sorted(['FOLLOWER'] if recorded else ['CORRECTION', 'FOLLOWER'])
     assert not fresh.steer_transfers
 
 
