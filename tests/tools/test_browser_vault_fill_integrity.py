@@ -1,0 +1,455 @@
+"""The vault fill writes exactly the stored value, only into an actual empty password field, and leaves no
+slot stamp behind on any exit.
+
+* The fill script is rendered in one pass, so a value containing a template placeholder, quotes,
+  backslashes, slashes or non-ASCII text reaches the page byte for byte.
+* ``el.focus()`` runs page focus listeners synchronously; the target and its emptiness are checked again
+  after it, immediately before the write.
+* The password target is an actual ``type=password`` control, chosen once for the gate and the writer, so
+  an ``autocomplete=current-password`` text box never causes a resolve.
+* The inspection's stamps are removed on every exit after it: refusals, no field, exceptions, success.
+
+The unit tests use a recording stand-in for the page. The ``integration`` tests run ``hermes vault fill``
+(``hermes_cli.vault._cmd_fill``) against a real headless Chrome; they are opt-in like
+``test_browser_supervisor.py`` (``HERMES_E2E_BROWSER=1`` and ``-m integration``). Secrets are dummy values
+in a temporary local vault."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import threading
+import urllib.request
+from contextlib import ExitStack
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+from agent.vault_backends.local import LocalLoginBackend
+from agent.vault_login_classifier import (
+    ClassifiedLoginControl,
+    LoginControl,
+    _render_js,
+    best_password_control,
+    build_clear_stamps_js,
+    build_fill_js,
+    build_inspection_js,
+    select_password_fill,
+)
+from agent.vault_store import VaultStore
+from tests.waiting import wait_until
+
+# Every placeholder the fill and inspection templates use, plus quoting, escaping and non-ASCII text.
+_HARD_VALUES = [
+    "REVIEW-__REQUIRE_EMPTY__-tail",
+    "a__NONCE__b",
+    "__FILLS__",
+    "x__EXPECTED_ORIGIN__y",
+    "__UNKNOWN__",
+    "q'uo\"te`s",
+    "back\\slash\\\\double",
+    "sl/ash</script>",
+    "uni-é中\U0001f511-\u2028-\u2029-end",
+    "$1$&$'$`",
+    " lead and trail ",
+]
+
+
+def _fills_literal(js: str) -> list:
+    [line] = [ln for ln in js.splitlines() if ln.strip().startswith("const fills = ")]
+    return json.loads(line.strip()[len("const fills = "):].rstrip(";"))
+
+
+@pytest.mark.parametrize("value", _HARD_VALUES)
+def test_fill_script_carries_the_full_value_and_nothing_else_changes(value):
+    fills = [{"index": 3, "token": "current-password", "value": value}]
+    js = build_fill_js(fills, "https://mail.example", "0123abcd", require_empty=True)
+    assert _fills_literal(js) == fills
+    plain = build_fill_js([{"index": 3, "token": "current-password", "value": "PLAIN"}], "https://mail.example",
+                          "0123abcd", require_empty=True)
+    # The only bytes that differ are the value's own JSON literal: no placeholder in the value was replaced.
+    assert js == plain.replace(json.dumps("PLAIN"), json.dumps(value))
+    assert "\u2028" not in js and "\u2029" not in js  # line separators stay escaped inside the JS literal
+
+
+@pytest.mark.parametrize("value", _HARD_VALUES)
+def test_origin_and_nonce_are_data_too(value):
+    js = build_fill_js([], value, value)
+    assert f"const expectedOrigin = {json.dumps(value)};" in js
+    assert f"const nonce = {json.dumps(value)};" in js
+    assert f"const nonce = {json.dumps(value)};" in build_inspection_js(value)
+
+
+def test_template_and_values_must_match():
+    with pytest.raises(ValueError):
+        _render_js("(() => __A__)()", a=1, b=2)
+    with pytest.raises(ValueError):
+        _render_js("(() => __A__ + __B__)()", a=1)
+
+
+def test_stamp_cleanup_is_scoped_to_its_own_inspection():
+    js = build_clear_stamps_js("feedc0de")
+    assert 'const prefix = "feedc0de" + ":";' in js and "startsWith(prefix)" in js
+
+
+def test_fill_script_rechecks_after_focus_before_the_write():
+    js = build_fill_js([{"index": 0, "token": "current-password", "value": "v"}], "https://m.example", "n",
+                       require_empty=True)
+    focus = js.index("el.focus();")
+    write = js.index("setter.set.call(el, f.value)")
+    assert focus < js.index("const still = el.isConnected", focus) < write
+    assert focus < js.index('if (requireEmpty && current(el).length > 0) return JSON.stringify({ refused: "field_not_empty" });', focus) < write
+    assert js.index("} finally {") > write and 'startsWith(nonce + ":")' in js
+
+
+def _ctrl(**kw):
+    base = dict(autocomplete="", form_index=0, index=0, label="", name="", type="text")
+    base.update(kw)
+    return LoginControl(**base)
+
+
+def test_a_text_box_claiming_current_password_is_never_the_password_target():
+    text = ClassifiedLoginControl(_ctrl(index=0, autocomplete="current-password"), 100, "current-password")
+    real = ClassifiedLoginControl(_ctrl(index=1, type="password"), 90, "current-password")
+    assert best_password_control([text]) is None and select_password_fill([text], "p") == []
+    assert best_password_control([text, real]) is real
+    assert select_password_fill([text, real], "p") == [{"index": 1, "token": "current-password", "value": "p"}]
+
+
+# ── browser_vault_fill on a recording page ──────────────────────────────────
+
+_ORIGIN = "https://mail.example"
+_PASSWORD = "dummy-password-integrity"
+
+
+class _Page:
+    """Answers the supervisor calls browser_vault_fill makes; records writes and stamp clean-ups."""
+
+    def __init__(self, controls, fill_result=None):
+        self.controls, self.writes, self.cleared, self.inspections = controls, [], [], []
+        self.fill_result = fill_result or {"filled": 1}
+
+    def focus_page(self, origin, accept=None):
+        return {"ok": origin == _ORIGIN, "url": _ORIGIN + "/login"}
+
+    def evaluate_runtime(self, expression):
+        if expression.strip() == "window.location.href":
+            return {"ok": True, "result": _ORIGIN + "/login"}
+        if "expectedOrigin" in expression:
+            self.writes.append(expression)
+            return {"ok": True, "result": json.dumps(self.fill_result)}
+        if "const prefix = " in expression:
+            self.cleared.append(expression)
+            return {"ok": True, "result": 0}
+        self.inspections.append(expression)
+        return {"ok": True, "result": json.dumps(self.controls)}
+
+
+class _Recording(LocalLoginBackend):
+    def __init__(self, raises=None):
+        self.resolved, self.raises = [], raises
+
+    def resolve_password(self, handle):
+        self.resolved.append(handle)
+        if self.raises:
+            raise self.raises
+        return super().resolve_password(handle)
+
+
+@pytest.fixture()
+def item(tmp_path):
+    from agent import redact
+
+    store = VaultStore(base_dir=tmp_path / "vault")
+    meta = store.add_item("login", "Mail", {"identifier_type": "email", "identifier": "a@mail.example",
+                                            "password": _PASSWORD}, origin=_ORIGIN)
+    try:
+        with patch("agent.vault_store.get_vault_store", return_value=store):
+            yield meta
+    finally:
+        redact.clear_vault_redaction_values()
+
+
+def _fill(meta, page, backend):
+    from tools import browser_vault_tool
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+    with patch.object(SUPERVISOR_REGISTRY, "get", return_value=page), browser_vault_tool.supervisor_only():
+        return json.loads(browser_vault_tool.browser_vault_fill(meta.id, task_id="t", require_empty=True,
+                                                                backend=backend))
+
+
+_EMAIL = {"autocomplete": "username", "formIndex": 0, "index": 0, "name": "e", "type": "email", "hasValue": True}
+_PW = {"autocomplete": "current-password", "formIndex": 0, "index": 1, "name": "p", "type": "password",
+       "hasValue": False}
+_FAKE_PW = {"autocomplete": "current-password", "formIndex": 0, "index": 0, "name": "e", "type": "text",
+            "hasValue": False}
+
+
+@pytest.mark.parametrize(
+    "controls, fill_result, error_type, resolves",
+    [
+        ([], None, None, False),  # no login control at all
+        ([_EMAIL], None, "no_password_field", False),
+        ([_FAKE_PW], None, "no_password_field", False),  # text box claiming current-password
+        ([_EMAIL, dict(_PW, hasValue=True)], None, "field_not_empty", False),
+        ([_EMAIL, _PW], {"refused": "field_not_empty"}, "field_not_empty", True),  # value appeared in the page
+        ([_EMAIL, _PW], {"refused": "target_changed"}, "target_changed", True),
+        ([_EMAIL, _PW], {"refused": "origin_changed", "found": "https://other.example"}, "origin_changed", True),
+        ([_EMAIL, _PW], {"filled": 0}, None, True),
+        ([_EMAIL, _PW], {"filled": 1}, None, True),
+    ],
+)
+def test_every_exit_after_inspection_removes_its_stamps(item, controls, fill_result, error_type, resolves):
+    page, backend = _Page(controls, fill_result), _Recording()
+    out = _fill(item, page, backend)
+    assert out.get("error_type") == error_type
+    assert out["success"] is (fill_result == {"filled": 1})
+    assert ("next" in out) is out["success"]  # no "Submit" hint when nothing was filled
+    assert backend.resolved == ([item.id] if resolves else [])
+    assert len(page.writes) == (1 if resolves else 0)
+    [inspection] = page.inspections
+    if fill_result is None:  # the fill script never ran: the tool removes this inspection's stamps
+        [cleanup] = page.cleared
+        [nonce] = re.findall(r'const nonce = "([0-9a-f]+)";', inspection)
+        assert f'const prefix = "{nonce}" + ":";' in cleanup  # only this inspection's stamps
+    else:  # the fill script ran to completion and removed them in its own finally
+        assert page.cleared == []
+    assert _PASSWORD not in json.dumps(out)
+
+
+def test_an_exception_while_resolving_still_removes_the_stamps(item):
+    page, backend = _Page([_EMAIL, _PW]), _Recording(raises=RuntimeError("backend exploded"))
+    with pytest.raises(RuntimeError):
+        _fill(item, page, backend)
+    assert len(page.cleared) == 1 and page.writes == []
+
+
+# ── hermes vault fill against a real Chrome ─────────────────────────────────
+
+_FORM = (b'<html><body><form onsubmit="window.submits++;return false">'
+         b'<input id="e" type="email" value="human@example.invalid">'
+         b'<input id="p" type="password" autocomplete="current-password"><button>Submit</button></form>'
+         b'<script>window.submits=0</script></body></html>')
+
+_STATE = ("JSON.stringify({slots:document.querySelectorAll('[data-hermes-vault-slot]').length,"
+          "email:document.getElementById('e').value,pw:document.getElementById('p').value,submits:window.submits})")
+
+
+def _chrome_binary():
+    for candidate in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+        if shutil.which(candidate):
+            return shutil.which(candidate)
+    return None
+
+
+def _integration(fn):
+    for mark in (
+        pytest.mark.integration,
+        pytest.mark.skipif(os.environ.get("HERMES_E2E_BROWSER", "").strip() != "1",
+                           reason="real-browser E2E: set HERMES_E2E_BROWSER=1 to opt in"),
+        pytest.mark.skipif(_chrome_binary() is None, reason="Chrome/Chromium not installed"),
+    ):
+        fn = mark(fn)
+    return fn
+
+
+@pytest.fixture
+def browser():
+    """A headless Chrome on a fresh profile with one login page served from 127.0.0.1."""
+
+    class _H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(_FORM)
+
+        def log_message(self, *a):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    origin = f"http://127.0.0.1:{server.server_port}"
+    # Chrome gets a complete disposable environment of its own (HOME, XDG directories, TMPDIR, no D-Bus
+    # session, no keyring, no credentials), not the runner's: a crash report, keyring entry or profile
+    # write can only land in this directory.
+    root = Path(tempfile.mkdtemp(prefix="hvf-"))
+    env = {"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8", "TZ": "UTC",
+           "DBUS_SESSION_BUS_ADDRESS": "disabled:"}
+    for var, sub in (("HOME", "home"), ("XDG_CONFIG_HOME", "config"), ("XDG_CACHE_HOME", "cache"),
+                     ("XDG_DATA_HOME", "data"), ("XDG_STATE_HOME", "state"), ("XDG_RUNTIME_DIR", "runtime"),
+                     ("TMPDIR", "tmp")):
+        (root / sub).mkdir(mode=0o700)
+        env[var] = str(root / sub)
+    profile = root / "profile"
+    proc = subprocess.Popen(
+        [_chrome_binary(), "--headless=new", "--remote-debugging-port=0", f"--user-data-dir={profile}",
+         "--no-first-run", "--no-default-browser-check", "--disable-gpu", "--disable-extensions",
+         "--disable-crash-reporter", "--disable-breakpad", "--password-store=basic", origin + "/login"],
+        env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        http, page = wait_until(lambda: _login_target(proc, profile, origin), timeout=15,
+                                what="Chrome exposing the login page over CDP")
+        wait_until(lambda: _ready(page), timeout=15, what="the login form")
+        yield SimpleNamespace(http=http, origin=origin, page=page)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        server.shutdown()
+        server.server_close()
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _login_target(proc, profile, origin):
+    """``(http endpoint, page target)`` once Chrome lists the login page, else None."""
+    if proc.poll() is not None:
+        pytest.fail(f"Chrome exited ({proc.returncode}) before exposing CDP")
+    try:
+        port = int((profile / "DevToolsActivePort").read_text().splitlines()[0])
+        http = f"http://127.0.0.1:{port}"
+        with urllib.request.urlopen(http + "/json/list", timeout=1) as r:
+            targets = json.load(r)
+    except (OSError, ValueError, IndexError):  # not written yet / not listening yet
+        return None
+    page = next((t for t in targets if t.get("type") == "page" and t["url"].startswith(origin)), None)
+    return (http, page) if page else None
+
+
+def _ready(page):
+    try:
+        return _evaluate(page, "document.readyState === 'complete' && !!document.getElementById('p')") is True
+    except (OSError, AssertionError):
+        return False
+
+
+def _evaluate(page, expression):
+    from websockets.sync.client import connect
+
+    with connect(page["webSocketDebuggerUrl"], open_timeout=5) as ws:
+        ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
+                            "params": {"expression": expression, "returnByValue": True}}))
+        while True:
+            msg = json.loads(ws.recv(timeout=5))
+            if msg.get("id") == 1:
+                assert "exceptionDetails" not in msg["result"], msg
+                return msg["result"]["result"].get("value")
+
+
+def _state(browser):
+    return json.loads(_evaluate(browser.page, _STATE))
+
+
+def _cli_fill(browser, store, password, capsys, during_resolve=None):
+    """Run ``hermes vault fill`` (the real CLI command, supervisor and fill) on the login page."""
+    from agent.redact import clear_vault_redaction_values
+    from hermes_cli import vault as vault_cli
+
+    meta = store.add_item("login", "Mail", {"identifier_type": "email", "identifier": "a@x.invalid",
+                                            "password": password}, origin=browser.origin)
+    resolved = []
+    original = LocalLoginBackend.resolve_password
+
+    def resolve(self, handle):
+        resolved.append(handle)
+        value = original(self, handle)
+        if during_resolve:
+            _evaluate(browser.page, during_resolve)
+        return value
+
+    args = SimpleNamespace(handle=meta.id, cdp=browser.http, target_id=browser.page["id"], backend="local")
+    with ExitStack() as stack:
+        stack.enter_context(patch("agent.vault_store.get_vault_store", return_value=store))
+        stack.enter_context(patch.object(LocalLoginBackend, "resolve_password", resolve))
+        with pytest.raises(SystemExit) as exc:
+            vault_cli._cmd_fill(args)
+    clear_vault_redaction_values()
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    return exc.value.code, out, resolved
+
+
+@pytest.fixture
+def store(tmp_path):
+    return VaultStore(base_dir=tmp_path / "vault")
+
+
+@_integration
+@pytest.mark.parametrize("value", ["REVIEW-full-value-ordinary-7", *_HARD_VALUES])
+def test_cli_fills_the_full_stored_value(browser, store, capsys, value):
+    _evaluate(browser.page, "document.getElementById('p').value=''")
+    code, out, _ = _cli_fill(browser, store, value, capsys)
+    assert code == 0 and out["success"] is True and out["filled_fields"] == 1
+    assert _state(browser) == {"slots": 0, "email": "human@example.invalid", "pw": value, "submits": 0}
+    assert value not in json.dumps(out)
+
+
+
+@_integration
+def test_cli_does_not_overwrite_a_value_a_focus_listener_writes(browser, store, capsys):
+    _evaluate(browser.page, "document.getElementById('e').focus();document.getElementById('p').value='';"
+                            "window.focusFired=0;document.getElementById('p').addEventListener('focus',"
+                            "function(){window.focusFired++;this.value='HUMAN-focus-value'},{once:true})")
+    code, out, _ = _cli_fill(browser, store, "vault-value-1", capsys)
+    assert code == 1 and out["error_type"] == "field_not_empty"
+    assert _evaluate(browser.page, "window.focusFired") == 1
+    assert _state(browser) == {"slots": 0, "email": "human@example.invalid", "pw": "HUMAN-focus-value",
+                               "submits": 0}
+
+
+
+@_integration
+def test_cli_refuses_when_a_focus_listener_changes_the_target(browser, store, capsys):
+    _evaluate(browser.page, "document.getElementById('e').focus();document.getElementById('p').value='';"
+                            "document.getElementById('p').addEventListener('focus',"
+                            "function(){this.type='text'},{once:true})")
+    code, out, _ = _cli_fill(browser, store, "vault-value-2", capsys)
+    assert code == 1 and out["error_type"] == "target_changed"
+    state = _state(browser)
+    assert state["pw"] == "" and state["slots"] == 0
+    _evaluate(browser.page, "document.getElementById('p').type='password'")
+
+
+
+@_integration
+def test_cli_refuses_a_value_typed_during_resolution_and_leaves_no_stamps(browser, store, capsys):
+    _evaluate(browser.page, "document.getElementById('p').value=''")
+    code, out, resolved = _cli_fill(browser, store, "vault-value-3", capsys,
+                                    during_resolve="document.getElementById('p').value='HUMAN-during-resolution'")
+    assert code == 1 and out["error_type"] == "field_not_empty" and len(resolved) == 1
+    assert _state(browser) == {"slots": 0, "email": "human@example.invalid", "pw": "HUMAN-during-resolution",
+                               "submits": 0}
+
+
+
+@_integration
+@pytest.mark.parametrize(
+    "setup, error_type",
+    [
+        # no usable control at all
+        ("document.getElementById('p').disabled=true;document.getElementById('e').type='hidden'", None),
+        # the only current-password control is a text box
+        ("document.getElementById('p').disabled=true;document.getElementById('e').type='text';"
+         "document.getElementById('e').autocomplete='current-password';document.getElementById('e').value=''",
+         "no_password_field"),
+    ],
+)
+def test_cli_without_an_actual_password_field_resolves_nothing_and_leaves_no_stamps(browser, store, capsys, setup,
+                                                                                    error_type):
+    _evaluate(browser.page, "document.getElementById('p').value='';" + setup)
+    code, out, resolved = _cli_fill(browser, store, "vault-value-4", capsys)
+    assert code == 1 and out["success"] is False and out.get("error_type") == error_type
+    assert resolved == [] and "next" not in out
+    assert _evaluate(browser.page, "document.querySelectorAll('[data-hermes-vault-slot]').length") == 0
+    assert _evaluate(browser.page, "document.getElementById('p').value") == ""
+

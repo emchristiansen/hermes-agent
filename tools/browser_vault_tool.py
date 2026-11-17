@@ -29,6 +29,8 @@ autofill (kernel-login-autofill.ts / fill_from_vault.ts).
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import secrets
 import logging
@@ -57,6 +59,22 @@ def _check_vault_available() -> bool:
 # JS evaluation plumbing (server-side; results never carry secret values)
 # ---------------------------------------------------------------------------
 
+# Set by ``supervisor_only()``: every page access goes through the task's registered supervisor and
+# nothing else, never a session attached on demand, a plugin page backend or the preview page.
+_SUPERVISOR_ONLY: contextvars.ContextVar[bool] = contextvars.ContextVar("vault_supervisor_only", default=False)
+
+
+@contextlib.contextmanager
+def supervisor_only():
+    """Confine vault page access to the registered supervisor (``hermes vault fill``): no session attached on
+    demand, no plugin page backend, no preview page. A missing or failing supervisor is a refusal."""
+    token = _SUPERVISOR_ONLY.set(True)
+    try:
+        yield
+    finally:
+        _SUPERVISOR_ONLY.reset(token)
+
+
 # A secret-bearing script runs inside this wrapper on a page backend, so a page exception is answered
 # in-page and its message (which may quote the script) never reaches the backend's error path or logs.
 _PAGE_FILL_FAILED = {"hermes_vault_eval_failed": True}
@@ -65,7 +83,9 @@ _PAGE_FILL_FAILED = {"hermes_vault_eval_failed": True}
 def _page_backend(task_id: str):
     """The page this operation runs on when it is not the task's CDP session: the Desktop in-app browser
     page pinned for a ``target='preview'`` operation, else the plugin browser holding this task's live page
-    (e.g. Camofox), else None."""
+    (e.g. Camofox), else None. Always None under ``supervisor_only()``."""
+    if _SUPERVISOR_ONLY.get():
+        return None
     from agent.browser_page_registry import backend_for_task
     from tools.browser_vault_preview import active_page
     return active_page() or backend_for_task(task_id)
@@ -107,11 +127,11 @@ def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
 def _ensure_supervisor(task_id: str):
     """The supervisor for ``task_id`` (browser_exec attaches one on every call), attaching one on demand to
     the task's session CDP endpoint when none is running. None when no endpoint is known; a fill then
-    refuses rather than touching argv."""
+    refuses rather than touching argv. Under ``supervisor_only()`` only the registered one, never an attach."""
     from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
     supervisor = SUPERVISOR_REGISTRY.get(task_id)
-    if supervisor is not None:
+    if supervisor is not None or _SUPERVISOR_ONLY.get():
         return supervisor
     from tools.browser_session import session_for_task
     from tools.browser_session_cdp import get_dialog_policy_config, resolve_cdp_override
@@ -162,7 +182,7 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
     # refuse here, before the credential lands in a page the human is now typing into. The outer
     # epoch check only discards the result, and a fill is a side effect, not a result.
     from tools.browser_vault_preview import active_page
-    if active_page() is None and _bot_desktop_browser_session(task_id):
+    if (_SUPERVISOR_ONLY.get() or active_page() is None) and _bot_desktop_browser_session(task_id):
         from tools.bot_desktop import lease as _bd_lease
         try:
             _bd_lease.assert_agent_may_act()
@@ -467,22 +487,27 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
 
 
 @plugin_errors_as_refusal
-def browser_vault_fill(handle: str, task_id: Optional[str] = None, *, with_identifier: bool = False) -> str:
+def browser_vault_fill(handle: str, task_id: Optional[str] = None, *, with_identifier: bool = False,
+                       require_empty: bool = False, backend: Any = None) -> str:
     """Fill the current page's password field from a vault handle.
 
     Password-only: the identifier is agent-visible metadata (see
     browser_vault_list) and is typed by the agent via normal input tools.
     The password is resolved server-side and injected via in-page JS over
     the supervisor CDP WebSocket; the result reports only counts/metadata.
+    ``require_empty`` (logins only) refuses with ``field_not_empty`` when the password field already
+    holds a value, and with ``no_password_field`` when the page has none, both before any value is
+    resolved; the fill script re-checks the field after focus, immediately before it writes. An
+    explicit ``backend`` is the only store consulted (no other backend is enumerated) and must own
+    ``handle``. A login's target is an actual ``type=password`` control. This inspection's slot stamps
+    are removed on every exit after it.
     """
-    from agent.vault_backends import UnlockRequired, backend_for_handle
+    from agent.vault_backends import UnlockRequired
 
     effective_task_id = task_id or "default"
-    backend = backend_for_handle(handle)
-    if backend is not None and backend.needs_unlock and not backend.is_unlocked():
-        unlocked = json.loads(browser_vault_unlock(backend.name))
-        if not unlocked.get("success"):
-            return json.dumps(unlocked)
+    backend, refused = _fill_backend(handle, backend)
+    if refused is not None:
+        return refused
 
     try:
         meta = backend.get_meta(handle) if backend is not None else None
@@ -513,7 +538,30 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, *, with_ident
         refusal = snapshot_refusal(backend, handle, meta, page_origin)
         if refusal is not None:
             return json.dumps(refusal)
-        return _fill_bound_page(backend, handle, meta, page_origin, effective_task_id, with_identifier)
+        return _fill_bound_page(backend, handle, meta, page_origin, effective_task_id, with_identifier,
+                                require_empty)
+
+
+def _fill_backend(handle: str, backend: Any) -> tuple[Any, Optional[str]]:
+    """The store a fill reads, and a refusal when it must not be read. An explicit ``backend`` is used as
+    supplied: it must own ``handle`` and is never unlocked or looked up by name. Without one, the handle
+    picks its backend, which may prompt to unlock."""
+    from agent.vault_backends import backend_for_handle
+
+    if backend is not None:
+        if not backend.owns(handle):
+            return backend, json.dumps({"success": False, "error_type": "backend_mismatch",
+                                        "error": f"Handle {handle!r} does not belong to the {backend.display_name} backend."})
+        if backend.needs_unlock and not backend.is_unlocked():
+            return backend, json.dumps({"success": False, "error_type": "unlock_required",
+                                        "error": f"{backend.display_name} is locked; nothing was read or written."})
+        return backend, None
+    backend = backend_for_handle(handle)
+    if backend is not None and backend.needs_unlock and not backend.is_unlocked():
+        unlocked = json.loads(browser_vault_unlock(backend.name))
+        if not unlocked.get("success"):
+            return backend, json.dumps(unlocked)
+    return backend, None
 
 
 def _identifier_fill(classified: list, password_fill: list[dict[str, Any]], identifier: str) -> list[dict[str, Any]]:
@@ -530,91 +578,146 @@ def _identifier_fill(classified: list, password_fill: list[dict[str, Any]], iden
 
 
 def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, effective_task_id: str,
-                     with_identifier: bool = False) -> str:
+                     with_identifier: bool = False, require_empty: bool = False) -> str:
     """Inspect the page, resolve the item's secret and write it; runs inside the backend's fill_context
-    after the origin guard passed. ``with_identifier`` also writes the login's (non-secret) identifier."""
+    after the origin guard passed. ``with_identifier`` also writes the login's (non-secret) identifier;
+    ``require_empty`` see :func:`browser_vault_fill`."""
     from agent.redact import register_vault_redaction_value
-    from agent.vault_login_classifier import (
-        ClassifiedLoginControl,
-        LoginControl,
-        build_fill_js,
-        build_inspection_js,
-        classify_checkout_control,
-        classify_login_control,
-        select_checkout_fills,
-        select_password_fill,
-    )
+    from agent.vault_login_classifier import build_fill_js, select_checkout_fills, select_password_fill
     from agent.vault_backends import UnlockRequired
     from agent.vault_store import ADDRESS_FIELDS, PAYMENT_FIELDS, scrub_secret_from_text
 
-    # ── Inspect + classify page controls ────────────────────────────────────
     nonce = secrets.token_hex(8)  # binds this fill to THIS inspection's stamps
-    inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
+    with _inspection_stamps(effective_task_id, nonce) as stamps:
+        classified, refused = _inspect_fill_targets(effective_task_id, nonce, meta, require_empty, with_identifier)
+        if refused is not None:
+            return refused
+
+        # ── Resolve secret and fill (secret never enters any logged string) ─────
+        try:
+            if meta.kind == "login":
+                secret = {"password": backend.resolve_password(handle)}
+                fills = select_password_fill(classified, secret["password"])
+                if with_identifier:
+                    fills += _identifier_fill(classified, fills, str(meta.identifier or ""))
+            else:
+                secret = backend.resolve_secret(handle)
+                fills = select_checkout_fills(classified, secret, PAYMENT_FIELDS if meta.kind == "payment" else ADDRESS_FIELDS)
+        except UnlockRequired:
+            return json.dumps({"success": False, "error_type": "unlock_required",
+                               "error": f"{backend.display_name} locked again; call browser_vault action=unlock."})
+        if not fills:
+            return json.dumps(
+                {"success": False, "error": f"No fillable {meta.kind} field matched the saved item on this page."}
+            )
+
+        # Register the secret bytes with the model-egress redaction boundary
+        # BEFORE they touch the page: any later browser_* result (including
+        # browser_cdp Runtime.evaluate reads) that echoes them is scrubbed.
+        # Address values are not secrets but the card fields are: register every payment value.
+        for value in (secret.values() if meta.kind == "payment" else [secret.get("password", "")]):
+            register_vault_redaction_value(value)
+
+        try:
+            fill_result = _eval_js_secret(
+                effective_task_id, build_fill_js(fills, expected_origin=page_origin, nonce=nonce,
+                                                 require_empty=require_empty)
+            )
+        except Exception as exc:  # health: allow BLE001 -- any CDP failure becomes a typed result; its text is scrubbed of the secret
+            return json.dumps(
+                {"success": False, "error": scrub_secret_from_text(str(exc), secret)}
+            )
+        if not fill_result.get("success"):
+            err = scrub_secret_from_text(str(fill_result.get("error") or "fill failed"), secret)
+            out = {"success": False, "error": err}
+            if fill_result.get("error_type"):
+                out["error_type"] = fill_result["error_type"]
+            return json.dumps(out)
+        stamps.removed_by_fill_script = True  # the script ran to completion, including its finally
+
+    return _fill_outcome(_parse_json_result(fill_result.get("result")), backend, meta, page_origin, fills)
+
+
+class _InspectionStamps:
+    """Whether this inspection's stamps still need removing: the fill script removes them itself when it
+    runs to completion; on every other exit the caller does."""
+
+    removed_by_fill_script = False
+
+
+@contextlib.contextmanager
+def _inspection_stamps(task_id: str, nonce: str):
+    """Remove the stamps of inspection ``nonce`` (only those) when the block exits, however it exits,
+    unless the fill script already did."""
+    from agent.vault_login_classifier import build_clear_stamps_js
+
+    stamps = _InspectionStamps()
+    try:
+        yield stamps
+    finally:
+        if not stamps.removed_by_fill_script:
+            _eval_js(task_id, build_clear_stamps_js(nonce))
+
+
+def _inspect_fill_targets(task_id: str, nonce: str, meta: Any, require_empty: bool,
+                          with_identifier: bool = False) -> tuple[list, Optional[str]]:
+    """Inspect and classify the page's controls (stamping them with ``nonce``), and refuse before anything
+    is resolved when there is nothing to fill. A login needs an actual ``type=password`` target (the same
+    control the writer selects) unless ``with_identifier`` fills an identifier-only step, and, with
+    ``require_empty``, one that holds no value."""
+    from agent.vault_login_classifier import (
+        LoginControl,
+        best_password_control,
+        build_inspection_js,
+        classify_checkout_control,
+        classify_login_control,
+    )
+
+    def refuse(error: str, error_type: Optional[str] = None) -> tuple[list, str]:
+        return [], json.dumps({"success": False, **({"error_type": error_type} if error_type else {}), "error": error})
+
+    inspect = _eval_js(task_id, build_inspection_js(nonce))
     if not inspect.get("success"):
-        return json.dumps(
-            {"success": False, "error": f"Could not inspect page inputs: {inspect.get('error', 'eval failed')}"}
-        )
+        return refuse(f"Could not inspect page inputs: {inspect.get('error', 'eval failed')}")
     raw_controls = _parse_json_result(inspect.get("result"))
     if isinstance(raw_controls, str):
         raw_controls = _parse_json_result(raw_controls)
     if not isinstance(raw_controls, list):
-        return json.dumps({"success": False, "error": "Page input inspection returned no usable controls."})
+        return refuse("Page input inspection returned no usable controls.")
 
     classify = classify_login_control if meta.kind == "login" else classify_checkout_control
-    classified: list[ClassifiedLoginControl] = []
-    for raw in raw_controls:
-        if not isinstance(raw, dict):
-            continue
-        result = classify(LoginControl.from_dict(raw))
-        if result is not None:
-            classified.append(result)
+    classified = [c for c in (classify(LoginControl.from_dict(raw)) for raw in raw_controls if isinstance(raw, dict))
+                  if c is not None]
     if not classified:
-        return json.dumps({"success": False, "error": f"No {meta.kind} form fields were found on the current page."})
+        return refuse(f"No {meta.kind} form fields were found on the current page.")
+    if require_empty and meta.kind != "login":
+        return refuse("require_empty applies to login fills only.", "unsupported")
+    if meta.kind != "login":
+        return classified, None
+    target = best_password_control(classified)
+    if target is None and require_empty:
+        return refuse("No password field on the page. Nothing was resolved or written.", "no_password_field")
+    if target is None and not with_identifier:
+        return refuse("No fillable login field matched the saved item on this page.")
+    if require_empty and target.control.has_value:
+        return refuse("Refused: the password field already holds a value. Nothing was resolved or written.",
+                      "field_not_empty")
+    return classified, None
 
-    # ── Resolve secret and fill (secret never enters any logged string) ─────
-    try:
-        if meta.kind == "login":
-            secret = {"password": backend.resolve_password(handle)}
-            fills = select_password_fill(classified, secret["password"])
-            if with_identifier:
-                fills += _identifier_fill(classified, fills, str(meta.identifier or ""))
-        else:
-            secret = backend.resolve_secret(handle)
-            fills = select_checkout_fills(classified, secret, PAYMENT_FIELDS if meta.kind == "payment" else ADDRESS_FIELDS)
-    except UnlockRequired:
-        return json.dumps({"success": False, "error_type": "unlock_required",
-                           "error": f"{backend.display_name} locked again; call browser_vault action=unlock."})
-    if not fills:
-        return json.dumps(
-            {"success": False, "error": f"No fillable {meta.kind} field matched the saved item on this page."}
-        )
 
-    # Register the secret bytes with the model-egress redaction boundary
-    # BEFORE they touch the page: any later browser_* result (including
-    # browser_cdp Runtime.evaluate reads) that echoes them is scrubbed.
-    # Address values are not secrets but the card fields are: register every payment value.
-    for value in (secret.values() if meta.kind == "payment" else [secret.get("password", "")]):
-        register_vault_redaction_value(value)
+# What the fill script reports when it wrote nothing because the page changed under it.
+_IN_PAGE_REFUSALS = {
+    "field_not_empty": "Refused: the field gained a value before the fill ran. Nothing was written.",
+    "target_changed": "Refused: the password field changed before the fill ran. Nothing was written.",
+}
 
-    try:
-        fill_result = _eval_js_secret(
-            effective_task_id, build_fill_js(fills, expected_origin=page_origin, nonce=nonce)
-        )
-    except Exception as exc:  # health: allow BLE001 -- any CDP failure becomes a typed result; its text is scrubbed of the secret
-        return json.dumps(
-            {"success": False, "error": scrub_secret_from_text(str(exc), secret)}
-        )
-    if not fill_result.get("success"):
-        err = scrub_secret_from_text(str(fill_result.get("error") or "fill failed"), secret)
-        out = {"success": False, "error": err}
-        if fill_result.get("error_type"):
-            out["error_type"] = fill_result["error_type"]
-        return json.dumps(out)
 
-    parsed = _parse_json_result(fill_result.get("result"))
+def _fill_outcome(parsed: Any, backend: Any, meta: Any, page_origin: str, fills: list) -> str:
+    """The tool result for the fill script's report: counts and metadata, never values."""
     if isinstance(parsed, str):
         parsed = _parse_json_result(parsed)
-    if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
+    refused = parsed.get("refused") if isinstance(parsed, dict) else None
+    if refused == "origin_changed":
         return json.dumps(
             {
                 "success": False,
@@ -627,11 +730,13 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
                 ),
             }
         )
+    if refused in _IN_PAGE_REFUSALS:
+        return json.dumps({"success": False, "error_type": refused, "error": _IN_PAGE_REFUSALS[refused]})
     filled = parsed.get("filled", 0) if isinstance(parsed, dict) else 0
 
     out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
            "kind": meta.kind, "origin": page_origin}
-    if meta.kind == "login":
+    if meta.kind == "login" and filled:
         out["next"] = ("Submit. If the site then asks for a verification code, call browser_vault action=enter_code with this handle"
                        + (" (a code will be generated automatically)." if meta.has_otp else "."))
     if meta.kind != "login":
