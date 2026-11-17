@@ -706,7 +706,7 @@ def _bot_chat_prompt_stale(agent, stored_prompt: str | None) -> bool:
         return False
     try:
         from tools.bot_mode_probe import (
-            BOT_CHAT_TITLE,
+            session_is_canonical_bot_chat,
             stored_bot_chat_prompt_needs_upgrade,
             stored_prompt_capability_stale,
         )
@@ -726,7 +726,8 @@ def _bot_chat_prompt_stale(agent, stored_prompt: str | None) -> bool:
                 title = str(agent._session_db.get_session_title(agent.session_id) or "").strip()
             except Exception:
                 title = ""
-        return title == BOT_CHAT_TITLE and bool(stored_bot_chat_prompt_needs_upgrade(stored_prompt, home))
+        return (session_is_canonical_bot_chat(agent._session_db, agent.session_id, title)
+                and bool(stored_bot_chat_prompt_needs_upgrade(stored_prompt, home)))
     except Exception:
         return False
 
@@ -734,14 +735,19 @@ def _bot_chat_prompt_stale(agent, stored_prompt: str | None) -> bool:
 def _persist_system_prompt(agent, failure_message: str, *, persist_tools: bool = False) -> None:
     """Persist ``agent._cached_system_prompt`` to the session row; failures log at WARNING
     (with ``failure_message``) because the gateway path (fresh AIAgent per turn) reads
-    this row every turn, so a silent failure breaks prefix-cache reuse."""
+    this row every turn, so a silent failure breaks prefix-cache reuse. ``persist_tools`` writes
+    the tools[] pin FIRST: a current-epoch prompt over a pre-refresh pin would never refresh
+    again, while an unwritten prompt is rebuilt by the next fresh agent."""
     if not agent._session_db:
         return
+    if persist_tools:
+        from tools.mcp_tool_agent import persist_agent_tool_names
+        if not persist_agent_tool_names(agent):
+            logger.warning("Session %s: the tools[] pin could not be persisted, so neither was the system "
+                           "prompt; the next fresh agent rebuilds both.", agent.session_id)
+            return
     try:
         agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
-        if persist_tools:
-            from tools.mcp_tool_agent import persist_agent_tool_names
-            persist_agent_tool_names(agent)
     except Exception as exc:
         logger.warning(failure_message, agent.session_id, exc)
 
@@ -781,6 +787,10 @@ def _refresh_bot_chat_tools(agent) -> None:
     policy = active_policy()
     platform = getattr(agent, "platform", None)
     if policy is None and platform not in ("desktop", "tui"):
+        # These agents already have current config-built tools, but the routed
+        # canonical identity also owns this dynamic schema. Include it before pinning.
+        from tools.bot_mode_dm import ensure_message_agent_tool
+        ensure_message_agent_tool(agent)
         return
     try:
         from tools.mcp_tool_agent import refresh_agent_mcp_tools
@@ -795,8 +805,9 @@ def _refresh_bot_chat_tools(agent) -> None:
             agent, enabled_override=_load_enabled_toolsets(platform),
             disabled_override=_load_disabled_toolsets(), quiet_mode=True, content_aware=True)
     except Exception as exc:
-        logger.warning("Bot Chat capability refresh kept the previous tools for session %s: %s",
-                       agent.session_id, exc)
+        logger.warning("Bot Chat capability refresh failed for session %s; no refreshed prompt is "
+                       "committed and the next turn retries: %s", agent.session_id, exc)
+        raise  # a current epoch records both prompt and tools: never stamp it over a failed rebuild
 
 
 def _restore_or_build_system_prompt(agent, system_message, conversation_history):

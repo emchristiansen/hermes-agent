@@ -1,5 +1,6 @@
 """Cap-only uptake through the real prompt builder, stale check and SessionDB."""
 
+import json
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -7,6 +8,7 @@ from agent.conversation_loop import _restore_or_build_system_prompt
 from agent.system_prompt import build_system_prompt
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_state import SessionDB
+from tools.bot_mode_dm import message_agent_tool_schema
 from tools.bot_mode_probe import stored_prompt_capability_stale
 
 
@@ -80,8 +82,12 @@ def test_cap_only_next_turn_persists_whole_soul_without_replacing_session(tmp_pa
         assert history == saved_history == db.get_messages(sid)
         after = db.get_session(sid)
         for key in ("id", "source", "model", "user_id", "session_key", "profile_name",
-                    "parent_session_id", "started_at", "ended_at", "message_count", "tool_names"):
+                    "parent_session_id", "started_at", "ended_at", "message_count"):
             assert after[key] == before[key], key
+        # The refresh re-pins the canonical Bot Chat's tools with its message_agent schema
+        # (_refresh_bot_chat_tools) and changes nothing else in the pin.
+        pinned_before, pinned_after = json.loads(before["tool_names"]), json.loads(after["tool_names"])
+        assert pinned_after == {**pinned_before, "tools": [*pinned_before["tools"], message_agent_tool_schema()]}
         assert agent._session_db is db and agent._owns_session_db is True
         assert agent.session_id == sid
         assert db.session_turn_lease_expires_at(sid, "fixture-turn-owner") == lease_before
