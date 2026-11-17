@@ -71,7 +71,7 @@ def test_drained_delivery_outcome_is_written_back(tmp_path, monkeypatch, transpo
             sent.append(text)
             return {"success": transport_ok_now["ok"], "message_id": "r2", "error": None}
 
-        monkeypatch.setattr("tools.send_message_tool._send_to_platform", send_ok)
+        monkeypatch.setattr("gateway.outbound.send._send_to_platform", send_ok)
         later = delivery_queue._now_seconds() + delivery_queue.RETRY_BACKOFF_MAX_SECONDS + 1
         monkeypatch.setattr(delivery_queue, "_now_seconds", lambda: later)
         assert scheduler.drain_delivery_queue({}, None) == 1

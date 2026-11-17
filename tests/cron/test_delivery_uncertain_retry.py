@@ -45,7 +45,7 @@ def env(tmp_path, monkeypatch):
         return {"error": "no platform credential in this profile"}
 
     monkeypatch.setattr(scheduler, "run_job", run)
-    monkeypatch.setattr("tools.send_message_tool._send_to_platform", standalone)
+    monkeypatch.setattr("gateway.outbound.send._send_to_platform", standalone)
     loop = asyncio.new_event_loop()
     thread = threading.Thread(target=loop.run_forever, daemon=True)
     thread.start()

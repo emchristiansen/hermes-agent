@@ -35,7 +35,7 @@ def env(tmp_path, monkeypatch):
         return {"success": not refused, "message_id": f"m{state['attempt']}",
                 "error": f"settlement refusal {state['attempt']}" if refused else None}
 
-    monkeypatch.setattr("tools.send_message_tool._send_to_platform", send)
+    monkeypatch.setattr("gateway.outbound.send._send_to_platform", send)
     return state
 
 

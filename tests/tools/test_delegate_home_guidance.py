@@ -34,9 +34,9 @@ def env(tmp_path, monkeypatch):
     (os_home / ".codex" / "AGENTS.md").symlink_to(core)
     monkeypatch.setenv("HOME", str(os_home))
     monkeypatch.setenv("HERMES_HOME", str(launch))
-    from tools import delegate_tool as dt
+    # Every delegate reader reaches the config through tools.delegate_tool_config (v0.23.2 dropped the
+    # tools.delegate_tool alias), so one patch there covers them all.
     import tools.delegate_tool_config as dtc
-    monkeypatch.setattr(dt, "_load_config", dict)
     monkeypatch.setattr(dtc, "_load_config", dict)
     # Skip only the write-side copy of each new config.yaml to backups/config (seconds per copy on the runner's ZFS
     # scratch root); the config readers stay real.
