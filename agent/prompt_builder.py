@@ -284,8 +284,11 @@ Avoid duplicate active executors, not legitimate same-owner continuation.
 Use board tasks for durable cross-agent handoffs that must outlive delegation.
 
 During long subprocesses, call `kanban_heartbeat(note=...)` every few minutes; short tasks need no extra heartbeat.
-For work over an hour, heartbeat at least hourly: the dispatcher can reclaim work past `kanban.dispatch_stale_timeout_seconds` (default four hours) without a heartbeat in the last hour.
-Reclaim makes the task ready without a failure penalty and ends your ownership of that run.
+For work over an hour, heartbeat at least hourly; heartbeats also renew your claim.
+Claim expiry and stale-run recovery are distinct, and only a successful reclaim ends your ownership of that run.
+Expiry or staleness makes a run eligible, not reclaimed: recovery may instead renew or defer it, for example while your host-local worker is alive with a missing or at-most-hour-old heartbeat, or survives termination.
+A successful reclaim of an expired claim counts as a failure toward the retry limit.
+A successful stale-run reclaim, of work past `kanban.dispatch_stale_timeout_seconds` (default four hours; 0 disables) without a heartbeat in the last hour, returns the task to its prior phase without counting a failure, except that a `max_retries=1` card is held blocked.
 
 ## Questions and waits
 
