@@ -45,7 +45,9 @@ class RuntimeSessionCompressionMixin:
     def get_compression_tip(self, session_id):
         return self._apply('compression.lineage', {'target': session_id})['tip']
 
-    def resolve_resume_session_id(self, session_id):
+    def resolve_resume_session_id(self, session_id, *, strict=False):
+        # SessionDB's ``strict`` only decides whether a failed lineage read is swallowed; this
+        # owner call never swallows one (``_apply`` raises), so it already answers strictly.
         return self._apply('compression.lineage', {'target': session_id})['resume']
 
     def declared_scope_identity(self, session_id):
