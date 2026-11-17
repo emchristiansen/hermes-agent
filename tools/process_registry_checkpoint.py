@@ -57,14 +57,17 @@ class ProcessCheckpointMixin:
         """This registry's entries (running, or finished with its scope in custody) and the IDs it decides.
         ``owner_pid``: the gateway that owns this writer's jobs (``_write_checkpoint``)."""
         from tools.process_registry import _CHECKPOINT_FIELDS
+        from tools.process_registry_awaiting import completion_settled
         with self._lock:
             entries = []
             # A finished session stays while its scope is in custody (process_registry_scope_custody).
             for s in (*self._running.values(), *self._finished.values()):
-                custody = bool(s.exited and s._scope_stop_pending and s.systemd_unit)
+                # A settling exit (its outcome still being recorded) stays a running entry, scope and all.
+                outcome_settled = completion_settled(s)  # the session lock, taken inside the registry lock
+                custody = bool(outcome_settled and s._scope_stop_pending and s.systemd_unit)
                 # A hosted agent's process is not this host's to persist: its record (command,
                 # cwd, owner) stays in memory, whoever triggers the write (scoped or not).
-                if (s.exited and not custody) or s.sandbox_key:
+                if (outcome_settled and not custody) or s.sandbox_key:
                     continue
                 # Backfill the start time so recovery can detect PID recycling
                 # even for sessions spawned before this field existed.

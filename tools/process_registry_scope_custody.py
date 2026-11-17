@@ -32,6 +32,38 @@ logger = logging.getLogger("tools.process_registry")
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
 # A finish whose completion fence cannot be taken retries with this backoff (seconds).
 _FENCE_RETRY_FIRST_SECONDS, _FENCE_RETRY_MAX_SECONDS = 0.05, 2.0
+# systemd's SD_MESSAGE_UNIT_OUT_OF_MEMORY: "A process of <unit> unit has been killed by the OOM killer."
+_UNIT_OOM_MESSAGE_ID = "fe6faa94e7774663a0da52717891d8ef"
+
+
+class _ScopeUnknown(Exception):
+    """systemd cannot be asked (no ``systemctl``, no user bus) or no cgroup hierarchy is mounted."""
+
+
+def _scope_cgroup(unit: str) -> Optional[Path]:
+    """*unit*'s kernel cgroup directory; None once the unit is garbage-collected or has no cgroup."""
+    from tools.process_registry import systemd_user_bus_env
+    binary = shutil.which("systemctl")
+    if binary is None:
+        raise _ScopeUnknown("no systemctl")
+    try:
+        out = subprocess.run(
+            [binary, "--user", "show", "-p", "LoadState", "-p", "ControlGroup", unit], capture_output=True,
+            text=True, timeout=15, stdin=subprocess.DEVNULL, env=systemd_user_bus_env(), check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("systemctl --user show %s failed: %s", unit, exc)
+        raise _ScopeUnknown(str(exc)) from exc
+    if out.returncode != 0:
+        raise _ScopeUnknown(f"systemctl exited {out.returncode}")
+    props = dict(line.partition("=")[::2] for line in out.stdout.splitlines())
+    if props.get("LoadState") == "not-found" or not props.get("ControlGroup"):
+        return None
+    # v2 (unified), then hybrid, then the v1 named hierarchy.
+    base = next((b for b in (_CGROUP_ROOT, _CGROUP_ROOT / "unified", _CGROUP_ROOT / "systemd")
+                 if (b / "cgroup.procs").exists()), None)
+    if base is None:
+        raise _ScopeUnknown("no cgroup hierarchy")
+    return base / props["ControlGroup"].lstrip("/")
 
 
 def scope_populated(unit: str) -> Optional[bool]:
@@ -39,35 +71,58 @@ def scope_populated(unit: str) -> Optional[bool]:
     None when that cannot be established (no ``systemctl``, no user bus): keep custody then."""
     if not unit:
         return False
-    from tools.process_registry import systemd_user_bus_env
-    binary = shutil.which("systemctl")
-    if binary is None:
-        return None
     try:
-        out = subprocess.run(
-            [binary, "--user", "show", "-p", "LoadState", "-p", "ControlGroup", unit], capture_output=True,
-            text=True, timeout=15, stdin=subprocess.DEVNULL, env=systemd_user_bus_env(), check=False)
-    except (OSError, subprocess.SubprocessError) as exc:
-        logger.debug("systemctl --user show %s failed: %s", unit, exc)
+        cgroup = _scope_cgroup(unit)
+    except _ScopeUnknown:
         return None
-    if out.returncode != 0:
-        return None
-    props = dict(line.partition("=")[::2] for line in out.stdout.splitlines())
-    if props.get("LoadState") == "not-found" or not props.get("ControlGroup"):
+    if cgroup is None:
         return False  # garbage-collected, or loaded without a cgroup: nothing runs in it
     # The kernel's view, not ActiveState: systemd notices an emptied scope asynchronously.
-    # cgroup.procs never lists zombies. v2 (unified), then hybrid, then the v1 named hierarchy.
-    base = next((b for b in (_CGROUP_ROOT, _CGROUP_ROOT / "unified", _CGROUP_ROOT / "systemd")
-                 if (b / "cgroup.procs").exists()), None)
-    if base is None:
-        return None
-    procs = base / props["ControlGroup"].lstrip("/") / "cgroup.procs"
+    # cgroup.procs never lists zombies.
     try:
-        return bool(procs.read_text(encoding="utf-8-sig").split())
+        return bool((cgroup / "cgroup.procs").read_text(encoding="utf-8-sig").split())
     except FileNotFoundError:
         return False  # the cgroup was removed after the query
     except OSError:
         return None
+
+
+def scope_oom_killed(unit: str) -> Optional[bool]:
+    """Whether the kernel OOM killer killed a process in *unit*'s scope; None when not established.
+
+    Neither the root's exit status nor ``termination_source`` (Hermes's own kills) shows a cgroup OOM:
+    under the default ``OOMPolicy=stop`` systemd then SIGTERMs the rest of the scope, so the root
+    reports an ordinary 143/-15. While the scope's cgroup exists its ``memory.events`` counter decides;
+    once ``--collect`` removed it, systemd's journal record of the kill, logged before that stop, does.
+    A journal without the record is no proof (it may be volatile or rate-limited): None, never False."""
+    try:
+        cgroup = _scope_cgroup(unit)
+    except _ScopeUnknown:
+        cgroup = None
+    if cgroup is not None:
+        try:
+            events = (cgroup / "memory.events").read_text(encoding="utf-8-sig").split()
+            return int(dict(zip(events[::2], events[1::2]))["oom_kill"]) > 0
+        except FileNotFoundError:
+            pass  # removed after the query: the journal still has the kill
+        except (OSError, ValueError, KeyError):
+            return None
+    return _journal_records_oom_kill(unit)
+
+
+def _journal_records_oom_kill(unit: str) -> Optional[bool]:
+    binary = shutil.which("journalctl")
+    if binary is None:
+        return None
+    try:
+        out = subprocess.run(
+            [binary, "--user", "--no-pager", "--quiet", "-o", "cat", "--output-fields=MESSAGE_ID", "-u", unit,
+             f"MESSAGE_ID={_UNIT_OOM_MESSAGE_ID}"],
+            capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("journalctl --user -u %s failed: %s", unit, exc)
+        return None
+    return True if out.returncode == 0 and out.stdout.strip() else None
 
 
 @contextmanager
@@ -104,6 +159,14 @@ class ProcessScopeCustodyMixin:
         return not session.exited or session._scope_stop_pending
 
     @staticmethod
+    def _observe_scope_oom(session, exit_code) -> Optional[bool]:
+        """Before a scoped root's nonzero exit is recorded: did the kernel OOM-kill a process in its
+        scope? Read-only and slow (systemctl, journal), so taken outside every lock; the finisher hands
+        it to ``mark_exited``, which records it with the exit or, after a raced kill, not at all. An
+        exit 0 is not checked."""
+        return scope_oom_killed(session.systemd_unit) if session.systemd_unit and exit_code != 0 else None
+
+    @staticmethod
     def _hold_scope_if_populated(session) -> None:
         """The root exited (or its PID is gone): keep the scope in custody unless it is verifiably
         empty. Called before the session is persisted as finished, so its receipt and checkpoint
@@ -126,7 +189,9 @@ class ProcessScopeCustodyMixin:
                     self._hold_scope_if_populated(session)
                     with session._lock:
                         mark_exited()
-                    self._move_to_finished(session)
+                        deferred = session._kills_in_flight > 0  # a kill that signalled it publishes this exit
+                    if not deferred:
+                        self._move_to_finished(session)
                     return True
             if delay == _FENCE_RETRY_FIRST_SECONDS:
                 logger.log(logging.WARNING if block else logging.DEBUG, "Completion of %s is pending: the "
@@ -163,8 +228,11 @@ class ProcessScopeCustodyMixin:
         stopped = _stop_systemd_unit(session.systemd_unit)
         session._scope_stop_pending = not stopped
         if session.exited and held != session._scope_stop_pending:
+            from tools.process_registry_awaiting import completion_settled
             from tools.process_registry_results import forget_result_scope, save_completed_result
-            if stopped:
+            if not completion_settled(session):
+                pass  # no receipt yet: the owner's publication persists the outcome with this custody
+            elif stopped:
                 forget_result_scope(session.id)
             else:
                 save_completed_result(session)
@@ -215,12 +283,15 @@ class ProcessScopeCustodyMixin:
         record = load_result_record(entry["session_id"]) or {}
         fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
         fields.update(command=entry.get("command", "unknown"), output_log=adoptable_log(entry.get("output_log")),
-                      owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""))
+                      owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
+                      scope_unit=record.get("scope_unit", fields["scope_unit"]))
+        # The receipt decides the finished fields: a later re-save (a failed stop) must not erase them.
         session = ProcessSession(
             id=entry["session_id"], detached=True, exited=True, _scope_stop_pending=True,
             output_buffer=record.get("output", ""), **fields,
             **{key: record.get(key, entry.get(key, default)) for key, default in (
-                ("exit_code", None), ("completion_reason", "exited"), ("termination_source", ""))})
+                ("exit_code", None), ("completion_reason", "exited"), ("termination_source", ""),
+                ("scope_oom_killed", None))})
         session._completion_event.set()
         with self._lock:
             self._finished.setdefault(session.id, session)

@@ -1333,6 +1333,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
     def _format_coalesced_process_completions(entries: list[tuple[str, dict, asyncio.Future]]) -> str:
         """Build one bounded synthetic event from several redacted completions."""
         from gateway.run import _redact_gateway_user_facing_secrets
+        from tools.process_registry_notifications import scope_oom_note
         lines = [
             f"[IMPORTANT: {len(entries)} background processes completed for this session.",
             "Treat these results as one completion batch and send at most one "
@@ -1348,10 +1349,17 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             output = _redact_gateway_user_facing_secrets(str(evt.get("output") or "")).strip()
             if len(output) > 800:
                 output = f"[… truncated …]\n{output[-800:]}"
-            lines.append(f"\n- {session_id}: exit_code={exit_code}, reason={reason}")
+            note = scope_oom_note(evt)
+            lines.append(f"\n- {session_id}: exit_code={exit_code}, reason={reason}" + (f" ({note})" if note else ""))
             if output:
                 lines.append(output)
-        omitted = len(entries) - len(shown)
+        # Every accepted completion's scope OOM kill stays in the delivery: its cause is the result, beyond the cap too.
+        explained = [(str(evt.get("session_id") or "unknown"), evt, scope_oom_note(evt)) for _t, evt, _f in entries[10:]]
+        explained = [entry for entry in explained if entry[2]]
+        for session_id, evt, note in explained:
+            lines.append(f"\n- {session_id}: exit_code={evt.get('exit_code')}, "
+                         f"reason={evt.get('completion_reason') or 'exited'} ({note}; output not shown)")
+        omitted = len(entries) - len(shown) - len(explained)
         if omitted:
             lines.append(
                 f"\n- … and {omitted} more completion(s); inspect them with "
@@ -1793,6 +1801,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             "exit_code": session.exit_code,
             "completion_reason": getattr(session, "completion_reason", "exited"),
             "termination_source": getattr(session, "termination_source", ""),
+            "scope_unit": getattr(session, "scope_unit", ""),
+            "scope_oom_killed": getattr(session, "scope_oom_killed", None),
             "output": _redact_gateway_user_facing_secrets(_out),
             # Spawning session-db id: lets pre-flight drop this completion if the user /new'd first.
             "parent_session_id": (
@@ -1866,6 +1876,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         the output tail) / all (running updates + final raw) / result (final raw) / error (final raw
         if exit != 0) / off."""
         from tools.process_registry import process_registry
+        from tools.process_registry_awaiting import completion_settled
         from tools.process_registry_notifications import format_process_notification, should_surface_notification
         session_id = watcher["session_id"]
         interval = watcher["check_interval"]
@@ -1899,10 +1910,15 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 if session.exited:
                     break
                 continue
+            # One observation decides this tick: a reconcile may flag the exit at any moment, so the completion
+            # branch below consumes this settled outcome, never a later raw ``exited`` read.
+            settled = completion_settled(session)
+            if session.exited and not settled:
+                continue  # a reconcile flagged the exit; the reader still settles output, exit and OOM cause
             current_output_len = len(session.output_buffer)
             has_new_output = current_output_len > last_output_len
             last_output_len = current_output_len
-            if session.exited:
+            if settled:
                 # Agent-notify: inject a synthetic message unless the agent already consumed the result via
                 # wait/log (poll() is read-only and deliberately does NOT mark consumed).
                 if agent_notify and not process_registry.is_completion_consumed(session_id):

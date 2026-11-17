@@ -9,6 +9,7 @@ state (when available) is acknowledged through its authoritative SQLite API.
 import asyncio
 import json
 import queue
+import time
 from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -20,6 +21,8 @@ from gateway.config import Platform
 from gateway.run import GatewayRunner
 from tests.module_clock import install_module_clock
 from tools.process_registry import ProcessRegistry, ProcessSession
+from tools.process_registry_notifications import format_process_notification
+from tools.process_registry_results import load_result_record as load_receipt
 
 
 class AdmittingHandler(AsyncMock):
@@ -380,6 +383,164 @@ def test_concurrent_process_watchers_coalesce_one_session_completion_turn(monkey
         assert f"proc_batch_{index}" in delivered.text
 
 
+def test_a_coalesced_batch_keeps_an_oom_killed_scope_apart_from_an_ordinary_exit(monkeypatch):
+    """A cgroup OOM kill ends a command as an ordinary 143; the batch must still say why, for that
+    command alone, as the single-completion notice does (MEMCG-R2-01)."""
+    import tools.process_registry as pr_module
+
+    registry = ProcessRegistry()
+    unit = "hermes-worker-proc_batch_oom.scope"
+    sessions = [
+        ProcessSession(id="proc_batch_oom", command="nix flake check", task_id="task-oom", started_at=1000.0,
+                       output_buffer="evaluating\n", exited=True, exit_code=143, notify_on_complete=True,
+                       systemd_unit=unit, scope_unit=unit, scope_oom_killed=True),
+        ProcessSession(id="proc_batch_plain", command="printf done", task_id="task-plain", started_at=1001.0,
+                       output_buffer="done\n", exited=True, exit_code=143, notify_on_complete=True),
+    ]
+    watchers = []
+    for session in sessions:
+        registry._finished[session.id] = session
+        watchers.append({
+            "session_id": session.id, "check_interval": 0, "session_key": "agent:main:telegram:dm:123",
+            "platform": "telegram", "chat_type": "dm", "chat_id": "123", "notify_on_complete": True,
+        })
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+
+    async def _exercise():
+        await asyncio.gather(*(runner._run_process_watcher(watcher) for watcher in watchers))
+
+    asyncio.run(_exercise())
+
+    adapter.handle_message.assert_awaited_once()
+    text = adapter.handle_message.await_args.args[0].text
+    assert "2 background processes completed" in text
+    oom_line, = [line for line in text.splitlines() if line.startswith("- proc_batch_oom:")]
+    plain_line, = [line for line in text.splitlines() if line.startswith("- proc_batch_plain:")]
+    assert "exit_code=143" in oom_line and f"kernel OOM killer killed a process in its systemd scope {unit}" in oom_line
+    assert "exit_code=143" in plain_line and "OOM" not in plain_line
+
+
+def _at_watcher_line(text: str, action) -> list:
+    """Run ``action`` once, in the watcher's own thread, when its polling loop (``_watch_process``, which
+    ``_run_process_watcher`` runs inside the owning profile's scope) reaches the source line containing
+    ``text``: an exact interleaving of the real watcher with another thread's step. Returns the record of
+    firing; the caller removes the trace (``sys.settrace(None)``)."""
+    import linecache
+    import sys
+    fired: list = []
+
+    def local(frame, event, _arg):
+        if event == "line" and not fired and text in linecache.getline(frame.f_code.co_filename, frame.f_lineno):
+            fired.append(frame.f_lineno)
+            action()
+        return local
+
+    sys.settrace(lambda frame, _event, _arg: local if frame.f_code.co_name == "_watch_process" else None)
+    return fired
+
+
+@pytest.mark.parametrize("when", ["before-observation", "between-observation-and-consumption"])
+@pytest.mark.parametrize(("exit_code", "observed"), [(143, True), (143, None), (0, None)],
+                         ids=["oom-observed", "observation-failed", "ordinary-exit"])
+def test_the_watcher_waits_for_the_reader_to_settle_a_reconciled_exit(monkeypatch, exit_code, observed, when):
+    """A reconcile flags the exit of a root whose pipe a descendant still holds, while the reader finishes
+    (its final drain, then the slow scope OOM lookup). The real watcher must not build the completion from
+    that provisional mark, whether the mark precedes its look or lands between its look and its decision to
+    deliver: it waits, then reports the settled exit, output and cause (MEMCG-R3-03)."""
+    import sys
+    import threading
+    import tools.process_registry as pr_module
+    import tools.process_registry_scope_custody as custody
+
+    registry = ProcessRegistry()
+    unit = "hermes-worker-proc_reconciled.scope"
+    session = ProcessSession(id="proc_reconciled", command="nix flake check", task_id="task-r", started_at=1000.0,
+                             output_buffer="evaluating\n", notify_on_complete=True,
+                             systemd_unit=unit, scope_unit=unit)
+    session.process = SimpleNamespace(poll=lambda: exit_code, stdout=None, stderr=None, stdin=None)
+    session._reader_selectable = True
+    held, release = threading.Event(), threading.Event()
+
+    def observe(_unit):  # the reader's slow lookup, held until the watcher has looked
+        held.set()
+        release.wait(10)
+        return observed
+
+    def reader():
+        session._reader_finish_requested.wait(10)
+        session.append_output("FINAL-TAIL\n")
+        if exit_code == 0:  # not looked up: hold the final drain instead
+            held.set()
+            release.wait(10)
+        registry._finish_exited(session, exit_code)
+
+    monkeypatch.setattr(custody, "scope_oom_killed", observe)
+    monkeypatch.setattr(custody, "scope_populated", lambda _unit: False)
+    monkeypatch.setattr(pr_module, "_READER_FINAL_DRAIN_WAIT_SECONDS", 0.01)
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+    session._reader_thread = threading.Thread(target=reader, daemon=True)
+    session._reader_thread.start()
+    registry._running[session.id] = session
+    looks = []
+    real_get = registry.get
+    monkeypatch.setattr(registry, "get", lambda sid: looks.append(sid) or real_get(sid))
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+    watcher = {"session_id": session.id, "check_interval": 0.005, "session_key": "agent:main:telegram:dm:123",
+               "platform": "telegram", "chat_type": "dm", "chat_id": "123", "notify_on_complete": True}
+
+    fired = []
+    if when == "between-observation-and-consumption":  # after the tick's settled look, before the exit branch
+        fired = _at_watcher_line("current_output_len = len(session.output_buffer)",
+                                 lambda: registry._reconcile_local_exit(session))
+
+    async def _exercise():
+        watching = asyncio.create_task(runner._run_process_watcher(watcher))
+        try:
+            if when == "before-observation":
+                await asyncio.to_thread(registry._reconcile_local_exit, session)  # the actual reconcile
+            deadline = time.monotonic() + 10
+            while not session.exited and not watching.done() and time.monotonic() < deadline:
+                await asyncio.sleep(0.005)
+            assert session.exited and not session._completion_event.is_set()
+            assert await asyncio.to_thread(held.wait, 10)
+            seen, deadline = len(looks), time.monotonic() + 10
+            # The watcher keeps looking at the flagged exit; a watcher that already built the completion
+            # from it is done, so stop on either (bounded, never on the counterexample alone).
+            while len(looks) < seen + 20 and not watching.done() and time.monotonic() < deadline:
+                await asyncio.sleep(0.005)
+            assert not adapter.handle_message.await_count, "a completion was built from the provisional exit"
+            assert not watching.done() and len(looks) >= seen + 20, "the watcher stopped looking while pending"
+            release.set()
+            await asyncio.wait_for(watching, 10)
+        finally:
+            release.set()
+            if not watching.done():
+                watching.cancel()
+            await asyncio.gather(watching, return_exceptions=True)
+
+    try:
+        asyncio.run(_exercise())
+    finally:
+        sys.settrace(None)
+        release.set()
+        session._reader_thread.join(10)
+    assert not session._reader_thread.is_alive()
+    assert len(fired) == (when != "before-observation")
+
+    adapter.handle_message.assert_awaited_once()
+    text = adapter.handle_message.await_args.args[0].text
+    assert f"exit_code={exit_code}" in text or f"exit code {exit_code}" in text, text
+    assert "FINAL-TAIL" in text
+    oom_note = f"kernel OOM killer killed a process in its systemd scope {unit}"
+    assert (oom_note in text) is (observed is True), text
+    assert (session.exit_code, session.scope_oom_killed) == (exit_code, observed)
+    notice = registry.completion_queue.get_nowait()
+    assert (notice["exit_code"], notice["scope_unit"], notice.get("scope_oom_killed")) == (exit_code, unit, observed)
+
+
 def test_completion_arriving_during_batch_delivery_schedules_next_flush():
     """A new event cannot be stranded behind an in-flight batch for its route."""
     first_delivery_entered = asyncio.Event()
@@ -482,6 +643,61 @@ def test_coalesced_success_records_every_completion_identity():
     for event in events:
         identity = runner._completion_delivery_identity(event)
         assert identity in runner._completion_deliveries_delivered
+
+
+@pytest.mark.parametrize("count", [10, 11, 13])
+@pytest.mark.parametrize(("exit_code", "reason", "observed"), [
+    (143, "exited", True), (-1, "lost", True), (143, "exited", False), (143, "exited", None),
+], ids=["oom-exit", "oom-lost", "no-oom", "unknown"])
+def test_an_accepted_batch_keeps_every_scope_oom_kill_beyond_its_first_ten(
+        monkeypatch, count, exit_code, reason, observed):
+    """MEMCG-R6-10: a batch shows ten entries in full; every accepted completion past them whose scope the kernel
+    OOM-killed in still carries its id, unchanged exit and cause in the one delivered text (its output is left to
+    the process tool), since the whole batch is marked delivered. Real finalizer, receipt, formatter and flush."""
+    import tools.process_registry_scope_custody as custody
+    monkeypatch.setattr(custody, "scope_oom_killed", lambda _unit: observed)
+    monkeypatch.setattr(custody, "scope_populated", lambda _unit: False)
+    registry = ProcessRegistry()
+    scoped = {count - 1, 10} if count > 11 else {count - 1}
+    events = []
+    for index in range(count):
+        sid = f"proc_batch_{index:02d}"
+        if index not in scoped:
+            events.append(_completion_event(started_at=float(index), session_id=sid))
+            continue
+        session = ProcessSession(id=sid, command="nix flake check", task_id="t1", started_at=float(index),
+                                 systemd_unit=f"hermes-worker-{sid}.scope", scope_unit=f"hermes-worker-{sid}.scope",
+                                 output_buffer="evaluating\n", notify_on_complete=True)
+        registry._running[sid] = session
+        registry._finish_exited(session, exit_code, reason=reason,
+                                source="backend_lost" if reason == "lost" else "")
+        notice = registry.completion_queue.get_nowait()
+        assert load_receipt(sid)["scope_oom_killed"] is observed
+        routing = {k: v for k, v in _completion_event(started_at=0.0).items()
+                   if k in ("session_key", "platform", "chat_type", "chat_id")}
+        events.append({**notice, **routing})
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+
+    async def _exercise():
+        return await asyncio.gather(*(
+            runner._enqueue_process_completion_notification(format_process_notification(event), event)
+            for event in events))
+
+    assert asyncio.run(_exercise()) == [True] * count
+    adapter.handle_message.assert_awaited_once()
+    text = adapter.handle_message.await_args.args[0].text
+    for event in events:
+        assert runner._completion_delivery_identity(event) in runner._completion_deliveries_delivered
+    beyond = [index for index in scoped if index >= 10 and observed is True]
+    for index in scoped:
+        sid = f"proc_batch_{index:02d}"
+        note = f"kernel OOM killer killed a process in its systemd scope hermes-worker-{sid}.scope"
+        assert (note in text) is (observed is True), text
+        if index in beyond:
+            assert f"- {sid}: exit_code={exit_code}, reason={reason} (the {note}" in text, text
+    omitted = count - 10 - len(beyond)
+    assert (f"and {omitted} more completion(s)" in text) is (omitted > 0), text
 
 
 def test_coalesced_format_bounds_details_and_reports_omitted_count():
