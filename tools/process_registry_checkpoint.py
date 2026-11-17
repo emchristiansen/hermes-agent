@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional
 
@@ -26,8 +27,17 @@ class ProcessCheckpointMixin:
         newer writer's and undo its transition), and a finish is never undone: an on-disk custody
         entry outranks a writer's running copy of the same process."""
         from hermes_cli.active_sessions import _FileLock
+        from tools.environments.sandbox_scope import hosted_scope
         from tools.process_registry import _checkpoint_path
         from utils import atomic_json_write
+        # A hosted caller only changes its own agent's records, which are never persisted here, so
+        # it has no host change to write: it neither takes the lock nor rewrites this host's file.
+        if hosted_scope() is not None:
+            return
+        from agent.runtime_session_store import is_worker_process
+        # Every interpreter on the home writes this file; ``hermes update --force`` sweeps only what
+        # the gateway it killed owns (update_cmd_force_stop): a managed worker's jobs are its owner's.
+        owner_pid = os.getppid() if is_worker_process() else os.getpid()  # windows-footgun: ok — getppid exists on Windows
         try:
             path = _checkpoint_path()
             with _FileLock(path.with_name(path.name + ".lock")):
@@ -35,7 +45,7 @@ class ProcessCheckpointMixin:
                     on_disk = [e for e in json.loads(path.read_text(encoding="utf-8-sig")) if isinstance(e, dict)]
                 except (OSError, ValueError):
                     on_disk = []
-                entries, known = self._checkpoint_snapshot(extra_entries, settled)
+                entries, known = self._checkpoint_snapshot(extra_entries, settled, owner_pid)
                 custody = {e.get("session_id"): e for e in on_disk if e.get("scope_custody") and e.get("systemd_unit")}
                 entries = [entry if entry.get("scope_custody") else custody.get(entry.get("session_id"), entry)
                            for entry in entries]
@@ -43,15 +53,18 @@ class ProcessCheckpointMixin:
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 
-    def _checkpoint_snapshot(self, extra_entries, settled):
-        """This registry's entries (running, or finished with its scope in custody) and the IDs it decides."""
+    def _checkpoint_snapshot(self, extra_entries, settled, owner_pid=None):
+        """This registry's entries (running, or finished with its scope in custody) and the IDs it decides.
+        ``owner_pid``: the gateway that owns this writer's jobs (``_write_checkpoint``)."""
         from tools.process_registry import _CHECKPOINT_FIELDS
         with self._lock:
             entries = []
             # A finished session stays while its scope is in custody (process_registry_scope_custody).
             for s in (*self._running.values(), *self._finished.values()):
                 custody = bool(s.exited and s._scope_stop_pending and s.systemd_unit)
-                if s.exited and not custody:
+                # A hosted agent's process is not this host's to persist: its record (command,
+                # cwd, owner) stays in memory, whoever triggers the write (scoped or not).
+                if (s.exited and not custody) or s.sandbox_key:
                     continue
                 # Backfill the start time so recovery can detect PID recycling
                 # even for sessions spawned before this field existed.
@@ -64,6 +77,7 @@ class ProcessCheckpointMixin:
                 # See #77484.
                 entry["command"] = redact_sensitive_text(s.command, code_file=True)
                 entry["owner_task_id"] = s.owner_task_id or s.task_id
+                entry["owner_pid"] = owner_pid
                 if custody:
                     entry.update(scope_custody=True, exit_code=s.exit_code,
                                  completion_reason=s.completion_reason, termination_source=s.termination_source)
@@ -190,7 +204,7 @@ class ProcessCheckpointMixin:
         fields.update(
             command=entry.get("command", "unknown"),
             owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
-            started_at=entry.get("started_at", time.time()))
+            started_at=entry.get("started_at", time.time()), sandbox_key=entry.get("sandbox_key", ""))
         # detached: no Popen handle, but can report status + kill; a worker spawn's output log
         # (and recorded exit) outlives its spawner, so tail it from the start.
         fields["output_log"] = log

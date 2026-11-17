@@ -335,7 +335,11 @@ def _run_worker_turns(agent, frame, history, settle, finalize):
         result = finalize(_follow_up(agent, _run_task_turns(agent, frame, history, context), settle,
                                      may_continue=lambda: _bound_claim_is_live(context)))
         code = turn_exit_code(result, kanban_worker=True)
-        last_output = str(result.get('final_response') or '')[-500:] if isinstance(result, dict) else ''
+        if isinstance(result, dict):
+            # Redact before the tail cut: a cut through a PEM header or a token prefix
+            # leaves a body the redactor no longer recognises.
+            from hermes_cli import kanban_db as kb
+            last_output = kb.redact_review_value(str(result.get('final_response') or ''))[-500:]
         wall = wall_from_result(result, agent)
         return result
     except Exception as exc:

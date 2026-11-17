@@ -62,6 +62,7 @@ def _settle_job_record(job_id: str, execution_id: str, observed_error: Optional[
     from cron.delivery_queue import get_status
     from cron.executions import latest_execution
     from cron.jobs import _with_job, save_jobs
+    from cron.jobs_error_text import sanitize_persisted_error
 
     latest = latest_execution(job_id)
     if latest is None or latest.get("id") != execution_id:
@@ -80,6 +81,9 @@ def _settle_job_record(job_id: str, execution_id: str, observed_error: Optional[
             logger.debug("Cron delivery %s: settling the current queue state (final=%s, error=%r), not the "
                          "caller's earlier view (final=%s, error=%r)", execution_id, final, delivery_error,
                          not retrying, observed_error)
+        # The queue row is redacted but not length-bounded; jobs.json gets the same cap as every
+        # other last_delivery_error writer, and the no-op check compares the stored form.
+        delivery_error = sanitize_persisted_error(delivery_error)
         if final and delivery_error and "content" not in row and job.get("last_delivery_error"):
             delivery_error = job["last_delivery_error"]  # a pruned row keeps no error text; keep the exact one
         status = job.get("last_status")

@@ -50,17 +50,17 @@ class GatewayTeardownMixin:
         with suppress(Exception):
             from gateway.shutdown_flush import flush_overflow_to_file
             flush_overflow_to_file(
-                {_k: list(_v) for _k, _v in dict(getattr(self, "_queued_events", None) or {}).items() if _v},
+                {_k: list(_st.conversation.queued_events)
+                 for _k, _st in dict(self.__dict__.get("_sessions") or {}).items() if _st.conversation.queued_events},
                 reason="shutdown",
             )
         # Live SessionState views: clear() resets one field per session (never a wholesale dict swap).
         self._running_agents.clear()
-        self._running_agents_ts.clear()
         self._pending_messages.clear()
-        self._pending_approvals.clear()
         for _state in list((self.__dict__.get("_sessions") or {}).values()):
             _state.turn.lease = None
-        getattr(self, "_busy_ack_ts", {}).clear()  # absent on bare shutdown-path doubles
+            _state.turn.started_ts = _state.turn.busy_ack_ts = 0.0
+            _state.persistent.approvals = None
         self._shutdown_event.set()
         # Global catch-all subprocess kill (safe to repeat) for the graceful path and late respawns, off-loop (#116327).
         # Awaited only within the leash left for the quiesce and the close; past it the live thread keeps SessionDB open
