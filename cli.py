@@ -903,11 +903,12 @@ class HermesCLI(CLIBacktrackMixin, CLIInitMixin, CLITuiRuntimeMixin, CLIProcessN
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        skip_memory: bool = False,
     ):
         """CLI args win over config; ``reasoning`` is per-run only; ``resume`` restores history from SQLite."""
         self._init_display_options(verbose, compact)
         self._init_model_routing(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget,
-                                 checkpoints, pass_session_id, ignore_rules)
+                                 checkpoints, pass_session_id, ignore_rules, skip_memory)
         self._init_runtime_state(resume)
 
 
@@ -1514,7 +1515,7 @@ class HermesCLI(CLIBacktrackMixin, CLIInitMixin, CLITuiRuntimeMixin, CLIProcessN
             relaunch(self._pending_relaunch, preserve_inherited=False)
 
 
-def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills):
+def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills, skip_memory=False):
     """Resolve the toolset list (explicit / coding posture / platform default), construct HermesCLI, and start the background skills preload."""
     toolsets_list = None
     if isinstance(toolsets, str) and toolsets:
@@ -1552,6 +1553,7 @@ def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url
             checkpoints=checkpoints,
             pass_session_id=pass_session_id,
             ignore_rules=ignore_rules,
+            skip_memory=skip_memory,
         )
     except ImportError as e:
         # Direct `python cli.py` bypasses cmd_chat's partial-update ImportError handler.
@@ -1695,6 +1697,7 @@ def main(
     output_format: str = "text",
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    skip_memory: bool = False,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -1722,6 +1725,7 @@ def main(
         resume: Resume a previous session by its ID (e.g., 20260225_143052_a1b2c3)
         worktree: Run in an isolated git worktree (for parallel agents). Alias: -w
         w: Shorthand for --worktree
+        skip_memory: Run this session without memory (no memory provider, no MEMORY.md/USER.md)
     
     Examples:
         python cli.py                            # Start interactive mode
@@ -1762,7 +1766,8 @@ def main(
             raise ValueError("--format stream-json requires -q/--query")
         quiet = True
     cli = _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget,
-                               verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills)
+                               verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills,
+                               skip_memory=skip_memory)
 
     # Join the background worktree creation before anything consumes TERMINAL_CWD.
     # A requested worktree whose setup failed aborts: never silently run without isolation.

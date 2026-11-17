@@ -59,8 +59,9 @@ async def _lost_head(runner, db, *, tool_step):
 async def test_a_lost_no_tool_turn_runs_again_even_after_a_boot_cut_short_after_its_fence(
         tmp_path, monkeypatch, tool_step, cut):
     """The next full boot runs the lost no-tool head, then its follower, whether or not a boot before it failed
-    after the fence. A lost turn that reached a tool is never run again: it stays ``unknown`` (its follower
-    waits for the person), cut or not."""
+    after the fence. A lost turn that reached a tool stays ``unknown`` and is never run again;
+    its independent follower completes, cut or not."""
+    from gateway.session_message_redelivery import REDELIVER_PREFIX
     executed = []
     store, runner = _runner(tmp_path, monkeypatch, executed)
     db = store._db
@@ -74,12 +75,18 @@ async def test_a_lost_no_tool_turn_runs_again_even_after_a_boot_cut_short_after_
             assert get_session_admission(db, admission_id=head['admission_id'])['status'] == 'unknown'
             monkeypatch.setattr(sa, 'recover_session_inputs', real)
         boot = await sa.initialize_session_authority(runner, profile_id='p', instance_id='next-boot')
+        retained = get_session_admission(db, admission_id=head['admission_id'])
         boot.sessions['s'] = LiveSession(SessionSource(platform=Platform.TELEGRAM, chat_id='c'), 's')
         boot._schedule(SessionRef('p', 's'))
         await boot.sessions['s'].task
         statuses = [get_session_admission(db, admission_id=row['admission_id'])['status'] for row in (head, follow)]
         if tool_step:
-            assert statuses == ['unknown', 'queued'] and executed == []  # never replayed
+            assert statuses == ['unknown', 'terminal'] and executed == ['FOLLOW']
+            assert get_session_admission(db, admission_id=head['admission_id']) == retained
+            assert retained['status'] == 'unknown' and retained['outcome'] is None
+            assert db._read_one('SELECT 1 FROM state_meta WHERE key=?',
+                                (REDELIVER_PREFIX + head['admission_id'],)) is None
+            assert get_session_admission(db, admission_id=follow['admission_id'])['outcome'] == 'completed'
         else:
             assert statuses == ['terminal', 'terminal'] and executed == ['HEAD', 'FOLLOW']
     finally:
@@ -116,14 +123,19 @@ async def test_an_owed_lost_turn_the_owner_no_longer_owes_is_never_replayed(tmp_
                 {'epoch': lost['owner_epoch'], 'generation': lost['generation'] + 1, 'status': 'unknown'}), key)))
         boot = await sa.initialize_session_authority(runner, profile_id='p', instance_id='next-boot')
         assert db._read_one('SELECT 1 FROM state_meta WHERE key=?', (key,)) is None  # the stale marker is dropped
+        retained = get_session_admission(db, admission_id=head['admission_id'])
         boot.sessions['s'] = LiveSession(SessionSource(platform=Platform.TELEGRAM, chat_id='c'), 's')
         boot._schedule(SessionRef('p', 's'))
         await boot.sessions['s'].task
         statuses = [get_session_admission(db, admission_id=row['admission_id'])['status'] for row in (head, follow)]
         if disposition == 'operator-resolved':  # resolved: never replayed; the FIFO advances
             assert statuses == ['terminal', 'terminal'] and executed == ['FOLLOW']
-        else:  # not this claim's marker: fenced, never replayed; the follower waits for the person
-            assert statuses == ['unknown', 'queued'] and executed == []
+        else:  # not this claim's marker: HEAD stays fenced; independent FOLLOW completes
+            assert statuses == ['unknown', 'terminal'] and executed == ['FOLLOW']
+            assert get_session_admission(db, admission_id=head['admission_id']) == retained == lost
+            assert retained['outcome'] is None
+            assert db._read_one('SELECT 1 FROM state_meta WHERE key=?', (key,)) is None
+            assert get_session_admission(db, admission_id=follow['admission_id'])['outcome'] == 'completed'
     finally:
         store.close_all_db_handles()
 

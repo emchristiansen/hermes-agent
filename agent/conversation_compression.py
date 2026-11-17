@@ -28,6 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
+from agent.agent_init_skip_memory import carry_session_skip_memory
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_compressor_summary import _accepts_keyword_argument
 from agent.context_engine import automatic_compaction_status_message, sanitize_memory_context
@@ -1578,14 +1579,11 @@ def _adopt_live_compression_child(
 ) -> Optional[list[dict[str, Any]]]:
     """Move a stale compression contender onto the live continuation tip.
     Resolve and load first, then mutate the agent, so ambiguous lineage or an unreadable handoff fails closed.
-    Uses the transitive ``get_compression_tip`` walk; a tip is adopted only while its row is still live.
 
     Resolution uses the canonical transitive walk ``get_compression_tip`` so a lineage with >=2 compression
     hops (root -> mid -> tip) recovers to the live tip — the depth-1 ``find_live_compression_child`` lookup
     this used to call finds no live *direct* child in that shape and skipped recovery (#82001). The tip walk
-    returns the input id when no continuation exists, and a resolved tip is adopted only while its row is
-    still live — both cases fail closed exactly as before.
-    """
+    returns the input id when no continuation exists, and a tip is adopted only while its row is still live."""
     resolver = getattr(type(session_db), "get_compression_tip", None)
     row_getter = getattr(type(session_db), "get_session", None)
     loader = getattr(type(session_db), "get_messages_as_conversation", None)
@@ -1607,6 +1605,7 @@ def _adopt_live_compression_child(
     if not confirmed or str(confirmed) != child_session_id:
         return None
     agent.session_id = child_session_id
+    carry_session_skip_memory(agent)
     _rebind_session_context(child_session_id)
     _hand_off_metrics_segment(parent_session_id, child_session_id)
     agent._session_db_created = True
@@ -3181,12 +3180,12 @@ def _parent_deliberately_ended(session_db: Any, session_id: str) -> bool:
 
 
 def _carry_session_state_to_child(agent: Any, old_session_id: str, old_title: Any) -> None:
-    """Migrate /goal, /heartbeat, /loop state, rejected-thinking fingerprints and the title from the parent to the child.
-    Each lookup is a flat per-session read with no parent walk, so state would silently die at the boundary. The title
-    is carried unchanged (renumbering per rotation made one session look like many); its provenance is read BEFORE the
-    transfer clears the ancestor's row, then restored so an inherited auto-title stays upgradeable.
-    """
-    # /goal, /heartbeat, /loop: carried locally, or atomically by the owner on a RuntimeSessionStore.
+    """Migrate /goal, /heartbeat, /loop state (locally, or atomically by a RuntimeSessionStore's owner), rejected-thinking
+    fingerprints, an explicit --skip-memory policy (SKM-06) and the title from the parent to the child. Each lookup is a
+    flat per-session read with no parent walk, so state would silently die at the boundary. The title is carried unchanged
+    (renumbering made one session look like many); its provenance is read BEFORE the transfer clears the ancestor's row,
+    then restored so an inherited auto-title stays upgradeable."""
+    carry_session_skip_memory(agent)
     from agent.compression_automation import carry_compression_automation
     carry_compression_automation(agent, old_session_id)
     with _swallow('Could not carry rejected thinking on compression: %s'):

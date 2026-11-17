@@ -113,8 +113,10 @@ def completion_payload(row, settled, response, captured):
 def _publish_completion(authority, live, ref, row, settled, response, captured):
     """Thread-safe half of terminal publication; the caller holds the stream lock. No SQLite write
     happens here: loop-side readers wait on this lock, so it never spans storage I/O."""
+    execution = {'authority_epoch': row['owner_epoch'], 'execution_generation': row['generation'],
+                 'admission_id': row['admission_id']}
     try:
-        live.controls.snapshot(ref.session_id, None)
+        live.controls.complete_execution(ref.session_id, execution)
     except Exception:
         logger.exception('Terminal control cleanup failed for admission %s', row['admission_id'])
     complete = completion_payload(row, settled, response, captured)
@@ -126,7 +128,7 @@ def _publish_completion(authority, live, ref, row, settled, response, captured):
         # ``warning`` is the slot every surface already renders on message.complete (Ink activity
         # line, Desktop toast), so a turn the owner's stop cut short says why (#134889 F1).
         complete['warning'] = notice
-    live.event_stream.publish(ref.session_id, complete)
+    live.event_stream.publish(ref.session_id, complete, execution=execution)
 
 
 RESTART_INTERRUPT_NOTICE = ('Gateway restarting: this turn was interrupted and will not be run again. '

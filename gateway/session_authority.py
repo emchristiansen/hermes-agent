@@ -341,8 +341,10 @@ class SessionAuthority:
         if row is None:  # deleted after ``authorize``: the commit lands before the retirement runs
             raise RuntimeStoreError('not_found')
         pending = self._pending_rows(ref)
-        state = 'unknown' if any(r['status'] == 'unknown' for r in pending) else (
-            'running' if any(r['status'] == 'started' for r in pending) else 'idle')
+        # A later accepted turn can run while an older BUSINESS outcome stays unknown.
+        # The handle names the current generation; pending rows retain the older uncertainty.
+        state = 'running' if any(r['status'] == 'started' for r in pending) else (
+            'unknown' if any(r['status'] == 'unknown' for r in pending) else 'idle')
         return SessionHandle(ref, self.instance_id, self.epoch, row['runtime_revision'],
                              row['runtime_generation'], state)
 
@@ -1119,9 +1121,10 @@ class SessionAuthority:
         # False asks the pump to re-read after a queued head changed during preflight.
         async with live.claim_gate, live.mutation_lock:
             pending = list_session_admissions(self.db, session_id=ref.session_id)
-            if any(row['status'] == 'unknown' for row in pending):
-                raise RuntimeStoreError('unknown_execution')
             first = next((row for row in pending if row['status'] == 'queued'), None)
+            if first is None and any(row['status'] == 'unknown' for row in pending):
+                # No new input: retain the truthful unresolved state, not idle retirement.
+                raise RuntimeStoreError('unknown_execution')
             from gateway.config import Platform
             if live.source.platform == Platform.LOCAL:
                 # A reasoning command or a model pick made while the previous turn ran lands here, at the
@@ -1272,7 +1275,8 @@ class SessionAuthority:
                         from gateway.session_unattended_unknown import settle_unattended_unknown
                         if await settle_unattended_unknown(self, ref):
                             continue
-                    if exc.reason == 'admission_conflict':
+                    from gateway.session_worker_reservation import WorkerOwnershipConflict
+                    if exc.reason == 'admission_conflict' and not isinstance(exc, WorkerOwnershipConflict):
                         # A verdict on the head alone (its route or binding moved under it) that every drain
                         # repeats: pausing behind it strands the FIFO for good. Refused only once the same
                         # head conflicted twice, read after each: never a successor a cancel advanced to.
@@ -1288,7 +1292,8 @@ class SessionAuthority:
                             if refused:
                                 continue
                     import logging
-                    logging.getLogger(__name__).warning('Session %s paused: %s', ref.session_id, exc.reason)
+                    logging.getLogger(__name__).warning('Session %s paused: %s (field=%s, detail=%s)',
+                                                        ref.session_id, exc.reason, exc.field, exc.detail)
                     self._pause(ref, exc.reason)
                     return None
             except (OSError, sqlite3.OperationalError) as exc:
@@ -1344,13 +1349,10 @@ class SessionAuthority:
             from gateway.session_unattended_unknown import settle_unattended_unknown
             if await settle_unattended_unknown(self, ref):
                 return None, 'settled_unknown'
-            if live.rescan:
-                # A ``_schedule`` (this very turn's resolution, or an admission) arrived while the lost
-                # worker was being torn down and found this drain still running, so no new drain will
-                # claim for it: claim again here instead of stranding it. A head still unknown pauses.
-                return None, 'rescan_unknown'
-            self._pause(ref, 'unknown_execution')
-            raise
+            # Recheck the actual claim gate even for a follower queued BEFORE the loss.
+            # Its own claim may proceed; the unknown admission is never selected/replayed.
+            # A still-authorized/ambiguous worker remains a refusal in that gate.
+            return None, 'rescan_unknown'
         except Exception:
             import logging
             logging.getLogger(__name__).exception('Admitted turn %s failed', row['admission_id'])

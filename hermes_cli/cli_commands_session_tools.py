@@ -80,9 +80,14 @@ def _lines(text: str, pad: str = "  ") -> list:
     return [f"{pad}{line}" if line else "" for line in text.splitlines()]
 
 
+def _summarize_paths(paths, limit: int = 5) -> str:
+    """``a, b, c (+N more)`` for a list of paths."""
+    more = _t("shared.more_suffix", count=len(paths) - limit) if len(paths) > limit else ""
+    return ", ".join(paths[:limit]) + more
+
+
 def _rollback_kept(result: dict) -> None:
     """The kept / not-removed path lines of a restore result (in-process CLI and gateway client alike)."""
-    from hermes_cli.cli_commands_mixin import _summarize_paths
     if skipped := result.get("skipped_user_edits"):
         _pr(*_lines(_gt("rollback.kept_user_edits", files=_summarize_paths(skipped))))
     if oversize := result.get("skipped_oversize"):

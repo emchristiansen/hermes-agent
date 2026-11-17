@@ -1340,7 +1340,9 @@ def _resolve_continue_arg(args, *, use_tui: bool) -> None:
                     new_sid = _create_titled_session(continue_val)
                 else:
                     from hermes_cli.gateway_session_store import create_titled_session
-                    new_sid = create_titled_session(continue_val)
+                    # The typed --skip-memory is frozen at creation: the resume below checks it.
+                    new_sid = create_titled_session(
+                        continue_val, skip_memory=getattr(args, "skip_memory", False) is True)
                 if new_sid:
                     args.resume = new_sid
                 else:
@@ -1671,6 +1673,7 @@ def cmd_chat(args):
         "run_budget": getattr(args, "run_budget", None),
         "output_format": getattr(args, "output_format", "text"),
         "ignore_rules": getattr(args, "ignore_rules", False) or safe_mode,
+        "skip_memory": getattr(args, "skip_memory", False) or None,  # absent unless typed
         "ignore_user_config": getattr(args, "ignore_user_config", False) or safe_mode,
         "compact": getattr(args, "compact", False),
         **{k: getattr(args, k, d) for k, d in _CHAT_PASSTHROUGH + (("api_key", None), ("base_url", None))},

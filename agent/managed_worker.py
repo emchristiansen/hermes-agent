@@ -497,15 +497,62 @@ class WorkerControls:
 _OUTBOX_NAME = re.compile(r'[A-Za-z0-9_-]{1,200}')
 
 
-def outbox_dir(home, execution_id):
-    """execution_id is a ledger key ('admission-worker:<hex>'); ':' is not a legal Windows path
-    character, so the private outbox directory is a portable spelling of the same identity."""
-    # A legacy-imported admission id is arbitrary text; never let it name a path outside
-    # worker-outboxes (``../`` on POSIX, ``..\\`` or drive spellings on Windows).
+def outbox_name(execution_id):
+    """Validate the legacy portable execution-key domain, without interpreting ownership."""
     name = execution_id.replace(':', '-') if isinstance(execution_id, str) else ''
     if not _OUTBOX_NAME.fullmatch(name):
         raise ValueError('invalid_execution_id')
-    return Path(home) / 'worker-outboxes' / name
+    return name
+
+
+def outbox_dir(home, execution_id):
+    """Portable execution identity, preserving exact matching pre-v2 journals.
+
+    ':' -> '-' was not injective for the supported legacy admission-ID domain.
+    Keep ordinary first-ID paths, but encode other strings without collisions or
+    path syntax. Never open/reconcile another execution's retained retry journal.
+    """
+    name = outbox_name(execution_id)
+    root = Path(home) / 'worker-outboxes'
+    encoded = execution_id.encode('utf-8', 'surrogatepass').hex()
+    current = root / 'v2'
+    # Reservation maps arbitrary imported IDs to short portable execution keys.
+    # Hex is injective over that execution domain, including ':' versus '-'.
+    for start in range(0, len(encoded), 120):
+        current /= encoded[start:start + 120]
+    current /= 'outbox'
+    path = root
+    if path.is_symlink():
+        raise ValueError('unsafe_outbox')
+    for part in current.relative_to(root).parts:
+        path /= part
+        if path.is_symlink():
+            raise ValueError('unsafe_outbox')
+    if (current / 'pending.json').is_symlink():
+        raise ValueError('unsafe_outbox')
+    legacy = root / name
+    journal = legacy / 'pending.json'
+    if legacy.is_symlink() or journal.is_symlink():
+        raise ValueError('unsafe_outbox')
+    if journal.exists():
+        try:
+            old_id = json.loads(journal.read_text(encoding='utf-8-sig'))['scope']['execution_id']
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError('invalid_outbox_identity') from exc
+        if old_id == execution_id:
+            if (current / 'pending.json').exists():
+                raise ValueError('outbox_identity_conflict')
+            return legacy
+        return current
+    # Lowercase portable first-ID spellings are injective even on a case-folding
+    # filesystem. All others use hex unless an existing journal proves identity.
+    if (current / 'pending.json').exists():
+        return current
+    if (execution_id.startswith('admission-worker:')
+            and execution_id == execution_id.lower()
+            and _OUTBOX_NAME.fullmatch(execution_id[len('admission-worker:'):])):
+        return legacy
+    return current
 
 
 def discover_profile_mcp(policy):
@@ -570,6 +617,7 @@ def execute(frame, channel, *, control_stream=None):
     register_worker_hooks(policy)
     discover_profile_mcp(policy)
     from run_agent import AIAgent
+    from agent.skill_utils import parse_config_string_list
     from tools.approval import register_gateway_notify, unregister_gateway_notify
     from tools.approval_context import set_current_session_key
     set_current_session_key(frame['route'])
@@ -589,12 +637,14 @@ def execute(frame, channel, *, control_stream=None):
                 # delegate_task stays offered: each child is reserved by the owner under this
                 # execution (agent/runtime_session_child.py) and retires with it.
                 enabled_toolsets=list(policy.toolsets), max_iterations=policy.max_turns,
+                disabled_toolsets=parse_config_string_list(
+                    (policy.config().get('agent') or {}).get('disabled_toolsets')) or None,
                 reasoning_config=policy.reasoning_config,
                 # ``tool`` / ``oneshot`` are storage labels for a CLI-surface agent (session_policy.SURFACES).
                 platform=policy.platform if policy.source in ('tool', 'oneshot') else policy.source,
                 gateway_session_key=frame['route'], user_id=frame['user_id'], chat_id=frame['chat_id'],
                 skip_context_files=policy.ignore_rules, load_soul_identity=not policy.ignore_rules,
-                skip_memory=policy.ignore_rules, skip_background_review=True, quiet_mode=True,
+                skip_memory=policy.skip_memory, skip_background_review=True, quiet_mode=True,
                 pass_session_id=policy.pass_session_id,
                 **checkpoint_agent_kwargs(policy.config()), **construct,
                 **routing_agent_kwargs(policy.config(), policy.model, policy.provider, policy.base_url),
@@ -603,6 +653,9 @@ def execute(frame, channel, *, control_stream=None):
                 tool_start_callback=lambda call_id, name, args: channel.send('tool.start', **tool_frame(call_id, name, args)),
                 tool_complete_callback=lambda call_id, name, args, result: channel.send('tool.complete',
                                                                                          **tool_frame(call_id, name, args, result)))
+            if policy.skip_memory_requested:
+                from agent.agent_init_skip_memory import apply_session_skip_memory
+                apply_session_skip_memory(agent)
             controls.adopt(agent)
             if controls.stopped.is_set():
                 from agent.interrupt_compat import request_hard_interrupt

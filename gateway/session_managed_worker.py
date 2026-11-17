@@ -793,11 +793,7 @@ def _prompt_frame(authority, ref, row, worker, frame):
     kind = frame.get('type')
     if kind == 'prompt_settled' and set(frame) == {'type', 'prompt_id'}:
         prompt_id = frame['prompt_id']
-        controls.remote_responders.pop(prompt_id, None)
-        saved = controls.pending.pop(prompt_id, None)
-        if saved:
-            live.event_stream.publish(ref.session_id, {'prompt_id': prompt_id,
-                'execution_generation': row['generation']}, event_type=saved[1]['kind'] + '.settled')
+        controls.settle(ref.session_id, prompt_id, row['generation'])
         return True
     if kind not in {'approval', 'clarify'}:
         return False

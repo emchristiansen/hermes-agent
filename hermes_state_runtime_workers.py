@@ -30,6 +30,43 @@ def worker_states(conn, session_id):
         "AND status IN ('registered','running','unknown')", (json.dumps(sorted(runtime_lineage(conn, session_id))),))}
 
 
+def claim_worker_states(conn, session_id, epoch):
+    """Workers that exclude a NEW admission, not the session's unresolved history.
+
+    Only a previous owner's private admission worker with positive unknown-claim
+    ownership may be passed. It stays unknown: its old owner epoch fences writes
+    and its private adoption cannot cross epochs (adopt_worker_execution). Neither
+    fact authorizes replay of its admission or any of its business operations.
+    All other workers keep the ordinary exclusion, including orphan/ambiguous
+    ownership and current-epoch unknown workers that could still adopt.
+    Reset/register callers deliberately keep using worker_states instead.
+    """
+    from gateway.session_worker_reservation import ADMISSION_WORKER_PREFIX, WorkerOwnershipConflict, admission_worker_rows
+    from hermes_state_runtime import RuntimeStoreError, _linked_worker_admission
+    states = set()
+    for worker in conn.execute(
+            "SELECT * FROM worker_executions WHERE session_id IN (SELECT value FROM json_each(?)) "
+            "AND status IN ('registered','running','unknown')",
+            (json.dumps(sorted(runtime_lineage(conn, session_id))),)).fetchall():
+        if (worker['status'] == 'unknown' and worker['kind'] == 'compute'
+                and worker['owner_epoch'] != epoch
+                and worker['execution_id'].startswith(ADMISSION_WORKER_PREFIX)):
+            try:
+                admission = _linked_worker_admission(conn, worker['session_id'], worker['generation'],
+                                                      worker['owner_epoch'], ('started', 'unknown'))
+            except RuntimeStoreError as exc:
+                if exc.reason != 'admission_conflict':
+                    raise
+                raise WorkerOwnershipConflict('ambiguous retained worker admission link') from exc
+            if (admission is not None and admission['status'] == 'unknown'
+                    and admission['target_session_id'] == session_id
+                    and any(key == worker['execution_id'] for key, _status, _generation
+                            in admission_worker_rows(conn, admission['admission_id']))):
+                continue
+        states.add(worker['status'])
+    return states
+
+
 def discard_orphan_workers_on_reset(conn, session_ids):
     """An explicit reset revokes unlinked unknown compute; it never replays its side effects.
 

@@ -128,10 +128,12 @@ async def test_owner_stop_settlement_failure_preserves_head_and_follower(tmp_pat
         await _healthy_drain(runner, source, ref)
         states = [get_session_admission(db, admission_id=aid)['status'] for aid in ids]
         if tool:
-            assert executed == (['FOLLOWER'] if failure == 'none' else [])
-            assert states == (['terminal', 'terminal'] if failure == 'none' else ['unknown', 'queued'])
+            # Tool-bearing HEAD is never replayed; its uncertainty cannot strand FOLLOWER.
+            assert executed == ['FOLLOWER']
+            assert states == (['terminal', 'terminal'] if failure == 'none' else ['unknown', 'terminal'])
         else:
             assert executed == ['HEAD', 'FOLLOWER'] and states == ['terminal', 'terminal']
+        assert get_session_admission(db, admission_id=ids[1])['outcome'] == 'completed'
         assert _marker(db, ids[0]) is None
     finally:
         store.close_all_db_handles()
@@ -155,9 +157,11 @@ async def test_failed_stop_requires_this_claims_proof_and_owner_cause(tmp_path, 
         assert bool(_marker(db, ids[0])) is eligible
         db._execute_write(lambda conn: conn.execute('DROP TRIGGER reject_terminal'))
         await _healthy_drain(runner, source, ref)
-        assert executed == (['HEAD', 'FOLLOWER'] if eligible else [])
+        assert executed == (['HEAD', 'FOLLOWER'] if eligible else ['FOLLOWER'])
         assert [get_session_admission(db, admission_id=aid)['status'] for aid in ids] == (
-            ['terminal', 'terminal'] if eligible else ['unknown', 'queued'])
+            ['terminal', 'terminal'] if eligible else ['unknown', 'terminal'])
+        assert get_session_admission(db, admission_id=ids[1])['outcome'] == 'completed'
+        assert _marker(db, ids[0]) is None
     finally:
         store.close_all_db_handles()
 

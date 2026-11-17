@@ -95,9 +95,29 @@ async def test_local_lineage_transitions_preserve_owner_or_roll_back(tmp_path, m
     compress(reset.session_id, 'compressed-again')
     fourth = runner()
     restarted = await initialize_session_authority(fourth, profile_id='fixture', instance_id='fourth')
-    assert get_session_admission(restarted.db, admission_id=claimed['admission_id'])['status'] == 'unknown'
-    with pytest.raises(RuntimeStoreError, match='unknown_execution'):
-        claim_session_input(restarted.db, epoch=restarted.epoch, session_id=ref.session_id)
+    retained = get_session_admission(restarted.db, admission_id=claimed['admission_id'])
+    # Recovery changes only the lost claim's status, not its logical owner or execution identity.
+    expected = {key: value for key, value in claimed.items() if key != 'transcript_mark'}
+    assert retained == dict(expected, status='unknown')
+    assert retained['target_session_id'] == ref.session_id
+    assert retained['owner_epoch'] == recovered.epoch != restarted.epoch
+    assert retained['generation'] == claimed['generation']
+    assert list_session_admissions(restarted.db, session_id=ref.session_id) == [retained]
+    # No input remains queued. An empty claim returns no work, never reclaims the old
+    # business turn, advances a generation, or mutates its receipt/physical lineage.
+    def no_work_state():
+        with restarted.db._read_ctx() as conn:
+            return {
+                table: [tuple(row) for row in conn.execute(f'SELECT * FROM {table} ORDER BY 1')]
+                for table in ('sessions', 'messages', 'session_admissions', 'worker_executions',
+                              'state_meta', 'gateway_routing')
+            }
+    before_no_work = no_work_state()
+    receipt_before_no_work = local_receipt(restarted.db, ref.session_id)
+    assert claim_session_input(restarted.db, epoch=restarted.epoch, session_id=ref.session_id) is None
+    assert no_work_state() == before_no_work
+    assert local_receipt(restarted.db, ref.session_id) == receipt_before_no_work
+    assert get_session_admission(restarted.db, admission_id=claimed['admission_id']) == retained
     assert len(list_session_admissions(restarted.db, session_id=ref.session_id)) == 1
     receipt = local_receipt(db, ref.session_id)
     db.set_meta('gateway.local_policy.v1:' + ref.session_id, json.dumps(dict(receipt, profile_id='foreign')))

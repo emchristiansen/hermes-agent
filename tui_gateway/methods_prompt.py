@@ -1189,6 +1189,7 @@ def _(rid, params: dict) -> dict:
         kwargs = _background_agent_kwargs(session["agent"], task_id)
         with _side_agent_session_db(kwargs.get("session_db")) as session_db:
             agent = AIAgent(**{**kwargs, "session_db": session_db})
+            _inherit_session_skip_memory(session["agent"], agent)
             try:
                 result = agent.run_conversation(user_message=text, task_id=task_id)
             finally:
@@ -1253,10 +1254,12 @@ def _(rid, params: dict) -> dict:
             {"task_id": task_id, "text": f"Starting hidden restart agent{history_note}"})
         # Deliberately NOT closed via AIAgent.close(): it would kill the background
         # server this task exists to leave running.
-        result = AIAgent(
+        preview = AIAgent(
             **_ephemeral_preview_agent_kwargs(session["agent"], task_id),
             **_preview_restart_callbacks(parent, task_id),
-        ).run_conversation(
+        )
+        _inherit_session_skip_memory(session["agent"], preview)
+        result = preview.run_conversation(
             user_message=prompt, task_id=task_id, conversation_history=parent_history or None)
         return _final_response_text(result)
 

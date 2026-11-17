@@ -12,13 +12,17 @@ config.yaml (``bot_peers``); the key lives in ``~/.hermes/.env`` as
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import re
+import socket
 import sys
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from typing import NamedTuple
 
 BOT_CHAT_TITLE = "Bot Chat"
 _PEER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -33,6 +37,132 @@ _UNKNOWN_PROFILE_ERROR = "Unknown or unconfigured profile"
 # One synchronous agent turn can legitimately take minutes.
 DM_TIMEOUT_S = 600
 LIST_TIMEOUT_S = 30
+
+# ``peer run`` exit codes beyond 0 ok / 1 peer error / 2 usage (see the parser epilog):
+EXIT_NOT_DELIVERED = 3  # positively never sent: the first connection was refused or unresolvable, so no byte went out
+EXIT_POSSIBLY_ADMITTED = 4  # sent (fully, partly or unknown), its outcome unconfirmed: it may be admitted and running
+
+_RESEND_NOTE = ("Resending the message is always allowed, immediately; a duplicate is fine. Reusing the "
+                "idempotency key is optional (it lets the peer recognise the same run); it is not a receipt "
+                "and not a dedup gate.")
+
+_SEND_PHASE = threading.local()
+_SEND_AUDIT_LOCK = threading.Lock()
+_send_audit_installed = False
+
+
+def _send_audit(event: str, _args: tuple) -> None:
+    # The stdlib's own events: ``http.client.connect`` opens each hop's connection, ``http.client.send``
+    # precedes every write of request bytes to its socket (headers and body, on every redirect hop).
+    if event == "http.client.send" or event == "http.client.connect":
+        phase = getattr(_SEND_PHASE, "current", None)
+        if phase is not None:
+            if event == "http.client.send":
+                phase.sends += 1
+            else:
+                phase.connects += 1
+
+
+class _RunSendPhase:
+    """What the real transport did for ONE run POST on this thread, observed through http.client's audit
+    events across every redirect hop. Nothing in the transport, redirect handling or exceptions changes.
+
+    http.client raises ``http.client.send`` BEFORE each ``sendall``, and a failed ``sendall`` cannot say how
+    much it wrote, so a seen send event means request bytes MAY have been sent: exit 4. Exit 3 (``never_sent``)
+    needs the stock transport, the first hop's connection attempted (``http.client.connect``), no send event, and
+    urllib reporting that connection refused or its host unresolvable. Any later hop (a redirect), an installed
+    custom handler or an unobserved phase is 4: an absent event alone is no evidence.
+
+    The audit hook is installed once per process behind a lock-guarded flag (``sys.addaudithook`` cannot be
+    removed). It is O(1), cannot raise, and does nothing for other events or when no POST is tracked on the
+    current thread; per-POST counts live in a thread-local, so concurrent and repeated calls never mix."""
+
+    def __init__(self) -> None:
+        self.connects = 0
+        self.sends = 0
+        self._outer = None
+        # Unknown until ``use`` binds the opener this POST actually goes through (PEER-TRUTH-07): a sample of the
+        # mutable global opener taken at another moment says nothing about the transport the request used.
+        self.stock_transport = False
+
+    def use(self, opener):
+        """Record the transport of ``opener``, the exact opener the run POST is then sent through."""
+        self.stock_transport = _stock_opener(opener)
+        return opener
+
+    def __enter__(self) -> _RunSendPhase:
+        global _send_audit_installed
+        with _SEND_AUDIT_LOCK:
+            if not _send_audit_installed:
+                sys.addaudithook(_send_audit)  # process-wide and permanent; inert outside a tracked POST
+                _send_audit_installed = True
+        self._outer = getattr(_SEND_PHASE, "current", None)
+        _SEND_PHASE.current = self
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        _SEND_PHASE.current = self._outer
+        return False
+
+    def never_sent(self, exc: BaseException) -> bool:
+        """Positive evidence only, and only for the stock transport, whose every write is preceded by its send
+        event and whose first-connection failure IS the error urllib raises: exactly one connection attempted,
+        no send event, and that error a refused connection or an unresolvable host (no TCP connection, so no
+        request byte left). An installed custom handler or processor may write without any event, or fail some
+        other connection after writing (review19553 PEER-TRUTH-03), so with one the outcome stays unknown."""
+        return (self.stock_transport and self.connects == 1 and self.sends == 0
+                and _connection_never_established(exc))
+
+    @property
+    def redirected(self) -> bool:
+        return self.connects > 1
+
+
+def _connection_never_established(exc: BaseException) -> bool:
+    """The stock transport's own report of its connection failing to open: urllib's URLError whose reason is a
+    refused connection or an unresolvable host (no deeper cause chain is trusted)."""
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    return isinstance(reason, (ConnectionRefusedError, socket.gaierror))
+
+
+def _stock_opener(opener) -> bool:
+    """True when every handler of ``opener`` (the credential-safe opener a request is sent through) runs only stock
+    code, so every write is the stock transport's and is preceded by its send event: the director is exactly urllib's
+    ``OpenerDirector`` and each handler is exactly one of urllib's own handler classes or Hermes' redirect/sanitizer
+    policy classes (class identity, not a module name a subclass can claim) AND carries no per-instance behavior. A
+    handler instance can replace what the director calls on it (an instance ``http_open``, as ``ProxyHandler``
+    itself does), and such a callable survives the policy's ``copy.copy`` clone (review19670 PEER-TRUTH-09); a stock
+    class proves nothing about it. Anything else: its writes are not observable here, so no zero-write proof."""
+    if type(opener) is not urllib.request.OpenerDirector:
+        return False
+    return all(_stock_handler(handler) for handler in getattr(opener, "handlers", ()))
+
+
+def _stock_handler(handler) -> bool:
+    from hermes_cli import urllib_security
+    cls = type(handler)
+    if not (getattr(urllib.request, cls.__name__, None) is cls
+            or cls in (urllib_security.SafeCredentialRedirectHandler, urllib_security._CrossOriginRequestSanitizer)):
+        return False
+    return not any(name != "parent" and (callable(value) or callable(getattr(cls, name, None)))
+                   for name, value in vars(handler).items())
+
+
+def _run_path(run_id: str) -> str:
+    """A run handle as the ``/v1/runs/<id>`` path segment every follow-up request (``status``/``stop``) uses."""
+    return urllib.parse.quote(run_id, safe="")
+
+
+def _usable_run_id(run_id) -> bool:
+    """A run handle the follow-up requests can use: a non-blank string that ``_run_path`` can encode (UTF-8). No
+    other grammar is imposed (``run:7/a b`` or any Unicode is fine); an escaped lone surrogate is not (PEER-TRUTH-08)."""
+    if not (isinstance(run_id, str) and run_id.strip()):
+        return False
+    try:
+        _run_path(run_id.strip())
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _peer_key_env(name: str) -> str:
@@ -68,10 +198,74 @@ def _peer_secret(name: str) -> str:
         return (os.environ.get(env_name) or "").strip()
 
 
+class _ReadPartial(NamedTuple):
+    """Exact bytes exposed by one read exception; source names provenance, not body order."""
+
+    source: str
+    body: bytes
+
+
+def _read_partials(error: Exception) -> tuple[_ReadPartial, ...]:
+    """Preserve structured partials without guessing that causal bytes are disjoint or contiguous.
+
+    In particular http.client's chunked reader wraps its completed prefix around a cause
+    holding the incomplete current chunk (PEER-TRUTH-13). Other readers can overlap or
+    repeat fragments: keep distinct observations, never concatenate/deduplicate by value.
+    Walk exception identities once, including context, so cycles cannot strand reporting.
+    """
+    pending, seen, observations = [("read_error", error)], set(), []
+    while pending:
+        source, current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, http.client.IncompleteRead):
+            observations.append(_ReadPartial(source + ".partial", current.partial))
+        if current.__context__ is not None:
+            pending.append((source + ".__context__", current.__context__))
+        if current.__cause__ is not None:
+            pending.append((source + ".__cause__", current.__cause__))
+    return tuple(observations)
+
+
+class _ResponseReadError(Exception):
+    """An observed HTTP answer whose body could not be completely read (PEER-TRUTH-11).
+
+    ``partial`` is exactly what the reader exposed, including b''; None means no bytes
+    were exposed, not an empty peer body. This answer must never reach the run parser.
+    ``observations`` also preserves nested exception partials without claiming that
+    they belong to a single contiguous body or can safely be concatenated.
+    """
+
+    def __init__(self, http_status: int, error: Exception) -> None:
+        self.http_status = http_status
+        self.partial = error.partial if isinstance(error, http.client.IncompleteRead) else None
+        self.observations = _read_partials(error)
+        self.read_error = f"{type(error).__name__}: {error}"
+        super().__init__(self.read_error)
+
+    def supplemental_observations(self) -> list[dict] | None:
+        """Only add the separate evidence field when the legacy outer partial cannot hold it all."""
+        if len(self.observations) > 1 or (self.observations and self.partial is None):
+            return [{"source": part.source, "body_hex": part.body.hex()} for part in self.observations]
+        return None
+
+
+def _read_response(response, http_status: int) -> bytes:
+    """Return a complete body or preserve the observed status and available partial bytes."""
+    try:
+        return response.read()
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        raise _ResponseReadError(http_status, exc) from exc
+
+
 def _request(
     url: str, key: str, *, method: str = "GET", body: dict | None = None,
-    timeout: int = LIST_TIMEOUT_S, headers: dict[str, str] | None = None) -> dict:
-    from hermes_cli.urllib_security import open_credentialed_url
+    timeout: int = LIST_TIMEOUT_S, headers: dict[str, str] | None = None, raw: bool = False, on_opener=None):
+    """The parsed JSON object; with ``raw``, the complete answer's ``(HTTP status, body bytes)`` exactly as received
+    (decoding, and judging whether they are text at all, is the caller's). ``on_opener(opener)`` sees the exact opener the request is then sent
+    through, built once from the installed policy (the same opener ``open_credentialed_url`` would build)."""
+    from hermes_cli.urllib_security import _secure_opener_from_installed_policy, open_credentialed_url
     data = json.dumps(body).encode("utf-8") if body is not None else None
     request_headers = {
         "Authorization": f"Bearer {key}", "Content-Type": "application/json",
@@ -83,7 +277,16 @@ def _request(
     # different origin must not carry the Authorization: Bearer key with it —
     # a compromised/MITM'd peer could otherwise harvest it. open_credentialed_url
     # strips non-safelisted headers across a cross-origin redirect.
-    with open_credentialed_url(req, timeout=timeout) as resp:
+    factory = None
+    if on_opener is not None:
+        opener = on_opener(_secure_opener_from_installed_policy(url))
+        for name, value in getattr(opener, "_hermes_initial_addheaders", ()):
+            if not req.has_header(name):
+                req.add_header(name, value)
+        factory = lambda _redirect_handler: opener  # the one opener this request is sent through
+    with open_credentialed_url(req, timeout=timeout, opener_factory=factory) as resp:
+        if raw:
+            return resp.status, _read_response(resp, resp.status)
         payload = resp.read().decode("utf-8", "replace")
     try:
         parsed = json.loads(payload)
@@ -288,6 +491,89 @@ def _peer_failure(peer_name: str, exc: Exception) -> int:
     return 1
 
 
+def _run_not_confirmed(args, peer_name: str, profile: str | None, session_id: str, idempotency_key: str,
+                       *, sent: bool, reason: str, error: str | None = None,
+                       response: dict | None = None, response_hex: str | None = None,
+                       response_body_observations: list[dict] | None = None,
+                       response_read_error: str | None = None, write_started: bool = False,
+                       unsent_why: str = "its connection was refused or its host unresolvable, so no request "
+                                         "byte was written") -> int:
+    """Report a run whose admission is not confirmed, truthfully, and keep its key.
+
+    ``sent=False`` (exit 3, ``not_delivered``) only with positive evidence that no byte of the run request
+    was ever written; otherwise exit 4, ``possibly_admitted``. ``response`` is the peer's actual answer
+    (HTTP status and the available body, verbatim) when one arrived but could not confirm the run; when that body is
+    not valid UTF-8 its rendering is not injective, so ``response_hex`` carries its exact bytes alongside. If the
+    read failed, ``response_read_error`` is separate evidence, not fabricated peer content, and None body means
+    unavailable bytes, not empty bytes. ``response_body_observations`` retains separately sourced nested partials
+    as exact hex, not a reconstructed body. The text claims only what is known (PEER-TRUTH-04): an answer means the
+    request was sent; a started write (its send
+    event precedes ``sendall``) may have sent none, some or all of it; otherwise whether it was sent is unknown."""
+    status = "possibly_admitted" if sent else "not_delivered"
+    if sent:
+        what = ("the run request was sent and answered" if response is not None else
+                "a write of the run request was started (none, some or all of its bytes may have gone out)"
+                if write_started else "it is unknown whether the run request was sent;")
+        print(f"Peer '{peer_name}': {what} but its outcome is not confirmed ({reason}); it may already be admitted "
+              f"and running. idempotency_key: {idempotency_key}. {_RESEND_NOTE}", file=sys.stderr)
+    else:
+        print(f"Could not reach peer '{peer_name}': {reason}. The run request was never sent: {unsent_why}. "
+              f"idempotency_key: {idempotency_key}. {_RESEND_NOTE}", file=sys.stderr)
+    if response is not None:
+        body = response["body"]
+        kind = ("body unavailable" if body is None else
+                "incomplete body, available bytes only" if response_read_error else "body verbatim")
+        print(f"Peer response (HTTP {response['http_status']}), {kind}:", file=sys.stderr)
+        if body is not None:
+            print(body, file=sys.stderr)
+        if response_hex is not None:
+            print(f"(not valid UTF-8; its exact bytes, hex: {response_hex})", file=sys.stderr)
+        if response_read_error is not None:
+            print(f"Response body read failed: {response_read_error}", file=sys.stderr)
+    if response_body_observations is not None:
+        print("Separate read-exception byte observations (not a reconstructed body):", file=sys.stderr)
+        for observation in response_body_observations:
+            print(f"{observation['source']}: hex {observation['body_hex']}", file=sys.stderr)
+    if getattr(args, "json", False):
+        payload = {"peer": peer_name, "profile": profile, "session_id": session_id or None, "run_id": None,
+                   "status": status, "idempotency_key": idempotency_key, "error": error or reason}
+        if response is not None:
+            payload["response"] = response
+        if response_hex is not None:
+            payload["response_hex"] = response_hex
+        if response_read_error is not None:
+            payload["response_complete"] = False
+            payload["response_read_error"] = response_read_error
+        if response_body_observations is not None:
+            payload["response_body_observations"] = response_body_observations
+        print(json.dumps(payload))
+    return EXIT_POSSIBLY_ADMITTED if sent else EXIT_NOT_DELIVERED
+
+
+def _raw_response(http_status: int, raw: bytes | None) -> tuple[dict, str | None]:
+    """An answer that could not confirm the run, for display and evidence: ``(response, response_hex)``. The
+    response's ``body`` is a readable rendering (undecodable bytes as ``\\xNN``, which is not injective: a literal
+    backslash text can render the same), so the exact received bytes are ALSO returned, hex-encoded, whenever the
+    body is not valid UTF-8 (otherwise None). None is unavailable, distinct from b'' (valid empty)."""
+    if raw is None:
+        return {"http_status": http_status, "body": None}, None
+    try:
+        return {"http_status": http_status, "body": raw.decode("utf-8")}, None
+    except UnicodeDecodeError:
+        return {"http_status": http_status, "body": raw.decode("utf-8", "backslashreplace")}, raw.hex()
+
+
+def _http_error_response(exc: urllib.error.HTTPError) -> tuple[dict, str | None, str | None, list[dict] | None]:
+    """The same byte-preserving evidence boundary for HTTP errors and ordinary answers."""
+    try:
+        raw = _read_response(exc, exc.code)
+    except _ResponseReadError as read_exc:
+        response, response_hex = _raw_response(read_exc.http_status, read_exc.partial)
+        return response, response_hex, read_exc.read_error, read_exc.supplemental_observations()
+    response, response_hex = _raw_response(exc.code, raw)
+    return response, response_hex, None, None
+
+
 def _emit(args, payload: dict, text_lines: list[str]) -> int:
     if getattr(args, "json", False):
         print(json.dumps(payload))
@@ -358,7 +644,7 @@ def _peer_run_ctl(args, action: str, peer_name: str, profile: str | None, base: 
     stop = action == "stop"
     try:
         result = _request(
-            f"{base}/v1/runs/{urllib.parse.quote(run_id, safe='')}" + ("/stop" if stop else ""),
+            f"{base}/v1/runs/{_run_path(run_id)}" + ("/stop" if stop else ""),
             key, method="POST" if stop else "GET", body={} if stop else None)
     except (urllib.error.URLError, TimeoutError, OSError, RuntimeError) as exc:
         return _peer_failure(peer_name, exc)
@@ -391,23 +677,92 @@ def _peer_run(args, message: str, peer_name: str, profile: str | None, base: str
             or re.search(r"[\r\n\x00]", idempotency_key)):
         print("Idempotency key must be 1-255 characters without control newlines.", file=sys.stderr)
         return 2
+    session_id = ""
     try:
         if _peer_run_durability(base, key) is not True:
             print(
-                "Warning: this peer does not advertise restart-durable "
-                "run replay; keep the run ID and avoid blind retries "
-                "after a gateway restart.", file=sys.stderr)
+                "Warning: this peer does not advertise restart-durable run replay; keep the run ID to follow "
+                "this run across a gateway restart. Resending the message is always allowed.", file=sys.stderr)
         session_id = _ensure_bot_chat(base, key)
-        result = _request(
-            f"{base}/v1/runs", key, method="POST",
-            body=_turn_body(message, message_key="input", session_id=session_id),
-            headers={"Idempotency-Key": idempotency_key})
-    except (urllib.error.URLError, TimeoutError, OSError, RuntimeError) as exc:
+    except urllib.error.HTTPError as exc:
         return _peer_failure(peer_name, exc)
-    run_id = str(result.get("run_id") or "")
-    if not run_id:
-        print(f"Peer '{peer_name}' did not return a run ID.", file=sys.stderr)
-        return 1
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
+        return _run_not_confirmed(
+            args, peer_name, profile, session_id, idempotency_key, sent=False, reason=str(exc),
+            error=f"{type(exc).__name__}: {exc}",
+            unsent_why="a setup request before it failed, so the run request was not attempted")
+    except RuntimeError as exc:
+        return _peer_failure(peer_name, exc)
+    # Kept BEFORE the run is sent, so a lost answer still leaves the caller this run's key.
+    print(f"peer run: sending to '{peer_name}' with idempotency_key: {idempotency_key}", file=sys.stderr)
+    # Delivery truth comes from what the real transport did (``_RunSendPhase``), never from an exception's
+    # class: only a first-hop connection that failed before any request byte was written is "not delivered".
+    phase = _RunSendPhase()
+    try:
+        with phase:
+            http_status, raw = _request(
+                f"{base}/v1/runs", key, method="POST",
+                body=_turn_body(message, message_key="input", session_id=session_id),
+                headers={"Idempotency-Key": idempotency_key}, raw=True, on_opener=phase.use)
+    except urllib.error.HTTPError as exc:
+        if phase.redirected or exc.code >= 500 or 100 <= exc.code < 200 or 300 <= exc.code < 400:
+            # A later hop's answer is not the receiver's verdict on the original POST; a 5xx does not say whether
+            # the run was admitted before it; and a redirect the client did not follow (307/308 for a POST, a
+            # refused Location) answered the complete POST without rejecting it (PEER-TRUTH-05).
+            # Stock urllib can surface 103 without consuming the final response. An
+            # informational answer is not a rejection or a usable admission verdict.
+            # Do not repeat the POST or invent the unobserved final response.
+            where = ("after a redirect" if phase.redirected else
+                     "an informational response, not a final admission verdict" if 100 <= exc.code < 200 else
+                     "a server error" if exc.code >= 500
+                     else "a redirect that was not followed")
+            response, response_hex, read_error, observations = _http_error_response(exc)
+            return _run_not_confirmed(
+                args, peer_name, profile, session_id, idempotency_key, sent=True,
+                reason=f"HTTP {exc.code} {where}", response=response,
+                error=f"HTTP {exc.code}: {where}" if 100 <= exc.code < 200 else f"HTTPError: {exc}",
+                response_hex=response_hex, response_read_error=read_error, response_body_observations=observations)
+        return _peer_failure(peer_name, exc)
+    except _ResponseReadError as exc:
+        response, response_hex = _raw_response(exc.http_status, exc.partial)
+        return _run_not_confirmed(
+            args, peer_name, profile, session_id, idempotency_key, sent=True,
+            reason=f"HTTP {exc.http_status} response body could not be completely read", error=exc.read_error,
+            response=response, response_hex=response_hex, response_read_error=exc.read_error,
+            response_body_observations=exc.supplemental_observations())
+    except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as exc:
+        sent = not phase.never_sent(exc)
+        if sent:
+            reason = (f"{exc} after a redirect" if phase.redirected
+                      else f"{exc} after a write of the request was started" if phase.sends
+                      else f"{exc}; the transport's send phase was not observed")
+        else:
+            reason = str(exc)
+        return _run_not_confirmed(args, peer_name, profile, session_id, idempotency_key, sent=sent,
+                                  reason=reason, error=f"{type(exc).__name__}: {exc}", write_started=phase.sends > 0)
+    try:
+        text = raw.decode("utf-8")  # strict: a display form of undecodable bytes is never parser input
+    except UnicodeDecodeError:
+        text = None
+    try:
+        result = json.loads(text) if text is not None else None
+        parsed = text is not None
+    except ValueError:
+        result, parsed = None, False
+    run_id = result.get("run_id") if isinstance(result, dict) else None
+    if not _usable_run_id(run_id):
+        # The peer answered but did not bind a usable run handle: that is not "not admitted", and no handle is
+        # made up from another type (PEER-TRUTH-06). Show its answer as it came.
+        shape = ("its body is not valid UTF-8 text (PEER-TRUTH-10)" if text is None else
+                 "its body is not JSON" if not parsed else
+                 "its body is not a JSON object" if not isinstance(result, dict) else
+                 "it carries no run_id" if result.get("run_id") in (None, "") else
+                 "its run_id is not a non-empty string" if not (isinstance(run_id, str) and run_id.strip()) else
+                 "its run_id cannot be used in a run request (not encodable as UTF-8)")
+        response, response_hex = _raw_response(http_status, raw)
+        return _run_not_confirmed(
+            args, peer_name, profile, session_id, idempotency_key, sent=True,
+            reason=f"the peer answered HTTP {http_status} but {shape}", response=response, response_hex=response_hex)
     payload = {
         "peer": peer_name, "profile": profile, "session_id": session_id, "run_id": run_id,
         "status": result.get("status") or "started", "idempotency_key": idempotency_key,
@@ -521,7 +876,13 @@ def build_peer_parser(subparsers) -> None:
             "  hermes peer stop spark run_abc123\n"
             "  hermes peer remove spark\n"
             "\n"
-            "Exit codes: 0 ok, 1 delivery/peer error, 2 usage error."),
+            "Exit codes: 0 ok, 1 delivery/peer error, 2 usage error.\n"
+            "'peer run' also: 3 not delivered (positively never sent: the first connection was refused or its\n"
+            "host unresolvable, or a setup request before it failed), 4 possibly admitted (request bytes may\n"
+            "have been sent and the outcome is unconfirmed: a lost or unusable answer, an unfollowed or failing\n"
+            "redirect, an HTTP 5xx, an unobserved send; the run may be running). Both print the idempotency key, which\n"
+            "'peer run' also prints before sending. Resending the message is always allowed, immediately; a\n"
+            "duplicate is fine. Reusing the key is optional; it is not a receipt and not a dedup gate."),
         formatter_class=argparse.RawDescriptionHelpFormatter)
     peer_sub = parser.add_subparsers(dest="peer_action")
 

@@ -47,7 +47,7 @@ _GENERATION_FENCED = frozenset({"delete", "rewind", "reset", "branch", "model", 
 _COUNTED_REPAIRS = frozenset({"prune_empty_ghost_sessions", "finalize_orphaned_compression_sessions"})
 # Launch options main's ``cli.main`` takes that are creation policy on the gateway session.
 _LAUNCH_POLICY = ("model", "provider", "toolsets", "reasoning", "api_key", "base_url", "max_turns",
-                  "ignore_rules", "checkpoints", "pass_session_id", "skills")
+                  "ignore_rules", "checkpoints", "pass_session_id", "skills", "skip_memory")
 
 
 def _noop(*_a, **_k):
@@ -151,10 +151,11 @@ class GatewaySessionStore:
                 if str(exc) in RESUME_REFUSALS:
                     return None
                 raise
-            # The CLI sends a coding-posture toolset pick and an env-folded ignore_rules too; only a typed
-            # -t / --ignore-rules is checked.
+            # The CLI sends a coding-posture toolset pick and env-folded ignore_rules / skip_memory too; only a
+            # typed -t / --ignore-rules / --skip-memory is checked.
             _check_resume_launch({**(launch or {}), "toolsets": getattr(cli, "_typed_toolsets", None),
-                                  "ignore_rules": getattr(cli, "_explicit_ignore_rules", None) or None}, snapshot)
+                                  "ignore_rules": getattr(cli, "_explicit_ignore_rules", None) or None,
+                                  "skip_memory": getattr(cli, "_explicit_skip_memory", None) or None}, snapshot)
             return self._adopt(snapshot)
         return self.create(launch)
 
@@ -552,13 +553,20 @@ def session_store():
     return GatewaySessionStore()
 
 
-def create_titled_session(title):
+def create_titled_session(title, *, skip_memory: bool = False):
     """``chat -c <title> --create-if-missing`` for the classic CLI: the gateway's ``session.create``
     with ``title`` (it resolves-or-creates under one owner lock), so this process writes no row.
     Main's ``_create_titled_session`` minted the id and wrote the row itself, with no cwd stamp
     (``row_cwd`` ""). Returns the id, or None when the gateway refused (the caller prints main's
-    "could not be created" copy)."""
-    params = _creation_policy({})
+    "could not be created" copy).
+
+    ``skip_memory`` is this launch's typed ``--skip-memory``: creation policy, so it rides this request and the
+    owner freezes it with the title, exactly as :meth:`create` sends it. The startup resume that follows checks a
+    typed ``--skip-memory`` against that frozen launch (:func:`_check_resume_launch`), so the session must be born
+    with it, never repaired after."""
+    if type(skip_memory) is not bool:
+        raise TypeError("skip_memory must be a bool")
+    params = _creation_policy({"skip_memory": skip_memory or None})
     params["cwd"] = _launch_cwd()
     params["source"] = "cli"  # main's titled row is `cli` (hermes_cli.main._create_titled_session)
     params["row_cwd"] = ""

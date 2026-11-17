@@ -42,6 +42,8 @@ class CanonicalCreateParams(ProfileParams):
     reasoning: str | None = None
     max_turns: int | str | None = None
     ignore_rules: bool = False
+    # `--skip-memory`: no memory provider and no MEMORY.md/USER.md for this session; rules, SOUL and skills load.
+    skip_memory: bool = False
     yolo: bool = False
     safe_mode: bool = False
     ignore_user_config: bool = False

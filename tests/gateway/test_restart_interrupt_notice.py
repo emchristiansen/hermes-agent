@@ -30,22 +30,27 @@ def test_restart_drain_timeout_default_stays_zero():
     assert DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT == 0.0
 
 
-class _Stream:
-    def __init__(self):
-        self.frames = []
+def _publish(outcome, captured=None, *, row=None, response='partial reply'):
+    from gateway.session_authority import LiveSession
+    from gateway.session_contract import SessionRef
 
-    def publish(self, session_id, payload):
-        self.frames.append(payload)
-
-
-def _publish(outcome, captured=None):
-    stream = _Stream()
-    live = SimpleNamespace(controls=SimpleNamespace(snapshot=lambda *a: None), event_stream=stream)
-    row = {'admission_id': 'adm-1', 'request_id': 'sub-1'}
-    _publish_completion(SimpleNamespace(runner=None), live, SimpleNamespace(session_id='s'), row,
-                        {'outcome': outcome}, 'partial reply', captured)
-    (frame,) = stream.frames
-    return frame
+    live = LiveSession(None, 'route')
+    claimed = {'admission_id': 'adm-1', 'request_id': 'sub-1', 'owner_epoch': 7,
+               'generation': 3, 'principal_id': 'person', 'payload': {'text': 'please work'}, **(row or {})}
+    execution = {'authority_epoch': claimed['owner_epoch'], 'execution_generation': claimed['generation'],
+                 'admission_id': claimed['admission_id']}
+    live.event_stream.execution = execution.copy()
+    frames = []
+    live.event_stream.observers.add(frames.append)
+    with live.event_stream.lock:
+        _publish_completion(SimpleNamespace(runner=None), live, SessionRef('owned', 's'), claimed,
+                            {'outcome': outcome}, response, captured)
+    (frame,) = frames
+    assert frame['params']['type'] == 'message.complete'
+    assert frame['params']['session_id'] == 's'
+    assert all(frame['params'][key] == value for key, value in execution.items())
+    assert live.event_stream.execution == execution
+    return frame['params']['payload']
 
 
 def _cause(message, **extra):
@@ -318,12 +323,7 @@ def test_automation_turn_the_owner_stop_interrupted_is_never_asked_to_resend(cau
     """#134889 GW-20: nobody sent an unattended turn, so the owner-stop notice is the neutral
     automation copy (GW-10's rule), never "Send your message again"."""
     from agent.turn_failure_copy import AUTOMATION_INTERRUPTED_NOTICE
-    stream = _Stream()
-    live = SimpleNamespace(controls=SimpleNamespace(snapshot=lambda *a: None), event_stream=stream)
-    _publish_completion(SimpleNamespace(runner=None), live, SimpleNamespace(session_id='s'),
-                        {'admission_id': 'adm-1', 'request_id': 'sub-1', **row},
-                        {'outcome': 'interrupted'}, '', _cause(cause))
-    (frame,) = stream.frames
+    frame = _publish('interrupted', _cause(cause), row=row, response='')
     assert frame['warning'] == AUTOMATION_INTERRUPTED_NOTICE
     assert 'again' not in frame['warning'].replace('not run again', '')
 

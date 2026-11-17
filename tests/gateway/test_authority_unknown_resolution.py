@@ -152,8 +152,17 @@ async def test_discard_and_its_transcript_boundary_commit_atomically_on_the_phys
         assert 'error' in failed, failed
         rows = {r['admission_id']: r['status'] for r in list_session_admissions(db, session_id='s')}
         assert rows.get(unknown['admission_id']) == 'unknown', 'Discard committed without its transcript boundary'
-        with pytest.raises(RuntimeStoreError, match='unknown_execution'):
+        # Independent FOLLOWER delivery no longer needs Discard, but it DOES need
+        # a safe transcript boundary. The same failed write must roll back its claim.
+        import sqlite3
+        generation = db.get_session('s')['runtime_generation']
+        messages = db.get_messages('s-tip')
+        with pytest.raises(sqlite3.IntegrityError, match='boundary failed'):
             claim_session_input(db, epoch=authority.epoch, session_id='s')
+        assert db.get_session('s')['runtime_generation'] == generation
+        assert db.get_messages('s-tip') == messages
+        assert next(r for r in list_session_admissions(db, session_id='s')
+                    if r['admission_id'] == follower.admission_id)['status'] == 'queued'
         db._execute_write(lambda c: c.execute('DROP TRIGGER deny_boundary'))
         retried = await viewer.dispatch({'id': 3, 'method': 'prompt.resolve_unknown', 'params': params})
         assert retried['result']['outcome'] == 'interrupted', retried

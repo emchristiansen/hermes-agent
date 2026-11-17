@@ -80,6 +80,8 @@ _ACP_FLAGS = (
 def cmd_acp(args):
     """Launch Hermes Agent as an ACP server."""
     import os
+    if getattr(args, "skip_memory", False):
+        raise SystemExit("hermes acp: --skip-memory is not supported here; use `hermes chat --skip-memory`")
     # The gateway-backed ACP server forwards launch flags from their documented env equivalents
     # (main() already exported --yolo / --safe-mode / --ignore-user-config).
     for attr, name in (("accept_hooks", "HERMES_ACCEPT_HOOKS"), ("ignore_rules", "HERMES_IGNORE_RULES")):

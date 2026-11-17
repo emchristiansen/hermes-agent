@@ -65,6 +65,11 @@ class GatewayBackgroundMixin:
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            # A local session's frozen launch policy follows its /bg agent as it follows the session's own turns
+            # (session_execution._build_fresh_agent): a --skip-memory session's background agent is memoryless.
+            # A messaging chat has no local policy (None): unchanged.
+            from gateway.session_policy import policy_for_source
+            policy = policy_for_source(self, source)
 
             # Enrich the prompt with image descriptions (same as the main flow).
             enriched_prompt = prompt
@@ -109,7 +114,12 @@ class GatewayBackgroundMixin:
                     # Reload from disk — do not reuse the startup snapshot.
                     # See #60955.
                     fallback_model=self._refresh_fallback_model(),
+                    # --skip-memory (or --ignore-rules / --safe-mode): no memory provider, no MEMORY.md/USER.md.
+                    **({"skip_memory": True} if policy is not None and policy.skip_memory else {}),
                 )
+                if policy is not None and policy.skip_memory_requested:
+                    from agent.agent_init_skip_memory import apply_session_skip_memory
+                    apply_session_skip_memory(agent)
                 # Built outside the turn wiring, so it takes its chat's Daybreak verdicts here.
                 agent.daybreak_surface = self._daybreak_surface(source) is True
                 agent.daybreak = self._load_daybreak(source) is True

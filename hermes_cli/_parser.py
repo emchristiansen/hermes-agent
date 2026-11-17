@@ -318,6 +318,8 @@ def _add_top_level_flags(parser: argparse.ArgumentParser) -> None:
               help=f"Ignore {_cfg_path()} and fall back to built-in defaults (credentials in .env and an administrator-managed agent.home_guidance_file still load)")
     inherited(parser, "--ignore-rules", action="store_true", default=False,
               help="Skip auto-injection of AGENTS.md, SOUL.md, .cursorrules, memory, and preloaded skills (the operating home guidance file set by agent.home_guidance_file still loads)")
+    inherited(parser, "--skip-memory", action="store_true", default=False,
+              help="Run this session without memory: no external memory provider (e.g. Hindsight) and no MEMORY.md/USER.md injection; SOUL.md, AGENTS.md, config and skills still load. No memory checkpoint is taken before compaction.")
     inherited(parser, "--safe-mode", action="store_true", default=False,
               help="Troubleshooting mode: disable customizations — user config, AGENTS.md/SOUL.md/memory injection, plugins, and MCP servers (implies --ignore-user-config and --ignore-rules); an administrator-managed agent.home_guidance_file still loads")
     inherited(parser, "--tui", action="store_true", default=False,
@@ -426,6 +428,8 @@ def _build_chat_parser(subparsers) -> argparse.ArgumentParser:
               help=f"Ignore {_cfg_path()} and fall back to built-in defaults (credentials in .env and an administrator-managed agent.home_guidance_file still load). Useful for isolated CI runs, reproduction, and third-party integrations.")
     inherited(chat_parser, "--ignore-rules", action="store_true", default=SUPPRESS,
               help="Skip auto-injection of AGENTS.md, SOUL.md, .cursorrules, memory, and preloaded skills; the operating home guidance file set by agent.home_guidance_file still loads. Combine with --ignore-user-config to also ignore your config file; an administrator-managed agent.home_guidance_file still loads.")
+    inherited(chat_parser, "--skip-memory", action="store_true", default=SUPPRESS,
+              help="Run this session without memory: no external memory provider (e.g. Hindsight) and no MEMORY.md/USER.md injection; SOUL.md, AGENTS.md, config and skills still load. No memory checkpoint is taken before compaction.")
     inherited(chat_parser, "--safe-mode", action="store_true", default=SUPPRESS,
               help="Troubleshooting mode: disable customizations — user config, AGENTS.md/SOUL.md/memory injection, plugins, and MCP servers (implies --ignore-user-config and --ignore-rules); an administrator-managed agent.home_guidance_file still loads. Use to isolate whether a problem comes from your setup or from Hermes itself.")
     add("--source", default=None,

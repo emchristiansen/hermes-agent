@@ -757,9 +757,11 @@ async def test_gateway_autosubscribe_roundtrips_user_id_alt_for_session_key(
 
 @pytest.mark.asyncio
 async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_path, monkeypatch):
-    """Missing artifact paths are silently skipped — they may have been
-    referenced by name only. The notifier must not crash and must still
-    deliver any artifacts that do exist."""
+    """Missing prose references are skipped; missing declared deliverables refuse completion.
+
+    The notifier still delivers the real artifact after a corrected completion.
+    """
+    import json
     import hermes_cli.kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_db_notify as kbn
@@ -773,6 +775,7 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
 
     real_pdf = tmp_path / "real.pdf"
     real_pdf.write_bytes(b"%PDF-fake")
+    ghost_pdf = tmp_path / "definitely-does-not-exist.pdf"
 
     conn = kbc.connect()
     try:
@@ -789,10 +792,24 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     os.environ["HERMES_KANBAN_TASK"] = tid
     try:
-        kt._handle_complete({
-            "summary": "one real, one ghost",
-            "artifacts": [str(real_pdf), "/tmp/definitely-does-not-exist.pdf"],
-        })
+        refused = json.loads(kt._handle_complete({
+            "summary": "declared artifact must exist",
+            "artifacts": [str(real_pdf), str(ghost_pdf)],
+        }))
+        assert "error" in refused
+        conn = kbc.connect()
+        try:
+            task = kb.get_task(conn, tid)
+            assert task.status == "running" and task.current_run_id == run_id
+            assert kb.list_attachments(conn, tid) == []
+            assert not any(e.kind == "completed" for e in kb.list_events(conn, tid))
+        finally:
+            conn.close()
+        completed = json.loads(kt._handle_complete({
+            "summary": f"Real artifact attached; reference-only missing path: {ghost_pdf}",
+            "artifacts": [str(real_pdf)],
+        }))
+        assert completed["ok"] is True
     finally:
         os.environ.pop("HERMES_KANBAN_TASK", None)
 

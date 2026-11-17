@@ -157,6 +157,9 @@ def admission_result(db, admission_id):
 def close_discarded_turn(db, conn, row, notice=None, *, replace_after=None, display_metadata=None):
     """Close a discarded ``unknown`` turn the way a failed turn is closed, on the resolution's
     own transaction (``resolve_unknown_session_input(_terminal_write=...)``).
+    A follower claim uses the same closure before its transcript mark, WITHOUT
+    resolving the unknown admission or retiring any worker. This changes only the
+    transcript's turn boundary, never the old execution's outcome or retry state.
 
     The lost input stays in the transcript for the user to resend, but an open ``user`` tail would be
     merged into the follower's provider request by consecutive-user repair, re-sending the discarded
@@ -193,7 +196,7 @@ def close_discarded_turn(db, conn, row, notice=None, *, replace_after=None, disp
                      (notice, db._encode_display_metadata(display_metadata), tail[2]))
         return True
     if notice is None and (tail is None or not (
-            tail[0] == 'user' or (tail[0] == 'assistant' and tail[1] not in (None, '', '[]')))):
+            tail[0] in ('user', 'tool') or (tail[0] == 'assistant' and tail[1] not in (None, '', '[]')))):
         return False
     boundary = {'role': 'assistant', 'content': notice or PARTIAL_FAILED_TURN_NOTICE, 'timestamp': time.time(),
                 'display_kind': FAILED_TURN_DISPLAY_KIND}

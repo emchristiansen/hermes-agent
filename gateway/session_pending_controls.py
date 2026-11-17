@@ -14,6 +14,37 @@ class PendingControls:
         self.events = events
         self.pending = {}
         self.remote_responders = {}
+        self._executions = {}
+
+    def _register(self, session_id, route, prompt):
+        # Registration runs under the owner's generation fence and stream lock.
+        # A later snapshot/response must not borrow a successor's execution stamp.
+        generation = prompt['execution_generation']
+        execution = dict(self.events.execution)
+        if execution and execution.get('execution_generation') != generation:
+            raise RuntimeStoreError('stale_generation')
+        # Non-admission users can have an unstamped stream. Never invent their
+        # admission/epoch; completion may supply its committed row's identity.
+        execution['execution_generation'] = generation
+        prompt_id = prompt['prompt_id']
+        self.pending[prompt_id] = (route, prompt)
+        self._executions[prompt_id] = execution
+        self.events.publish(session_id, prompt, event_type=prompt['kind'] + '.request', execution=execution)
+
+    def settle(self, session_id, prompt_id, generation, *, execution=None):
+        """Remove/publish one owning projection; a stale callback cannot consume its successor."""
+        with self.events.lock:
+            saved = self.pending.get(prompt_id)
+            if saved is None or saved[1]['execution_generation'] != generation:
+                return False
+            _route, prompt = self.pending.pop(prompt_id)
+            owning = self._executions.pop(prompt_id)
+            self.remote_responders.pop(prompt_id, None)
+            if 'admission_id' not in owning and execution is not None:
+                owning = execution
+            self.events.publish(session_id, {'prompt_id': prompt_id, 'execution_generation': generation},
+                                event_type=prompt['kind'] + '.settled', execution=owning)
+            return True
 
     def register(self, session_id, route, generation, data, *, timeout_s=None):
         from gateway.run import _redact_approval_command
@@ -34,8 +65,7 @@ class PendingControls:
                 prompt['choices'] = ['once', 'deny']
             if timeout_s is not None:
                 prompt['timeout_s'] = timeout_s
-            self.pending[prompt_id] = (route, prompt)
-            self.events.publish(session_id, prompt, event_type='approval.request')
+            self._register(session_id, route, prompt)
 
     def register_clarify(self, session_id, generation, entry, *, timeout_s=None):
         from gateway.run import _redact_approval_command
@@ -47,8 +77,21 @@ class PendingControls:
                       "multi_select": entry.multi_select}
             if timeout_s is not None:
                 prompt["timeout_s"] = timeout_s
-            self.pending[entry.clarify_id] = (entry, prompt)
-            self.events.publish(session_id, prompt, event_type="clarify.request")
+            self._register(session_id, entry, prompt)
+
+    def complete_execution(self, session_id, execution):
+        """Settle only the completed claim's projections, not a later running turn's.
+
+        The same stamp addresses cleanup frames and completion. Publication of an
+        older result must not alter the stream's currently executing claim.
+        """
+        with self.events.lock:
+            generation = execution['execution_generation']
+            if generation is None:  # an unclaimed row owns no execution controls
+                return
+            for prompt_id, (_route, prompt) in list(self.pending.items()):
+                if prompt['execution_generation'] == generation:
+                    self.settle(session_id, prompt_id, generation, execution=execution)
 
     def snapshot(self, session_id, generation):
         with self.events.lock:
@@ -57,10 +100,7 @@ class PendingControls:
                           (not route.event.is_set() if prompt['kind'] == 'clarify' else
                            any(p['request_id'] == prompt_id for p in list_gateway_approvals(route))))
                 if prompt['execution_generation'] != generation or not active:
-                    del self.pending[prompt_id]
-                    self.remote_responders.pop(prompt_id, None)
-                    self.events.publish(session_id, {'prompt_id': prompt_id,
-                        'execution_generation': prompt['execution_generation']}, event_type=prompt['kind'] + '.settled')
+                    self.settle(session_id, prompt_id, prompt['execution_generation'])
             return tuple(deepcopy(prompt) for _, prompt in self.pending.values())
 
     def respond(self, session_id, generation, prompt_id, response, *, kind="approval"):
@@ -79,10 +119,7 @@ class PendingControls:
                         or (kind == 'approval' and response[field] not in prompt['choices'])):
                     raise RuntimeStoreError('invalid_params')
                 self.remote_responders[prompt_id](kind, prompt_id, response[field])
-                del self.remote_responders[prompt_id]
-                del self.pending[prompt_id]
-                self.events.publish(session_id, {'prompt_id': prompt_id, 'execution_generation': generation},
-                                    event_type=kind + '.settled')
+                self.settle(session_id, prompt_id, generation)
                 return {'status': 'resolved', 'prompt_id': prompt_id}
             if kind == 'clarify':
                 from tools.clarify_gateway import resolve_gateway_clarify

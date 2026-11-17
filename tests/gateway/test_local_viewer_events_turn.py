@@ -231,12 +231,17 @@ def test_messaging_tool_events_carry_no_diff_or_todo_frame():
 
 @pytest.mark.parametrize('platform', [Platform.LOCAL, Platform.TELEGRAM])
 def test_prompts_carry_the_gateway_wait_window_only_for_local_viewers(monkeypatch, platform):
+    from gateway.session_events import SessionEvents
     from gateway.session_pending_controls import PendingControls
-    import threading
     monkeypatch.setattr('tools.approval_context._get_approval_timeout', lambda: 90)
     monkeypatch.setattr('tools.clarify_gateway.get_clarify_timeout', lambda: 600)
-    published = []
-    events = SimpleNamespace(lock=threading.RLock(), publish=lambda sid, prompt, event_type: published.append((event_type, prompt)))
+    # The real stream, stamped as SessionAuthority._stamp_claim stamps a claimed turn: registration
+    # captures that owning stamp and each request frame carries it (MR-SCOPE28).
+    events = SessionEvents()
+    claim = {'authority_epoch': 'epoch-1', 'execution_generation': 1, 'admission_id': 'admission-1'}
+    events.execution = dict(claim)
+    frames = []
+    events.observers.add(frames.append)
     controls = PendingControls(events)
     authority = SimpleNamespace(
         check_approval_generation=lambda *a: None,
@@ -250,7 +255,14 @@ def test_prompts_carry_the_gateway_wait_window_only_for_local_viewers(monkeypatc
     entry = SimpleNamespace(clarify_id='c1', question='Which?', choices=['x'], multi_select=False)
     from gateway import local_viewer_events
     authority.register_clarify('s', 1, entry, timeout_s=local_viewer_events.prompt_timeout_s(turn, 'clarify'))
-    approval, clarify = published[0][1], published[1][1]
+    assert [frame['params']['type'] for frame in frames] == ['approval.request', 'clarify.request']
+    for frame in frames:
+        assert frame['params']['session_id'] == 's'
+        assert {key: frame['params'][key] for key in claim} == claim
+    assert events.execution == claim  # registration copies the stamp; it never rewrites the stream's
+    approval, clarify = (frame['params']['payload'] for frame in frames)
+    assert (approval['prompt_id'], clarify['prompt_id']) == ('a1', 'c1')
+    assert approval['execution_generation'] == clarify['execution_generation'] == 1
     if platform == Platform.LOCAL:
         assert (approval['timeout_s'], clarify['timeout_s']) == (90, 600)
         from tui_gateway.contracts.canonical_sessions import CanonicalPendingPrompt

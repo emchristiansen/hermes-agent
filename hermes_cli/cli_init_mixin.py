@@ -53,6 +53,7 @@ def _gateway_launch(cli):
             "checkpoints": getattr(cli, "_explicit_checkpoints", False) or None,
             "pass_session_id": getattr(cli, "pass_session_id", False) or None,
             "ignore_rules": getattr(cli, "ignore_rules", False) or None,
+            "skip_memory": getattr(cli, "skip_memory", False) or None,
             "run_budget": getattr(cli, "_explicit_run_budget", None),
             "verbose": getattr(cli, "verbose", False) or None,
             "skills": _explicit_launch_skills(cli)}
@@ -190,12 +191,12 @@ class CLIInitMixin:
         self._last_input_mode_recovery = self._last_termios_drift_check = None  # None = never; monotonic epoch is arbitrary
         self._input_mode_recovery_notice_shown = self._termios_drift_notice_shown = False
 
-    def _init_model_routing(self, model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, checkpoints, pass_session_id, ignore_rules):
+    def _init_model_routing(self, model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, checkpoints, pass_session_id, ignore_rules, skip_memory=False):
         """Resolve model/provider/base_url, turn limits, toolsets, checkpoints, prompt/personality, reasoning + routing config."""
         self._init_model_and_provider(model, provider, api_key, base_url)
         self._init_turn_limits(max_turns, run_budget)
         self._init_toolsets(toolsets)
-        self._init_checkpoints_and_rules(checkpoints, pass_session_id, ignore_rules)
+        self._init_checkpoints_and_rules(checkpoints, pass_session_id, ignore_rules, skip_memory)
         self._init_prompt_and_reasoning(reasoning)
 
     def _init_model_and_provider(self, model, provider, api_key, base_url):
@@ -324,7 +325,7 @@ class CLIInitMixin:
         # refuses an unknown picked name at session.create and reports a stale profile one with the session
         # (``_adopt_gateway_toolsets``), so this process never discovers plugins to tell them apart (PLG-7).
 
-    def _init_checkpoints_and_rules(self, checkpoints, pass_session_id, ignore_rules):
+    def _init_checkpoints_and_rules(self, checkpoints, pass_session_id, ignore_rules, skip_memory=False):
         from cli import CLI_CONFIG
         cp_cfg = CLI_CONFIG.get("checkpoints", {})
         if isinstance(cp_cfg, bool):
@@ -339,6 +340,9 @@ class CLIInitMixin:
         self.ignore_rules = ignore_rules or is_truthy_value(os.environ.get("HERMES_IGNORE_RULES"))
         # The env opt-in is creation policy only: a resume checks just a typed --ignore-rules (the thin client's rule).
         self._explicit_ignore_rules = bool(ignore_rules)
+        # --skip-memory: AIAgent(skip_memory=True) only — no memory provider and no MEMORY.md/USER.md; context
+        # files, SOUL, config and skills load. A typed flag only (no environment equivalent).
+        self.skip_memory = self._explicit_skip_memory = bool(skip_memory)
 
     def _init_prompt_and_reasoning(self, reasoning):
         """Ephemeral system prompt/prefill, reasoning + service tier, OpenRouter routing knobs, fallback chain."""

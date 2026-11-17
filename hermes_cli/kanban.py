@@ -929,6 +929,18 @@ def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint: 
     return None
 
 
+def _warn_unattached_artifacts(conn, tid: str) -> None:
+    """Name each declared artifact the completion kept only as a path (never as an attachment),
+    so a CLI handoff with outside paths does not read as delivered. ``hermes kanban attach``
+    stores such a file explicitly."""
+    run = kb.latest_run(conn, tid)
+    metadata = run.metadata if run is not None and isinstance(run.metadata, dict) else {}
+    for item in metadata.get("unattached_artifacts") or ():
+        if isinstance(item, dict):
+            print(f"kanban: {tid}: artifact NOT attached: {item.get('path')} ({item.get('reason')}); "
+                  f"use `hermes kanban attach {tid} PATH` to store it", file=sys.stderr)
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids, rc = _require_ids(args)
@@ -968,6 +980,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
                                  f"describing what was done (an empty completion is not evidence).")
                 return False
+            if done:
+                _warn_unattached_artifacts(conn, tid)
             if not done:
                 # complete_task returns bare False for a dependency refusal too;
                 # name the open parents instead of claiming the id is unknown.

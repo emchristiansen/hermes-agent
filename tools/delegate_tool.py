@@ -294,6 +294,12 @@ def _build_child_agent(
         from agent.conversation_compression_checkpoint import checkpoint_required_from_config
 
         child_checkpoint_required = checkpoint_required_from_config()
+        # A --skip-memory session's children inherit the session opt-out (``apply_session_skip_memory`` below), so
+        # their own delegates stay memoryless too. The opt-out dominates the gate above: such a child is built
+        # with skip_memory=True even under checkpoint_required (it never initializes the provider, and
+        # apply_session_skip_memory disarms its checkpoint). Any other child is built with skip_memory=True only
+        # while the gate is off; under an armed gate it is built with skip_memory=False, as above.
+        session_skip_memory = getattr(parent_agent, "_session_skip_memory", False) is True
         with delegated_child_context():
             try:
                 child = AIAgent(
@@ -301,7 +307,7 @@ def _build_child_agent(
                     enabled_toolsets=child_toolsets, disabled_toolsets=child_disabled_toolsets, quiet_mode=True,
                     ephemeral_system_prompt=child_prompt, log_prefix=f"[subagent-{task_index}]", platform="subagent",
                     side_agent=True,
-                    skip_context_files=True, skip_memory=not child_checkpoint_required,
+                    skip_context_files=True, skip_memory=session_skip_memory or not child_checkpoint_required,
                     memory_agent_context="subagent", clarify_callback=None,
                     thinking_callback=(
                         (lambda text: _safe_progress(child_progress_cb, "_thinking", text) if text else None)
@@ -328,6 +334,9 @@ def _build_child_agent(
             effective_requested_provider=rt.get("requested_provider"),
         )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    if session_skip_memory:
+        from agent.agent_init_skip_memory import apply_session_skip_memory
+        apply_session_skip_memory(child)  # grandchildren inherit the session's opt-out; no store, no memory tool
     _apply_child_cache_ttl(child)
     if child_session_db is not None:
         child._owns_session_db = True  # released by the child's close(), never by the parent

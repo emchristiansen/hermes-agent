@@ -421,12 +421,22 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         # The side agent persists into the PARENT's store: a named-profile chat's ``bg_*`` rows
         # belong to that profile's state.db, not the launch handle.
         "platform": "tui", "session_db": getattr(agent, "_session_db", None) or _get_db(), "fallback_model": fallback,
-        "side_agent": True}
+        "side_agent": True,
+        # A --skip-memory session's /bg agent loads no memory provider and no MEMORY.md/USER.md either.
+        **({"skip_memory": True} if getattr(agent, "_session_skip_memory", False) is True else {})}
 
 
 def _ephemeral_preview_agent_kwargs(agent, task_id: str) -> dict:
     return {**_background_agent_kwargs(agent, task_id),
             "enabled_toolsets": ["terminal", "file"], "session_db": None, "skip_memory": True}
+
+
+def _inherit_session_skip_memory(parent, side_agent) -> None:
+    """A --skip-memory session's side agent carries the session opt-out, not just ``skip_memory``: its own
+    delegates then stay memoryless (``tools/delegate_tool.py``). A legacy ``skip_memory`` agent is unchanged."""
+    if getattr(parent, "_session_skip_memory", False) is True:
+        from agent.agent_init_skip_memory import apply_session_skip_memory
+        apply_session_skip_memory(side_agent)
 
 
 @contextlib.contextmanager

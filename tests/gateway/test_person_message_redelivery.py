@@ -105,19 +105,23 @@ async def test_a_lost_turn_that_reached_a_tool_is_not_run_again(tmp_path, monkey
             assert executed == ['FOLLOWER']
             assert not any('will run again' in notice for notice in _notices(authority.db))
         else:
-            # Fenced unknown: the person's FIFO pauses for them, exactly as before.
+            # HEAD stays uncertain and is never replayed; that cannot strand FOLLOWER.
             assert _statuses(authority.db)[head_id] == ('unknown', None)
-            assert executed == []
-            assert _statuses(authority.db)[follower_id] == ('queued', None)
+            assert executed == ['FOLLOWER']
+            assert _statuses(authority.db)[follower_id] == ('terminal', 'completed')
+            assert not any('will run again' in notice for notice in _notices(authority.db))
     finally:
         store.close_all_db_handles()
 
 
 @pytest.mark.asyncio
 async def test_a_redelivered_managed_turns_worker_outbox_is_never_replayed(tmp_path, monkeypatch):
-    """The lost turn ran in a managed worker. Its message runs again, but the worker's own outbox (its
-    transcript/usage writes: persistence, not messages) is never replayed: the lost execution is
-    retired with the redelivery, so neither its adoption nor its claim on the session survives."""
+    """The lost turn ran in a managed worker that was still running when its owner died. A worker acts
+    outside the transcript, so "no tool row" proves nothing: the message is NOT queued again, and the
+    worker's own outbox (its transcript/usage writes) is never replayed either: the boot fences it
+    ``unknown``, its adoption by the next owner is refused, and no redelivery writes it ``terminal``
+    (that would drop the claim fence). The independent FOLLOWER completes while HEAD and its worker
+    remain unknown; HEAD's outbox and business operation are never replayed."""
     import hashlib
     from hermes_state_runtime import RuntimeStoreError, adopt_worker_execution
     executed = []
@@ -132,16 +136,33 @@ async def test_a_redelivered_managed_turns_worker_outbox_is_never_replayed(tmp_p
                                                           row['generation'], hashlib.sha256(b's3cret').hexdigest())))
         return row
     monkeypatch.setitem(globals(), 'claim_session_input', claim_with_worker)  # _lost_person_turn's claim
-    store, authority, head_id, _follower_id = await _lost_person_turn(
+    store, authority, head_id, follower_id = await _lost_person_turn(
         tmp_path, monkeypatch, executed, tool_step=False, stopped=False)
     try:
         worker = authority.db._read_one("SELECT status, generation FROM worker_executions WHERE execution_id=?",
                                         ('admission-worker:' + head_id,))
-        assert worker[0] == 'terminal'
+        assert worker[0] == 'unknown'
         with pytest.raises(RuntimeStoreError):
             adopt_worker_execution(authority.db, epoch=authority.epoch, execution_id='admission-worker:' + head_id,
                                    session_id='s', generation=worker[1], adoption_secret='s3cret')
+        old_worker = dict(authority.db._read_one('SELECT * FROM worker_executions WHERE execution_id=?',
+                                                ('admission-worker:' + head_id,)))
+        with authority.db._read_ctx() as conn:
+            old_receipts = [tuple(row) for row in conn.execute(
+                'SELECT * FROM worker_receipts WHERE execution_id=?', ('admission-worker:' + head_id,))]
         await _drained(authority)
-        assert executed == ['HEAD', 'FOLLOWER']
+        assert executed == ['FOLLOWER']
+        assert _statuses(authority.db)[head_id] == ('unknown', None)
+        assert _statuses(authority.db)[follower_id] == ('terminal', 'completed')
+        assert authority.db._read_one("SELECT status FROM worker_executions WHERE execution_id=?",
+                                      ('admission-worker:' + head_id,))[0] == 'unknown'
+        assert dict(authority.db._read_one('SELECT * FROM worker_executions WHERE execution_id=?',
+                                           ('admission-worker:' + head_id,))) == old_worker
+        with authority.db._read_ctx() as conn:
+            assert [tuple(row) for row in conn.execute('SELECT * FROM worker_receipts WHERE execution_id=?',
+                                                       ('admission-worker:' + head_id,))] == old_receipts
+        with pytest.raises(RuntimeStoreError):
+            adopt_worker_execution(authority.db, epoch=authority.epoch, execution_id='admission-worker:' + head_id,
+                                   session_id='s', generation=worker[1], adoption_secret='s3cret')
     finally:
         store.close_all_db_handles()

@@ -1,7 +1,7 @@
 """GW-10 (#139532): an ``unknown`` admission no person is waiting on settles as interrupted.
 
-A turn lost across an owner restart is fenced ``unknown`` and pauses the session's FIFO until a
-person resolves it, because only they know whether to resend it. An automation delivery (a cron
+A tool-bearing turn lost across an owner restart stays fenced ``unknown`` until a person resolves
+it, without blocking independent followers or replaying uncertain work. An automation delivery (a cron
 run, a ``local_automation_v1`` completion, a native automation envelope) has nobody to ask: it
 settles ``interrupted`` (never replayed), the transcript gets a notice, and the FIFO moves on.
 Real ``SessionStore`` SQLite, two real owner epochs; no store monkeypatching.
@@ -131,17 +131,23 @@ async def test_unknown_automation_settles_interrupted_and_fifo_moves_on(tmp_path
 
 @pytest.mark.asyncio
 async def test_a_persons_unknown_turn_still_pauses_the_fifo(tmp_path, monkeypatch):
-    """A person's lost turn that reached a tool (one that did not runs again: test_person_message_redelivery)."""
+    """The old pause oracle now requires FOLLOWER delivery, never replay of the tool-bearing HEAD."""
+    from gateway.session_message_redelivery import REDELIVER_PREFIX
+    from hermes_state_runtime import get_session_admission
     executed = []
     store, authority, head_id, follower_id = await _lost_head_then_restart(tmp_path, monkeypatch, executed, _person_head,
                                                                            tool_step=True)
     try:
         assert _statuses(authority.db)[head_id] == ('unknown', None)
+        retained = get_session_admission(authority.db, admission_id=head_id)
         authority._schedule(SessionRef('p', 's'))
         live = authority.sessions['s']
-        await async_wait_until(lambda: live.task is not None and live.task.done(), what='drain paused')
-        assert executed == []
-        assert _statuses(authority.db)[follower_id] == ('queued', None)
+        await async_wait_until(lambda: live.task is not None and live.task.done(), what='follower completed')
+        assert executed == ['FOLLOWER']
+        assert _statuses(authority.db)[follower_id] == ('terminal', 'completed')
+        assert _statuses(authority.db)[head_id] == ('unknown', None)
+        assert get_session_admission(authority.db, admission_id=head_id) == retained
+        assert authority.db._read_one('SELECT 1 FROM state_meta WHERE key=?', (REDELIVER_PREFIX + head_id,)) is None
     finally:
         store.close_all_db_handles()
 

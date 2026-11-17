@@ -158,7 +158,7 @@ class GatewaySessionAgentMixin:
         from gateway.session_policy import policy_for_source
         from gateway.session_worker_construct import session_prefill
         policy = policy_for_source(runner, src)
-        return ctx.AIAgent(
+        agent = ctx.AIAgent(
             model=turn_route["model"], **turn_route["runtime"], **_checkpoint_agent_kwargs(ctx.user_config),
             max_iterations=max_iterations, quiet_mode=not bool(policy and policy.verbose), verbose_logging=False,
             enabled_toolsets=ctx.enabled_toolsets, disabled_toolsets=ctx.disabled_toolsets,
@@ -181,12 +181,17 @@ class GatewaySessionAgentMixin:
             skip_context_files=skip_context_files,
             # Keep the persona even with minimal context: soul identity is one small file.
             load_soul_identity=not bool(policy and policy.ignore_rules),
-            skip_memory=bool(policy and policy.ignore_rules),
+            # --skip-memory (or --ignore-rules / --safe-mode): no memory provider, no MEMORY.md/USER.md.
+            skip_memory=bool(policy and policy.skip_memory),
             pass_session_id=bool(policy and policy.pass_session_id),
             # A local session's frozen budget (`--run-budget` / its profile's agent.run_budget_seconds);
             # None leaves the agent reading the owner's config, as before.
             run_budget_seconds=policy.run_budget_seconds if policy else None,
         )
+        if policy is not None and policy.skip_memory_requested:
+            from agent.agent_init_skip_memory import apply_session_skip_memory
+            apply_session_skip_memory(agent)
+        return agent
 
     def _resolve_turn_agent(self, turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr):
         """Reuse this session's cached AIAgent (frozen system prompt + tool schemas → prompt cache
@@ -194,9 +199,17 @@ class GatewaySessionAgentMixin:
         ctx = self._ctx
         runner = self._runner
         skip_context_files = self._skip_context_files(platform_key)
+        from gateway.session_policy import policy_for_source
+        policy = policy_for_source(runner, ctx.source)
+        key_config = ctx.user_config
+        if policy is not None and policy.skip_memory and isinstance(key_config, dict):
+            # The agent is built with skip_memory (no external provider), so the configured provider's
+            # identity is no cache key, and loading it for one would import that plugin anyway.
+            memory = key_config.get("memory")
+            key_config = {**key_config, "memory": {**(memory if isinstance(memory, dict) else {}), "provider": None}}
         sig = runner._agent_config_signature(
             turn_route["model"], turn_route["runtime"], ctx.enabled_toolsets, combined_ephemeral,
-            cache_keys=runner._extract_cache_busting_config(ctx.user_config),
+            cache_keys=runner._extract_cache_busting_config(key_config),
             user_id=getattr(ctx.source, "user_id", None),
             user_id_alt=getattr(ctx.source, "user_id_alt", None),
             skip_context_files=skip_context_files,

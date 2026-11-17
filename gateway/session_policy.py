@@ -17,7 +17,7 @@ CREATE_FIELDS = frozenset({'request_id', 'source', 'cwd', 'model', 'toolsets',
                            'yolo', 'safe_mode', 'ignore_user_config',
                            'skills', 'checkpoints', 'accept_hooks', 'pass_session_id', 'follow_profile_config',
                            'service_tier', 'cwd_explicit', 'run_budget', 'verbose', 'row_cwd', 'client_env',
-                           'client'})
+                           'client', 'skip_memory'})
 # Sections a ``follow_profile_config`` session re-reads from the owning profile's CURRENT config each
 # turn (main's Bot Chat row), credentials included: a frozen key never crosses a profile route change.
 FOLLOW_SECTIONS = ('model', 'providers', 'custom_providers', 'fallback_providers', 'fallback_model', 'model_aliases',
@@ -304,6 +304,19 @@ class LocalSessionPolicy:
     @property
     def ignore_rules(self):
         return self.safe_mode or json.loads(self.request_json).get('ignore_rules', False)
+
+    @property
+    def skip_memory_requested(self):
+        """`--skip-memory` as this session was created with: the explicit per-launch
+        opt-out, independent of --ignore-rules / --safe-mode."""
+        return json.loads(self.request_json).get('skip_memory', False) is True
+
+    @property
+    def skip_memory(self):
+        """The session's agents run with AIAgent ``skip_memory=True``: no external memory provider and no
+        MEMORY.md/USER.md injection. --ignore-rules / --safe-mode imply it; `--skip-memory` asks for only this
+        (SOUL, context files, config and skills still load)."""
+        return self.ignore_rules or self.skip_memory_requested
 
     @property
     def yolo(self):
@@ -613,8 +626,8 @@ def _apply_launch_overrides(params, config):
                         or url.username or url.password or url.query or url.fragment):
                     _refuse('base_url', 'must be an http(s) URL without credentials, query or fragment')
             config.setdefault('model', {})[key] = value
-    bad_flag = next((flag for flag in ('ignore_rules', 'yolo', 'checkpoints', 'accept_hooks', 'pass_session_id',
-                                      'follow_profile_config', 'cwd_explicit', 'verbose')
+    bad_flag = next((flag for flag in ('ignore_rules', 'skip_memory', 'yolo', 'checkpoints', 'accept_hooks',
+                                      'pass_session_id', 'follow_profile_config', 'cwd_explicit', 'verbose')
                      if flag in params and type(params[flag]) is not bool), None)
     if bad_flag:
         _refuse(bad_flag, 'must be a boolean')
@@ -762,7 +775,17 @@ def render_launch_skills(params, session_id):
     if not skills:
         return None
     from agent.skill_commands import build_preloaded_skills_prompt, format_missing_skills
-    prompt, loaded, missing = build_preloaded_skills_prompt(skills, task_id=session_id)
+    from tools.skills_tool import (
+        allow_memory_provider_loads_for, memory_provider_loads_suppressed, suppress_memory_provider_loads_for)
+    # A --skip-memory launch never loads its memory provider to find a namespaced skill (SKM-04), and its
+    # session's later reads stay suppressed; a new ordinary session's id is ordinary.
+    skip = params.get('skip_memory') is True
+    (suppress_memory_provider_loads_for if skip else allow_memory_provider_loads_for)(session_id)
+    token = memory_provider_loads_suppressed.set(skip or memory_provider_loads_suppressed.get())
+    try:
+        prompt, loaded, missing = build_preloaded_skills_prompt(skills, task_id=session_id)
+    finally:
+        memory_provider_loads_suppressed.reset(token)
     if not loaded:
         raise RuntimeStoreError('unknown_skill')
     if missing:

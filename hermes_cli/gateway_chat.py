@@ -20,7 +20,8 @@ _UNSUPPORTED = (
     "run_budget", "verbose", "compact",
 )
 _POLICY = ("model", "provider", "reasoning", "toolsets", "max_turns", "base_url", "ignore_rules", "api_key",
-           "yolo", "safe_mode", "ignore_user_config", "skills", "checkpoints", "accept_hooks", "pass_session_id")
+           "yolo", "safe_mode", "ignore_user_config", "skills", "checkpoints", "accept_hooks", "pass_session_id",
+           "skip_memory")
 # Where each refused option lives now; the refusal names it so the user is not left guessing.
 _RELOCATED = {
     "image": "`hermes --tui` or the Desktop app to attach the image",

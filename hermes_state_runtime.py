@@ -221,7 +221,8 @@ _ANY_HEAD = object()
 
 
 def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_ANY_HEAD) -> dict | bool | None:
-    """Claim the FIFO head. ``_guard(conn)`` (owner admission gate) raises to refuse inside the
+    """Claim the first queued input, never an earlier unknown business operation.
+    ``_guard(conn)`` (owner admission gate) raises to refuse inside the
     write transaction, so a drain that began while this waited on the writer still wins.
     ``head`` is the admission id the caller's preclaim checks validated (None: it saw nothing
     queued); if the head is another row by the time this write runs, nothing is claimed and False
@@ -231,12 +232,12 @@ def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_A
         if _guard is not None:
             _guard(conn)
         session = _session(conn, session_id)
-        blocked = conn.execute("SELECT status FROM session_admissions WHERE target_session_id=? AND status IN ('started','unknown')", (session_id,)).fetchall()
-        if any(row[0] == 'unknown' for row in blocked):
-            raise RuntimeStoreError('unknown_execution')
-        from hermes_state_runtime_workers import worker_states
-        workers = worker_states(conn, session_id)
-        if 'unknown' in workers:
+        blocked = conn.execute("SELECT 1 FROM session_admissions WHERE target_session_id=? AND status='started'", (session_id,)).fetchone()
+        from hermes_state_runtime_workers import claim_worker_states
+        workers = claim_worker_states(conn, session_id, epoch)
+        if 'unknown' in workers or (workers and conn.execute(
+                "SELECT 1 FROM session_admissions WHERE target_session_id=? AND status='unknown'",
+                (session_id,)).fetchone()):
             raise RuntimeStoreError('unknown_execution')
         if blocked or workers:
             return None
@@ -245,6 +246,16 @@ def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_A
             return False
         if row is None:
             return None
+        # The old business claim stays unknown, but its open transcript is not a
+        # new instruction. Close it AFTER the worker/policy fences and BEFORE this
+        # claim's mark, in this same transaction. A failed boundary write rolls
+        # back the claim and cannot launch inference on the unsafe history.
+        lost = conn.execute("SELECT * FROM session_admissions WHERE target_session_id=? "
+                            "AND status='unknown' AND seq<? ORDER BY seq DESC LIMIT 1",
+                            (session_id, row['seq'])).fetchone()
+        if lost is not None:
+            from gateway.session_results import close_discarded_turn
+            close_discarded_turn(db, conn, lost)
         generation = session['runtime_generation'] + 1
         conn.execute('UPDATE sessions SET runtime_generation=? WHERE id=?', (generation, session_id))
         changed = conn.execute("UPDATE session_admissions SET status='started',owner_epoch=?,generation=? WHERE admission_id=? AND status='queued'", (epoch, generation, row['admission_id']))
@@ -293,9 +304,12 @@ def settle_session_input(db, *, epoch: int, admission_id: str, generation: int, 
                 or type(generation) is not int or row['generation'] != generation
                 or session['runtime_generation'] != generation):
             raise RuntimeStoreError('stale_generation')
-        _retire_admission_workers(conn, row, epoch)
+        # The owner's effect reads the claim's worker rows as they stood (an owner-stop redelivery
+        # needs every one already ended, ``session_message_redelivery``), so it runs before this
+        # settlement retires them, as in ``resolve_unknown_session_input``.
         if _terminal_write is not None:
             _terminal_write(conn, row)
+        _retire_admission_workers(conn, row, epoch)
         if result is not None:
             from hermes_state_terminal import RESULT_PREFIX
             encoded = _json(encode_result(compact_result(result, user_message=json.loads(row['payload_json']).get('text'))))

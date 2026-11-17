@@ -337,7 +337,18 @@ def _auto_load_parts(agent: Any) -> list[str]:
         try:
             if not is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")):
                 from agent.skill_commands import build_auto_load_prompt
-                result = build_auto_load_prompt(task_id=getattr(agent, "session_id", None), home_override=_agent_home(agent))
+                from tools.skills_tool import memory_provider_loads_suppressed, suppress_memory_provider_loads_for
+                # A --skip-memory session never loads its memory provider just to find a namespaced skill, here or in
+                # its later model-facing reads (bound to its session id). An agent without the marker declares no
+                # policy: an internal fork sharing a live parent's id must not revoke the parent's (SKM-05).
+                skip = getattr(agent, "_session_skip_memory", False) is True
+                if skip:
+                    suppress_memory_provider_loads_for(getattr(agent, "session_id", None))
+                token = memory_provider_loads_suppressed.set(skip)
+                try:
+                    result = build_auto_load_prompt(task_id=getattr(agent, "session_id", None), home_override=_agent_home(agent))
+                finally:
+                    memory_provider_loads_suppressed.reset(token)
             if result[2]:
                 logger.warning("skills.auto_load: skill(s) not found or disabled, skipped: %s", ", ".join(result[2]))
         except Exception:
