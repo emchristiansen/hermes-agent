@@ -625,8 +625,9 @@ def heartbeat_current_worker_from_env() -> bool:
         return False
 
 
-# Live operator-note injection: poll the task for new comments and steer them in
-# OUT-OF-BAND, so a user can talk to a running task without block → comment → unblock.
+# Live note injection: poll the task for new comments and steer each in as a delivered message
+# naming its author (never the user's own frame), so a participant can talk to a running task
+# without block → comment → unblock.
 # Watermarked per task by comment id, never by wall-clock time. The first poll starts after the
 # task's last comment when this worker's run was claimed (``comment_floor`` on the claim event):
 # the context snapshot was built after the claim, so any later comment may be missing from it and
@@ -689,20 +690,39 @@ def inject_new_comments_from_env(agent: Any) -> bool:
     if not fresh:
         _comment_watermark[tid] = newest
         return False
-    lines = [f"- {c.author or 'operator'}: {c.body.strip()}" for c in fresh]
-    note = ("New note" + ("s" if len(fresh) > 1 else "")
-            + " on your kanban task from the operator (delivered mid-run). "
-            + "Take it into account for the work you're doing right now:\n" + "\n".join(lines))
-    try:
-        injected = bool(agent.steer(note))
-    except Exception:
-        logger.debug("comment-inject: steer failed", exc_info=True)
-        injected = False
-    if injected:
-        # Advance past everything read (own notes included) only once the agent took the note: a
-        # failed injection is retried by the next poll. A note may arrive twice; it is never lost.
+    # A board comment is another principal's delivered message, never the user's own steer: the board
+    # records only an author name, which proves no human authority (AGENT-01). Each comment goes in
+    # its own delivered frame naming that author and the comment, so a mixed-author batch keeps every
+    # author's provenance. An agent without the delivered-message seam gets nothing (never the user
+    # frame); its notes stay behind the watermark.
+    if not _steer_records_sender(agent):
+        logger.debug("comment-inject: agent cannot record a delivered sender; notes left for retry")
+        return False
+    taken = []
+    for c in fresh:
+        note = (f"A new note on your kanban task {tid} (delivered mid-run). "
+                f"Take it into account for the work you're doing right now:\n{c.body.strip()}")
+        sender = {"id": f"kanban comment {c.id} on {tid}", "name": c.author or "unknown author"}
+        try:
+            taken.append(bool(agent.steer(note, delivered_by=sender)))
+        except Exception:
+            logger.debug("comment-inject: steer failed", exc_info=True)
+            taken.append(False)
+    if all(taken):
+        # Advance past everything read (own notes included) only once the agent took every note: a
+        # failed injection is retried by the next poll, with any note taken beside it (a duplicate,
+        # never a loss); a refused note never holds the others back.
         _comment_watermark[tid] = newest
-    return injected
+    return any(taken)
+
+
+def _steer_records_sender(agent: Any) -> bool:
+    """Whether ``agent.steer`` accepts ``delivered_by`` (``agent.interrupt_control.InterruptControlMixin``)."""
+    import inspect
+    try:
+        return "delivered_by" in inspect.signature(agent.steer).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 # --- Handlers ---
