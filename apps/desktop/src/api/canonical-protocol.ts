@@ -416,11 +416,18 @@ export class CanonicalDesktopProtocol {
     const pinned = typeof correction === 'string' ? correctionPins.get(correction) : undefined
 
     if (pinned && pinned.owner !== owner) { throw new CorrectionTargetChanged() }
-    const generation = control.execution_generation ?? pinned?.generation ?? this.generations.get(owner)
+
+    // An established pin is never moved: a retry that names another generation explicitly is the
+    // same correction aimed at a different execution, so it is sent nowhere, and the pin keeps its
+    // own generation for every later retry (UI-03).
+    if (pinned && control.execution_generation != null && control.execution_generation !== pinned.generation) {
+      throw new CorrectionTargetChanged()
+    }
+    const generation = pinned?.generation ?? control.execution_generation ?? this.generations.get(owner)
 
     if (typeof generation !== 'number') { throw new Error('Session execution identity unavailable; reconnect before controlling this turn') }
 
-    if (typeof correction === 'string') { correctionPins.set(correction, { owner, generation }) }
+    if (typeof correction === 'string' && !pinned) { correctionPins.set(correction, { owner, generation }) }
 
     return { ...control, session_id: control.session_id, execution_generation: generation }
   }

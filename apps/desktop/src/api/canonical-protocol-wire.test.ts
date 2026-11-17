@@ -3,6 +3,7 @@ import { expect, test, vi } from 'vitest'
 
 import { CorrectionTargetChanged } from '@/lib/uncertain-correction'
 
+import { CanonicalDesktopProtocol } from './canonical-protocol'
 import { HermesGateway } from './client'
 
 test('named canonical prompt listeners receive replay-safe IDs before answering on the wire', async () => {
@@ -279,6 +280,25 @@ test('a correction retry presents its first generation through a newer execution
     for (const socket of server.clients) { socket.terminate() }
     await new Promise<void>(resolve => server.close(() => resolve()))
   }
+})
+
+// UI-03: an explicit execution_generation never moves an established correction pin. A conflicting
+// one is refused (sent nowhere) and the next ordinary retry still names the first generation; one
+// equal to the pin is accepted; an independent correction may name the newer generation.
+test('an explicit generation neither overrides nor rewrites an established correction pin', () => {
+  const protocol = new CanonicalDesktopProtocol()
+  protocol.result('session.resume', { session_id: 's' }, { session_id: 's', revision: 1, execution_generation: 4 })
+  expect(protocol.prepare('session.steer', { session_id: 's', text: 'A', correction_id: 'ui03-A' }).execution_generation).toBe(4)
+  protocol.result('session.resume', { session_id: 's' }, { session_id: 's', revision: 2, execution_generation: 5 })
+  expect(() => protocol.prepare('session.steer', { session_id: 's', text: 'A', correction_id: 'ui03-A', execution_generation: 5 }))
+    .toThrow(CorrectionTargetChanged)
+  expect(protocol.prepare('session.steer', { session_id: 's', text: 'A', correction_id: 'ui03-A' }).execution_generation).toBe(4)
+  expect(protocol.prepare('session.redirect', { session_id: 's', text: 'A', correction_id: 'ui03-A', execution_generation: 4 })
+    .execution_generation).toBe(4)
+  expect(protocol.prepare('session.steer', { session_id: 's', text: 'B', correction_id: 'ui03-B', execution_generation: 5 })
+    .execution_generation).toBe(5)
+  expect(protocol.prepare('session.steer', { session_id: 's', text: 'B', correction_id: 'ui03-B' }).execution_generation).toBe(5)
+  expect(protocol.prepare('session.steer', { session_id: 's', text: 'C', correction_id: 'ui03-C' }).execution_generation).toBe(5)
 })
 
 test('a legacy dial strips the client-only correction id from steer and redirect', async () => {
