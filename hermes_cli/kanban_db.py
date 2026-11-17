@@ -3302,6 +3302,7 @@ def request_review(
     upload. A declared artifact that cannot be preserved raises
     :class:`ArtifactPreservationError`, rolling the whole transition back: the
     task stays ``running`` and retryable, with no attachments and no event.
+    Invalid reviewer-continuation keys (``kanban_db_review_handoff``) refuse it the same way.
     """
 
     def _ret(ok: bool, reason: Optional[str] = None):
@@ -3325,8 +3326,10 @@ def request_review(
                 "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
                 "worker_started_at FROM tasks WHERE id = ?", (task_id,),
             ).fetchone()
-            if trow is None:
-                return _ret(False, "task not found")
+            from hermes_cli.kanban_db_review_handoff import _prior_reviewer, review_continuity_error
+            refused = "task not found" if trow is None else review_continuity_error(conn, task_id, metadata)
+            if refused:
+                return _ret(False, refused)
             # Refuse to clear a live worker's claim without proof of ownership
             # (expected_run_id) or an explicit human override (force=True);
             # the same fence as complete_task (_claim_is_live).
@@ -3411,22 +3414,6 @@ def request_review(
             _attachments._discard_staged_copies(staged_copies, staged_copies[0].parent)
         raise
     return _ret(True)
-
-
-def _prior_reviewer(conn: sqlite3.Connection, task_id: str):
-    """Reviewer recorded by the latest ``changes_requested`` run's event.
-    ``None`` = first review (no such run); ``False`` = a run exists but its
-    provenance is missing/malformed."""
-    changes_run = conn.execute(
-        "SELECT id FROM task_runs "
-        "WHERE task_id = ? AND outcome = 'changes_requested' "
-        "ORDER BY id DESC LIMIT 1", (task_id,),
-    ).fetchone()
-    if changes_run is None:
-        return None
-    changes_event = _latest_event(conn, task_id, "changes_requested", changes_run["id"])
-    reviewer = _json_dict(_row_get(changes_event, "payload")).get("reviewer")
-    return reviewer if isinstance(reviewer, str) and reviewer.strip() else False
 
 
 def _nonblank_str(value: Any) -> Optional[str]:

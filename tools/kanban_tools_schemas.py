@@ -245,7 +245,11 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
             "type": "object",
             "description": (
                 "Optional structured handoff facts for the reviewer, such "
-                "as changed_files, tests_run, commit, or decisions."
+                "as changed_files, tests_run, commit, or decisions. "
+                "reviewer_context: \"continue\" gives the reviewer the "
+                "previous review conversation of this task (same reviewer "
+                "profile); add review_continues_task: <task id> to "
+                "continue another card's review when this card has none."
             ),
             "additionalProperties": True,
         },
