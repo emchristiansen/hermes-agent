@@ -25,6 +25,12 @@ import { notify } from '@/store/notifications'
 import { isOnboardingChat } from '@/store/onboarding-session'
 import { answerParkedCard, skipParkedCards, yieldParkedCardsToMessage } from '@/store/parked-card-answers'
 import { hasBlockingPromptRequest } from '@/store/prompts'
+import {
+  forgetUnresolvedCorrection,
+  keepUnresolvedCorrection,
+  restoreUnresolvedCorrections,
+  unresolvedCorrectionNoticeId
+} from '@/store/unresolved-corrections'
 
 import { cloneAttachments, type QueueEditState } from '../composer-utils'
 import { onComposerSubmitRequest } from '../focus'
@@ -245,9 +251,15 @@ export function useComposerSubmit({
       unsent
     }: { canonical: boolean; displayText: string; keep: () => void; unsent: () => void }
   ) => {
-    const settle = (attempt: Promise<boolean>): Promise<void> =>
+    // `kept`: the id under which an earlier attempt of this correction was kept durably (UI-02); a
+    // known outcome forgets it.
+    const settle = (attempt: Promise<boolean>, kept?: string): Promise<void> =>
       attempt.then(
         accepted => {
+          if (kept) {
+            forgetUnresolvedCorrection(kept)
+          }
+
           if (!accepted) {
             keep()
           }
@@ -256,9 +268,19 @@ export function useComposerSubmit({
           if (!canonical) {
             keep()
           } else if (!(err instanceof UncertainCorrection)) {
+            if (kept) {
+              forgetUnresolvedCorrection(kept)
+            }
+
             unsent()
           } else {
+            // Kept durably with the destination its first send pinned, so a renderer restart offers it
+            // again (to that destination only) rather than losing it (UI-02). Until then this page's own
+            // retry closure sends it, with the same id and generation, and settles through this composer.
+            const durable = err.correction ? keepUnresolvedCorrection(err.correction, displayText) : undefined
+
             notify({
+              ...(durable ? { id: unresolvedCorrectionNoticeId(durable.id), durationMs: 0 } : {}),
               kind: 'warning',
               persistent: true,
               title: translateNow('composer.correctionUnconfirmedTitle'),
@@ -266,8 +288,16 @@ export function useComposerSubmit({
               detail: displayText,
               action: {
                 label: translateNow('composer.correctionSendAgain'),
-                onClick: () => void settle(err.retry())
-              }
+                onClick: () => void settle(err.retry(), durable?.id)
+              },
+              ...(durable
+                ? {
+                    secondaryAction: {
+                      label: translateNow('statusStack.dismiss'),
+                      onClick: () => forgetUnresolvedCorrection(durable.id)
+                    }
+                  }
+                : {})
             })
           }
         }
@@ -287,6 +317,10 @@ export function useComposerSubmit({
   // if the turn has already ended, or a steer is not possible, queue it so it
   // runs next. This holds for hidden setup notes and for visible messages a
   // button sends on the user's behalf alike.
+  // A correction a previous renderer left unresolved is offered again once per page, each to its own
+  // pinned destination (UI-02). Only an offer: nothing here waits for it or sends it on its own.
+  useLayoutEffect(() => restoreUnresolvedCorrections(), [])
+
   const externalSubmitRef = useRef({ busy, dispatchSubmit, onSteer, onSteerHidden, settleCorrection })
   externalSubmitRef.current = { busy, dispatchSubmit, onSteer, onSteerHidden, settleCorrection }
 

@@ -258,6 +258,17 @@ const MUTATION_METHODS = new Set(['session.title', 'session.archive', 'session.c
 // one gateway or protocol instance, so no reconnect or rebuilt client re-decorates a retry.
 const correctionPins = new Map<string, { owner: string; generation: number }>()
 
+/** The destination a correction's first preparation pinned (its owner session, profile and execution
+ * generation), for a correction whose outcome is unknown to be kept across a renderer restart (UI-02). */
+export function correctionPin(correctionId: string): { sessionId: string; profile: string; generation: number } | undefined {
+  const pin = correctionPins.get(correctionId)
+
+  if (!pin) { return undefined }
+  const [profile, sessionId] = JSON.parse(pin.owner) as [string, unknown]
+
+  return typeof sessionId === 'string' ? { sessionId, profile, generation: pin.generation } : undefined
+}
+
 export class CanonicalDesktopProtocol {
   private creates = new Map<string, string>()
   private revisions = new Map<string, number>()

@@ -9,12 +9,22 @@
  */
 export class UncertainCorrection extends Error {
   readonly retry: () => Promise<boolean>
+  /** Which correction this is: its id (the key of its pinned destination), kind and words. With it the
+   * composer keeps the unresolved correction durably, so a renderer restart cannot lose it (UI-02). */
+  readonly correction?: UnresolvedCorrectionIdentity
 
-  constructor(cause: unknown, retry: () => Promise<boolean>) {
+  constructor(cause: unknown, retry: () => Promise<boolean>, correction?: UnresolvedCorrectionIdentity) {
     super(cause instanceof Error ? cause.message : String(cause), { cause })
     this.name = 'UncertainCorrection'
     this.retry = retry
+    this.correction = correction
   }
+}
+
+export interface UnresolvedCorrectionIdentity {
+  id: string
+  mode: 'interrupt' | 'steer'
+  text: string
 }
 
 /**

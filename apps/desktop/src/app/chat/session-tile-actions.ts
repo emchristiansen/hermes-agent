@@ -539,7 +539,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
 
           notifyError(err, copy.promptFailed)
           // Uncertain (the owner may hold it): it stays a correction, retried to this tile's session.
-          throw new UncertainCorrection(err, attempt)
+          throw new UncertainCorrection(err, attempt, { id: correctionId, mode, text })
         }
 
         discardOptimisticMessage()

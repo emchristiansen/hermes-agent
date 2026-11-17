@@ -1027,7 +1027,7 @@ export function usePromptActions({
           }
 
           notifyError(err, copy.promptFailed)
-          throw new UncertainCorrection(err, attempt)
+          throw new UncertainCorrection(err, attempt, { id: correctionId, mode, text })
         }
       }
 
