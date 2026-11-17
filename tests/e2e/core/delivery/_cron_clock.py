@@ -6,9 +6,10 @@ What is virtual and what stays real:
   installed at the single wall-clock seam — ``hermes_time.datetime`` (every ``_hermes_now``
   binding in cron/jobs.py, scheduler.py, executions.py, occurrences via jobs, ... resolves
   ``hermes_time.now()`` -> ``datetime.now(tz)`` at call time) — plus the ``time.time()`` reads of
-  cron.jobs / cron.scheduler / cron.executions (in-flight ages, ledger handoff grace, ticker
-  heartbeat marker). ``time.monotonic`` stays real on purpose: it only paces REAL waits (lock
-  deadlines, heartbeat thread cadence, reap/GC throttles).
+  cron.jobs / cron.scheduler / cron.executions / cron.delivery_queue (in-flight ages, ledger
+  handoff grace, ticker heartbeat marker, queued-send retry_after). ``time.monotonic`` stays
+  real on purpose: it only paces REAL waits (lock deadlines, heartbeat thread cadence, reap/GC
+  throttles).
 * The fire-claim heartbeat cadence is time-scaled (60 s -> ``HEARTBEAT_REAL_SECONDS``) so a
   run that spans many virtual minutes still refreshes its lease the way a real one would.
 * Fakes: the agent (``cron.scheduler.run_job``, the one function that would build an AIAgent)
@@ -241,6 +242,7 @@ class FakeSink:
 
 def install(clock: VirtualClock, control: Control, setattr_fn=setattr) -> None:
     """Install the virtual clock + fakes. ``setattr_fn`` is ``monkeypatch.setattr`` in pytest."""
+    from cron import delivery_queue
     from cron import executions
     from cron import jobs
     from cron import scheduler
@@ -249,7 +251,9 @@ def install(clock: VirtualClock, control: Control, setattr_fn=setattr) -> None:
 
     setattr_fn(hermes_time, "datetime", _virtual_datetime_class(clock))
     proxy = _TimeProxy(clock)
-    for module in (jobs, scheduler, executions):
+    # delivery_queue's retry_after (requeue backoff and claim eligibility) reads time.time();
+    # left real, a send that failed on a virtual day waits out its backoff in REAL seconds.
+    for module in (jobs, scheduler, executions, delivery_queue):
         setattr_fn(module, "time", proxy)
     setattr_fn(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", HEARTBEAT_REAL_SECONDS)
     setattr_fn(scheduler, "run_job", FakeAgent(clock, control))

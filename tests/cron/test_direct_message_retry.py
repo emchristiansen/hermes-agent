@@ -307,13 +307,51 @@ def test_direct_notice_publication_rechecks_the_real_fire_fence(env, monkeypatch
 def test_cancelled_no_agent_execution_does_not_publish_or_retry_a_message(env, monkeypatch):
     from cron.cancellation import request_cancel
 
+    import threading
+    import time
+
     monkeypatch.setattr(scheduler, "run_job", _REAL_RUN_JOB)
     job, counter = _script_job(env, "cancel")
+    # The script does its business (the counter) once, then announces that it has started and
+    # blocks, so the operator cancel lands while it runs (as tests/cron/test_cron_cancel.py does).
+    # A cancel requested before the run would tree-kill the script on its first poll, before any
+    # business, which is the documented cancel behavior but leaves nothing to count.
+    ready = env.home / "cancel.ready"
+    release = env.home / "cancel.release"
+    (env.home / "scripts" / "cancel.py").write_text(
+        "import os, time\n"
+        "from pathlib import Path\n"
+        f"p = Path({str(counter)!r})\n"
+        "p.write_text(str(int(p.read_text()) + 1) if p.exists() else '1')\n"
+        f"Path({str(ready) + '.tmp'!r}).write_text(str(os.getpid()))\n"
+        f"os.replace({str(ready) + '.tmp'!r}, {str(ready)!r})\n"
+        "deadline = time.monotonic() + 60\n"
+        f"while not Path({str(release)!r}).exists() and time.monotonic() < deadline:\n"
+        "    time.sleep(0.05)\n"
+        "print('body-cancel')\n"
+    )
     eid = executions.create_execution(job["id"], source="test")["id"]
     job["execution_id"] = eid
-    request_cancel(eid, reason="fixture operator cancel")
-    scheduler.run_one_job(job)
+    started = []
+
+    def cancel_once_started():
+        deadline = time.monotonic() + 30
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        started.append(ready.exists())
+        request_cancel(eid, reason="fixture operator cancel")
+
+    canceller = threading.Thread(target=cancel_once_started, daemon=True)
+    canceller.start()
+    try:
+        scheduler.run_one_job(job)
+    finally:
+        # A script that the cancel did not reach exits by itself; nothing stays blocked.
+        release.write_text("")
+        canceller.join(timeout=35)
+    assert started == [True], "the script must start before it is cancelled"
     assert executions.get_execution(eid)["status"] == "cancelled"
-    # Existing run_one_job cancellation is observed after the subprocess returns;
-    # this verifies message exclusion, not preemptive cancellation of business.
-    assert counter.read_text() == "1" and delivery_queue.get_status(eid) is None
+    # The cancel landed mid-run: business ran exactly once, and the cancelled execution
+    # publishes no message and leaves nothing queued for a retry.
+    assert counter.read_text() == "1"
+    assert delivery_queue.get_status(eid) is None
