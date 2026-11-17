@@ -517,6 +517,33 @@ canonical_method("kanban.run", params=KanbanRunParams, result=KanbanRunResult,
                  doc="Native-owner only: admit the dispatcher's current claim on a kanban task.")
 
 
+class SessionKanbanRunParams(ProfileParams):
+    board: str
+    task_id: str
+    run_id: int
+
+
+class SessionKanbanRunOwner(Result):
+    profile_id: str
+    instance_id: str
+    epoch: int
+
+
+class SessionKanbanRunResult(Result):
+    board: str
+    task_id: str
+    run_id: int
+    session_id: str
+    execution_generation: int
+    owner: SessionKanbanRunOwner
+
+
+canonical_method("session.kanban_run", params=SessionKanbanRunParams, result=SessionKanbanRunResult,
+                 doc="Read-only: the live finite session and execution generation of one card's CURRENT run "
+                     "(``stale_kanban_claim`` for an ended, replaced or unclaimed run); carry both into "
+                     "``session.steer`` / ``session.redirect``.")
+
+
 class A2aForwardParams(Params):
     agent: str
     tenant: str

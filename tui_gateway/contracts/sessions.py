@@ -292,33 +292,6 @@ method("session.active_list", params=SessionActiveListParams, result=SessionActi
        doc="Live sessions in this process, insertion order (not a DB browser).")
 
 
-class SessionKanbanRunParams(ProfileParams):
-    board: str
-    task_id: str
-    run_id: int
-
-
-class SessionKanbanRunOwner(Result):
-    profile_id: str
-    instance_id: str
-    epoch: int
-
-
-class SessionKanbanRunResult(Result):
-    board: str
-    task_id: str
-    run_id: int
-    session_id: str
-    execution_generation: int
-    owner: SessionKanbanRunOwner
-
-
-method("session.kanban_run", params=SessionKanbanRunParams, result=SessionKanbanRunResult,
-       doc="Read-only: the live finite session and execution generation of one card's CURRENT run "
-           "(``stale_kanban_claim`` for an ended, replaced or unclaimed run); carry both into "
-           "``session.steer`` / ``session.redirect``.")
-
-
 # ── stored-row mutation ───────────────────────────────────────────────────────────────────────
 
 

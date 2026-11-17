@@ -45,6 +45,14 @@ def _read_claim(authority, params):
     return payload['session_id'], str(db_path)
 
 
+def _is_this_run(authority, session_id, generation, params, db_path):
+    """Worker thread: the session's saved policy for *generation* is exactly this board card and run."""
+    from gateway.session_managed_worker import card_context
+    card = card_context(authority, session_id, generation)
+    return (card is not None and card.get('task_id') == params['task_id'] and card.get('run_id') == params['run_id']
+            and Path(card['db']).resolve() == Path(db_path).resolve())
+
+
 async def kanban_run(connection, ref, params):
     required = {'board': str, 'task_id': str, 'run_id': int}
     if (set(params) - set(required) - {'profile'}
@@ -75,10 +83,7 @@ async def kanban_run(connection, ref, params):
         handle = authority._handle(ref)
     if handle.execution_state != 'running':
         raise RuntimeStoreError('stale_kanban_claim')
-    from gateway.session_managed_worker import card_context
-    card = await asyncio.to_thread(card_context, authority, session_id, handle.execution_generation)
-    if (card is None or card.get('task_id') != params['task_id'] or card.get('run_id') != params['run_id']
-            or Path(card['db']).resolve() != Path(db_path).resolve()):
+    if not await asyncio.to_thread(_is_this_run, authority, session_id, handle.execution_generation, params, db_path):
         raise RuntimeStoreError('stale_kanban_claim')
     return {'board': params['board'], 'task_id': params['task_id'], 'run_id': params['run_id'],
             'session_id': session_id, 'execution_generation': handle.execution_generation,

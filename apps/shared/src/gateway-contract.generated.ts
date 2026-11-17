@@ -3433,25 +3433,6 @@ export interface SessionActiveItem {
   title: string
 }
 export type LiveSessionStatus = 'idle' | 'starting' | 'waiting' | 'working' | 'streaming' | 'resuming'
-export interface SessionKanbanRunParams {
-  profile?: string | null
-  board: string
-  task_id: string
-  run_id: number
-}
-export interface SessionKanbanRunResult {
-  board: string
-  task_id: string
-  run_id: number
-  session_id: string
-  execution_generation: number
-  owner: SessionKanbanRunOwner
-}
-export interface SessionKanbanRunOwner {
-  profile_id: string
-  instance_id: string
-  epoch: number
-}
 /** ``session_id`` is the STORED id. */
 export interface SessionDeleteParams {
   session_id: string
@@ -5105,6 +5086,25 @@ export interface KanbanRunParams {
 export interface KanbanRunResult {
   session_id: string
   receipt: AdmissionStatus
+}
+export interface SessionKanbanRunParams {
+  profile?: string | null
+  board: string
+  task_id: string
+  run_id: number
+}
+export interface SessionKanbanRunResult {
+  board: string
+  task_id: string
+  run_id: number
+  session_id: string
+  execution_generation: number
+  owner: SessionKanbanRunOwner
+}
+export interface SessionKanbanRunOwner {
+  profile_id: string
+  instance_id: string
+  epoch: number
 }
 export interface A2aForwardParams {
   agent: string
@@ -6763,8 +6763,6 @@ export interface RpcMethods {
   'session.history': { params: SessionHistoryParams; result: SessionHistoryResult }
   /** Stop the running turn (and streaming TTS); retires the crash-recovery marker. */
   'session.interrupt': { params: SessionInterruptParams; result: SessionInterruptResult }
-  /** Read-only: the live finite session and execution generation of one card's CURRENT run (``stale_kanban_claim`` for an ended, replaced or unclaimed run); carry both into ``session.steer`` / ``session.redirect``. */
-  'session.kanban_run': { params: SessionKanbanRunParams; result: SessionKanbanRunResult }
   /** Human-facing stored sessions, most recent first (sub-agent / kanban sources denied). */
   'session.list': { params: SessionListParams; result: SessionListResult }
   /** Most recent human-facing session; errors fold into a null session_id. */
@@ -7096,7 +7094,6 @@ export const RPC_METHODS = [
   'session.foreign.preview',
   'session.history',
   'session.interrupt',
-  'session.kanban_run',
   'session.list',
   'session.most_recent',
   'session.redirect',
@@ -7236,6 +7233,8 @@ export interface CanonicalRpcMethods {
   /** Frozen launch policy projection of one local session. */
   'session.info': { params: CanonicalSessionInfoParams; result: CanonicalSessionInfo }
   'session.interrupt': { params: CanonicalControlParams; result: CanonicalSessionHandle }
+  /** Read-only: the live finite session and execution generation of one card's CURRENT run (``stale_kanban_claim`` for an ended, replaced or unclaimed run); carry both into ``session.steer`` / ``session.redirect``. */
+  'session.kanban_run': { params: SessionKanbanRunParams; result: SessionKanbanRunResult }
   'session.list': { params: CanonicalListParams; result: CanonicalListResult }
   /** Revision-fenced, retry-idempotent session edit (rename, archive, sidebar, branch, delete, rewind, reset, model, reasoning, workspace, edit_policy, compress, import). */
   'session.mutate': { params: SessionMutateParams; result: SessionMutateResult }
@@ -7301,6 +7300,7 @@ export const CANONICAL_RPC_METHODS = [
   'session.export',
   'session.info',
   'session.interrupt',
+  'session.kanban_run',
   'session.list',
   'session.mutate',
   'session.prune',

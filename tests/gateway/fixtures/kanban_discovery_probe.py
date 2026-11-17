@@ -128,9 +128,9 @@ def main():
                     sid = {n: found[n]['result']['session_id'] for n in found}
                     gen = {n: found[n]['result']['execution_generation'] for n in found}
                     markers = {}
-                    for n in run:
+                    for n, started in run.items():
                         marker = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='owner_admitted' ORDER BY id DESC LIMIT 1",
-                                              (tasks[n], run[n].current_run_id)).fetchone()
+                                              (tasks[n], started.current_run_id)).fetchone()
                         markers[n] = json.loads(marker[0])['session_id']
                     receipt['two_runs_exact'] = sid['A'] != sid['B'] and sid == markers
                     # (2) unqualified / unauthorized callers are refused.

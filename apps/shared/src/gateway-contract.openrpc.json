@@ -3535,24 +3535,6 @@
       }
     },
     {
-      "name": "session.kanban_run",
-      "summary": "Read-only: the live finite session and execution generation of one card's CURRENT run (``stale_kanban_claim`` for an ended, replaced or unclaimed run); carry both into ``session.steer`` / ``session.redirect``.",
-      "params": [
-        {
-          "name": "params",
-          "schema": {
-            "$ref": "#/components/schemas/SessionKanbanRunParams"
-          }
-        }
-      ],
-      "result": {
-        "name": "result",
-        "schema": {
-          "$ref": "#/components/schemas/SessionKanbanRunResult"
-        }
-      }
-    },
-    {
       "name": "session.list",
       "summary": "Human-facing stored sessions, most recent first (sub-agent / kanban sources denied).",
       "params": [
@@ -51147,6 +51129,24 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/CanonicalSessionHandle"
+        }
+      }
+    },
+    {
+      "name": "session.kanban_run",
+      "summary": "Read-only: the live finite session and execution generation of one card's CURRENT run (``stale_kanban_claim`` for an ended, replaced or unclaimed run); carry both into ``session.steer`` / ``session.redirect``.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SessionKanbanRunParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionKanbanRunResult"
         }
       }
     },
