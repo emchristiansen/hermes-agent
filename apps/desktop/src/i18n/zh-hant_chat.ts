@@ -168,7 +168,7 @@ export const zhHantChat = {
     queueStuckBody: '佇列中的對話多次傳送失敗。它仍在佇列中，請重試傳送。',
     correctionUnconfirmedTitle: '更正未確認',
     correctionUnconfirmedBody:
-      '它可能已送達執行。請作為同一更正再次傳送；重複也沒關係。',
+      '它可能已送達執行。系統會自動將其作為同一更正再次傳送，直到執行確認為止；點選「再次傳送」可立即傳送。重複也沒關係。',
     correctionSendAgain: '再次傳送',
     correctionNotSentTitle: '更正未傳送',
     correctionNotSentBody:

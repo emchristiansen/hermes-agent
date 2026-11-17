@@ -3949,7 +3949,7 @@ export const esOverrides = {
     queueStuckBody: 'Un turno en cola no llegó a enviarse. Sigue en la cola; vuelve a intentarlo.',
     correctionUnconfirmedTitle: 'Corrección no confirmada',
     correctionUnconfirmedBody:
-      'Puede que ya haya llegado a la ejecución. Vuelve a enviarla como la misma corrección; un duplicado no es problema.',
+      'Puede que ya haya llegado a la ejecución. Se vuelve a enviar automáticamente como la misma corrección hasta que la ejecución la confirme; «Enviar de nuevo» la envía ahora. Un duplicado no es problema.',
     correctionSendAgain: 'Enviar de nuevo',
     correctionNotSentTitle: 'Corrección no enviada',
     correctionNotSentBody:

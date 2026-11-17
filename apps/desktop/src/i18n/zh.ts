@@ -3410,7 +3410,7 @@ export const zhOverrides = {
     queueStuckBody: '排队的对话多次发送失败。它仍在队列中，请重试发送。',
     correctionUnconfirmedTitle: '更正未确认',
     correctionUnconfirmedBody:
-      '它可能已送达运行。请作为同一更正再次发送；重复也没关系。',
+      '它可能已送达运行。系统会自动将其作为同一更正再次发送，直到运行确认为止；点击“再次发送”可立即发送。重复也没关系。',
     correctionSendAgain: '再次发送',
     correctionNotSentTitle: '更正未发送',
     correctionNotSentBody:

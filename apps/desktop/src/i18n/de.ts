@@ -3961,7 +3961,7 @@ export const deOverrides = {
       'Ein eingereihter Turn konnte nicht gesendet werden. Er ist noch in der Warteschlange — versuchen Sie, ihn erneut zu senden.',
     correctionUnconfirmedTitle: 'Korrektur nicht bestätigt',
     correctionUnconfirmedBody:
-      'Sie hat den Lauf möglicherweise schon erreicht. Senden Sie sie erneut als dieselbe Korrektur; ein Duplikat ist unproblematisch.',
+      'Sie hat den Lauf möglicherweise schon erreicht. Sie wird automatisch erneut als dieselbe Korrektur gesendet, bis der Lauf sie bestätigt; „Erneut senden“ sendet sie sofort. Ein Duplikat ist unproblematisch.',
     correctionSendAgain: 'Erneut senden',
     correctionNotSentTitle: 'Korrektur nicht gesendet',
     correctionNotSentBody:

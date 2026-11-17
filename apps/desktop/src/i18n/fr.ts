@@ -3970,7 +3970,7 @@ export const frOverrides = {
       "Un tour en file d'attente a continué à échouer lors de l'envoi. Il est toujours en file d'attente — essayez de l'envoyer à nouveau.",
     correctionUnconfirmedTitle: 'Correction non confirmée',
     correctionUnconfirmedBody:
-      'Elle a peut-être déjà atteint l’exécution. Renvoyez-la comme la même correction ; un doublon ne pose pas de problème.',
+      'Elle a peut-être déjà atteint l’exécution. Elle est renvoyée automatiquement comme la même correction jusqu’à ce que l’exécution la confirme ; « Renvoyer » l’envoie maintenant. Un doublon ne pose pas de problème.',
     correctionSendAgain: 'Renvoyer',
     correctionNotSentTitle: 'Correction non envoyée',
     correctionNotSentBody:

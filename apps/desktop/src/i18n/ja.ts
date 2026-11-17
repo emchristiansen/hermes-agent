@@ -2478,7 +2478,7 @@ export const jaOverrides = {
       'キューに入れたターンの送信が繰り返し失敗しました。まだキューに残っています。もう一度送信してください。',
     correctionUnconfirmedTitle: '修正を確認できません',
     correctionUnconfirmedBody:
-      'すでに実行に届いている可能性があります。同じ修正として再送信してください。重複しても問題ありません。',
+      'すでに実行に届いている可能性があります。実行が確認するまで、同じ修正として自動的に再送信されます。「再送信」を押すとすぐに送信します。重複しても問題ありません。',
     correctionSendAgain: '再送信',
     correctionNotSentTitle: '訂正は送信されませんでした',
     correctionNotSentBody:

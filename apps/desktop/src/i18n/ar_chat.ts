@@ -144,7 +144,7 @@ export const arChat = {
     queueStuckBody: 'ظل دور في قائمة الانتظار يفشل في الإرسال. ما زال في قائمة الانتظار — حاول إرساله مرة أخرى.',
     correctionUnconfirmedTitle: 'لم يُؤكَّد التصحيح',
     correctionUnconfirmedBody:
-      'ربما وصل بالفعل إلى التشغيل. أرسله مرة أخرى كالتصحيح نفسه؛ لا بأس بالتكرار.',
+      'ربما وصل بالفعل إلى التشغيل. يُعاد إرساله تلقائيًا كالتصحيح نفسه حتى يؤكده التشغيل؛ و«أرسل مرة أخرى» يرسله الآن. لا بأس بالتكرار.',
     correctionSendAgain: 'أرسل مرة أخرى',
     correctionNotSentTitle: 'لم يُرسَل التصحيح',
     correctionNotSentBody:
