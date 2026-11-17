@@ -8803,6 +8803,11 @@
             "title": "Ignore Rules",
             "type": "boolean"
           },
+          "skip_memory": {
+            "default": false,
+            "title": "Skip Memory",
+            "type": "boolean"
+          },
           "yolo": {
             "default": false,
             "title": "Yolo",

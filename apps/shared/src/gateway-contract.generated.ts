@@ -5189,6 +5189,7 @@ export interface CanonicalCreateParams {
   reasoning?: string | null
   max_turns?: number | string | null
   ignore_rules?: boolean
+  skip_memory?: boolean
   yolo?: boolean
   safe_mode?: boolean
   ignore_user_config?: boolean
