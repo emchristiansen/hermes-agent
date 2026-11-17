@@ -44,15 +44,16 @@ def test_frozen_legacy_import_preserves_work_without_branch_theft(tmp_path):
         assert [r['admission_id'] for r in tip] == ['old-1', 'old-2', 'old-4']
         assert [r['status'] for r in tip] == ['queued', 'unknown', 'terminal']
         assert [r['admission_id'] for r in rt.list_session_admissions(db, session_id='fork')] == ['old-3']
-        with pytest.raises(rt.RuntimeStoreError, match='unknown_execution'):
-            rt.claim_session_input(db, epoch=epoch, session_id='tip')
-        with pytest.raises(rt.RuntimeStoreError, match='stale_generation'):
-            rt.resolve_unknown_session_input(db, epoch=epoch, admission_id='old-2', generation=99)
+        # At-least-once contract: the imported unknown claim (old-2) does not strand the queued input before
+        # it (old-1). That input is claimed, while the unknown one is kept and stays resolvable for retry.
         unknown_generation = tip[1]['generation']
         assert type(unknown_generation) is int and unknown_generation > 40
-        rt.resolve_unknown_session_input(db, epoch=epoch, admission_id='old-2', generation=unknown_generation)
         claimed = rt.claim_session_input(db, epoch=epoch, session_id='tip')
         assert claimed['admission_id'] == 'old-1' and claimed['generation'] > unknown_generation
+        assert rt.get_session_admission(db, admission_id='old-2')['status'] == 'unknown'
+        with pytest.raises(rt.RuntimeStoreError, match='stale_generation'):
+            rt.resolve_unknown_session_input(db, epoch=epoch, admission_id='old-2', generation=99)
+        rt.resolve_unknown_session_input(db, epoch=epoch, admission_id='old-2', generation=unknown_generation)
         with sqlite3.connect(source) as conn:
             conn.execute("UPDATE admissions SET payload='{}' WHERE seq=1")
         with pytest.raises(rt.RuntimeStoreError, match='admission_conflict'):

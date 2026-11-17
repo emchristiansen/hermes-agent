@@ -49,13 +49,23 @@ def test_admission_retry_claim_and_restart_are_fenced(tmp_path):
         assert rt.recover_session_inputs(db, epoch=new_epoch) == 1
         assert rt.recover_session_inputs(db, epoch=new_epoch) == 0
         assert rt.get_session_admission(db, admission_id=second['admission_id'])['status'] == 'unknown'
+        # At-least-once contract: an earlier operation whose outcome is unknown never strands the later
+        # input. The next queued input is claimed; the unknown one is kept (never replayed by the claim)
+        # and stays resolvable, so it remains eligible for an explicit retry.
+        later = rt.claim_session_input(db, epoch=new_epoch, session_id='s')
+        assert later['admission_id'] == third['admission_id'] and later['status'] == 'started'
+        assert rt.get_session_admission(db, admission_id=second['admission_id'])['status'] == 'unknown'
+        unknown_generation = rt.get_session_admission(db, admission_id=second['admission_id'])['generation']
         with pytest.raises(rt.RuntimeStoreError) as exc:
-            rt.claim_session_input(db, epoch=new_epoch, session_id='s')
-        assert exc.value.reason == 'unknown_execution'
+            rt.resolve_unknown_session_input(db, epoch=new_epoch, admission_id=second['admission_id'], generation=unknown_generation + 99)
+        assert exc.value.reason == 'stale_generation'
         with pytest.raises(rt.RuntimeStoreError) as exc:
             rt.settle_session_input(db, epoch=epoch, admission_id=running['admission_id'], generation=running['generation'], outcome='completed')
         assert exc.value.reason == 'stale_epoch'
-        assert rt.cancel_session_input(db, epoch=new_epoch, admission_id=third['admission_id'])['outcome'] == 'cancelled'
+        with pytest.raises(rt.RuntimeStoreError) as exc:  # the claimed later input is running, not cancellable
+            rt.cancel_session_input(db, epoch=new_epoch, admission_id=third['admission_id'])
+        assert exc.value.reason == 'stale_generation'
+        rt.settle_session_input(db, epoch=new_epoch, admission_id=later['admission_id'], generation=later['generation'], outcome='completed')
         assert [r['admission_id'] for r in rt.list_session_admissions(db, session_id='s')] == [second['admission_id']]
         assert db._conn.execute('PRAGMA foreign_keys').fetchone()[0] == 1
         with pytest.raises(sqlite3.IntegrityError):
