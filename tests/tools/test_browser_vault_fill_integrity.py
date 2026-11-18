@@ -416,7 +416,7 @@ def _registries(browser):
     """Inspection registries left anywhere: in the page's own world and in every isolated world a command of
     this test created (where the CLI keeps its registry)."""
     count = _evaluate(browser.page, f"{_REGISTRIES}.length")
-    for world in browser.worlds:
+    for world in getattr(browser, "worlds", []):
         assert world and world.get("unique_id"), world  # the supervisor obtained the world's uniqueId
         count += _evaluate_in(browser.page, f"{_REGISTRIES}.length", world["unique_id"]) or 0
     return count
@@ -442,17 +442,19 @@ def _cli_fill(browser, store, password, capsys, during_resolve=None):
     args = SimpleNamespace(handle=meta.id, cdp=browser.http, target_id=browser.page["id"], backend="local")
     from tools.browser_supervisor import CDPSupervisor
 
-    real_world = CDPSupervisor.create_isolated_world
+    real_world = getattr(CDPSupervisor, "create_isolated_world", None)
+    worlds = getattr(browser, "worlds", None)
 
     def world(self, name, **kw):  # records each command's isolated world, so tests can look inside it
         made = real_world(self, name, **kw)
-        browser.worlds.append(made.get("world"))
+        worlds.append(made.get("world"))
         return made
 
     with ExitStack() as stack:
         stack.enter_context(patch("agent.vault_store.get_vault_store", return_value=store))
         stack.enter_context(patch.object(LocalLoginBackend, "resolve_password", resolve))
-        stack.enter_context(patch.object(CDPSupervisor, "create_isolated_world", world))
+        if real_world is not None and worlds is not None:  # a tree without worlds, or a caller's own browser
+            stack.enter_context(patch.object(CDPSupervisor, "create_isolated_world", world))
         with pytest.raises(SystemExit) as exc:
             vault_cli._cmd_fill(args)
     clear_vault_redaction_values()
