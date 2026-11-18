@@ -49,7 +49,7 @@ class _FakePage:
 
     def __init__(self, href: str, controls: list[dict]):
         self.href, self.controls, self.writes = href, controls, []
-        self.fill_result = {"filled": 1}
+        self.fill_result = {"filled": 1, "written": 1, "roles": ["current-password"]}
 
     def focus_page(self, origin: str, accept=None) -> dict:
         return {"ok": bool(origin) and normalize_origin(self.href) == origin, "url": self.href}
@@ -168,7 +168,7 @@ class TestOneTimeCode:
         ({"refused": "expired", "written": 0, "roles": []}, "expired", "Nothing was written"),
         # FB-1: a refusal after an earlier box was written says so, by role, never "Nothing was written"
         ({"refused": "target_changed", "written": 1, "roles": ["one-time-code"]}, "target_changed",
-         "1 field was written before this and was not cleared: a one-time-code box."),
+         "1 field was written (or a write was attempted) before this and was not cleared: a one-time-code box."),
         ({"refused": "target_changed"}, "target_changed", "Whether anything was written is not established"),
         ({"filled": 0, "written": 0, "roles": []}, None, "No code field was written"),
         # written, then emptied by the page: written is not held

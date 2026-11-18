@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent.vault_login_classifier import PAGE_CLOCK_JS
 from agent.redact import clear_vault_redaction_values
 from agent.vault_store import get_vault_store
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -36,12 +37,14 @@ class PreviewWindow:
         if request["operation"] == "close":
             return json.dumps({"success": True})
         expression = request["expression"]
-        if "location.href" in expression:
+        if expression == PAGE_CLOCK_JS:  # the page-clock read before inspection and before the fill
+            result = json.dumps({"timeOrigin": 1.0, "now": 0.0})
+        elif "location.href" in expression:
             result = self.origin + "/login"
         elif "data-hermes-vault-slot\", nonce" in expression:
             result = json.dumps(CONTROLS)
         else:
-            result = json.dumps({"filled": 1})
+            result = json.dumps({"filled": 1, "written": 1, "roles": ["current-password"]})
         return json.dumps({"success": True, "result": result})
 
     def ops(self):
@@ -83,7 +86,9 @@ def test_preview_fill_writes_through_the_pinned_tab_and_redacts_echoes(home):
         "action": "fill", "handle": meta.id, "target": "preview"}, InlineToolContext(effective_task_id="t"))
     result = json.loads(raw)
     assert result["success"] is True and result["filled_fields"] == 1 and result["origin"] == ORIGIN, result
-    assert window.ops() == ["open", "evaluate", "evaluate", "evaluate", "close"]
+    # origin read, page-clock read, inspection, page-clock read (the fill's anchor), fill script
+    assert window.ops() == ["open", "evaluate", "evaluate", "evaluate", "evaluate", "evaluate", "close"]
+    assert [c["expression"] for c in window.calls[2:6:2]] == [PAGE_CLOCK_JS, PAGE_CLOCK_JS]
     assert json.dumps(password) in window.calls[-2]["expression"]
     assert password not in raw
     # A page can echo its input into its text, an element label or an error.

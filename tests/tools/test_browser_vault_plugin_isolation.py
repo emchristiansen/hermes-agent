@@ -194,7 +194,7 @@ def page(monkeypatch):
 
     def secret_eval(task_id, expression):
         secret_evals.append(expression)
-        return {"success": True, "result": json.dumps({"filled": 1})}
+        return {"success": True, "result": json.dumps({"filled": 1, "written": 1, "roles": ["current-password"]})}
 
     monkeypatch.setattr(browser_vault_tool, "_eval_js_secret", secret_eval)
     return state
@@ -434,7 +434,7 @@ def test_plugin_otp_is_minted_and_written_inside_the_backends_fill_context(vault
     def secret_eval(task_id, expression):
         backend.calls.append("write")
         page.secret_evals.append(expression)
-        return {"success": True, "result": json.dumps({"filled": 1})}
+        return {"success": True, "result": json.dumps({"filled": 1, "written": 1, "roles": ["current-password"]})}
 
     monkeypatch.setattr(browser_vault_tool, "_eval_js_secret", secret_eval)
 

@@ -116,7 +116,7 @@ def _enter_code_page(seen):
 
     def fake_secret(_task, expr):
         seen["expr"] = expr
-        return {"success": True, "result": json.dumps({"filled": 1})}
+        return {"success": True, "result": json.dumps({"filled": 1, "written": 1, "roles": ["one-time-code"]})}
     return (patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None),
             patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval),
             patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_secret))

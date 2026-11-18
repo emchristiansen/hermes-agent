@@ -348,7 +348,7 @@ class TestBrowserVaultTools:
 
         def fake_eval_secret(task_id, expression):
             secret_exprs.append(expression)
-            return {"success": True, "result": json.dumps({"filled": 1})}
+            return {"success": True, "result": json.dumps({"filled": 1, "written": 1, "roles": ["current-password"]})}
 
         with patch("agent.vault_backends.backend_for_handle", return_value=_ManagerBackend()), \
              patch.object(browser_vault_tool, "_current_page_origin", return_value="https://www.amazon.co.uk"), \
@@ -416,7 +416,7 @@ class TestBrowserVaultTools:
 
         def fake_eval_secret(task_id, expression):
             secret_exprs.append(expression)
-            return {"success": True, "result": json.dumps({"filled": 1})}
+            return {"success": True, "result": json.dumps({"filled": 1, "written": 1, "roles": ["current-password"]})}
 
         with patch("agent.vault_store.get_vault_store", return_value=store), \
              patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
@@ -536,7 +536,7 @@ class TestBrowserVaultTools:
             return {"success": True, "result": json.dumps(controls)}
 
         def fake_eval_secret(task_id, expression):
-            return {"success": True, "result": json.dumps({"filled": 1})}
+            return {"success": True, "result": json.dumps({"filled": 1, "written": 1, "roles": ["current-password"]})}
 
         try:
             with patch("agent.vault_store.get_vault_store", return_value=store), \
@@ -587,7 +587,7 @@ class TestBrowserVaultTools:
 
         def fake_eval_secret(task_id, expression):
             secret_exprs.append(expression)
-            return {"success": True, "result": json.dumps({"filled": 3})}
+            return {"success": True, "result": json.dumps({"filled": 3, "written": 3, "roles": ["cc-number", "cc-exp", "cc-csc"]})}
 
         try:
             with patch("agent.vault_store.get_vault_store", return_value=store), \
@@ -784,7 +784,7 @@ class TestTwoFactor:
 
         def fake_secret(task_id, expr):
             seen["expr"] = expr
-            return {"success": True, "result": json.dumps({"filled": 1})}
+            return {"success": True, "result": json.dumps({"filled": 1, "written": 1, "roles": ["current-password"]})}
 
         with patch("agent.vault_store.get_vault_store", return_value=store), \
              patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
@@ -809,7 +809,7 @@ class TestTwoFactor:
 
         def fake_secret(t, e):
             seen["expr"] = e
-            return {"success": True, "result": json.dumps({"filled": 6})}
+            return {"success": True, "result": json.dumps({"filled": 6, "written": 6, "roles": ["one-time-code"] * 6})}
 
         with patch("agent.vault_backends.unlock.can_prompt_here", return_value=True), \
              patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \

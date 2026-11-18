@@ -29,7 +29,7 @@ def _controls(has_value: bool):
 class _Page:
     def __init__(self, controls, fill_result=None):
         self.controls, self.writes, self.cleared = controls, [], 0
-        self.fill_result = fill_result or {"filled": 1}
+        self.fill_result = fill_result or {"filled": 1, "written": 1, "roles": ["current-password"]}
 
     def focus_page(self, origin, accept=None):
         return {"ok": origin == _ORIGIN, "url": _ORIGIN + "/login"}

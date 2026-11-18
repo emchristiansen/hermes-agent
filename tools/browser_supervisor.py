@@ -25,6 +25,7 @@ from tools.browser_supervisor_dialogs import (
     DialogSupervisionMixin, PendingDialog,
 )
 from tools.browser_supervisor_frames import FrameInfo, FrameTrackingMixin
+from tools.browser_supervisor_worlds import WorldTrackingMixin, world_params
 
 # ``websockets`` costs ~22 ms at import and is only needed once a supervisor connects.
 if TYPE_CHECKING:
@@ -58,6 +59,10 @@ class _LoopUnavailable(RuntimeError):
     """The supervisor loop refused new work (closed / shutting down)."""
 
 
+class _NotConnected(RuntimeError):
+    """No supervisor WebSocket: the command was not sent."""
+
+
 def _schedule(coro, loop, *, timeout: float):
     """Run ``coro`` on the supervisor loop from a sync caller and wait for its result."""
     from agent.async_utils import safe_schedule_threadsafe
@@ -75,6 +80,11 @@ EVAL_REPLY_WAIT_S = 10.0
 
 def _fail(error: str) -> dict[str, Any]:
     return {"ok": False, "error": error}
+
+
+def _unsent(error: str) -> dict[str, Any]:
+    """A failure before the command reached the browser."""
+    return {**_fail(error), "sent": False}
 
 
 def _err(exc: BaseException) -> dict[str, Any]:
@@ -113,7 +123,7 @@ class SupervisorSnapshot:
         return out
 
 
-class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
+class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, WorldTrackingMixin):
     """One supervisor per (task_id, cdp_url) pair. ``start()`` spawns a daemon thread
     running its own asyncio loop, connects, attaches to the first page target, enables
     domains and auto-attach. ``snapshot()`` / ``respond_to_dialog()`` / ``evaluate_runtime()``
@@ -145,6 +155,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         # Native dialogs open per page session, recorded passively (``open_dialog``), bridge or not.
         self._open_native_dialogs: dict[str, dict[str, Any]] = {}
         self._recent_dialogs: list[DialogRecord] = []
+        # (session id, context id) -> uniqueId of the vault's isolated worlds (``create_isolated_world``).
+        self._world_unique_ids: dict[tuple[Optional[str], Any], str] = {}
         self._frames: dict[str, FrameInfo] = {}
         self._active = False
         # Supervisor loop machinery — populated in start().
@@ -245,30 +257,38 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         return {"ok": True, "dialog": dialog.to_dict()}
 
     def evaluate_runtime(self, expression: str, *, return_by_value: bool = True,
-                         await_promise: bool = True, timeout: float = EVAL_REPLY_WAIT_S) -> dict[str, Any]:
-        """Evaluate ``expression`` in the page's Runtime context over the live WS.
-        Returns ``{"ok": True, "result", "result_type"}`` or ``{"ok": False, "error"}``.
+                         await_promise: bool = True, timeout: float = EVAL_REPLY_WAIT_S,
+                         world: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        """Evaluate ``expression`` in the page's Runtime context over the live WS, or with ``world`` (from
+        ``create_isolated_world``) in that isolated world, on the session it was created on.
+        Returns ``{"ok": True, "result", "result_type"}`` or ``{"ok": False, "error"}``; a failure known to
+        have happened before the command was sent carries ``"sent": False``.
         ``return_by_value=True`` JSON-serializes the result (DevTools-console
         semantics); non-serializable objects come back as a description string."""
         loop = self._loop
         if loop is None or not loop.is_running():
-            return _fail("supervisor loop is not running")
+            return _unsent("supervisor loop is not running")
         with self._state_lock:
             active, session_id = self._active, self._page_session_id
+        if world is not None:
+            session_id = world.get("session_id")
         if not active:
-            return _fail("supervisor is not active")
+            return _unsent("supervisor is not active")
         if not session_id:
-            return _fail("supervisor has no attached page session")
+            return _unsent("supervisor has no attached page session")
 
         def _run_eval(by_value: bool) -> dict[str, Any]:
             # userGesture: clipboard / fullscreen APIs need user activation.
             params = {"expression": expression, "returnByValue": by_value,
-                      "awaitPromise": await_promise, "userGesture": True}
+                      "awaitPromise": await_promise, "userGesture": True,
+                      **(world_params(world) if world is not None else {})}
             coro = self._cdp("Runtime.evaluate", params, session_id=session_id, timeout=timeout)
             return _schedule(coro, loop, timeout=timeout + 1)
 
         try:
             response = _run_eval(return_by_value)
+        except (_LoopUnavailable, _NotConnected) as exc:
+            return _unsent(str(exc))
         except Exception as exc:
             # Deep-serializing live DOM nodes / NodeLists / Window can blow past
             # CDP's recursion guard (``Object reference chain is too long``).
@@ -299,12 +319,10 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             value = result_obj.get("description") or result_obj.get("unserializableValue")
         return {"ok": True, "result": value, "result_type": result_type}
 
-    def terminate_execution(self, *, timeout: float = 1.0) -> dict[str, Any]:
-        """Best effort: ask the attached page to terminate its current (or next) JavaScript execution
-        (``Runtime.terminateExecution``), waiting at most about ``timeout`` for the reply. Measured in Chromium
-        157: it stops a script that is executing JavaScript (a synchronous spin); it does not reach anything held
-        by a native dialog (the reply is queued until the dialog closes, then nothing is terminated). Whether it
-        stopped a given script is for the caller to establish, not this."""
+    def create_isolated_world(self, name: str, *, timeout: float = 2.0) -> dict[str, Any]:
+        """Create isolated world ``name`` in the main frame of the attached page session
+        (``tools.browser_supervisor_worlds``). Returns ``{"ok": True, "world"}`` (pass ``world`` to
+        ``evaluate_runtime``) or ``{"ok": False, "error"}``."""
         loop = self._loop
         if loop is None or not loop.is_running():
             return _fail("supervisor loop is not running")
@@ -313,13 +331,10 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         if not session_id:
             return _fail("supervisor has no attached page session")
         try:
-            _schedule(self._cdp("Runtime.terminateExecution", session_id=session_id, timeout=timeout), loop,
-                      timeout=timeout + 0.5)
-        except TimeoutError:  # the request went out; the page did not acknowledge it in time (e.g. paused)
-            return {"ok": False, "sent": True, "acknowledged": False, "error": "not acknowledged in time"}
+            world = _schedule(self._create_world(session_id, name, timeout=timeout), loop, timeout=timeout * 2 + 1)
         except Exception as exc:
             return _err(exc)
-        return {"ok": True, "sent": True, "acknowledged": True}
+        return {"ok": True, "world": world}
 
     def set_driven_target(self, target_id: Optional[str]) -> None:
         """Record the CDP target the task's browser_exec session drives (None: unknown)."""
@@ -556,7 +571,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                    session_id: Optional[str] = None, timeout: Optional[float] = 10.0) -> dict[str, Any]:
         """Send a CDP command and await its response."""
         if self._ws is None:
-            raise RuntimeError("supervisor WebSocket is not connected")
+            raise _NotConnected("supervisor WebSocket is not connected")
         call_id, self._next_call_id = self._next_call_id, self._next_call_id + 1
         payload: dict[str, Any] = {"id": call_id, "method": method}
         payload.update({k: v for k, v in (("params", params), ("sessionId", session_id)) if v})
@@ -598,7 +613,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
     # CDP event → handler(self, params, session_id). Async handlers return an
     # awaitable that ``_read_loop`` awaits; sync handlers return None.
     _EVENT_HANDLERS: dict[str, Callable[..., Any]] = {
-        **DialogSupervisionMixin.EVENT_HANDLERS, **FrameTrackingMixin.EVENT_HANDLERS
+        **DialogSupervisionMixin.EVENT_HANDLERS, **FrameTrackingMixin.EVENT_HANDLERS,
+        **WorldTrackingMixin.EVENT_HANDLERS,
     }
 
 

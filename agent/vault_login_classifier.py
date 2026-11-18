@@ -386,10 +386,11 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
 
 # The fill script's page-clock budget, defence in depth: a script that starts, or reaches one of its checks,
 # more than this long after the anchor read just before it was sent (``performance.now()`` of the same
-# document, same ``performance.timeOrigin``) writes nothing. That bounds the ordinary late release (a dialog
-# closed after the caller gave up). It is NOT a guarantee that the script cannot write later: a check and the
-# write that follows it are not atomic, so a debugger paused between them, or page code that replaces the
-# clock, can hold the script past its checks and let it write. It must be strictly shorter than the caller's
+# document, same ``performance.timeOrigin``, both read in the same isolated world) writes nothing. That bounds
+# the ordinary late release (a dialog closed after the caller gave up). It is NOT a guarantee that the script
+# cannot write later: a check and the write that follows it are not atomic, so a debugger paused between them
+# can hold the script past its checks and let it write (in the page's own world, on a plugin page backend,
+# page code that replaces the clock or the value setter can too). It must be strictly shorter than the caller's
 # wait for the script's reply (tools.browser_supervisor.EVAL_REPLY_WAIT_S); a test
 # in tests/tools/test_browser_vault_fill_integrity.py asserts the margin.
 FILL_PAGE_BUDGET_S = 3.0
@@ -444,12 +445,13 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
     :data:`FILL_PAGE_BUDGET_S` has passed on the page's clock, checked when it starts, before each field's
     focus and again as the last gate immediately before each write.
 
-    Every report carries ``written`` and ``roles``: how many fields this script wrote and left written (not
-    cleared again), and their tokens in order, never their values. A refusal after earlier writes (split code
+    Every report carries ``written`` and ``roles``: how many fields this script wrote, or attempted to write
+    (counted before the setter runs), and left written (not cleared again), and their tokens in order, never
+    their values. A refusal after earlier writes (split code
     boxes, checkout fields, a password before its identifier) therefore never claims that nothing was
     written; ``filled`` counts only fields that still held a value after their events. A ``not_established``
     whose original the page turned into a non-password control still showing the stored value empties it
-    with the native setter, without events, and reports ``exposed_cleared``. Values are rendered by
+    with the setter, without events, reports ``exposed_cleared`` and no longer counts that field as written. Values are rendered by
     :func:`_render_js`, so they reach the page unchanged whatever they contain.
     """
     return _render_js(
@@ -471,11 +473,13 @@ _FILL_JS_TEMPLATE = """(() => {
   const anchor = __ANCHOR__;
   const budgetMs = __BUDGET_MS__;
   // Past the page-clock budget (or in another document) the script writes nothing: a script queued behind a
-  // dialog that is closed later stops at its next check. Not a guarantee: a pause between a check and the
-  // write, or a page-replaced performance.now, is not caught (see FILL_PAGE_BUDGET_S).
+  // dialog that is closed later stops at its next check. Not a guarantee: a debugger pause between a check and
+  // the write is not caught (see FILL_PAGE_BUDGET_S).
   const late = () => anchor !== null && (performance.timeOrigin !== anchor.timeOrigin
     || !(performance.now() - anchor.now <= budgetMs));
-  // The native accessors, so a value is read and written without page-defined element properties.
+  // The value accessors. Run in the vault's isolated world (tools.browser_supervisor_worlds) they are that
+  // world's own, which page code cannot replace; run in the page's world (a plugin page backend) they are
+  // whatever the page left on the prototype.
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
   const current = (el) => String((el.tagName !== "SELECT" && setter && setter.get) ? setter.get.call(el) : (el.value || ""));
   const slotOf = (f) => find('[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]')[0];
@@ -518,8 +522,8 @@ _FILL_JS_TEMPLATE = """(() => {
           const opt = Array.from(el.options).find((o) => [o.value, o.textContent].some((t) => norm(t) === want || norm(t) === want.replace(/^0/, "")));
           if (opt && late()) return report({ refused: "expired" });
           if (opt) {
+            wrote.push(f.token);  // before the write: a write that throws still counts as attempted
             el.value = opt.value;
-            wrote.push(f.token);
             el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
             filled += 1;
           }
@@ -541,8 +545,8 @@ _FILL_JS_TEMPLATE = """(() => {
         // The last gate before the write: still within the page-clock budget.
         if (late()) return report({ refused: "expired" });
         // one-time-code split into single-character boxes: f.value is the slice for THIS box (see build_otp_fills)
+        wrote.push(f.token);  // before the write: a write that throws still counts as attempted
         if (setter && setter.set) { setter.set.call(el, f.value); } else { el.value = f.value; }
-        wrote.push(f.token);
         // composed: a component listening on its shadow host must see the value change too.
         el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" }));
         el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
@@ -587,6 +591,7 @@ _FILL_JS_TEMPLATE = """(() => {
       if (w.el.isConnected && w.el.type !== "password" && current(w.el) === w.f.value && setter && setter.set) {
         setter.set.call(w.el, "");
         exposedCleared += 1;
+        wrote.splice(wrote.lastIndexOf(w.f.token), 1);  // emptied again: no longer left written
       }
     });
     return report({ refused: "not_established", exposed_cleared: exposedCleared });
