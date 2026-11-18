@@ -332,7 +332,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, WorldTrackingMix
             return _fail("supervisor has no attached page session")
         try:
             world = _schedule(self._create_world(session_id, name, timeout=timeout), loop, timeout=timeout * 2 + 1)
-        except Exception as exc:
+        except (RuntimeError, OSError, TimeoutError, KeyError, TypeError) as exc:  # CDP error, socket, no reply, odd reply
             return _err(exc)
         return {"ok": True, "world": world}
 
