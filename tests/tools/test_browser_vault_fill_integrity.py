@@ -1052,32 +1052,120 @@ def test_every_failure_after_sending_is_not_established(item, error, error_type)
     assert len(page.writes) == 1 and len(page.cleared) == 1
 
 
-def test_a_lost_world_before_the_script_started_is_the_only_nothing_written(item):
-    """FB-2 / point 1: only "Cannot find context with specified id" for the command's isolated world (the page
-    moved to a new document before the script started) means nothing was written; the stamp cleanup finding the
-    world gone says the new document carries none of the stamps."""
-    page, backend = _BlockedPage([_EMAIL, _PW]), _Recording()
-    original, seen = page.evaluate_runtime, []
-    gone = {"ok": False, "error": "RuntimeError: CDP error on id=9: {'code': -32000, 'message': "
-                                  "'Cannot find context with specified id'}"}
-    page.create_isolated_world = lambda name, **kw: {"ok": True, "world": {"session_id": "S", "context_id": 7,
-                                                                           "unique_id": "u-7"}}
+_GONE_SAME_SITE = {"code": -32000, "message": "Cannot find context with specified id"}
+_GONE_CROSS_SITE = {"code": -32602, "message": "uniqueContextId not found"}
+_WORLD_U7 = {"session_id": "S", "context_id": 7, "unique_id": "u-7"}
+
+
+def _world_page(fill_reply, cleanup_reply=None):
+    """A recording page with an isolated world whose fill and cleanup evaluations get the given replies."""
+    page = _BlockedPage([_EMAIL, _PW])
+    original, page.seen = page.evaluate_runtime, []
+    page.create_isolated_world = lambda name, **kw: {"ok": True, "world": dict(_WORLD_U7)}
 
     def evaluate_runtime(expression, **kw):
-        seen.append(kw.get("world"))
+        page.seen.append(kw.get("world"))
         if "expectedOrigin" in expression:
             page.writes.append(expression)
-            return gone
-        if "return retireInspection(" in expression:
+            return fill_reply
+        if "return retireInspection(" in expression and cleanup_reply is not None:
+            page.cleared.append(expression)
+            return cleanup_reply
+        return original(expression, **kw)
+
+    page.evaluate_runtime = evaluate_runtime
+    return page
+
+
+@pytest.mark.parametrize("error", [_GONE_SAME_SITE, _GONE_CROSS_SITE], ids=["same-site", "cross-site"])
+def test_a_lost_world_before_the_script_started_is_the_only_nothing_written(item, error):
+    """FB-2 / point 1 and the agreed rule: only the CDP protocol error -32000 "Cannot find context with specified
+    id" or -32602 "uniqueContextId not found", matched on the error object, for an evaluation addressed by
+    uniqueContextId, means the script never started: nothing was written. The stamp cleanup reads its own
+    reply the same way and says the new document carries none of the stamps."""
+    gone = {"ok": False, "error": f"CDPProtocolError: CDP error on id=9: {error}", "protocol_error": dict(error),
+            "addressed": "uniqueContextId"}
+    page = _world_page(gone, gone)
+    out = _fill(item, page, _Recording())
+    assert out["error_type"] == "page_navigated" and out["success"] is False and "next" not in out, out
+    assert "the script never ran. Nothing was written" in out["error"], out
+    assert "carries none of this inspection's stamps" in out["stamps"], out
+    assert page.seen and all(w == _WORLD_U7 for w in page.seen), page.seen
+
+
+@pytest.mark.parametrize("reply", [
+    # FC-3: an in-script exception whose description carries the text, with no protocol error object
+    {"ok": False, "error": "Uncaught: Error: Cannot find context with specified id\n    at <anonymous>:1:7",
+     "addressed": "uniqueContextId"},
+    {"ok": False, "error": "Uncaught: Error: uniqueContextId not found", "addressed": "uniqueContextId"},
+    # the protocol error, but not for an evaluation addressed by uniqueContextId
+    {"ok": False, "error": "CDPProtocolError: x", "protocol_error": dict(_GONE_SAME_SITE)},
+    # another protocol error on the world
+    {"ok": False, "error": "CDPProtocolError: x", "protocol_error": {"code": -32000, "message": "Inspected target navigated or closed"},
+     "addressed": "uniqueContextId"},
+], ids=["exception-text", "exception-text-unique", "not-addressed-by-unique-id", "other-protocol-error"])
+def test_only_the_typed_protocol_error_means_never_started(item, reply):
+    """FC-3: text that looks like the lost-world error never yields page_navigated; the result stays "may still
+    complete, not established", and the stamp cleanup's note is not given."""
+    page = _world_page(reply, reply)
+    out = _fill(item, page, _Recording())
+    assert out["error_type"] == "fill_unconfirmed" and out["may_complete_later"] is True, out
+    assert "Nothing was written" not in out["error"] and "stamps" not in out, out
+    assert "Cannot find context" not in json.dumps(out) and "uniqueContextId" not in json.dumps(out), out
+
+
+def test_a_world_lost_before_the_second_gate_is_a_navigation_not_an_unresponsive_page(item):
+    """FC-2: the page moves to a new document after inspection; the clock read before sending gets the typed
+    lost-world error. The page answered, so the refusal says the page moved, the value was not sent and nothing
+    was written; the unresponsive-page wording stays for real timeouts."""
+    page = _world_page({"ok": True, "result": json.dumps(_FILLED)})
+    original, clocks = page.evaluate_runtime, []
+    gone = {"ok": False, "error": "x", "protocol_error": dict(_GONE_SAME_SITE), "addressed": "uniqueContextId"}
+
+    def evaluate_runtime(expression, **kw):
+        from agent.vault_login_classifier import PAGE_CLOCK_JS
+
+        if expression == PAGE_CLOCK_JS:
+            clocks.append(1)
+            if len(clocks) == 2:
+                return gone
+        if "return retireInspection(" in expression and len(clocks) >= 2:
+            page.cleared.append(expression)
             return gone
         return original(expression, **kw)
 
     page.evaluate_runtime = evaluate_runtime
-    out = _fill(item, page, backend)
-    assert out["error_type"] == "page_navigated" and out["success"] is False and "next" not in out, out
-    assert "the script never ran. Nothing was written" in out["error"], out
-    assert "carries none of this inspection's stamps" in out["stamps"], out
-    assert seen and all(w == {"session_id": "S", "context_id": 7, "unique_id": "u-7"} for w in seen), seen
+    out = _fill(item, page, _Recording())
+    assert out["error_type"] == "page_navigated" and "the value was not sent; nothing was written" in out["error"], out
+    assert "did not answer" not in out["error"] and "dialog" not in out["error"], out
+    assert page.writes == [] and "carries none of this inspection's stamps" in out["stamps"], out
+
+
+def test_the_supervisor_types_protocol_errors():
+    """The rule's first condition: a CDP error reply becomes CDPProtocolError, whose code and message are the
+    error object's own fields, and the result carries them as ``protocol_error``."""
+    from tools.browser_supervisor import CDPProtocolError, _err
+
+    out = _err(CDPProtocolError(9, dict(_GONE_CROSS_SITE)))
+    assert out["protocol_error"] == _GONE_CROSS_SITE and out["ok"] is False
+    assert "protocol_error" not in _err(RuntimeError("CDP error on id=9: " + str(_GONE_CROSS_SITE)))
+
+
+def test_fill_outcome_says_what_was_written_when_nothing_held_a_value():
+    """FC-1: a field written (or attempted) that holds no value after the page's events is named in the result."""
+    from tools.browser_vault_tool import _fill_outcome
+
+    backend, login = SimpleNamespace(name="local"), SimpleNamespace(kind="login", has_otp=False)
+    fills = [{"index": 1, "token": "current-password", "value": "x"}]
+    written = json.loads(_fill_outcome({"filled": 0, "written": 1, "roles": ["current-password"]}, backend, login,
+                                       _ORIGIN, fills))
+    assert written["success"] is False and "next" not in written, written
+    assert written["error"].startswith("1 field was written (or a write was attempted) and was not cleared: the password "
+                                       "field. None of the targeted fields held a value"), written
+    none = json.loads(_fill_outcome({"filled": 0, "written": 0, "roles": []}, backend, login, _ORIGIN, fills))
+    assert none["error"] == "No targeted field was written.", none
+    unknown = json.loads(_fill_outcome({"filled": 0}, backend, login, _ORIGIN, fills))
+    assert "not established" in unknown["error"], unknown
 
 
 def test_a_failure_before_sending_keeps_its_own_refusal(item):
@@ -1159,11 +1247,75 @@ def test_the_isolated_world_is_created_without_universal_access():
     assert world == {"session_id": "S1", "context_id": 11, "unique_id": "u-11"}
     assert calls[1] == ("Page.createIsolatedWorld", {"frameId": "F1", "worldName": "hermes-vault:n1"}, "S1")
     assert world_params(world) == {"uniqueContextId": "u-11"}
-    assert world_params(dict(world, unique_id=None)) == {"contextId": 11}
+    with pytest.raises(KeyError):  # FC-4: never a numeric context id
+        world_params({"session_id": "S1", "context_id": 11})
     assert list(sup._world_unique_ids) == [("S1", 11)]  # only the vault's own worlds are recorded
     sup._on_contexts_cleared({}, "S1")
     assert sup._world_unique_ids == {}
     assert not hasattr(sup, "terminate_execution")
+
+
+def _supervisor_on_a_loop():
+    """A supervisor whose loop runs in a thread, attached to session S1 (no browser)."""
+    import asyncio
+
+    from tools.browser_supervisor import CDPSupervisor
+
+    sup = CDPSupervisor("t", "ws://127.0.0.1:1/devtools/browser/x", attach_target_id="T1", dialog_bridge=False)
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    sup._loop, sup._page_session_id, sup._active = loop, "S1", True
+    return sup, loop, thread
+
+
+def test_a_world_without_a_unique_id_is_refused_before_anything_is_sent(item):
+    """FC-4: no uniqueId reported for the world means no world: create_isolated_world refuses, evaluate_runtime
+    never addresses a world by its numeric id, and the fill refuses before inspection."""
+    sup, loop, thread = _supervisor_on_a_loop()
+    sent = []
+
+    async def cdp(method, params=None, **kw):
+        sent.append(method)
+        if method == "Page.getFrameTree":
+            return {"result": {"frameTree": {"frame": {"id": "F1"}}}}
+        return {"result": {"executionContextId": 11}}  # no executionContextCreated event: no uniqueId
+
+    try:
+        sup._cdp = cdp
+        made = sup.create_isolated_world("hermes-vault:n1", timeout=1.0)
+        assert made["ok"] is False and made["no_unique_id"] is True, made
+        no_unique = sup.evaluate_runtime("1", world={"session_id": "S1", "context_id": 11, "unique_id": None})
+        assert no_unique["ok"] is False and no_unique["sent"] is False and sent == ["Page.getFrameTree",
+                                                                                  "Page.createIsolatedWorld"], no_unique
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(5)
+    page, backend = _BlockedPage([_EMAIL, _PW]), _Recording()
+    page.create_isolated_world = lambda name, **kw: made
+    out = _fill(item, page, backend)
+    assert out["error_type"] == "world_unavailable" and "unique context id" in out["error"], out
+    assert "nothing was inspected, resolved, sent or written" in out["error"], out
+    assert page.inspections == [] and backend.resolved == [] and page.writes == []
+
+
+def test_a_socket_closed_at_the_send_is_a_refusal_not_an_exception():
+    """FC-5: the WebSocket closes after _cdp checked it and before the send; websockets' ConnectionClosed
+    derives from Exception only, and is caught by name."""
+    from websockets.exceptions import ConnectionClosed
+
+    class _Closed:
+        async def send(self, data):
+            raise ConnectionClosed(None, None)
+
+    sup, loop, thread = _supervisor_on_a_loop()
+    try:
+        sup._ws = _Closed()
+        made = sup.create_isolated_world("hermes-vault:n1", timeout=1.0)
+        assert made["ok"] is False and "ConnectionClosed" in made["error"], made
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(5)
 
 
 def test_a_timeout_is_classified_by_the_supervisors_marker_not_by_text():
@@ -1814,9 +1966,9 @@ def test_a_navigation_before_the_fill_script_starts(browser, store, capsys, site
     fill script is sent, so the script is evaluated in the old document's isolated world, which is gone; it
     never runs in the new document. Same site (same renderer): "Cannot find context with specified id", the
     one reply that means the script never started, so nothing was written and the new document has no stamps.
-    Cross site (another renderer process): measured, the reply to the world's uniqueContextId is a different
-    error ("uniqueContextId not found"), which the strict rule does not read as "never started": the result
-    says not established. Either way nothing was written to the new document."""
+    Cross site (another renderer process): measured, the reply to the world's uniqueContextId is -32602
+    "uniqueContextId not found", and the expression never runs there either; by the agreed rule it reads as
+    never started too."""
     from tools import browser_vault_tool
 
     port = browser.origin.rsplit(":", 1)[1]
@@ -1834,14 +1986,10 @@ def test_a_navigation_before_the_fill_script_starts(browser, store, capsys, site
         code, out, resolved = _cli_fill(browser, store, "NAV-vault-value", capsys)
     print("NAV_BEFORE_START=" + json.dumps({"site": site, "result": out, "reply_error": replies[0].get("error")}))
     assert code == 1 and len(resolved) == 1 and "next" not in out and out["success"] is False, out
-    if site == "same-site":
-        assert "Cannot find context with specified id" in replies[0]["error"], replies
-        assert out["error_type"] == "page_navigated" and "Nothing was written" in out["error"], out
-        assert "carries none of this inspection's stamps" in out["stamps"], out
-    else:
-        assert "uniqueContextId not found" in replies[0]["error"], replies
-        assert out["error_type"] == "fill_unconfirmed" and out["may_complete_later"] is True, out
-        assert "not established" in out["error"] and "Nothing was written" not in out["error"], out
+    expected = _GONE_SAME_SITE if site == "same-site" else _GONE_CROSS_SITE
+    assert replies[0]["protocol_error"] == expected and replies[0]["addressed"] == "uniqueContextId", replies
+    assert out["error_type"] == "page_navigated" and "Nothing was written" in out["error"], out
+    assert "carries none of this inspection's stamps" in out["stamps"], out
     assert _evaluate(browser.page, "location.href") == url
     assert _evaluate(browser.page, f"JSON.stringify([document.getElementById('p').value,{_STAMPS_ANYWHERE}])") == '["",0]'
 
@@ -1896,5 +2044,95 @@ def test_a_setter_that_writes_and_then_throws_counts_as_written(browser):
     raw = json.loads(_evaluate(browser.page, build_fill_js(
         [{"index": index, "token": "current-password", "value": "NH-value"}], browser.origin, nonce, require_empty=True)))
     assert raw == {"filled": 0, "written": 1, "roles": ["current-password"]}, raw
+    fills = [{"index": index, "token": "current-password", "value": "NH-value"}]
+    out = json.loads(_fill_outcome(raw, SimpleNamespace(name="local"), SimpleNamespace(kind="login", has_otp=False),
+                                   browser.origin, fills))  # FC-1: the tool result names the write
+    assert out["success"] is False and "next" not in out and "NH-value" not in json.dumps(out), out
+    assert out["error"].startswith("1 field was written (or a write was attempted) and was not cleared: the password field."), out
     assert _evaluate(browser.page, "document.getElementById('p').value") == "NH-value"
     assert _evaluate(browser.page, _STAMPS_ANYWHERE) == 0
+
+
+@_integration
+def test_a_navigation_before_the_second_gate_is_reported_as_a_navigation(browser, store, capsys):
+    """FC-2 in Chromium: the tab moves to a new document after inspection and before the gate that precedes
+    sending. The value is not sent, nothing is written, and the refusal says the page moved (not that it did
+    not answer)."""
+    from tools import browser_vault_tool
+
+    _evaluate(browser.page, "document.getElementById('p').value=''")
+    real, calls = browser_vault_tool._send_gate, []
+
+    def gate(*a, **k):
+        calls.append(1)
+        if len(calls) == 2:
+            _navigate(browser, browser.origin + "/next")
+        return real(*a, **k)
+
+    sent = []
+    real_secret = browser_vault_tool._eval_js_secret
+    with patch.object(browser_vault_tool, "_send_gate", gate), \
+         patch.object(browser_vault_tool, "_eval_js_secret", lambda *a, **k: sent.append(1) or real_secret(*a, **k)):
+        code, out, resolved = _cli_fill(browser, store, "FC2-vault-value", capsys)
+    assert code == 1 and out["error_type"] == "page_navigated" and len(resolved) == 1 and sent == [], out
+    assert "the value was not sent; nothing was written" in out["error"] and "did not answer" not in out["error"], out
+    assert "carries none of this inspection's stamps" in out["stamps"], out
+    assert _evaluate(browser.page, f"JSON.stringify([document.getElementById('p').value,{_STAMPS_ANYWHERE}])") == '["",0]'
+
+
+_OTP_BOX = ("const f=document.querySelector('form');const b=document.createElement('input');b.id='otp';b.name='otp';"
+            "b.setAttribute('autocomplete','one-time-code');f.appendChild(b);")
+
+
+def _enter_code(browser, prompt):
+    """browser_vault_enter_code (no saved login) through an exact-target supervisor on the test tab, with
+    ``prompt`` as the user's code prompt; returns the tool result and the worlds created."""
+    from agent.vault_backends import unlock
+    from tools import browser_vault_tool
+    from tools.browser_session_cdp import resolve_cdp_override
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+    task_id = "enter-code-" + browser.page["id"][:8]
+    SUPERVISOR_REGISTRY.get_or_start(task_id, resolve_cdp_override(browser.http), attach_target_id=browser.page["id"],
+                                     dialog_bridge=False)
+    unlock.set_code_prompt_callback(prompt)
+    try:
+        with patch.object(unlock, "can_prompt_here", lambda prompt=None: True), browser_vault_tool.supervisor_only():
+            return json.loads(browser_vault_tool.browser_vault_enter_code(task_id=task_id))
+    finally:
+        unlock.set_code_prompt_callback(None)
+        SUPERVISOR_REGISTRY.stop(task_id)
+
+
+@_integration
+def test_enter_code_fills_exactly_and_retires_its_inspection(browser):
+    _evaluate(browser.page, _OTP_BOX)
+    out = _enter_code(browser, lambda site, hint: "739415")
+    assert out["success"] is True and out["filled_fields"] == 1 and "739415" not in json.dumps(out), out
+    assert _evaluate(browser.page, f"JSON.stringify([document.getElementById('otp').value,{_STAMPS_ANYWHERE}])") == '["739415",0]'
+
+
+@_integration
+def test_enter_code_declined_leaves_no_stamps(browser):
+    """FC-6: the user declines the code; the inspection's stamps, registry and observer are retired anyway."""
+    _evaluate(browser.page, _OTP_BOX)
+    out = _enter_code(browser, lambda site, hint: "")
+    assert out["error_type"] == "code_declined", out
+    assert _evaluate(browser.page, f"JSON.stringify([document.getElementById('otp').value,{_STAMPS_ANYWHERE}])") == '["",0]'
+
+
+@_integration
+def test_enter_code_navigation_while_the_user_types_is_a_navigation(browser):
+    """FC-2, the enter_code case: the tab moves to a new document while the user is asked for the code. The code
+    is not sent, nothing is written, the refusal says the page moved, and the new document has no stamps."""
+    _evaluate(browser.page, _OTP_BOX)
+
+    def prompt(site, hint):
+        _navigate(browser, browser.origin + "/next")
+        return "739415"
+
+    out = _enter_code(browser, prompt)
+    assert out["success"] is False and out["error_type"] == "page_navigated", out
+    assert "the value was not sent; nothing was written" in out["error"] and "did not answer" not in out["error"], out
+    assert "carries none of this inspection's stamps" in out["stamps"] and "739415" not in json.dumps(out), out
+    assert _evaluate(browser.page, f"JSON.stringify([location.pathname,{_STAMPS_ANYWHERE}])") == '["/next",0]'

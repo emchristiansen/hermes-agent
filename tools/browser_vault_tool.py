@@ -127,10 +127,13 @@ def _eval_js(task_id: str, expression: str, *, timeout: Optional[float] = None) 
 
 
 def _markers(sup: dict[str, Any]) -> dict[str, Any]:
-    """The supervisor's typed markers: ``timed_out`` (no reply in time) and ``sent: False`` (the command
-    never reached the browser)."""
+    """The supervisor's typed markers: ``timed_out`` (no reply in time), ``sent: False`` (the command never
+    reached the browser), ``protocol_error`` (the CDP error object's code and message) and ``addressed``
+    (how an isolated-world evaluation was addressed)."""
     return {**({"timed_out": True} if sup.get("timed_out") is True else {}),
-            **({"sent": False} if sup.get("sent") is False else {})}
+            **({"sent": False} if sup.get("sent") is False else {}),
+            **({"protocol_error": sup["protocol_error"]} if isinstance(sup.get("protocol_error"), dict) else {}),
+            **({"addressed": sup["addressed"]} if isinstance(sup.get("addressed"), str) else {})}
 
 
 # The isolated world (tools.browser_supervisor_worlds) every page script of the current vault command runs in,
@@ -158,11 +161,18 @@ def _page_world(task_id: str, nonce: str, *, nothing: str):
         yield None
         return
     made = create(VAULT_WORLD_PREFIX + nonce, timeout=_PAGE_CLOCK_WAIT_S)
-    world = made.get("world") if isinstance(made, dict) and made.get("ok") else None
-    if not isinstance(world, dict):
-        yield {"success": False, "error_type": "page_unresponsive",
-               "error": (f"Refused: the vault's isolated script world could not be created on the tab within "
-                         f"{_PAGE_CLOCK_WAIT_S:g} s ({_dialog_note(task_id)}); {nothing}.")}
+    made = made if isinstance(made, dict) else {}
+    world = made.get("world") if made.get("ok") else None
+    if not isinstance(world, dict) or not world.get("unique_id"):
+        if made.get("timed_out") is True:
+            yield {"success": False, "error_type": "page_unresponsive",
+                   "error": (f"Refused: the page did not answer the creation of the vault's isolated script world "
+                             f"within {_PAGE_CLOCK_WAIT_S:g} s ({_dialog_note(task_id)}); {nothing}.")}
+        else:
+            reason = ("the browser did not report the world's unique context id" if made.get("no_unique_id") is True
+                      or (isinstance(world, dict) and not world.get("unique_id")) else "the browser refused it")
+            yield {"success": False, "error_type": "world_unavailable",
+                   "error": f"Refused: the vault's isolated script world could not be created on the tab ({reason}); {nothing}."}
         return
     token = _WORLD.set(world)
     try:
@@ -291,14 +301,28 @@ def _dialog_refusal(task_id: str, nothing: str) -> Optional[dict[str, Any]]:
             "error": f"Refused: {_dialog_words(dialog)} is open on the tab; {nothing}. Ask the user to close it, then retry."}
 
 
+# What _page_clock returns when the command's isolated world is gone (the page moved to a new document).
+_WORLD_GONE: dict[str, float] = {}
+
+
+def _world_gone(result: dict[str, Any]) -> bool:
+    """The command's isolated world no longer exists: a typed match on the CDP protocol error of an evaluation
+    addressed by uniqueContextId (tools.browser_supervisor_worlds.world_gone), never on error text."""
+    from tools.browser_supervisor_worlds import world_gone
+
+    return _WORLD.get() is not None and world_gone(result)
+
+
 def _page_clock(task_id: str) -> Optional[dict[str, float]]:
     """The page's ``performance.timeOrigin`` and ``performance.now()``, read with a short wait (non-secret),
-    or None when the page does not answer in time or answers something else."""
+    or None when the page does not answer in time or answers something else, or ``_WORLD_GONE``."""
     import math
 
     from agent.vault_login_classifier import PAGE_CLOCK_JS
 
     res = _eval_js(task_id, PAGE_CLOCK_JS, timeout=_PAGE_CLOCK_WAIT_S)
+    if _world_gone(res):  # FC-2: the page answered; the isolated world is gone (a new document)
+        return _WORLD_GONE
     clock = _parse_json_result(res.get("result")) if res.get("success") else None
     if not isinstance(clock, dict):
         return None
@@ -318,6 +342,10 @@ def _send_gate(task_id: str, *, nothing: str = "the value was not sent; nothing 
     if dialog is not None:
         return None, dialog
     anchor = _page_clock(task_id)
+    if anchor is _WORLD_GONE:
+        return None, {"success": False, "error_type": "page_navigated",
+                      "error": ("Refused: the page moved to a new document (the vault's isolated world for the "
+                                f"inspected page is gone); {nothing}. Inspect the new page again.")}
     if anchor is None:
         return None, {"success": False, "error_type": "page_unresponsive",
                       "error": (f"Refused: the page did not answer within {_PAGE_CLOCK_WAIT_S:g} s "
@@ -327,17 +355,17 @@ def _send_gate(task_id: str, *, nothing: str = "the value was not sent; nothing 
 
 
 def _after_send(task_id: str, result: dict[str, Any]) -> dict[str, Any]:
-    """The result when the fill script was sent and no report came back (FB-2). Only a lost isolated world
-    ("Cannot find context with specified id": the page moved to a new document before the script started)
-    means nothing was written. Every other failure after sending (no reply in time, the connection closing,
+    """The result when the fill script was sent and no report came back (FB-2). Only a lost isolated world (the
+    CDP protocol error -32000 "Cannot find context with specified id" or -32602 "uniqueContextId not found" for
+    an evaluation addressed by uniqueContextId, matched on the error object: the page moved to a new document
+    before the script started) means nothing was written. Every other failure after sending (no reply in time, the connection closing,
     an exception, the document going away while the script ran) leaves the field's state not established:
     the script may still complete, or may have written before it stopped. Page text is never repeated."""
     from agent.vault_login_classifier import FILL_PAGE_BUDGET_S
     from tools.browser_supervisor import EVAL_REPLY_WAIT_S
-    from tools.browser_supervisor_worlds import CONTEXT_GONE_TEXT
 
     error = str(result.get("error") or "")
-    if _WORLD.get() is not None and CONTEXT_GONE_TEXT in error:
+    if _world_gone(result):
         return {"success": False, "error_type": "page_navigated",
                 "error": ("Refused: the page moved to a new document before the fill script started (the vault's "
                           "isolated world for the old document is gone), so the script never ran. Nothing was "
@@ -621,15 +649,32 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
 def _enter_code_on_page(effective_task_id: str, nonce: str, origin: str, backend: Any, handle: str, meta: Any) -> str:
     """enter_code once the origin is known, inside the command's isolated world: inspect, get the code (minted
     or asked of the user) and write it."""
-    from agent.redact import register_vault_redaction_value
-    from agent.vault_backends.unlock import can_prompt_here, get_code_prompt_callback
-    from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
-
     site = origin.split("://", 1)[-1]
     # N-j: a blocked tab (a dialog, an unresponsive page) refuses before inspection, with or without a saved login.
     _, blocked = _send_gate(effective_task_id, nothing="nothing was inspected or written")
     if blocked is not None:
         return json.dumps(blocked)
+    # FC-6: this inspection's stamps, registry and observer are retired on every exit, in the command's world,
+    # unless the fill script ran to completion (its own finally retires them).
+    stamps = _InspectionStamps()
+    with _inspection_stamps(effective_task_id, nonce, stamps):
+        result = _enter_code_inspected(effective_task_id, nonce, origin, site, backend, handle, meta, stamps)
+    if stamps.new_document:
+        out = json.loads(result)
+        out["stamps"] = ("The page had moved to a new document, which carries none of this inspection's stamps; "
+                         "nothing remained to remove.")
+        return json.dumps(out)
+    return result
+
+
+def _enter_code_inspected(effective_task_id: str, nonce: str, origin: str, site: str, backend: Any, handle: str,
+                          meta: Any, stamps: _InspectionStamps) -> str:
+    """enter_code's inspection (stamping with ``nonce``), the code and its write; ``stamps`` records whether the
+    fill script retired the inspection itself."""
+    from agent.redact import register_vault_redaction_value
+    from agent.vault_backends.unlock import can_prompt_here, get_code_prompt_callback
+    from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
+
     inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
     raw_controls = _parse_json_result(inspect.get("result")) if inspect.get("success") else None
     if isinstance(raw_controls, str):
@@ -643,6 +688,7 @@ def _enter_code_on_page(effective_task_id: str, nonce: str, origin: str, backend
     def write(code: str, source: str) -> str:
         anchor, refusal = _send_gate(effective_task_id)
         if refusal is not None:
+            stamps.page_blocked = True
             return json.dumps(refusal)
         register_vault_redaction_value(code)
         fills = build_otp_fills(otp_controls, code)
@@ -653,7 +699,9 @@ def _enter_code_on_page(effective_task_id: str, nonce: str, origin: str, backend
             if result.get("sent") is False:  # never reached the page: its own refusal
                 return json.dumps({"success": False, **({"error_type": result["error_type"]} if result.get("error_type") else {}),
                                    "error": str(result.get("error") or "fill failed")[:200]})
+            stamps.page_blocked = True  # the cleanup is still sent, with the short wait
             return json.dumps(_after_send(effective_task_id, result))
+        stamps.removed_by_fill_script = True  # the script ran to completion, including its finally
         parsed = _parse_json_result(result.get("result"))
         if isinstance(parsed, str):
             parsed = _parse_json_result(parsed)
@@ -872,15 +920,13 @@ def _inspection_stamps(task_id: str, nonce: str, stamps: _InspectionStamps):
     unless the fill script already did. The cleanup runs in the command's isolated world, where the
     inspection's registry lives."""
     from agent.vault_login_classifier import build_clear_stamps_js
-    from tools.browser_supervisor_worlds import CONTEXT_GONE_TEXT
 
     try:
         yield stamps
     finally:
         if not stamps.removed_by_fill_script:
             res = _eval_js(task_id, build_clear_stamps_js(nonce), timeout=_PAGE_CLOCK_WAIT_S if stamps.page_blocked else None)
-            stamps.new_document = (_WORLD.get() is not None and not res.get("success")
-                                   and CONTEXT_GONE_TEXT in str(res.get("error") or ""))
+            stamps.new_document = _world_gone(res)
 
 
 def _inspect_fill_targets(task_id: str, nonce: str, meta: Any, require_empty: bool,
@@ -975,15 +1021,16 @@ def _role_words(role: Any) -> str:
     return "another field"
 
 
-def _written_clause(parsed: dict[str, Any]) -> str:
-    """What the fill script says it wrote and left written (roles, never values)."""
+def _written_clause(parsed: dict[str, Any], *, before: bool = True) -> str:
+    """What the fill script says it wrote and left written (roles, never values); ``before``: said of a refusal
+    that came after those writes."""
     count, roles = parsed.get("written"), parsed.get("roles")
     if count == 0:
         return "Nothing was written."
     if isinstance(count, int) and not isinstance(count, bool) and count > 0 and isinstance(roles, list):
         names = ", ".join(_role_words(r) for r in roles)
-        return (f"{count} field{' was' if count == 1 else 's were'} written (or a write was attempted) before this "
-                f"and {'was' if count == 1 else 'were'} not cleared: {names}.")
+        return (f"{count} field{' was' if count == 1 else 's were'} written (or a write was attempted)"
+                f"{' before this' if before else ''} and {'was' if count == 1 else 'were'} not cleared: {names}.")
     return "Whether anything was written is not established."
 
 
@@ -1087,6 +1134,13 @@ def _fill_outcome(parsed: Any, backend: Any, meta: Any, page_origin: str, fills:
     elif filled:
         out["error_type"] = "partial_fill"
         out["error"] = _partial(filled, written, len(fills), "targeted fields")
+    elif written is not None and written > 0:  # FC-1: written (or attempted), but nothing held a value
+        out["error"] = (f"{_written_clause(parsed, before=False)} None of the targeted fields held a value after the page's own "
+                        "events (the page emptied or changed it); nothing is filled. Do not submit this form.")
+    elif written == 0:
+        out["error"] = "No targeted field was written."
+    else:
+        out["error"] = "No targeted field holds a value; whether anything was written is not established."
     if meta.kind != "login":
         out["fields"] = sorted(f["token"] for f in fills)  # which controls were targeted, never the values
     return json.dumps(out)

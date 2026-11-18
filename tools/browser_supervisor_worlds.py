@@ -15,7 +15,7 @@ from typing import Any, Callable, Optional
 # Names of the worlds the vault creates; only their unique context ids are recorded.
 VAULT_WORLD_PREFIX = "hermes-vault:"
 
-# The CDP error text for an evaluation whose execution context no longer exists (the script never started).
+# The CDP error message for an evaluation whose execution context no longer exists (the script never started).
 CONTEXT_GONE_TEXT = "Cannot find context with specified id"
 
 
@@ -27,7 +27,7 @@ class WorldTrackingMixin:
         """Create world ``name`` in the main frame of ``session_id``. ``grantUniveralAccess`` is left unset.
         Returns ``{"session_id", "context_id", "unique_id"}``; ``unique_id`` is the context's ``uniqueId``
         from ``Runtime.executionContextCreated`` (never reused across processes) when the event arrived
-        before the reply, else None."""
+        before the reply, else None (the caller then refuses the world)."""
         tree = await self._cdp("Page.getFrameTree", session_id=session_id, timeout=timeout)
         frame_id = tree["result"]["frameTree"]["frame"]["id"]
         made = await self._cdp("Page.createIsolatedWorld", {"frameId": frame_id, "worldName": name},
@@ -55,9 +55,21 @@ class WorldTrackingMixin:
     }
 
 
+# The CDP protocol errors (code, message) of an evaluation addressed by uniqueContextId whose world no longer
+# exists. Measured in Chromium 157: the expression never runs, in the old document or the new one. Matched on
+# the protocol error object, never on text (an exception description is page-reachable text).
+WORLD_GONE_ERRORS = frozenset({(-32000, CONTEXT_GONE_TEXT), (-32602, "uniqueContextId not found")})
+
+
+def world_gone(result: dict[str, Any]) -> bool:
+    """True when ``result`` (a supervisor evaluation result) is one of WORLD_GONE_ERRORS for an evaluation
+    addressed by uniqueContextId."""
+    error = result.get("protocol_error")
+    return (result.get("addressed") == "uniqueContextId" and isinstance(error, dict)
+            and (error.get("code"), error.get("message")) in WORLD_GONE_ERRORS)
+
+
 def world_params(world: dict[str, Any]) -> dict[str, Any]:
-    """The ``Runtime.evaluate`` parameter that targets ``world``: its unique context id when known (one
-    context, never another process's), else its context id."""
-    if world.get("unique_id"):
-        return {"uniqueContextId": world["unique_id"]}
-    return {"contextId": world["context_id"]}
+    """The ``Runtime.evaluate`` parameter that targets ``world``: its unique context id, never the numeric
+    context id (measured: an old number, once reused, runs in the new document)."""
+    return {"uniqueContextId": world["unique_id"]}

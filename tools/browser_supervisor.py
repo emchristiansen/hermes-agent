@@ -87,8 +87,21 @@ def _unsent(error: str) -> dict[str, Any]:
     return {**_fail(error), "sent": False}
 
 
+class CDPProtocolError(RuntimeError):
+    """A CDP reply carrying an ``error`` object; ``code`` and ``message`` are that object's own fields (the
+    browser's, never page text)."""
+
+    def __init__(self, call_id: Any, error: Any) -> None:
+        super().__init__(f"CDP error on id={call_id}: {error}")
+        fields = error if isinstance(error, dict) else {}
+        self.code = fields.get("code")
+        self.message = fields.get("message")
+
+
 def _err(exc: BaseException) -> dict[str, Any]:
     out = _fail(f"{type(exc).__name__}: {exc}")
+    if isinstance(exc, CDPProtocolError):  # typed: callers match the protocol error, never the text
+        out["protocol_error"] = {"code": exc.code, "message": exc.message}
     if isinstance(exc, TimeoutError):  # typed: the page did not answer in time (asyncio/futures timeouts alias it)
         out["timed_out"] = True
     return out
@@ -272,6 +285,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, WorldTrackingMix
             active, session_id = self._active, self._page_session_id
         if world is not None:
             session_id = world.get("session_id")
+            if not world.get("unique_id"):  # never a numeric context id: a reused number reaches the new document
+                return _unsent("isolated world has no uniqueContextId")
         if not active:
             return _unsent("supervisor is not active")
         if not session_id:
@@ -285,6 +300,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, WorldTrackingMix
             coro = self._cdp("Runtime.evaluate", params, session_id=session_id, timeout=timeout)
             return _schedule(coro, loop, timeout=timeout + 1)
 
+        addressed = {"addressed": "uniqueContextId"} if world is not None else {}
         try:
             response = _run_eval(return_by_value)
         except (_LoopUnavailable, _NotConnected) as exc:
@@ -294,11 +310,11 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, WorldTrackingMix
             # CDP's recursion guard (``Object reference chain is too long``).
             # Retry once with returnByValue=False so Chrome returns the description.
             if not (return_by_value and "reference chain is too long" in str(exc).lower()):
-                return _err(exc)
+                return {**_err(exc), **addressed}
             try:
                 response = _run_eval(False)
             except Exception as exc2:
-                return _err(exc2)
+                return {**_err(exc2), **addressed}
 
         # Response: {"result": {"result": {"type", "value", ...}, "exceptionDetails"?}}
         result_payload = response.get("result", {}) if isinstance(response, dict) else {}
@@ -330,10 +346,14 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, WorldTrackingMix
             session_id = self._page_session_id
         if not session_id:
             return _fail("supervisor has no attached page session")
+        from websockets.exceptions import ConnectionClosed  # deferred like the websockets import in _run
+
         try:
             world = _schedule(self._create_world(session_id, name, timeout=timeout), loop, timeout=timeout * 2 + 1)
-        except (RuntimeError, OSError, TimeoutError, KeyError, TypeError) as exc:  # CDP error, socket, no reply, odd reply
-            return _err(exc)
+        except (RuntimeError, OSError, TimeoutError, KeyError, TypeError, ConnectionClosed) as exc:
+            return _err(exc)  # CDP error, socket error, no reply, malformed reply, socket closed at the send
+        if not world.get("unique_id"):  # FC-4: a numeric context id alone is never used
+            return {**_fail("the browser did not report the isolated world's unique context id"), "no_unique_id": True}
         return {"ok": True, "world": world}
 
     def set_driven_target(self, target_id: Optional[str]) -> None:
@@ -600,7 +620,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, WorldTrackingMix
                     if fut is None or fut.done():
                         continue
                     if "error" in msg:
-                        fut.set_exception(RuntimeError(f"CDP error on id={msg['id']}: {msg['error']}"))
+                        fut.set_exception(CDPProtocolError(msg["id"], msg["error"]))
                     else:
                         fut.set_result(msg)
                 elif handler := self._EVENT_HANDLERS.get(msg.get("method")):
