@@ -1,5 +1,6 @@
 """The vault fill and enter_code in the command's CDP isolated world, against a real headless Chrome
-(opt-in like ``tests/tools/test_browser_vault_fill_integrity.py``, whose fixtures and helpers these use):
+(opt-in like ``tests/tools/test_browser_vault_fill_integrity.py``, whose helpers these use; its fixtures come
+through this package's conftest):
 registry isolation, page tampering, navigation before and while the script runs, and enter_code's exits."""
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ from unittest.mock import patch
 import pytest
 
 from agent.vault_login_classifier import build_clear_stamps_js, build_fill_js, build_inspection_js
-from tests.tools.test_browser_vault_fill_integrity import (  # browser, store: fixtures
+from tests.tools.test_browser_vault_fill_integrity import (
     _GONE_CROSS_SITE,
     _GONE_SAME_SITE,
     _REGISTRIES,
@@ -26,8 +27,6 @@ from tests.tools.test_browser_vault_fill_integrity import (  # browser, store: f
     _navigate,
     _registries,
     _state,
-    browser,
-    store,
 )
 from tools.browser_vault_tool import _fill_outcome
 
