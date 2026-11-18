@@ -1129,6 +1129,7 @@ export interface ConnectionOperationTarget {
   missing_env?: string[] | null
   server_errors?: CatalogServerError[] | null
   already_installed?: boolean | null
+  upstream_repo?: string | null
 }
 export type ConnectionTargetKind = 'connector' | 'mcp' | 'plugin' | 'skill'
 export type ConnectionTargetAction = 'authorize' | 'connect' | 'enable' | 'install' | 'reconnect'
@@ -2310,7 +2311,7 @@ export interface OnboardingSetRunParams {
   run: boolean
   mark_profile_offered?: boolean
 }
-/** ``rerun``: start a new onboarding chat even when one is in progress (Settings, Run onboarding again; it never claims the welcome trial). ``fresh_launch``: the app's once-per-launch start; a run the app was closed on does not count, so its chat is deleted and the run starts over. ``facts_source``: whether the backend runs on the user's own computer. ``locale``: the desktop's UI language, preferred over the backend OS locale. ``assume_fresh``: as on ``onboarding.state``. A new run on a first install claims the welcome trial before its chat exists; a failed claim is error 5079 and leaves no guest and no chat. A claim that is blocked (another install took the trial) with no trial or provider to run on is error 5080 and opens no chat. */
+/** ``rerun``: start a new onboarding chat even when one is in progress (Settings, Run onboarding again; it never claims the welcome trial). ``fresh_launch``: the app's once-per-launch start; a run the app was closed on does not count, so it ends as ``replaced`` (its chat stays in the history) and the run starts over in a new chat. ``facts_source``: whether the backend runs on the user's own computer. ``locale``: the desktop's UI language, preferred over the backend OS locale. ``assume_fresh``: as on ``onboarding.state``. A new run on a first install claims the welcome trial before its chat exists; a failed claim is error 5079 and leaves no guest and no chat. A claim that is blocked (another install took the trial) with no trial or provider to run on is error 5080 and opens no chat. */
 export interface OnboardingStartParams {
   rerun?: boolean
   fresh_launch?: boolean
@@ -3629,6 +3630,7 @@ export interface SessionUsageResult {
   plan_gauge?: PlanGauge | null
   credits_lines?: string[] | null
   credits_usage_window?: boolean | null
+  nous_route?: boolean | null
   [key: string]: unknown
 }
 export interface SessionContextBreakdownParams {
@@ -3646,6 +3648,7 @@ export interface SessionContextBreakdownResult {
   context_source: string
   model: string
   context_files?: ContextFileSource[]
+  prompt_cache?: PromptCacheWindow | null
 }
 export interface ContextCategory {
   color: string
@@ -3661,6 +3664,16 @@ export interface ContextFileSource {
   est_tokens: number
   loaded: boolean
   status: string
+}
+/** ``agent.prompt_cache_clock.cache_window``: until when the session's cached prompt prefix is warm. ``guaranteed_until``: the whole prefix is warm before it (a documented minimum or a proven tier); ``estimated_until``: certainly gone after it; between the two it may still be warm. ``coverage`` maps each cached tier to its deadline. ``confidence`` is ``proven`` | ``declared`` | ``assumed`` | ``unknown``; times are epoch seconds. */
+export interface PromptCacheWindow {
+  guaranteed_until: number | null
+  estimated_until: number | null
+  tier: string | null
+  confidence: string
+  reason: string
+  refreshed_at?: number | null
+  coverage?: Record<string, number>
 }
 export interface SessionCompressParams {
   session_id: string
@@ -4089,7 +4102,7 @@ export interface CronManageResult {
   removed_job?: CronRemovedJob | null
   [key: string]: unknown
 }
-/** ``tools/cronjob_job_args.py::_format_job``. */
+/** ``cron/job_args.py::_format_job``. */
 export interface CronJobRow {
   job_id: string
   name?: string
@@ -4922,6 +4935,36 @@ export interface SessionStats {
   fallback_model?: string | null
   plan_gauge?: PlanGauge | null
 }
+export interface SessionAccountUsageParams {
+  session_id: string
+}
+/** ``gateway/session_usage.py::account_usage``: the account blocks of ``/usage``. ``lines``: the route's provider plan limits. ``nous_lines``: the Nous balance whenever Nous is signed in on the profile, after them (headed as a separate account off a Nous route). ``nous_route``: the route is Nous inference, so the ``/topup`` CTA applies. ``nous_usage``: on a Nous route, the same account read's dollar model, so the CLI draws its two bars without reading the account again. */
+export interface SessionAccountUsage {
+  lines: string[]
+  nous_lines?: string[]
+  nous_route: boolean
+  nous_usage?: NousUsageDollars | null
+}
+/** ``agent.billing_usage.UsageModel`` in numbers: the classic CLI's two-bar Nous balance block. */
+export interface NousUsageDollars {
+  available: boolean
+  status?: string
+  plan_name?: string | null
+  renews_at?: string | null
+  renews_display?: string | null
+  subscription_remaining_usd?: number | null
+  topup_remaining_usd?: number | null
+  total_spendable_usd?: number | null
+  plan_bar?: NousUsageBar | null
+  topup_bar?: NousUsageBar | null
+}
+/** ``agent.billing_usage.UsageBar``: one dollar bar (``topup`` has no cap, so total == remaining). */
+export interface NousUsageBar {
+  kind: 'plan' | 'topup'
+  remaining_usd: number
+  total_usd: number
+  spent_usd?: number
+}
 export interface RollbackSessionDiffParams {
   session_id: string
   profile?: string | null
@@ -5044,6 +5087,25 @@ export interface KanbanRunResult {
   session_id: string
   receipt: AdmissionStatus
 }
+export interface SessionKanbanRunParams {
+  profile?: string | null
+  board: string
+  task_id: string
+  run_id: number
+}
+export interface SessionKanbanRunResult {
+  board: string
+  task_id: string
+  run_id: number
+  session_id: string
+  execution_generation: number
+  owner: SessionKanbanRunOwner
+}
+export interface SessionKanbanRunOwner {
+  profile_id: string
+  instance_id: string
+  epoch: number
+}
 export interface A2aForwardParams {
   agent: string
   tenant: string
@@ -5146,6 +5208,7 @@ export interface CanonicalCreateParams {
   reasoning?: string | null
   max_turns?: number | string | null
   ignore_rules?: boolean
+  skip_memory?: boolean
   yolo?: boolean
   safe_mode?: boolean
   ignore_user_config?: boolean
@@ -5333,6 +5396,8 @@ export interface CanonicalCorrectionAck {
   execution_generation: number
   authority_epoch: number
   delivered?: false | null
+  admission_id?: string | null
+  kept?: 'task_comment' | null
 }
 /** A bare stop phrase typed while the session's voice chat is on: the chat ended, nothing was admitted (TUI-26). */
 export interface CanonicalVoiceStopped {
@@ -6219,7 +6284,7 @@ export interface PreviewOpenPayload {
   url: string
   label?: string
 }
-/** ``tools/preview_tool.py`` / ``tools/close_preview_tool.py``; ``url`` '' closes every tab. */
+/** ``tools/preview_tool.py``; ``url`` '' closes every tab. */
 export interface PreviewClosePayload {
   url?: string
 }
@@ -7155,6 +7220,8 @@ export interface CanonicalRpcMethods {
   'rollback.session_diff': { params: RollbackSessionDiffParams; result: RollbackSessionDiffResult }
   /** Owner identity and the canonical capabilities a client may rely on. */
   'runtime.describe': { params: RuntimeDescribeParams; result: RuntimeDescribeResult }
+  /** The /usage account blocks for this session's route: provider plan limits, then the Nous balance. */
+  'session.account_usage': { params: SessionAccountUsageParams; result: SessionAccountUsage }
   /** The classic CLI's /goal, /subgoal, /loop, /heartbeat manager calls (state writes, the goal judge, quality gates), run by the owner on the session's row. */
   'session.automation': { params: SessionAutomationParams; result: SessionAutomationResult }
   'session.create': { params: CanonicalCreateParams; result: CanonicalSnapshot }
@@ -7166,6 +7233,8 @@ export interface CanonicalRpcMethods {
   /** Frozen launch policy projection of one local session. */
   'session.info': { params: CanonicalSessionInfoParams; result: CanonicalSessionInfo }
   'session.interrupt': { params: CanonicalControlParams; result: CanonicalSessionHandle }
+  /** Read-only: the live finite session and execution generation of one card's CURRENT run (``stale_kanban_claim`` for an ended, replaced or unclaimed run); carry both into ``session.steer`` / ``session.redirect``. */
+  'session.kanban_run': { params: SessionKanbanRunParams; result: SessionKanbanRunResult }
   'session.list': { params: CanonicalListParams; result: CanonicalListResult }
   /** Revision-fenced, retry-idempotent session edit (rename, archive, sidebar, branch, delete, rewind, reset, model, reasoning, workspace, edit_policy, compress, import). */
   'session.mutate': { params: SessionMutateParams; result: SessionMutateResult }
@@ -7223,6 +7292,7 @@ export const CANONICAL_RPC_METHODS = [
   'prompt.submit',
   'rollback.session_diff',
   'runtime.describe',
+  'session.account_usage',
   'session.automation',
   'session.create',
   'session.detach',
@@ -7230,6 +7300,7 @@ export const CANONICAL_RPC_METHODS = [
   'session.export',
   'session.info',
   'session.interrupt',
+  'session.kanban_run',
   'session.list',
   'session.mutate',
   'session.prune',

@@ -27,7 +27,7 @@ def test_gateway_housekeeping_drains_cron_delivery_with_live_adapters(monkeypatc
     monkeypatch.setattr(
         scheduler,
         "drain_delivery_queue",
-        lambda live_adapters, live_loop: calls.append((live_adapters, live_loop)),
+        lambda live_adapters, live_loop, *, wait=True: calls.append((live_adapters, live_loop, wait)),
         raising=False,
     )
 
@@ -35,7 +35,7 @@ def test_gateway_housekeeping_drains_cron_delivery_with_live_adapters(monkeypatc
         _OneTickStopEvent(), adapters=adapters, loop=loop, interval=0
     )
 
-    assert calls == [(adapters, loop)]
+    assert calls == [(adapters, loop, False)]
 
 
 def test_gateway_housekeeping_drains_cron_delivery_without_connected_adapters(monkeypatch):
@@ -45,7 +45,7 @@ def test_gateway_housekeeping_drains_cron_delivery_without_connected_adapters(mo
     monkeypatch.setattr(
         scheduler,
         "drain_delivery_queue",
-        lambda live_adapters, live_loop: calls.append((live_adapters, live_loop)),
+        lambda live_adapters, live_loop, *, wait=True: calls.append((live_adapters, live_loop, wait)),
         raising=False,
     )
 
@@ -53,7 +53,7 @@ def test_gateway_housekeeping_drains_cron_delivery_without_connected_adapters(mo
         _OneTickStopEvent(), adapters=adapters, loop=loop, interval=0
     )
 
-    assert calls == [(adapters, loop)]
+    assert calls == [(adapters, loop, False)]
 
 
 def test_multiplex_housekeeping_scopes_primary_and_drains_each_profile(
@@ -92,7 +92,7 @@ def test_multiplex_housekeeping_scopes_primary_and_drains_each_profile(
     monkeypatch.setattr(
         scheduler,
         "drain_delivery_queue",
-        lambda adapters, loop: calls.append(("drain", adapters)),
+        lambda adapters, loop, *, wait=True: calls.append(("drain", adapters, wait)),
     )
 
     gateway_run._start_gateway_housekeeping(
@@ -105,9 +105,9 @@ def test_multiplex_housekeeping_scopes_primary_and_drains_each_profile(
 
     assert calls == [
         ("scope", root_home),
-        ("drain", root_adapters),
+        ("drain", root_adapters, False),
         ("scope", secondary_home),
-        ("drain", secondary_adapters),
+        ("drain", secondary_adapters, False),
     ]
 
 
@@ -143,7 +143,7 @@ def test_multiplex_housekeeping_uses_primary_routes_for_credentialless_satellite
     monkeypatch.setattr(
         scheduler,
         "drain_delivery_queue",
-        lambda adapters, _loop: calls.append(("drain", adapters)),
+        lambda adapters, _loop, *, wait=True: calls.append(("drain", adapters, wait)),
     )
 
     gateway_run._drain_restart_safe_cron_deliveries(
@@ -151,9 +151,9 @@ def test_multiplex_housekeeping_uses_primary_routes_for_credentialless_satellite
     )
 
     assert calls == [
-        ("drain", root_adapters),
+        ("drain", root_adapters, False),
         ("routed", root_adapters),
-        ("drain", routed),
+        ("drain", routed, False),
     ]
 
 
@@ -212,9 +212,19 @@ def test_primary_drain_delivers_credentialless_satellite_queue_row_through_prima
     runner = SimpleNamespace(config=SimpleNamespace(multiplex_profiles=True), _profile_adapters={"satellite": {}})
     monkeypatch.setattr(gateway_run, "_handoff_watch_scopes", lambda _r: [("satellite", satellite_home)])
     try:
-        with patch("tools.send_message_tool._send_to_platform", _standalone), \
+        with patch("gateway.outbound.send._send_to_platform", _standalone), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}):
             gateway_run._drain_restart_safe_cron_deliveries({Platform.DISCORD: PrimaryDiscord()}, loop, runner)
+
+            # The housekeeping drain does not wait for its sends (MR-DISPATCH-06): wait for this row's outcome.
+            def satellite_status():
+                token = set_hermes_home_override(str(satellite_home))
+                try:
+                    return delivery_queue.get_status("exec-1")["status"]
+                finally:
+                    reset_hermes_home_override(token)
+            from tests.waiting import wait_until
+            wait_until(lambda: satellite_status() != "delivering", timeout=30, what="the satellite row's outcome")
     finally:
         loop.call_soon_threadsafe(loop.stop)
 
@@ -239,7 +249,7 @@ def test_a_queued_worker_delivery_is_drained_before_the_next_housekeeping_tick(t
     drained = threading.Event()
     drains = []
 
-    def record_drain(live_adapters, live_loop):
+    def record_drain(live_adapters, live_loop, *, wait=True):
         drains.append(time.monotonic())
         drained.set()
 

@@ -40,6 +40,10 @@ from agent.vault_store import (
     scrub_secret_from_text,
 )
 
+# The page-clock read the fill sends just before a secret-bearing script (tools.browser_vault_tool._page_clock).
+_PAGE_CLOCK = json.dumps({"timeOrigin": 1.0, "now": 0.0})
+
+
 
 @pytest.fixture()
 def store(tmp_path):
@@ -206,7 +210,8 @@ class TestClassifier:
     def test_select_password_fill_picks_best_password(self):
         user = ClassifiedLoginControl(_ctrl(index=0, form_index=0, autocomplete="username"), 100, "username")
         pw_heur = ClassifiedLoginControl(_ctrl(index=1, form_index=0, type="password"), 90, "current-password")
-        pw_exact = ClassifiedLoginControl(_ctrl(index=3, form_index=0, autocomplete="current-password"), 100, "current-password")
+        pw_exact = ClassifiedLoginControl(_ctrl(index=3, form_index=0, autocomplete="current-password", type="password"),
+                                          100, "current-password")
         fills = select_password_fill([user, pw_heur, pw_exact], "p")
         # Password only — the identifier field is never filled by the vault.
         assert [(f["index"], f["token"]) for f in fills] == [(3, "current-password")]
@@ -336,12 +341,14 @@ class TestBrowserVaultTools:
         ]
         secret_exprs = []
 
-        def fake_eval(task_id, expression):
+        def fake_eval(task_id, expression, **_):
+            if "performance.timeOrigin" in expression:
+                return {"success": True, "result": _PAGE_CLOCK}
             return {"success": True, "result": json.dumps(controls)}
 
         def fake_eval_secret(task_id, expression):
             secret_exprs.append(expression)
-            return {"success": True, "result": json.dumps({"filled": 1})}
+            return {"success": True, "result": json.dumps({"filled": 1, "written": 1, "roles": ["current-password"]})}
 
         with patch("agent.vault_backends.backend_for_handle", return_value=_ManagerBackend()), \
              patch.object(browser_vault_tool, "_current_page_origin", return_value="https://www.amazon.co.uk"), \
@@ -398,7 +405,9 @@ class TestBrowserVaultTools:
             {"autocomplete": "current-password", "formIndex": 0, "index": 1, "label": "", "name": "pw", "type": "password"},
         ]
 
-        def fake_eval(task_id, expression):
+        def fake_eval(task_id, expression, **_):
+            if "performance.timeOrigin" in expression:
+                return {"success": True, "result": _PAGE_CLOCK}
             if "location.href" in expression:
                 return {"success": True, "result": "https://example.com/login"}
             return {"success": True, "result": json.dumps(controls)}
@@ -407,7 +416,7 @@ class TestBrowserVaultTools:
 
         def fake_eval_secret(task_id, expression):
             secret_exprs.append(expression)
-            return {"success": True, "result": json.dumps({"filled": 1})}
+            return {"success": True, "result": json.dumps({"filled": 1, "written": 1, "roles": ["current-password"]})}
 
         with patch("agent.vault_store.get_vault_store", return_value=store), \
              patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
@@ -442,7 +451,9 @@ class TestBrowserVaultTools:
             {"autocomplete": "current-password", "formIndex": 0, "index": 0, "label": "", "name": "pw", "type": "password"},
         ]
 
-        def fake_eval(task_id, expression):
+        def fake_eval(task_id, expression, **_):
+            if "performance.timeOrigin" in expression:
+                return {"success": True, "result": _PAGE_CLOCK}
             if "location.href" in expression:
                 # Pre-check sees the allowed origin.
                 return {"success": True, "result": "https://example.com/login"}
@@ -480,7 +491,9 @@ class TestBrowserVaultTools:
             {"autocomplete": "current-password", "formIndex": 0, "index": 0, "label": "", "name": "pw", "type": "password"},
         ]
 
-        def fake_eval(task_id, expression):
+        def fake_eval(task_id, expression, **_):
+            if "performance.timeOrigin" in expression:
+                return {"success": True, "result": _PAGE_CLOCK}
             if "location.href" in expression:
                 return {"success": True, "result": "https://example.com/login"}
             return {"success": True, "result": json.dumps(controls)}
@@ -515,13 +528,15 @@ class TestBrowserVaultTools:
             {"autocomplete": "current-password", "formIndex": 0, "index": 0, "label": "", "name": "pw", "type": "password"},
         ]
 
-        def fake_eval(task_id, expression):
+        def fake_eval(task_id, expression, **_):
+            if "performance.timeOrigin" in expression:
+                return {"success": True, "result": _PAGE_CLOCK}
             if "location.href" in expression:
                 return {"success": True, "result": "https://example.com/login"}
             return {"success": True, "result": json.dumps(controls)}
 
         def fake_eval_secret(task_id, expression):
-            return {"success": True, "result": json.dumps({"filled": 1})}
+            return {"success": True, "result": json.dumps({"filled": 1, "written": 1, "roles": ["current-password"]})}
 
         try:
             with patch("agent.vault_store.get_vault_store", return_value=store), \
@@ -561,7 +576,9 @@ class TestBrowserVaultTools:
             {"autocomplete": "email", "index": 3, "type": "email"},
         ]
 
-        def fake_eval(task_id, expression):
+        def fake_eval(task_id, expression, **_):
+            if "performance.timeOrigin" in expression:
+                return {"success": True, "result": _PAGE_CLOCK}
             if "location.href" in expression:
                 return {"success": True, "result": "https://shop.test/checkout"}
             return {"success": True, "result": json.dumps(controls)}
@@ -570,7 +587,7 @@ class TestBrowserVaultTools:
 
         def fake_eval_secret(task_id, expression):
             secret_exprs.append(expression)
-            return {"success": True, "result": json.dumps({"filled": 3})}
+            return {"success": True, "result": json.dumps({"filled": 3, "written": 3, "roles": ["cc-number", "cc-exp", "cc-csc"]})}
 
         try:
             with patch("agent.vault_store.get_vault_store", return_value=store), \
@@ -760,12 +777,14 @@ class TestTwoFactor:
         controls = [{"index": 0, "type": "text", "name": "otp", "label": "Authentication code", "autocomplete": "one-time-code"}]
         seen = {}
 
-        def fake_eval(task_id, expr):
+        def fake_eval(task_id, expr, **_):
+            if "performance.timeOrigin" in expr:
+                return {"success": True, "result": _PAGE_CLOCK}
             return {"success": True, "result": json.dumps(controls) if "querySelectorAll" in expr else "https://github.com/sessions/two-factor"}
 
         def fake_secret(task_id, expr):
             seen["expr"] = expr
-            return {"success": True, "result": json.dumps({"filled": 1})}
+            return {"success": True, "result": json.dumps({"filled": 1, "written": 1, "roles": ["current-password"]})}
 
         with patch("agent.vault_store.get_vault_store", return_value=store), \
              patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
@@ -786,11 +805,11 @@ class TestTwoFactor:
         boxes = [{"index": i, "type": "tel", "name": f"digit{i}", "label": "", "autocomplete": "one-time-code",
                   "formIndex": 0, "maxLength": 1} for i in range(6)]
         seen = {}
-        fake_eval = lambda t, e: {"success": True, "result": json.dumps(boxes) if "querySelectorAll" in e else "https://acme.test/2fa"}
+        fake_eval = lambda t, e, **_: {"success": True, "result": _PAGE_CLOCK if "performance.timeOrigin" in e else json.dumps(boxes) if "querySelectorAll" in e else "https://acme.test/2fa"}
 
         def fake_secret(t, e):
             seen["expr"] = e
-            return {"success": True, "result": json.dumps({"filled": 6})}
+            return {"success": True, "result": json.dumps({"filled": 6, "written": 6, "roles": ["one-time-code"] * 6})}
 
         with patch("agent.vault_backends.unlock.can_prompt_here", return_value=True), \
              patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
@@ -825,7 +844,7 @@ class TestTwoFactor:
     def test_no_code_field_points_at_passkey_or_device_approval(self):
         from tools import browser_vault_tool
 
-        fake_eval = lambda t, e: {"success": True, "result": json.dumps([{"index": 0, "type": "text", "name": "q", "label": "Search", "autocomplete": ""}]) if "querySelectorAll" in e else "https://acme.test/approve"}
+        fake_eval = lambda t, e, **_: {"success": True, "result": _PAGE_CLOCK if "performance.timeOrigin" in e else json.dumps([{"index": 0, "type": "text", "name": "q", "label": "Search", "autocomplete": ""}]) if "querySelectorAll" in e else "https://acme.test/approve"}
         with patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
              patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval):
             out = json.loads(browser_vault_tool.browser_vault_enter_code(task_id="t"))

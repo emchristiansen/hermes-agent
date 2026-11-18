@@ -246,7 +246,12 @@ class GatewayClient:
                 # The frame may have left before the socket died: the same unknown outcome as a lost answer.
                 raise GatewayClientError(DISCONNECTED) from exc
             budget = DEFAULT_RPC_TIMEOUT if _timeout is None else _timeout
-            return await asyncio.wait_for(future, None if budget == float("inf") else budget)
+            try:
+                return await asyncio.wait_for(future, None if budget == float("inf") else budget)
+            except TimeoutError as exc:
+                # Unanswered, not unconnected: a bare TimeoutError reads as a failed connection
+                # (connect_gateway). The request was sent, so its outcome is unknown.
+                raise GatewayClientError(f"Gateway did not answer {method} within {budget:g} s") from exc
         finally:
             self.pending.pop(rid, None)
             if future.done() and not future.cancelled():
@@ -327,16 +332,18 @@ def outside_restart_wait():
 
 
 @asynccontextmanager
-async def connect_gateway(endpoint=None, subject=None, *, max_size=8 * 1024 * 1024):
+async def connect_gateway(endpoint=None, subject=None, ready_timeout=None, *, max_size=8 * 1024 * 1024):
     """Attach to this home's owner. ``endpoint``: an already-discovered ready owner to dial as-is
     (maintenance that must never start a gateway); default ensures one, starting it if needed.
     ``subject``: mint the ticket for this principal (the caller's authenticated dashboard user)
     rather than the socket identity; only a peer the owner already trusts may name one.
+    ``ready_timeout``: seconds the owner ensure may take (default: its own deadline).
     ``max_size``: the largest frame accepted; a ``session.resume`` answer carries the whole history.
     Inside ``outside_restart_wait()`` an owner in a restart's after-turn wait is refused as
     ``draining`` (``restart_wait``) instead of attached, and the ticket carries that policy so the
     owner also refuses the socket when the wait opens between discovery and the dial."""
     from websockets.asyncio.client import connect
+    from websockets.exceptions import InvalidMessage
     from hermes_constants import get_hermes_home
     from hermes_cli.gateway_runtime import attachable, ensure_gateway_runtime, gateway_profile_home
     from hermes_cli.gateway_runtime_discovery import DiscoveryError
@@ -358,7 +365,10 @@ async def connect_gateway(endpoint=None, subject=None, *, max_size=8 * 1024 * 10
         home = gateway_profile_home(get_hermes_home())
         # A client's own start: the daemon it may launch ends itself once idle (no client, adapter,
         # cron/kanban work or admission), and the next client starts a fresh one.
-        result = await asyncio.to_thread(ensure_gateway_runtime, home, idle_exit=True)
+        # ``ready_timeout`` bounds the ensure, which runs on in its thread even once this await is
+        # cancelled (and the process cannot exit before it ends); default: its own deadline.
+        bound = {} if ready_timeout is None else {"timeout": ready_timeout}
+        result = await asyncio.to_thread(ensure_gateway_runtime, home, idle_exit=True, **bound)
         if not attachable(result) or (_REFUSE_RESTART_WAIT.get() and result.state != "ready"):
             detail = getattr(result, "detail", None)
             if result.reason_code == "runtime_exited" and detail:
@@ -376,18 +386,31 @@ async def connect_gateway(endpoint=None, subject=None, *, max_size=8 * 1024 * 10
             detail = exc.bounded_detail(500)
             raise GatewayUnavailableError(f"Gateway inaccessible: {exc.reason}" + (f" ({detail})" if detail else ""),
                                           "inaccessible", exc.reason) from exc
+        except TimeoutError as exc:
+            # The owner's control socket took the request but answered nothing within the mint's bound:
+            # the verdict the ensure gives a control timeout (``starting``/deadline), not a refusal.
+            # Nothing was submitted, so a caller may wait for the owner (``kanban_worker_client``).
+            raise GatewayUnavailableError("Gateway starting: control_timeout (session ticket unanswered)",
+                                          "starting", "control_timeout") from exc
         url, protocols = gateway_ws_target(endpoint, ticket)
     try:
         # The gateway is a loopback (or explicitly named) peer, never something to route through the
         # user's HTTP(S) proxy; websockets>=14 reads HTTP_PROXY/HTTPS_PROXY by default and a proxy that
         # cannot reach 127.0.0.1 turns every launch into a 10 s open timeout.
+        # No keepalive to a loopback owner, as its listener sends none (build_listener_server): the
+        # owner answers pongs on its event loop, so a GIL-starved loop would miss the 20 s pong
+        # deadline and the healthy socket would be dropped. A dead loopback owner closes the socket.
+        from hermes_cli.web_server_boundary import _LOOPBACK_HOST_VALUES
+        keepalive = {"ping_interval": None} if urlsplit(url).hostname in _LOOPBACK_HOST_VALUES else {}
         async with connect(url, subprotocols=protocols, open_timeout=10, max_size=max_size,
-                           proxy=None) as ws:
+                           proxy=None, **keepalive) as ws:
             if protocols and ws.subprotocol != GATEWAY_WS_PROTOCOL:
                 raise GatewayClientError("Gateway protocol mismatch; update/restart required")
             async with GatewayClient(ws) as client:
                 yield client
     except GatewayClientError:
         raise
-    except (OSError, TimeoutError) as exc:
+    except (OSError, TimeoutError, InvalidMessage) as exc:
+        # InvalidMessage: the upgrade response was cut off or garbled (a socket reset mid-handshake),
+        # a transport loss like the others; an owner's refusal (InvalidStatus) still propagates.
         raise GatewayClientError("Gateway connection failed; no local fallback") from exc

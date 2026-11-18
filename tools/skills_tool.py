@@ -137,6 +137,29 @@ def set_secret_capture_callback(callback) -> None:
 # process-global slot and over the gateway-surface "unsupported" hint, because that turn's viewer can
 # answer. A ContextVar, so tool worker threads started with ``propagate_context_to_thread`` inherit it.
 _turn_secret_capture = contextvars.ContextVar("turn_secret_capture", default=None)
+# Set while a --skip-memory session resolves skills (``agent/system_prompt._auto_load_parts``, the launch preload
+# ``gateway.session_policy.render_launch_skills``, the registered ``skill_view`` of a suppressed session): a
+# provider-namespaced skill not yet registered is reported missing, never found by loading that provider.
+memory_provider_loads_suppressed = contextvars.ContextVar("memory_provider_loads_suppressed", default=False)
+# The sessions (and task ids) that opted out with --skip-memory: a model-facing ``skill_view`` names only its
+# session/task, so the opt-out is bound to that identity, not to whichever call stack happens to hold the flag.
+_memory_suppressed_sessions: set[str] = set()
+
+
+def suppress_memory_provider_loads_for(*identities) -> None:
+    """Record that these sessions/task ids opted out with --skip-memory (idempotent; falsy ids ignored)."""
+    _memory_suppressed_sessions.update(i for i in identities if isinstance(i, str) and i)
+
+
+def allow_memory_provider_loads_for(*identities) -> None:
+    """These sessions are (again) ordinary: the policy most recently declared for an identity wins."""
+    _memory_suppressed_sessions.difference_update(i for i in identities if isinstance(i, str) and i)
+
+
+def memory_provider_loads_suppressed_for(*identities) -> bool:
+    """True while the flag is bound in this context, or when any given session/task id opted out."""
+    return memory_provider_loads_suppressed.get() or any(
+        isinstance(i, str) and i in _memory_suppressed_sessions for i in identities)
 
 
 @contextmanager
@@ -374,7 +397,7 @@ def _resolve_plugin_skill(name, file_path, task_id, preprocess):
     plugin_skill_md = pm.find_plugin_skill(name)
     # Memory providers load through plugins.memory, not the general PluginManager: load the
     # namespaced provider once so its collector can forward its skills into the registry.
-    if plugin_skill_md is None and namespace == active_memory_provider:
+    if plugin_skill_md is None and namespace == active_memory_provider and not memory_provider_loads_suppressed_for(task_id):
         try:
             from plugins.memory import load_memory_provider
             load_memory_provider(namespace)
@@ -787,7 +810,12 @@ def _skill_view_with_bump(args, **kw):
     # possibly-pruned transcript copy (#95976). No dedup in the fork; None also keeps its views
     # out of the parent's bucket.
     dedup_task_id = None if is_background_review() else task_id
-    result = skill_view(name, file_path=args.get("file_path"), task_id=task_id)
+    # A --skip-memory session's model-facing read never loads its memory provider (SKM-04).
+    token = memory_provider_loads_suppressed.set(memory_provider_loads_suppressed_for(task_id, kw.get("session_id")))
+    try:
+        result = skill_view(name, file_path=args.get("file_path"), task_id=task_id)
+    finally:
+        memory_provider_loads_suppressed.reset(token)
     with suppress(Exception):
         parsed = json.loads(result)
         if isinstance(parsed, dict) and parsed.get("success"):

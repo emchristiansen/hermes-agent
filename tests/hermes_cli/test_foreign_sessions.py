@@ -345,6 +345,26 @@ async def test_imported_chat_resumes_writable_as_cli(tmp_path, monkeypatch):
     authority.authorize(conn.actor, ref, "session:submit")
 
 
+def test_a_cli_import_keeps_its_home_guidance_boundary_beside_the_row(tmp_path, gateway):
+    """The import carries no ``origin_json`` (resume refuses a row with one), so the gateway keeps the transcript's
+    ``imported_from`` record and its last row (the home-guidance boundary) in ``state_meta`` beside the row."""
+    from agent.home_guidance import foreign_import_view
+    from hermes_state_mutation_binding import authorize_history
+    from hermes_state_portability import FOREIGN_IMPORT_META_PREFIX
+    from gateway.session_contract import SessionActor
+    f = _write_claude_fixture(tmp_path)
+    session_id = import_foreign_session("claude", f)
+    row = gateway.db.get_session(session_id)
+    assert row["origin_json"] is None and row["source"] == "cli"
+    record = json.loads(gateway.db.get_meta(FOREIGN_IMPORT_META_PREFIX + session_id))
+    assert record["tool"] == "claude" and record["path"] == str(f)
+    assert record["through_message_id"] == max(m["id"] for m in gateway.db.get_messages(session_id))
+    assert json.loads(foreign_import_view(gateway.db, row)["origin_json"]) == {"imported_from": record}
+    actor = SessionActor("owner", "p", frozenset({"session:read", "session:control", "session:create"}), "cli")
+    with gateway.db._read_ctx() as conn:  # the history authorizer still admits it (no origin_json on the row)
+        assert authorize_history(conn, actor, session_id)
+
+
 def test_leading_assistant_gets_single_stub(tmp_path):
     day = tmp_path / ".codex" / "sessions" / "2026" / "01" / "01"
     day.mkdir(parents=True)

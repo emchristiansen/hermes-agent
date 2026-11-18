@@ -48,8 +48,9 @@ class _Claim:
 
 async def run(params, board_db):
     from agent.retry_utils import jittered_backoff
-    from hermes_cli.gateway_client import connect_gateway, GatewayClientError, outside_restart_wait
-    from hermes_cli.gateway_owner_restart import restartable
+    from hermes_cli.gateway_client import (
+        connect_gateway, GatewayClientError, GatewayUnavailableError, outside_restart_wait)
+    from hermes_cli.gateway_owner_restart import _TRANSIENT_OWNER_STATES, restartable
     from websockets.exceptions import WebSocketException
     if os.environ.get('HERMES_TUI_GATEWAY_URL'):
         raise GatewayClientError('Kanban requires the assigned local profile owner')
@@ -59,6 +60,12 @@ async def run(params, board_db):
     # worker, and one that stays silent for ``OWNER_WAIT_S`` fails the worker honestly.
     claim = _Claim(answered=time.monotonic())
     failures = 0
+    # The owner incarnation live when this attempt started, for ``_owner_restart_grace``.
+    from hermes_cli.kanban_presubmit_grace import baseline
+    owner = await asyncio.to_thread(baseline)
+    # Set once ``connect_gateway`` yields a connection, the only way ``kanban.run`` can be sent. From
+    # then on the owner may hold the claim, so the pre-submission grace is never spent for it.
+    connected = False
     while True:
         seen = claim.answered
         try:
@@ -67,6 +74,7 @@ async def run(params, board_db):
             # turn it waits on alive, holding `hermes update` until restart_after_turn_timeout.
             with outside_restart_wait():
                 async with connect_gateway() as client:
+                    connected = True
                     # kanban.run subscribes this socket to the card's session, but only receipts
                     # matter here: discard the turn's events, or they fill the client's bounded
                     # queue and its reader stops, with the next receipt behind it.
@@ -81,6 +89,11 @@ async def run(params, board_db):
             if not restartable(exc):
                 raise
             if claim.silent_for() >= OWNER_WAIT_S:
+                if (not connected and isinstance(exc, GatewayUnavailableError)
+                        and exc.state in _TRANSIENT_OWNER_STATES
+                        and await asyncio.to_thread(_owner_restart_grace, owner, params, board_db)):
+                    from hermes_cli.kanban_db_retry_policy import KANBAN_OWNER_RESTART_EXIT_CODE
+                    return KANBAN_OWNER_RESTART_EXIT_CODE
                 # WebSocket errors can embed remote bodies; only our own messages are quoted.
                 status = getattr(getattr(exc, 'response', None), 'status_code', None)
                 detail = exc if isinstance(exc, GatewayClientError) else type(exc).__name__ + (
@@ -92,6 +105,22 @@ async def run(params, board_db):
         # Jittered (1-2 s first, up to 16 s): workers of one dead owner do not all redial, and so
         # start a replacement, in the same instant.
         await asyncio.sleep(jittered_backoff(failures, base_delay=1.0, max_delay=8.0, jitter_ratio=1.0))
+
+
+def _owner_restart_grace(owner, params, board_db):
+    """The owner never became ready within the wait and nothing was submitted: True when the owner
+    incarnation live at this attempt's start was replaced by another, and the card's one grace before
+    an actual admission was still unspent and is now spent on this exact run
+    (``kanban_presubmit_grace``). Otherwise False, and the wait's ordinary counted exit follows."""
+    from hermes_cli.kanban_presubmit_grace import record_grace, replacement
+    home, old = owner
+    new = replacement(old, home)
+    if new is None or not record_grace(board_db, params, old, new, home):
+        return False
+    print(f'Kanban attempt not submitted: its owner {old[0]} was replaced by {new[0]} and never became ready '
+          f'within {OWNER_WAIT_S:g} s; owner restart recorded (the card\'s one grace before an admission)',
+          file=sys.stderr)
+    return True
 
 
 async def _discard(events):
@@ -134,6 +163,10 @@ def _exit_code(receipt, params, board_db):
     # The attempt's reply ends the log, as a one-shot worker's did: crash diagnostics quote it.
     if result.get('last_output'):
         print(result['last_output'])
+    from hermes_cli.kanban_db_retry_policy import KANBAN_OWNER_RESTART_EXIT_CODE
+    if result.get('exit_code') == KANBAN_OWNER_RESTART_EXIT_CODE:
+        print(f'Kanban attempt interrupted by its owner\'s restart (admission {receipt["admission_id"]} '
+              'settled interrupted; not replayed)', file=sys.stderr)
     return result.get('exit_code', 1)
 
 

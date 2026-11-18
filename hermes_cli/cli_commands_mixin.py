@@ -34,7 +34,8 @@ from agent.turn_context import extract_api_content_sidecar
 from hermes_cli.cli_agent_setup_mixin import _gateway_open, _retire_agent
 from hermes_cli.cli_commands_session_tools import (
     CLICommandsSessionToolsMixin, _TTYBuf, _accent, _accent_line, _command_arg, _cp, _dim,
-    _dim_line, _gt, _lines, _pr, _probe, _rollback_kept, _save, _say_block, _shlex_args, _t, _tn)
+    _dim_line, _gt, _lines, _pr, _probe, _rollback_kept, _save, _say_block, _shlex_args, _summarize_paths, _t,
+    _tn)
 from hermes_cli.cli_session_switch import (
     _end_current_session, _sync_agent_to_session)
 from hermes_cli.browser_connect import (
@@ -67,12 +68,6 @@ def _take_flag(parts: list, flag: str):
     if idx + 1 >= len(parts):
         return parts, None, False
     return parts[:idx] + parts[idx + 2:], parts[idx + 1], True
-
-
-def _summarize_paths(paths, limit: int = 5) -> str:
-    """``a, b, c (+N more)`` for a list of paths."""
-    more = _t("shared.more_suffix", count=len(paths) - limit) if len(paths) > limit else ""
-    return ", ".join(paths[:limit]) + more
 
 
 def _ellipsize(text: str, limit: int) -> str:
@@ -120,7 +115,7 @@ _WORKTREE_SUBCOMMANDS = {
 
 # Message fields copied verbatim onto a /branch row (plus role / tool_name / api_content).
 _BRANCH_COPY_KEYS = ("content", "tool_calls", "tool_call_id", "reasoning", "reasoning_content", "reasoning_details",
-                     "codex_reasoning_items", "codex_message_items", "timestamp", "data_use")
+                     "codex_reasoning_items", "codex_message_items", "timestamp", "data_use", "display_kind", "display_metadata")
 
 # /hatch progress event -> catalog key (``cli.commands.hatch.*``).
 _HATCH_PROGRESS = {"compose": "hatch.progress_compose", "save": "hatch.progress_save"}
@@ -1372,10 +1367,15 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
                                                    "max_tokens")}, enabled_toolsets=self.enabled_toolsets,
                     quiet_mode=True, verbose_logging=False, session_id=task_id, platform="cli",
                     side_agent=True,
+                    # A --skip-memory launch's /bg agent loads no memory provider and no MEMORY.md/USER.md either.
+                    **({"skip_memory": True} if getattr(self, "skip_memory", False) is True else {}),
                     session_db=self._session_db, reasoning_config=self.reasoning_config,
                     service_tier=self.service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     **{kw: getattr(self, attr) for kw, attr in _BG_PROVIDER_KWARGS.items()})
+                if getattr(self, "skip_memory", False) is True:
+                    from agent.agent_init_skip_memory import apply_session_skip_memory
+                    apply_session_skip_memory(bg_agent)  # its delegates inherit the opt-out too
                 # Silence raw spinner; route thinking through TUI widget when no foreground agent is active.
                 bg_agent._print_fn = lambda *_a, **_kw: None
 
@@ -2034,14 +2034,11 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
         """Handle /busy [status|queue|steer|interrupt] — what Enter does while Hermes is working."""
         arg = _command_arg(cmd, lower=True)
         usage = _dim_line(_t("busy.usage"))
-        if not arg or arg == "status":
-            mode = self.busy_input_mode if self.busy_input_mode in _BUSY_MODES else "interrupt"
-            return _cp(_accent_line(_t("busy.status", mode=self.busy_input_mode)),
-                       _dim_line(_t("busy.enter_while_busy", behavior=_t(f"busy.short_{mode}"))), usage)
-        if arg not in _BUSY_MODES:
+        if arg and arg != "status" and arg not in _BUSY_MODES:
             return _cp(_dim_line(_t("shared.unknown_argument", arg=arg)), usage)
-        self.busy_input_mode = arg
-        _persist_display_choice("display.busy_input_mode", arg, _t("busy.label"), _t(f"busy.long_{arg}"))
+        # Every message steers (``CLIInitMixin.busy_input_mode``): any mode asked for reports steer.
+        return _cp(_accent_line(_t("busy.status", mode=self.busy_input_mode)),
+                   _dim_line(_t("busy.enter_while_busy", behavior=_t(f"busy.short_{self.busy_input_mode}"))), usage)
 
     def _handle_indicator_command(self, cmd: str):
         """Handle /indicator [status|kaomoji|emoji|unicode|ascii] — pick the TUI busy-indicator style.

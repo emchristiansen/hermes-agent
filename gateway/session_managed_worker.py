@@ -9,6 +9,7 @@ import os
 import queue
 import threading
 from types import SimpleNamespace
+from typing import NamedTuple
 from pathlib import Path
 import subprocess
 import sys
@@ -27,10 +28,120 @@ STOP_ACK_SECONDS = 30
 # How long a lost attempt's board note may hold up settling its admission (the note is
 # advisory; a busy board's write finishes in the background).
 LOSS_RECORD_WAIT_S = 10
+# A correction's verdict comes back over the frame loop from the child's control reader, which
+# answers as it reads. Controls on one client socket dispatch in arrival order, so this bounds how
+# long a later message on that socket can wait behind an earlier unanswered correction; past it the
+# outcome is unknown and its sender resends (a duplicate correction is acceptable, a lost one is not).
+CORRECTION_ACK_SECONDS = 5
 # Own session (POSIX): a worker whose owner died kills its whole group (managed_worker
 # _die_with_owner); on Windows it exits itself.
 # detached-spawn: ok — covered: the worker kills its own group when its owner dies (_die_with_owner)
 WORKER_POPEN = {'start_new_session': True, 'close_fds': True}
+
+
+def _describe_exit(returncode):
+    """``returncode`` for the loss log: the signal's name when one ended the child, ``running`` when
+    it has not exited yet."""
+    if returncode is None:
+        return 'running'
+    if returncode < 0:
+        import signal
+        try:
+            return f'{returncode} ({signal.Signals(-returncode).name})'
+        except ValueError:
+            return str(returncode)
+    return str(returncode)
+
+
+def _kanban_attempt(request_id):
+    """The dispatcher attempt a Kanban admission carries in its request identity
+    (``session_kanban``: ``kanban:[board, task_id, run_id]``), else None. Read, never reconstructed."""
+    if not isinstance(request_id, str) or not request_id.startswith('kanban:'):
+        return None
+    try:
+        attempt = json.loads(request_id[len('kanban:'):])
+    except ValueError:
+        return None
+    if not isinstance(attempt, list) or len(attempt) != 3:
+        return None
+    board, task_id, run_id = attempt
+    return {'board': board, 'task_id': task_id, 'run_id': run_id}
+
+
+def _managed_exit_record(row, scope, process, lifecycle, returncode, exit_observed_at):
+    """The worker's lifecycle as the owner observed it on the ordinary finish path, stored with the
+    admission's settled result (``managed_exit``) so the finish, the ACK and the actual OS exit are
+    correlated durably by card/run (the Kanban request identity), admission, generation and execution.
+
+    ``exit`` is only what ``process.wait`` returned for the reserved interpreter itself. A wait that
+    timed out, or a handle that is not the reserved interpreter (a launcher), leaves the status
+    ``unknown`` with its reason: an exit is never inferred from the turn's or the board's result.
+    Times are owner wall-clock seconds: ``result_received_at`` (the worker's result frame accepted),
+    ``ack_sent_at`` (the owner's ``finish`` ACK written to the worker), ``finish_observed_at`` (the
+    worker's ``finished``, which it sends only after its durable execution.finish receipt)."""
+    handle_is_worker = process.pid == scope['pid']
+    if returncode is None:
+        exit_ = {'status': 'unknown', 'returncode': None, 'observed_at': None, 'reason': 'wait_timeout'}
+    elif not handle_is_worker:
+        exit_ = {'status': 'unknown', 'returncode': None, 'observed_at': None, 'reason': 'handle_is_not_the_worker',
+                 'handle_returncode': returncode, 'handle_observed_at': exit_observed_at}
+    elif returncode < 0:
+        import signal
+        try:
+            name = signal.Signals(-returncode).name
+        except ValueError:
+            name = None
+        exit_ = {'status': 'signalled', 'returncode': returncode, 'signal': name, 'observed_at': exit_observed_at}
+    else:
+        exit_ = {'status': 'exited', 'returncode': returncode, 'observed_at': exit_observed_at}
+    return {'v': 1, 'request_id': row.get('request_id'), 'kanban': _kanban_attempt(row.get('request_id')),
+            'admission_id': row['admission_id'], 'generation': row['generation'], 'owner_epoch': scope.get('epoch'),
+            'execution_id': scope['execution_id'], 'worker_pid': scope['pid'], 'worker_birth': scope['birth'],
+            'handle_pid': process.pid, **lifecycle, 'exit': exit_}
+
+
+async def _fence_lost_worker(authority, row, scope, owner_restart=None):
+    """Fence a lost worker's admission ``unknown``. The loss's cause is bound where the loss is found:
+    an owner already stopping lost it to its own end, and that cause commits with the fence itself,
+    so the settlement that follows (this drain's, or a later owner's boot) owes the card its restart
+    result. A kill under a live owner stays a crash even if a stop begins afterwards. A caller that
+    waits before fencing (``_settle_lost``) passes the ``owner_restart`` it read at the loss; None
+    reads it now."""
+    from gateway.session_runtime_workers import tracked_write
+    from gateway.session_unattended_unknown import owner_ending
+    from gateway.session_worker_reservation import lose_admission_worker
+    if owner_restart is None:
+        owner_restart = owner_ending(authority)
+    await tracked_write(authority, partial(lose_admission_worker, authority, row, scope, owner_restart))
+
+
+async def _settle_transferred(authority, ref, row, worker):
+    """The fenced claim's transfers: the corrections its child confirmed consumed ran, so they settle
+    ``interrupted`` and never run again; one whose hand-over was not recorded (its write failed, and
+    may have committed) is queued again (``settle_steer_transfers``, as for an unknown in-process
+    claim, ``_mark_unknown``): a duplicate, never left in transfer. A failed write leaves them
+    registered to the claim, and the supported resolution of its ``unknown`` admission settles them
+    the same way (``SessionAuthority._close_resolved``). Nothing for a worker that transferred none."""
+    if not worker.transferred:
+        return
+    from gateway.session_queued_controls import publish_transfers, steer_transfers
+    from gateway.session_runtime_workers import tracked_write
+    from hermes_state_runtime import _epoch, settle_steer_transfers
+    with authority.sessions[ref.session_id].event_stream.lock:
+        transfers = steer_transfers(authority, ref.session_id, row['generation'])
+
+    def write(conn):
+        _epoch(conn, authority.epoch)
+        settle_steer_transfers(conn, epoch=authority.epoch, generation=row['generation'], transfers=transfers,
+                               outcome='unknown')
+    try:
+        await tracked_write(authority, partial(authority.db._execute_write, write))
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception('Managed claim %s: transfers left for its resolution to settle',
+                                              row['admission_id'])
+        return
+    publish_transfers(authority, ref, row['generation'])
 
 
 class ManagedExecutionUnknown(RuntimeError):
@@ -184,6 +295,25 @@ class ManagedWorker:
         self.stderr_drain = None
         # Exact secrets this worker was handed; the stderr sink scrubs them besides the patterns.
         self.secrets = []
+        # correction id -> owner-loop future the child's ``correction`` frame answers (``correct``).
+        self.corrections = {}
+        # correction id -> its durable keeping (``KeptCorrection``), until ``consumed`` confirms it.
+        self.kept = {}
+        # Kept admissions registered as transfers to this claim (``settle_consumed``), whether or not
+        # their hand-over write was confirmed: a loss settles every one (``_settle_transferred``).
+        self.transferred = []
+        # The launch policy this worker executes (``execute_managed``); its ``kanban_json`` names the
+        # running card attempt whose task keeps this worker's corrections.
+        self.policy = None
+        # The child's ``ready``: its agent exists and its control reader answers as it reads.
+        self.ready = False
+        # The owner session and reserved bootstrap scope this worker executes (``execute_managed``):
+        # the destination a private peer message must name exactly.
+        self.session_id = None
+        self.scope = None
+        # (delivery id, attempt n) -> (owner-loop future of the child's verdict, settle callback) for
+        # each forwarded private peer message attempt (``peer_message``).
+        self.peer_messages = {}
 
     def _write_controls(self):
         try:
@@ -297,8 +427,153 @@ class ManagedWorker:
             stopper.cancel()
             arrived.cancel()
 
-    def interrupt(self):
-        self.control({'type': 'stop'})
+    def interrupt(self, message=None, **kwargs):
+        """The Stop control, under the explicit-stop ABI (``agent.interrupt_compat``): the profile
+        stop and ``adopt_agent`` reach an adopted worker through ``request_hard_interrupt``, which
+        passes a message and may pass ``tool_reason``. The stop frame carries neither; a gateway
+        stop's cause is recorded by ``stop_authority_turns``. The execution's ``finally`` drops the
+        worker from ``_managed_workers`` and closes it while ``adopted`` still names it, so a closed
+        worker has nothing left to stop. A full control queue is not an error either: ``control``
+        latched ``stop`` first and the owner's read loop escalates on that latch."""
+        try:
+            self.control({'type': 'stop'})
+        except RuntimeStoreError as exc:
+            if exc.reason not in {'managed_worker_lost', 'worker_control_backpressure'}:
+                raise
+            import logging
+            logging.getLogger(__name__).debug('Managed Stop not queued (%s)', exc.reason)
+
+    def correct(self, verb, text, kept):
+        """Hand ``session.steer`` / ``session.redirect`` text, already ``kept`` durably, to the
+        child's agent over the control pipe: the future of the child's verdict
+        (``WorkerControls.correct``), read by the owner loop's ``answer_correction``. Before
+        ``ready`` the child can only latch the text for the agent it is building (it rejects
+        nothing then but a Stop), so the verdict is ``queued`` at once instead of waiting out the
+        child's startup; the child's own verdict is still read."""
+        correction_id = kept.id
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self.corrections[correction_id] = future
+        self.kept[correction_id] = kept
+        try:
+            self.control({'type': 'correct', 'id': correction_id, 'verb': verb, 'text': text})
+        except BaseException:
+            self.corrections.pop(correction_id, None)
+            raise
+        if self.ready:
+            return future
+        answered = loop.create_future()
+        answered.set_result('rejected' if self.stop.is_set() else 'queued')
+        return answered
+
+    def peer_message(self, message, n, settle=None):
+        """Forward attempt ``n`` of a private peer message to the child's agent: the future of the
+        child's verdict (``WorkerControls.peer_message``): ``steered`` (buffered under the attempt's own
+        ticket; never consumption), ``rejected`` (nothing was buffered) or ``unknown`` (the agent raised
+        while taking it). A child lost before answering fails the future (outcome unknown); one that
+        finished without reading the frame answers ``rejected``.
+
+        Called under the session's stream lock, so it neither blocks nor writes. Before ``ready``, for
+        a worker executing no card attempt, or for a message naming anything but this worker's exact
+        profile, owner session, generation, board, task and run, it answers ``rejected`` at once:
+        nothing is queued (never latched). ``RuntimeStoreError``: nothing was queued either.
+
+        ``settle(outcome)`` runs off the loop, once, after the verdict, with ``consumed`` (a completed,
+        flushed turn that ran it and left nothing unrun) or ``unconsumed`` (withdrawn unread when intake
+        closed). An attempt whose consumption is unknown is never settled. The child answers before it
+        settles; a settlement that still found its attempt unanswered resolves it ``steered`` (only a
+        buffered attempt is settled), and one whose waiter gave up (cancelled) still runs ``settle``."""
+        loop = asyncio.get_running_loop()
+        key = (message.delivery_id, n)
+        refused = loop.create_future()
+        refused.set_result('rejected')
+        if not self.ready or self.stop.is_set() or not self._names_this_attempt(message) or key in self.peer_messages:
+            return refused
+        future = loop.create_future()
+        self.peer_messages[key] = (future, settle)
+        try:
+            self.control({'type': 'peer_message', 'id': message.delivery_id, 'n': n, 'text': message.text,
+                          'author': dict(message.sender.author), 'profile': message.profile,
+                          'session_id': self.scope['session_id'], 'generation': message.generation,
+                          'board_db': message.board_db, 'task_id': message.task_id, 'run_id': message.run_id})
+        except BaseException:
+            self.peer_messages.pop(key, None)
+            raise
+        return future
+
+    def _names_this_attempt(self, message):
+        kanban = json.loads(getattr(self.policy, 'kanban_json', None) or 'null')
+        return (kanban is not None and self.scope is not None
+                and type(generation := getattr(message, 'generation', None)) is int
+                and (getattr(message, 'profile', None), message.session_id, generation, message.board_db, message.task_id,
+                     message.run_id) == (self.scope['profile_id'], self.session_id, self.scope['generation'],
+                                         kanban['db'], kanban['task_id'], kanban['run_id']))
+
+    def answer_peer_message(self, frame):
+        """The child's ``peer_message.verdict`` frame resolves its forwarded attempt; one arriving after
+        its waiter gave up is dropped. False for any other frame."""
+        if (frame.get('type') != 'peer_message.verdict' or set(frame) != {'type', 'id', 'n', 'status'}
+                or frame['status'] not in {'steered', 'rejected', 'unknown'}):
+            return False
+        entry = self.peer_messages.get((frame['id'], frame['n']))
+        if entry is not None and not entry[0].done():
+            entry[0].set_result(frame['status'])
+        return True
+
+    async def settle_peer_message(self, frame):
+        """The child's ``peer_settled`` frame: run the attempt's ``settle`` once. False for any other frame."""
+        if (frame.get('type') != 'peer_settled' or set(frame) != {'type', 'id', 'n', 'outcome'}
+                or frame['outcome'] not in {'consumed', 'unconsumed'}):
+            return False
+        entry = self.peer_messages.pop((frame['id'], frame['n']), None)
+        if entry is None:
+            return True
+        future, settle = entry
+        if not future.done():
+            # Only a buffered attempt is settled, so it was steered, even if its verdict has not arrived
+            # (NC15-PEER-01): the attempt resolves here instead of being lost with its entry.
+            future.set_result('steered')
+        elif not future.cancelled() and (future.exception() is not None or future.result() != 'steered'):
+            return True
+        # A waiter that gave up (a cancelled future) does not end the attempt: its settlement still runs.
+        if settle is not None:
+            try:
+                await asyncio.to_thread(settle, frame['outcome'])
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception('Peer message settlement failed')
+        return True
+
+    def answer_correction(self, frame):
+        """The child's ``correction`` verdict frame resolves its waiting ``correct``; a verdict that
+        arrives after its waiter gave up is dropped. False for any other frame."""
+        if (frame.get('type') != 'correction' or set(frame) != {'type', 'id', 'status'}
+                or frame['status'] not in {'redirected', 'queued', 'rejected', 'unknown'}):
+            return False
+        future = self.corrections.pop(frame['id'], None)
+        if future is not None and not future.done():
+            future.set_result(frame['status'])
+        return True
+
+    def abandon_corrections(self, *, unread):
+        """The execution has ended with corrections still unanswered. ``unread``: the child finished
+        normally, so it never read them (it answers every correction it reads before the owner's
+        ``finish``) and no agent saw them. Otherwise it was lost and their outcome is unknown."""
+        for future in self.corrections.values():
+            if not future.done():
+                if unread:
+                    future.set_result('rejected')
+                else:
+                    future.set_exception(RuntimeStoreError('correction_outcome_unknown'))
+        self.corrections.clear()
+        # Private peer attempts the same way; a buffered attempt never settled stays unknown.
+        for future, _ in self.peer_messages.values():
+            if not future.done():
+                if unread:
+                    future.set_result('rejected')
+                else:
+                    future.set_exception(RuntimeStoreError('peer_message_outcome_unknown'))
+        self.peer_messages.clear()
 
     def respond(self, kind, prompt_id, value):
         self.control({'type': kind, 'prompt_id': prompt_id, 'value': value})
@@ -365,6 +640,148 @@ class ManagedWorker:
             self.process.stderr.close()
 
 
+class KeptCorrection(NamedTuple):
+    """Where a managed correction is durable before its sender hears anything: ``admission_id``, a
+    queued row of the session's FIFO that runs as its own turn unless the child confirms it ran the
+    text in this turn (``settle_consumed``); or, for a running Kanban card attempt, a comment on its
+    task (``admission_id`` None: a queued row there would start a turn against an ended claim)."""
+    id: str
+    admission_id: str | None
+
+    def unreached(self):
+        """The ACK when the running turn never took the text: it still reaches the session as its own
+        queued turn, or the card's next attempt through the comment."""
+        if self.admission_id is None:
+            return {'status': 'rejected', 'delivered': False, 'kept': 'task_comment'}
+        return {'status': 'queued', 'admission_id': self.admission_id}
+
+
+async def keep_correction(authority, actor, ref, worker, text):
+    """Make the correction durable before the child sees it: nothing is acknowledged that only a
+    process's memory holds. A failure here is an error, never an ACK, and its sender resends."""
+    import uuid
+    correction_id = uuid.uuid4().hex
+    try:
+        if worker.policy.kanban_json:
+            from gateway.session_kanban import keep_on_board
+            await asyncio.to_thread(keep_on_board, json.loads(worker.policy.kanban_json), text)
+            return KeptCorrection(correction_id, None)
+        from gateway.session_contract import Submission
+        # The sender's own next prompt, exactly as ``prompt.submit`` admits one (route checks,
+        # FIFO cap, scheduling): run as its own turn whenever this turn did not consume it.
+        receipt = await authority.submit(actor, Submission('correction:' + correction_id, ref, {'text': text}, 'queue'))
+    except RuntimeStoreError:
+        raise
+    except Exception as exc:
+        raise RuntimeStoreError('correction_not_kept') from exc
+    return KeptCorrection(correction_id, receipt.admission_id)
+
+
+async def managed_correction(authority, actor, ref, worker, verb, text, generation):
+    """``session.steer`` / ``session.redirect`` against a managed worker. The text is kept durably
+    first (``keep_correction``), then the child's verdict is the canonical correction ACK. A
+    ``rejected``, or a turn that ended before the text could be sent, answers where the kept text
+    will still be delivered (``KeptCorrection.unreached``). A lost child, a failed application or a
+    verdict past ``CORRECTION_ACK_SECONDS`` is ``correction_outcome_unknown``: the kept text is
+    still delivered, and a resend is a harmless duplicate."""
+    kept = await keep_correction(authority, actor, ref, worker, text)
+    ack = {'text': text, 'execution_generation': generation, 'authority_epoch': authority.epoch}
+    with authority.sessions[ref.session_id].event_stream.lock:
+        reachable = (getattr(authority, '_managed_workers', {}).get(ref.session_id) is worker
+                     and authority.executing.get(ref.session_id) == generation)
+        verdict = worker.correct(verb, text, kept) if reachable else None
+    if verdict is None:
+        return {**ack, **kept.unreached()}
+    try:
+        status = await asyncio.wait_for(verdict, CORRECTION_ACK_SECONDS)
+    except TimeoutError as exc:
+        raise RuntimeStoreError('correction_outcome_unknown') from exc
+    if status == 'unknown':
+        raise RuntimeStoreError('correction_outcome_unknown')
+    if status == 'rejected':
+        return {**ack, **kept.unreached()}
+    return {**ack, 'status': status, **({'admission_id': kept.admission_id} if kept.admission_id else {})}
+
+
+def card_context(authority, session_id, generation):
+    """The card attempt (its ``kanban_json``) a Kanban session was launched for, when ``generation``
+    is one of that session's own claims; None for every other session or generation. A Kanban
+    session's corrections belong to its card's task, after its claim ends as while it runs."""
+    from hermes_state_local import POLICY_PREFIX
+    with authority.db._read_ctx() as conn:
+        saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (POLICY_PREFIX + session_id,)).fetchone()
+        claimed = conn.execute('SELECT 1 FROM session_admissions WHERE target_session_id=? AND generation=? LIMIT 1',
+                               (session_id, generation)).fetchone()
+    try:
+        context = json.loads(json.loads(saved[0])['policy'].get('kanban_json') or 'null') if saved else None
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return None
+    if (claimed is None or not isinstance(context, dict) or not isinstance(context.get('db'), str)
+            or not isinstance(context.get('task_id'), str) or type(context.get('run_id')) is not int):
+        return None
+    return context
+
+
+async def keep_card_correction(authority, context, text, generation, *, ended):
+    """``session.steer`` / ``session.redirect`` for a Kanban session that no live agent can take:
+    its claim has ended (``ended``: the ACK was lost, the claim replaced), or the claim runs but its
+    worker is not yet attached. Kept on the card's task exactly as a running attempt's correction is
+    (``keep_on_board``): the running worker's first poll reads a comment above its claim's floor, and
+    the task's next attempt and its operator read it too. Answered as the kept ACK, so no client
+    re-admits it as an unbound prompt; a resend keeps a duplicate, never a loss."""
+    from gateway.session_kanban import keep_on_board
+    try:
+        await asyncio.to_thread(partial(keep_on_board, context, text, ended=ended))
+    except Exception as exc:
+        raise RuntimeStoreError('correction_not_kept') from exc
+    return {'text': text, 'execution_generation': generation, 'authority_epoch': authority.epoch,
+            **KeptCorrection(None, None).unreached()}
+
+
+async def settle_consumed(authority, ref, row, worker, ids):
+    """The child ran these corrections in its completed turn (its ``consumed`` frame, sent before
+    the result). Each one's kept row is handed to this claim as a delivered transfer, so the claim's
+    settlement records it ``steered`` (``settle_steer_transfers``) instead of running it again. A
+    hand-over that fails leaves the row queued: it runs again, a duplicate and never a loss."""
+    from gateway.session_queued_controls import _register, _unregister
+    from gateway.session_runtime_workers import tracked_write
+    from hermes_state_runtime import confirm_steer_transfer, steer_session_input
+    live, generation = authority.sessions[ref.session_id], row['generation']
+    for correction_id in ids:
+        kept = worker.kept.pop(correction_id, None) if isinstance(correction_id, str) else None
+        if kept is None or kept.admission_id is None:
+            continue
+        with live.event_stream.lock:
+            _register(authority, ref.session_id, generation, kept.admission_id)
+        worker.transferred.append(kept.admission_id)
+        try:
+            await tracked_write(authority, partial(steer_session_input, authority.db, epoch=authority.epoch,
+                                                   admission_id=kept.admission_id, generation=generation))
+        except RuntimeStoreError:
+            # Definitely not handed over (e.g. its sender cancelled it): it stays as it is.
+            with live.event_stream.lock:
+                _unregister(authority, ref.session_id, generation, kept.admission_id)
+            continue
+        except Exception:
+            # May have committed: the registration stays undelivered, so settlement queues it again.
+            import logging
+            logging.getLogger(__name__).exception('Managed correction %s could not be recorded consumed',
+                                                  kept.admission_id)
+            continue
+        with live.event_stream.lock:
+            authority.steer_transfers[ref.session_id][1][kept.admission_id] = True
+        try:
+            # Durable beside the row, so a restarted owner too settles it as consumed, never runs it
+            # again; unrecorded, a restart queues it again: a duplicate, never a loss.
+            await tracked_write(authority, partial(confirm_steer_transfer, authority.db, epoch=authority.epoch,
+                                                   admission_id=kept.admission_id, generation=generation))
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception('Managed correction %s consumption could not be recorded durably',
+                                                  kept.admission_id)
+    authority._publish_pending(ref)
+
+
 def interrupt_managed(authority, actor, ref, generation):
     worker = getattr(authority, '_managed_workers', {}).get(ref.session_id)
     if worker is None:
@@ -375,17 +792,27 @@ def interrupt_managed(authority, actor, ref, generation):
     return True
 
 
+async def _control_frame(authority, ref, row, worker, frame):
+    """A frame answering or raising an owner control: the child's correction verdict or consumption,
+    or one of its approval / clarify prompts (registered under the session's stream lock)."""
+    if worker.answer_correction(frame) or worker.answer_peer_message(frame):
+        return True
+    if await worker.settle_peer_message(frame):
+        return True
+    if (frame.get('type') == 'consumed' and set(frame) == {'type', 'ids'} and isinstance(frame['ids'], list)):
+        await settle_consumed(authority, ref, row, worker, frame['ids'])
+        return True
+    with authority.sessions[ref.session_id].event_stream.lock:
+        return _prompt_frame(authority, ref, row, worker, frame)
+
+
 def _prompt_frame(authority, ref, row, worker, frame):
     live = authority.sessions[ref.session_id]
     controls = live.controls
     kind = frame.get('type')
     if kind == 'prompt_settled' and set(frame) == {'type', 'prompt_id'}:
         prompt_id = frame['prompt_id']
-        controls.remote_responders.pop(prompt_id, None)
-        saved = controls.pending.pop(prompt_id, None)
-        if saved:
-            live.event_stream.publish(ref.session_id, {'prompt_id': prompt_id,
-                'execution_generation': row['generation']}, event_type=saved[1]['kind'] + '.settled')
+        controls.settle(ref.session_id, prompt_id, row['generation'])
         return True
     if kind not in {'approval', 'clarify'}:
         return False
@@ -584,21 +1011,20 @@ def _record_lost_attempt(authority, policy, exc, reason, scope):
                                                                pid=(scope or {}).get('pid'), bound=scope is not None)))
 
 
-async def _settle_lost(authority, row, scope, recording):
+async def _settle_lost(authority, row, scope, recording, *, owner_restart=None):
     """Settle a lost worker's admission ``unknown`` once its board note (``recording``) landed.
 
     The note comes first: the submitter exits on the settled 'unknown' and the crash sweep then
     books the bound interpreter, so a later write is dropped and an exit-0 worker_result reads
     as a protocol violation. A busy board holds this up ``LOSS_RECORD_WAIT_S`` at most (the
     write carries on, tracked), and a cancellation during the wait still settles.
+    ``owner_restart``: the cause the caller read when it found the loss (``_fence_lost_worker``).
     """
-    from gateway.session_worker_reservation import lose_admission_worker
-    from gateway.session_runtime_workers import tracked_write
     try:
         if recording is not None:
             await asyncio.wait({recording}, timeout=LOSS_RECORD_WAIT_S)
     finally:
-        await tracked_write(authority, partial(lose_admission_worker, authority, row, scope))
+        await _fence_lost_worker(authority, row, scope, owner_restart)
 
 
 async def _spawn_registered_worker(authority, ref, row):
@@ -710,12 +1136,16 @@ async def execute_managed(authority, ref, row, policy):
     if spawned is None:
         return ''
     worker, process = spawned
+    # Set before this coroutine first yields, so no correction reaches the worker without it.
+    worker.policy = policy
+    worker.session_id = ref.session_id
     workers = authority._managed_workers
     # A Stop acknowledged during the env/spawn awaits found no worker and was latched for this
     # generation; consume it in the same step that makes the worker reachable to interrupt_managed.
     authority.adopt_agent(ref.session_id, row['generation'], worker)
     accepted = usage = None
     scope = None
+    lifecycle = {}
     try:
         # The interpreter behind the handle introduces itself first; the owner verifies that
         # identity (alive, same birth, descends from the handle) before reserving for it.
@@ -729,6 +1159,7 @@ async def execute_managed(authority, ref, row, policy):
                     admission_id=row['admission_id'], process=process, principal_id=row['principal_id'], hello=hello,
                     worker_subject=owner_worker_subject()))
         worker.worker = (scope['pid'], scope['birth'])
+        worker.scope = scope
         # The child reads nothing else until the exact reservation has committed.
         frame = await asyncio.to_thread(_bootstrap, authority, ref, row, policy, scope, text)
         worker.secrets.extend(v for v in (frame['api_key'], scope['secret']) if isinstance(v, str) and v)
@@ -739,13 +1170,13 @@ async def execute_managed(authority, ref, row, policy):
             # The claim's execution stamp, not a ledger read per frame (publish_execution fences the same way).
             if authority.executing.get(ref.session_id) != row['generation']:
                 raise RuntimeStoreError('stale_generation')
-            with authority.sessions[ref.session_id].event_stream.lock:
-                if _prompt_frame(authority, ref, row, worker, frame):
-                    continue
+            if await _control_frame(authority, ref, row, worker, frame):
+                continue
             if frame == {'type': 'error', 'reason': 'managed_worker_failed'}:
                 raise RuntimeStoreError('managed_worker_failed')
             kind = frame.get('type')
             if kind == 'ready' and set(frame) == {'type', 'pid'} and frame['pid'] == scope['pid']:
+                worker.ready = True
                 continue
             if kind == 'delta' and set(frame) == {'type', 'text'} and isinstance(frame['text'], str):
                 authority.publish_execution(ref.session_id, row['generation'], 'message.delta', {'text': frame['text']})
@@ -757,27 +1188,39 @@ async def execute_managed(authority, ref, row, policy):
                     accepted, usage = accept_result(frame['result'])
                 except ValueError as exc:
                     raise RuntimeStoreError('invalid_worker_result') from exc
+                lifecycle['result_received_at'] = time.time()
                 authority.sessions[ref.session_id].controls.snapshot(ref.session_id, None)
                 await asyncio.to_thread(worker.send, {'type': 'finish'})
+                lifecycle['ack_sent_at'] = time.time()
                 continue
             if frame == {'type': 'finished'} and accepted is not None:
                 # 'finished' follows the worker's durable execution.finish: the turn is complete.
                 # A slow or non-zero interpreter exit after it is close()'s cleanup, not a loss.
+                lifecycle['finish_observed_at'] = time.time()
+                returncode = exit_observed_at = None
                 with suppress(subprocess.TimeoutExpired):
-                    await asyncio.to_thread(process.wait, 10)
+                    returncode = await asyncio.to_thread(process.wait, 10)
+                    exit_observed_at = time.time()
+                managed_exit = _managed_exit_record(row, scope, process, lifecycle, returncode, exit_observed_at)
+                import logging
+                logging.getLogger(__name__).info(
+                    'Managed worker finished: admission %s generation %s request %s execution %s pid %s exit %s (%s)',
+                    row['admission_id'], row['generation'], row.get('request_id'), scope['execution_id'], scope['pid'],
+                    managed_exit['exit']['status'], managed_exit['exit']['returncode']
+                    if managed_exit['exit']['returncode'] is not None else managed_exit['exit']['reason'])
                 accepted = _with_stop_cause(accepted, worker)
                 await _finalize_managed_refusal(authority, scope['session_id'], accepted)
                 # Like in-process execution, settlement belongs to the drain's stream lock.
                 authority.pending_results[row['admission_id']] = {
-                    'result': {**accepted, 'local_viewer': True}, 'usage': usage,
+                    'result': {**accepted, 'local_viewer': True}, 'usage': usage, 'managed_exit': managed_exit,
                     **await asyncio.to_thread(_settled_session_usage, authority, scope['session_id'], accepted, scope['execution_id'])}
                 return accepted['final_response']
             raise RuntimeStoreError('invalid_worker_frame')
     except (Exception, asyncio.CancelledError) as exc:
         import logging
         reason = exc.reason if isinstance(exc, RuntimeStoreError) else type(exc).__name__
-        logging.getLogger(__name__).warning('Managed worker lost: %s', reason)
         if scope is None:
+            logging.getLogger(__name__).warning('Managed worker lost: %s', reason)
             if isinstance(exc, asyncio.CancelledError) or (
                     isinstance(exc, RuntimeStoreError) and exc.reason == 'managed_worker_stopped'):
                 # Stopped before the child ever received its bootstrap: nothing executed, so
@@ -785,7 +1228,15 @@ async def execute_managed(authority, ref, row, policy):
                 return _interrupted_before_bootstrap(authority, row, worker.stop_cause)
             _record_lost_attempt(authority, policy, exc, reason, scope)  # nothing bound: a late note is dropped, never misbooked
             raise
-        await _settle_lost(authority, row, scope, _record_lost_attempt(authority, policy, exc, reason, scope))
+        # The reserved child's exit status tells its own exit from a kill (a negative code names
+        # the signal). Read without waiting: only the board note's bounded wait precedes the loss write.
+        logging.getLogger(__name__).warning('Managed worker lost: %s (pid %s, exit %s)', reason,
+            process.pid, _describe_exit(process.poll()))
+        # The loss's cause is bound now, where it is found, before the board note's bounded wait.
+        from gateway.session_unattended_unknown import owner_ending
+        await _settle_lost(authority, row, scope, _record_lost_attempt(authority, policy, exc, reason, scope),
+                           owner_restart=owner_ending(authority))
+        await _settle_transferred(authority, ref, row, worker)
         live = authority.sessions[ref.session_id]
         with live.event_stream.lock:
             live.controls.snapshot(ref.session_id, None)
@@ -801,4 +1252,5 @@ async def execute_managed(authority, ref, row, policy):
         raise ManagedExecutionUnknown('managed_worker_unknown') from exc
     finally:
         workers.pop(ref.session_id, None)
+        worker.abandon_corrections(unread=lifecycle.get('finish_observed_at') is not None)
         await asyncio.to_thread(worker.close)

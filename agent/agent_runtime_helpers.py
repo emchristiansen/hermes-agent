@@ -491,10 +491,9 @@ def _remember_absorbed_row(survivor: dict[str, Any], dropped: dict[str, Any], *,
     if dropped.get(RETIRED_DURABLE_ROWS):
         survivor.setdefault(RETIRED_DURABLE_ROWS, []).extend(
             {k: v for k, v in row.items() if k != OWN_ROW} for row in dropped[RETIRED_DURABLE_ROWS])
-    # The uid witness claims the dropped dict's TEXT lives on in the survivor: only a fold earns it. A
-    # superseded row (``folded=False``) is retired like any absorbed row but its content is discarded.
-    if folded:
-        record_absorbed_message(survivor, dropped)
+    # The uid witness claims the dropped dict's TEXT lives on in the survivor: only a fold earns it. A superseded
+    # row (``folded=False``) is retired like any absorbed row, provenance included, but its content is discarded.
+    record_absorbed_message(survivor, dropped, text_kept=folded)
 
 
 def _count_unnamed_row(survivor: dict[str, Any], retired: dict[str, Any]) -> None:
@@ -1656,7 +1655,7 @@ def plan_cache_sections_for_destination(
     plan = build_prompt_cache_plan(
         messages, tools,
         # effective_cache_ttl resolves None → "5m"; cache-disabled agents never reach here.
-        cache_ttl=effective_cache_ttl(cache_ttl, provider=provider, model=model),
+        cache_ttl=effective_cache_ttl(cache_ttl, provider=provider, model=model, base_url=base_url),
         native_anthropic=native_layout,
         static_system_prefix=static_system_prefix if isinstance(static_system_prefix, str) else None,
         direct_native_tool_cache=_direct_native_anthropic_tool_cache_capability(stub, **dest),

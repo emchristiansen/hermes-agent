@@ -45,7 +45,6 @@ _bootstrap_root = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pa
 if _bootstrap_root not in sys.path:
     sys.path.insert(0, _bootstrap_root)
 from hermes_cli import _startup_fast
-import itertools
 
 # A literal ``~``/``$VAR`` in HERMES_HOME (fish, or any quoted value) must become absolute
 # before the first reader — otherwise it resolves against cwd and scaffolds <cwd>/~/.hermes.
@@ -60,11 +59,7 @@ _startup_fast.normalize_hermes_home_env()
 # mentioning both words never arm a 300s hard-exit timer. Foreground runs arm
 # too — a pre-loop wedge is just as dead without a supervisor; GatewayRunner
 # disarms once the event loop is live.
-def _argv_is_gateway_run(argv: list) -> bool:
-    return any(a == "gateway" and b == "run" for a, b in itertools.pairwise(argv))
-
-
-if _argv_is_gateway_run(sys.argv[1:]):
+if _startup_fast.is_gateway_run_argv(sys.argv[1:]):
     try:
         from hermes_startup_watchdog import arm_startup_watchdog as _arm_sw
 
@@ -506,6 +501,10 @@ if __name__ == "__main__" and getattr(sys.modules.get("__main__"), "__file__", N
     # override on the stripped argv, and `--profile default` would fall to the sticky profile.
     sys.modules.setdefault("hermes_cli.main", sys.modules["__main__"])
 _apply_profile_override()
+# ``hermes auth principals`` promises no home initialization or writes: answer it before the scratch
+# export below and the config/logging imports.
+if (_principals_rc := _startup_fast.try_auth_principals()) is not None:
+    raise SystemExit(_principals_rc)
 # ``-p``/active_profile re-homed the process after hermes_bootstrap ran: re-point the temp vars
 # at THIS home's scratch dir (a user-set TMPDIR is still left alone).
 try:
@@ -1265,7 +1264,9 @@ def _resolve_continue_arg(args, *, use_tui: bool) -> None:
                     new_sid = _create_titled_session(continue_val)
                 else:
                     from hermes_cli.gateway_session_store import create_titled_session
-                    new_sid = create_titled_session(continue_val)
+                    # The typed --skip-memory is frozen at creation: the resume below checks it.
+                    new_sid = create_titled_session(
+                        continue_val, skip_memory=getattr(args, "skip_memory", False) is True)
                 if new_sid:
                     args.resume = new_sid
                 else:
@@ -1596,6 +1597,7 @@ def cmd_chat(args):
         "run_budget": getattr(args, "run_budget", None),
         "output_format": getattr(args, "output_format", "text"),
         "ignore_rules": getattr(args, "ignore_rules", False) or safe_mode,
+        "skip_memory": getattr(args, "skip_memory", False) or None,  # absent unless typed
         "ignore_user_config": getattr(args, "ignore_user_config", False) or safe_mode,
         "compact": getattr(args, "compact", False),
         **{k: getattr(args, k, d) for k, d in _CHAT_PASSTHROUGH + (("api_key", None), ("base_url", None))},
@@ -2264,42 +2266,7 @@ def cmd_update(args):
 
 
 
-def _coalesce_session_name_args(argv: list) -> list:
-    """Join unquoted multi-word session names after -c/--continue and -r/--resume: ``hermes -c Pokemon
-    Agent Dev`` → ``['-c', 'Pokemon Agent Dev']``, up to the next flag or known top-level subcommand."""
-    _SUBCOMMANDS = {
-        "chat", "model", "gateway", "setup", "whatsapp", "whatsapp-cloud", "login", "logout",
-        "auth", "status", "cron", "doctor", "config", "pairing", "skills", "tools", "mcp",
-        "sessions", "insights", "update", "uninstall", "profile", "dashboard", "serve", "webapp",
-        "desktop", "gui", "claw", "plugins", "security", "acp", "webhook", "peer",
-        "memory", "dump", "debug", "backup", "import", "completion", "logs", "usage",
-    }
-    _SESSION_FLAGS = {"-c", "--continue", "-r", "--resume"}
-    if _SESSION_FLAGS.intersection(argv):  # the active memory provider registers ``hermes <name>``
-        from plugins.memory import active_memory_provider_commands
-        _SUBCOMMANDS |= active_memory_provider_commands()
-
-    result = []
-    i = 0
-    while i < len(argv):
-        token = argv[i]
-        if token in _SESSION_FLAGS:
-            result.append(token)
-            i += 1
-            parts: list = []
-            while (
-                i < len(argv)
-                and not argv[i].startswith("-")
-                and argv[i] not in _SUBCOMMANDS
-            ):
-                parts.append(argv[i])
-                i += 1
-            if parts:
-                result.append(" ".join(parts))
-        else:
-            result.append(token)
-            i += 1
-    return result
+from hermes_cli._parser import _coalesce_session_name_args  # shared with the no-init classifier
 
 
 from hermes_cli.profile_cmd import cmd_profile

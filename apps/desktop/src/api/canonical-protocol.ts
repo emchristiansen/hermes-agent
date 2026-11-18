@@ -5,6 +5,8 @@
 
 import { randomUuid } from '@hermes/shared'
 
+import { CorrectionTargetChanged } from '@/lib/uncertain-correction'
+
 export const CANONICAL_GATEWAY_PROTOCOL = 'hermes-gateway-v1'
 
 /** Dial `/api/ws` or a sibling stream beside it. A local gateway's one-use ticket leaves the URL
@@ -251,6 +253,32 @@ const VALUE_OPERATIONS = new Set(['rename', 'archive', 'model', 'reasoning', 'wo
 // token, as the owner asked it (a deferred pick's confirmation): the same request the TUI resends.
 const MUTATION_METHODS = new Set(['session.title', 'session.archive', 'session.compress', 'session.rewind', 'session.model', ...BRANCH_METHODS])
 
+// Correction id (a random UUID per typed correction) → the owner session and execution generation its
+// first preparation named. Module-wide, like the retry the composer holds for it: the pin outlives any
+// one gateway or protocol instance, so no reconnect or rebuilt client re-decorates a retry.
+const correctionPins = new Map<string, { owner: string; generation: number }>()
+
+/** The destination a correction's first preparation pinned (its owner session, profile and execution
+ * generation), for a correction whose outcome is unknown to be kept across a renderer restart (UI-02). */
+export function correctionPin(correctionId: string): { sessionId: string; profile: string; generation: number } | undefined {
+  const pin = correctionPins.get(correctionId)
+
+  if (!pin) { return undefined }
+  const [profile, sessionId] = JSON.parse(pin.owner) as [string, unknown]
+
+  return typeof sessionId === 'string' ? { sessionId, profile, generation: pin.generation } : undefined
+}
+
+// Told synchronously when a correction's first preparation pins its destination, before that request
+// leaves: the durable record of an unresolved correction takes the pin then, so a crash during the
+// request (or during a restored retry's request) cannot lose the generation it was prepared for (UI-R1).
+let correctionPinned: ((correctionId: string, pin: { sessionId: string; profile: string; generation: number }) => void) | undefined
+
+/** Register the one listener for newly established correction pins (the unresolved-corrections store). */
+export function onCorrectionPinned(listener: typeof correctionPinned): void {
+  correctionPinned = listener
+}
+
 export class CanonicalDesktopProtocol {
   private creates = new Map<string, string>()
   private revisions = new Map<string, number>()
@@ -396,6 +424,40 @@ export class CanonicalDesktopProtocol {
     for (const key of [...this.mutations.keys()]) { if (key !== keep && JSON.parse(key)[0] === owner) { this.mutations.delete(key) } }
   }
 
+  // An interrupt or correction, fenced to the execution it names.
+  private prepareControl(params: Record<string, unknown>): Record<string, unknown> {
+    const { correction_id: correction, ...control } = params
+    const owner = canonicalSessionKey(control.session_id, control.profile)
+    // A correction names the execution it was typed against: its first preparation pins the whole
+    // destination (owner session and profile, generation), and every retry of it (after a lost ACK,
+    // a later run, a focus switch, another gateway instance) presents that pin, never the latest
+    // generation, so the owner refuses or keeps it for its own task rather than handing it to a
+    // newer run. A retry naming another owner (a resumed runtime id) is sent nowhere: a generation
+    // number means nothing on another session (NC13-CLIENT-01). The id never reaches the wire.
+    const pinned = typeof correction === 'string' ? correctionPins.get(correction) : undefined
+
+    if (pinned && pinned.owner !== owner) { throw new CorrectionTargetChanged() }
+
+    // An established pin is never moved: a retry that names another generation explicitly is the
+    // same correction aimed at a different execution, so it is sent nowhere, and the pin keeps its
+    // own generation for every later retry (UI-03).
+    if (pinned && control.execution_generation != null && control.execution_generation !== pinned.generation) {
+      throw new CorrectionTargetChanged()
+    }
+    const generation = pinned?.generation ?? control.execution_generation ?? this.generations.get(owner)
+
+    if (typeof generation !== 'number') { throw new Error('Session execution identity unavailable; reconnect before controlling this turn') }
+
+    if (typeof correction === 'string' && !pinned) {
+      correctionPins.set(correction, { owner, generation })
+      const pin = correctionPin(correction)
+
+      if (pin) { correctionPinned?.(correction, pin) }
+    }
+
+    return { ...control, session_id: control.session_id, execution_generation: generation }
+  }
+
   private preparePayload(method: string, params: Record<string, unknown>): Record<string, unknown> {
     const mutation = this.prepareMutation(method, params)
 
@@ -417,13 +479,7 @@ export class CanonicalDesktopProtocol {
       return { ...resume, omit_messages: false }
     }
 
-    if (method === 'session.interrupt' || method === 'session.redirect' || method === 'session.steer') {
-      const generation = params.execution_generation ?? this.generations.get(canonicalSessionKey(params.session_id, params.profile))
-
-      if (typeof generation !== 'number') { throw new Error('Session execution identity unavailable; reconnect before controlling this turn') }
-
-      return { ...params, session_id: params.session_id, execution_generation: generation }
-    }
+    if (method === 'session.interrupt' || method === 'session.redirect' || method === 'session.steer') { return this.prepareControl(params) }
 
     if (method === 'prompt.resolve_unknown') {
       const lost = this.unknownAdmissions.get(canonicalSessionKey(params.admission_id, params.profile))

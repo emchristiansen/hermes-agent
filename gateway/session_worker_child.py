@@ -11,7 +11,7 @@ import secrets
 from functools import partial
 
 from hermes_state_runtime import RuntimeStoreError, apply_worker_receipt
-from hermes_state_runtime_workers import CHILD_SEPARATOR, descendant_range
+from hermes_state_runtime_workers import CHILD_SEPARATOR, ChildOwnership, child_ownership, descendant_range, execution_lineage
 
 _DEFAULTS = {'max_concurrent_children': 10, 'max_spawn_depth': 1}
 
@@ -27,11 +27,11 @@ def delegation_limits(authority, execution_id, session_id):
     """``(max_concurrent_children, max_spawn_depth)`` from the root conversation's frozen policy
     (the profile's config for a session with no local policy), never from the asking worker."""
     from gateway.session_policy import policy_for_source, profile_config
-    root = execution_id.split(CHILD_SEPARATOR, 1)[0]
-    if root != execution_id:
-        with authority.db._read_ctx() as conn:
-            row = conn.execute('SELECT session_id FROM worker_executions WHERE execution_id=?', (root,)).fetchone()
-        session_id = row[0] if row else session_id
+    with authority.db._read_ctx() as conn:
+        lineage = execution_lineage(conn, execution_id)
+    if not lineage or lineage[-1]['kind'] == 'child':
+        raise RuntimeStoreError('admission_conflict')
+    session_id = lineage[-1]['session_id']
     live = authority.sessions.get(authority.logical_owner(session_id))
     policy = policy_for_source(authority.runner, live.source) if live is not None else None
     config = policy.config(authority) if policy is not None else profile_config(authority)
@@ -49,10 +49,17 @@ def reserve_child_execution(db, conn, session_id, payload, *, epoch, execution_i
         raise RuntimeStoreError('invalid_params')
     max_children, max_depth = limits
     prefix = execution_id + CHILD_SEPARATOR
-    live = conn.execute("SELECT COUNT(*) FROM worker_executions WHERE execution_id>=? AND execution_id<? "
-                        "AND instr(substr(execution_id,?),'/')=0 AND status!='terminal'",
-                        (*descendant_range(execution_id), len(prefix) + 1)).fetchone()[0]
-    if refused is None and prefix.count(CHILD_SEPARATOR) > max_depth:
+    lineage = execution_lineage(conn, execution_id)
+    if not lineage or lineage[-1]['kind'] == 'child':
+        return {'refused': 'admission_conflict'}
+    candidates = conn.execute("SELECT execution_id FROM worker_executions WHERE execution_id>=? AND execution_id<? "
+                              "AND instr(substr(execution_id,?),'/')=0 AND status!='terminal'",
+                              (*descendant_range(execution_id), len(prefix) + 1)).fetchall()
+    live = 0
+    for (candidate,) in candidates:
+        if child_ownership(conn, candidate, execution_id) is not ChildOwnership.FOREIGN:
+            live += 1
+    if refused is None and len(lineage) > max_depth:
         refused = 'delegation_depth_exceeded'
     if refused is None and live >= max_children:
         refused = 'delegation_capacity'
@@ -72,13 +79,10 @@ def reserve_child_execution(db, conn, session_id, payload, *, epoch, execution_i
 async def worker_child_request(connection, ref, params):
     """worker.persist ``child.reserve``: the parent's full claim and assignment are verified first."""
     import asyncio
-    from gateway.session_worker import _SCOPE, _claim, _verify
+    from gateway.session_worker import _SCOPE, verified_worker_claim
     if set(params) != _SCOPE | {'epoch', 'sequence', 'operation', 'payload'}:
         raise RuntimeStoreError('invalid_params')
-    claim = _claim(connection, ref, params)
-    if 'worker:adopt' not in connection.actor.capabilities:
-        raise RuntimeStoreError('permission_denied')
-    _verify(connection, ref, params, claim)
+    await verified_worker_claim(connection, ref, params)
     authority = connection.authority
 
     def reserve():

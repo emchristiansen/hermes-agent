@@ -112,10 +112,14 @@ def _side_agent(authority, policy, live, task_id, **overrides):
         # Its own session in the owning profile's store, like the sidecar's ``bg_*`` rows.
         session_id=task_id, platform=policy.platform, session_db=authority.db,
         fallback_model=refresh_fallback() if callable(refresh_fallback) else None,
-        load_soul_identity=not policy.ignore_rules, skip_memory=policy.ignore_rules,
+        load_soul_identity=not policy.ignore_rules, skip_memory=policy.skip_memory,
         side_agent=True)
     kwargs.update(overrides)
-    return AIAgent(**kwargs)
+    agent = AIAgent(**kwargs)
+    if policy.skip_memory_requested:
+        from agent.agent_init_skip_memory import apply_session_skip_memory
+        apply_session_skip_memory(agent)
+    return agent
 
 
 def _abandoned(holder):

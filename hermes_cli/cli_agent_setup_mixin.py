@@ -725,7 +725,8 @@ class CLIAgentSetupMixin:
                 checkpoint_max_total_size_mb=self.checkpoint_max_total_size_mb,
                 checkpoint_max_file_size_mb=self.checkpoint_max_file_size_mb,
                 pass_session_id=self.pass_session_id, skip_context_files=self.ignore_rules,
-                skip_memory=self.ignore_rules, tool_progress_callback=self._on_tool_progress,
+                skip_memory=self.ignore_rules or getattr(self, "skip_memory", False),
+                tool_progress_callback=self._on_tool_progress,
                 tool_start_callback=self._on_tool_start if self._inline_diffs_enabled else None,
                 tool_complete_callback=self._on_tool_complete if self._inline_diffs_enabled else None,
                 stream_delta_callback=self._stream_delta if self.streaming_enabled else None,
@@ -741,6 +742,12 @@ class CLIAgentSetupMixin:
             import cli as _cli
             _cli._active_agent_ref = self.agent
             self.agent.control_update_callback = self._mark_automation_stale
+            # --skip-memory is the gateway session's policy, not this client's: the launch carries it
+            # (``_gateway_launch``: ``skip_memory``), the resume check refuses a mismatch (``check_resume_policy``),
+            # and the gateway applies it to the agent that runs every turn and to its children
+            # (``session_execution``: ``apply_session_skip_memory``). This GatewayAgent holds no memory store and
+            # only reflects the session's tool surface (read-only ``tools``/``valid_tool_names``), so nothing is
+            # applied here (SKM-07).
             # Seed the agent's once-per-lifecycle auto_load cache with the bytes the preload
             # thread rendered, so the shared prompt path never re-reads config or skill files.
             _auto_result = getattr(self, "_auto_load_skills_result", None)

@@ -69,6 +69,11 @@ class TestBootstrapSelector:
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.delenv("HERMES_CONFIG_INSTANCE_ID", raising=False)
         monkeypatch.setattr(cb, "_BOOTSTRAPPED", False)
+        # The bootstrap publishes the .env selector straight into os.environ. Own it first, so
+        # teardown restores the prior state even when it was unset (a plain delenv of an unset
+        # name records nothing to restore).
+        monkeypatch.setenv(cb.BACKEND_ENV, "")
+        monkeypatch.delenv(cb.BACKEND_ENV)
         remote._reset_for_tests()
         yield
         remote._reset_for_tests()

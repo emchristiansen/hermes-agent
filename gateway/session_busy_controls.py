@@ -52,21 +52,9 @@ async def busy_config(connection, ref, params, *, write=False):
         # UI negotiation is not a settings write and must not rebuild frozen
         # launch policy, toolsets, history, or the retained AIAgent.
         live.busy_input_mode = params['value']
-    value = getattr(live, 'busy_input_mode', None)
-    if value is None:
-        from gateway.session_policy import policy_for_source
-        policy = policy_for_source(authority.runner, live.source)
-        # Main's TUI defaulted to ``queue`` (``ui-tui/src/app/useConfigSync.ts`` TUI_BUSY_DEFAULT): in a
-        # full-screen composer the next prompt is authored while the agent streams, and an unintended
-        # interrupt loses work. Only an explicit ``display.busy_input_mode`` overrides it; every other
-        # surface keeps the framework default ``interrupt``.
-        fallback = 'queue' if policy is not None and getattr(policy, 'source', None) == 'tui' else 'interrupt'
-        display = (policy.config().get('display') or {}) if policy else {}
-        value = (display.get('busy_input_mode') or fallback if policy else
-                 authority.runner._effective_busy_input_mode(live.source))
-        if value not in ('interrupt', 'steer', 'queue'):
-            value = fallback
-    return {'key': 'busy', 'value': value, 'scope': 'session'}
+    # Every message steers (Eric, 2026-11-04): a client asking for ``queue`` or ``interrupt`` is told
+    # ``steer``, so it never interrupts the running turn or holds the message for the turn end.
+    return {'key': 'busy', 'value': 'steer', 'scope': 'session'}
 
 
 _VERBOSE_CYCLE = ('off', 'new', 'all', 'verbose')
@@ -188,31 +176,58 @@ async def correct(connection, ref, params, *, verb):
     authority = connection.authority
     generation = params['execution_generation']
     live = authority.sessions[ref.session_id]
+    worker = reply = None
     with live.event_stream.lock:
-        authority.check_approval_generation(ref.session_id, generation)
-        # Managed workers have a separate control channel, not a cached owner
-        # agent. Refuse explicitly instead of acknowledging undeliverable text.
-        if ref.session_id in getattr(authority, '_managed_workers', {}):
-            raise RuntimeStoreError('unsupported_control')
-        # Accepted for this exact claim before its turn built an agent: steer_agent latches it for
-        # the agent this generation adopts, never a later one.
-        agent, latched = authority.steer_agent(ref, generation, params['text'] if verb == 'steer' else None)
-        if latched:
-            return {'status': 'queued', 'text': params['text'], 'execution_generation': generation,
-                    'authority_epoch': authority.epoch}
-        # A claim can outlive the agent that carried it (a reaped turn the client still believes is
-        # running), and a redirect in the build window has no agent to queue behind. Nothing live can
-        # take the text, so answer 'rejected' — the wire contract's "not corrected, queue it as the
-        # next prompt" (desktop SessionRedirectResponse, tui_gateway's idle-steer reply). Raising here
-        # made clients discard the message (#141644). ``delivered: False`` is the confirmation a
-        # client may re-admit on: the live-agent 'rejected' below can follow delivery.
-        if agent is None:
-            return {'status': 'rejected', 'text': params['text'], 'execution_generation': generation,
-                    'authority_epoch': authority.epoch, 'delivered': False}
-        method = getattr(agent, verb, None)
-        if not callable(method):
-            raise RuntimeStoreError('execution_not_ready')
-        accepted = method(params['text'])
-        return {'status': ({'steer': 'queued', 'redirect': 'redirected'}[verb] if accepted else 'rejected'),
-                'text': params['text'], 'execution_generation': generation,
+        try:
+            authority.check_approval_generation(ref.session_id, generation)
+        except RuntimeStoreError as exc:
+            closed = exc
+        else:
+            closed = None
+            # A managed worker's agent lives in its child: the text is kept durably, then crosses the
+            # worker's control pipe, and the ACK is the child's own verdict, awaited outside this lock.
+            worker = getattr(authority, '_managed_workers', {}).get(ref.session_id)
+            if worker is None:
+                reply = _correct_owner_agent(authority, ref, params, verb, generation)
+                if reply.get('delivered') is not False:
+                    return reply
+    from gateway.session_managed_worker import card_context, keep_card_correction, managed_correction
+    if closed is not None or worker is None:
+        # No live agent can take it: the claim it named has ended, or (``delivered: False``) the
+        # claim runs with no agent or worker attached yet. A Kanban session's correction is kept on
+        # the card's task, never handed back for a client's fresh, task-unbound prompt. Any other
+        # session: refused, or answered undelivered.
+        card = await asyncio.to_thread(card_context, authority, ref.session_id, generation)
+        if card is None:
+            if closed is not None:
+                raise closed
+            return reply
+        return await keep_card_correction(authority, card, params['text'], generation, ended=closed is not None)
+    return await managed_correction(authority, connection.actor, ref, worker, verb, params['text'], generation)
+
+
+def _correct_owner_agent(authority, ref, params, verb, generation):
+    """The in-process claim: its owner agent (or the latch for the agent it adopts) takes the text.
+    The caller holds the session's event_stream.lock after check_approval_generation."""
+    # Accepted for this exact claim before its turn built an agent: steer_agent latches it for
+    # the agent this generation adopts, never a later one.
+    agent, latched = authority.steer_agent(ref, generation, params['text'] if verb == 'steer' else None)
+    if latched:
+        return {'status': 'queued', 'text': params['text'], 'execution_generation': generation,
                 'authority_epoch': authority.epoch}
+    # A claim can outlive the agent that carried it (a reaped turn the client still believes is
+    # running), and a redirect in the build window has no agent to queue behind. Nothing live can
+    # take the text, so answer 'rejected' — the wire contract's "not corrected, queue it as the
+    # next prompt" (desktop SessionRedirectResponse, tui_gateway's idle-steer reply). Raising here
+    # made clients discard the message (#141644). ``delivered: False`` is the confirmation a
+    # client may re-admit on: the live-agent 'rejected' below can follow delivery.
+    if agent is None:
+        return {'status': 'rejected', 'text': params['text'], 'execution_generation': generation,
+                'authority_epoch': authority.epoch, 'delivered': False}
+    method = getattr(agent, verb, None)
+    if not callable(method):
+        raise RuntimeStoreError('execution_not_ready')
+    accepted = method(params['text'])
+    return {'status': ({'steer': 'queued', 'redirect': 'redirected'}[verb] if accepted else 'rejected'),
+            'text': params['text'], 'execution_generation': generation,
+            'authority_epoch': authority.epoch}

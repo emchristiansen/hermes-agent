@@ -18,6 +18,9 @@ from typing import Any, Callable, Optional
 from agent.delegation_context import owned_kanban_task
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
+from hermes_cli.kanban_attachments import KANBAN_ATTACHMENT_MAX_BYTES, ArtifactPreservationError, VettedArtifact
+from tools.output_control import open_destination as open_output_destination
+from tools.output_control import parse_args as parse_output_control, render_json_result
 from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
@@ -625,17 +628,42 @@ def heartbeat_current_worker_from_env() -> bool:
         return False
 
 
-# Live operator-note injection: poll the task for new comments and steer them in
-# OUT-OF-BAND, so a user can talk to a running task without block → comment → unblock.
-# Watermarked per task (seeded on first poll: that history is already in the context).
+# Live note injection: poll the task for new comments and steer each in as a delivered message
+# naming its author (never the user's own frame), so a participant can talk to a running task
+# without block → comment → unblock.
+# Watermarked per task by comment id, never by wall-clock time. The first poll starts after the
+# task's last comment when this worker's run was claimed (``comment_floor`` on the claim event):
+# the context snapshot was built after the claim, so any later comment may be missing from it and
+# is delivered (a duplicate when the snapshot held it; never a gap). With no floor recorded, the
+# first poll delivers the whole thread.
 _COMMENT_POLL_MIN_INTERVAL_SECONDS = 6.0
 _comment_poll_last_attempt: float = 0.0
 _comment_watermark: dict[str, int] = {}
+# (board file, comment id) of every comment ``kanban_comment`` wrote from THIS process: the only
+# notes the injection skips as echoes. Another process under the same profile (a peer worker, the
+# managed owner keeping a correction) shares the author name, and its notes are delivered.
+_own_comment_ids: set[tuple[str, int]] = set()
+
+
+def _board_file(conn) -> str:
+    return os.path.realpath(conn.execute("PRAGMA database_list").fetchone()[2])
+
+
+def _run_comment_floor(kb, conn, tid: str) -> Optional[int]:
+    """The task's last comment id when this worker's run was claimed (its own run id, else the
+    task's current run); None when no run or no recorded floor is known."""
+    run_id = _worker_run_id(tid)
+    if run_id is None:
+        run_id = kb._current_run_id(conn, tid)
+    if run_id is None:
+        return None
+    floor = kb._json_dict(kb._row_get(kb._latest_event(conn, tid, "claimed", run_id), "payload")).get("comment_floor")
+    return floor if type(floor) is int else None
 
 
 def inject_new_comments_from_env(agent: Any) -> bool:
-    """Steer new operator comments on the worker's task into ``agent``; True iff a
-    steer was injected; never raises. Own comments (``_persisted_identity``) are skipped."""
+    """Steer new comments on the worker's task into ``agent``; True iff a steer was
+    injected; never raises. Only comments this process wrote (``_own_comment_ids``) are skipped."""
     global _comment_poll_last_attempt
     # Operator notes address the dispatcher-owned worker; a delegate_task child sharing
     # this process must neither receive them nor advance the shared watermark (#112817).
@@ -648,31 +676,55 @@ def inject_new_comments_from_env(agent: Any) -> bool:
     seen = _comment_watermark.get(tid)
     try:
         with _board(None, quiet_close=True) as (kb, conn):
-            rows = kb.list_comments_after(conn, tid, after_id=seen or 0)
+            if seen is None:
+                seen = _run_comment_floor(kb, conn, tid) or 0
+            rows = kb.list_comments_after(conn, tid, after_id=seen)
+            board_file = _board_file(conn)
     except Exception:
         logger.debug("comment-inject: bridge failed", exc_info=True)
         return False
-    if seen is None:
-        _comment_watermark[tid] = max((c.id for c in rows), default=0)
-    if seen is None or not rows:
+    if not rows:
+        _comment_watermark[tid] = seen
         return False
-    # Advance past everything read (including our own notes) so nothing is re-injected.
-    _comment_watermark[tid] = max(c.id for c in rows)
-    # Same resolution the write side used, so a worker skips its OWN comments even
-    # when the dispatcher did not pin HERMES_PROFILE (echoed notes would otherwise
-    # re-enter the live turn as fake operator steering).
-    own = _persisted_identity()
-    fresh = [c for c in rows if (c.author or "").strip() != own and (c.body or "").strip()]
+    newest = max(c.id for c in rows)
+    # A worker's own notes would re-enter its live turn as fake operator steering. Its own is what
+    # this process wrote, by exact id: the author name is the profile's, which other processes share.
+    fresh = [c for c in rows if (board_file, c.id) not in _own_comment_ids and (c.body or "").strip()]
     if not fresh:
+        _comment_watermark[tid] = newest
         return False
-    lines = [f"- {c.author or 'operator'}: {c.body.strip()}" for c in fresh]
-    note = ("New note" + ("s" if len(fresh) > 1 else "")
-            + " on your kanban task from the operator (delivered mid-run). "
-            + "Take it into account for the work you're doing right now:\n" + "\n".join(lines))
+    # A board comment is another principal's delivered message, never the user's own steer: the board
+    # records only an author name, which proves no human authority (AGENT-01). Each comment goes in
+    # its own delivered frame naming that author and the comment, so a mixed-author batch keeps every
+    # author's provenance. An agent without the delivered-message seam gets nothing (never the user
+    # frame); its notes stay behind the watermark.
+    if not _steer_records_sender(agent):
+        logger.debug("comment-inject: agent cannot record a delivered sender; notes left for retry")
+        return False
+    taken = []
+    for c in fresh:
+        note = (f"A new note on your kanban task {tid} (delivered mid-run). "
+                f"Take it into account for the work you're doing right now:\n{c.body.strip()}")
+        sender = {"id": f"kanban comment {c.id} on {tid}", "name": c.author or "unknown author"}
+        try:
+            taken.append(bool(agent.steer(note, delivered_by=sender)))
+        except Exception:
+            logger.debug("comment-inject: steer failed", exc_info=True)
+            taken.append(False)
+    if all(taken):
+        # Advance past everything read (own notes included) only once the agent took every note: a
+        # failed injection is retried by the next poll, with any note taken beside it (a duplicate,
+        # never a loss); a refused note never holds the others back.
+        _comment_watermark[tid] = newest
+    return any(taken)
+
+
+def _steer_records_sender(agent: Any) -> bool:
+    """Whether ``agent.steer`` accepts ``delivered_by`` (``agent.interrupt_control.InterruptControlMixin``)."""
+    import inspect
     try:
-        return bool(agent.steer(note))
-    except Exception:
-        logger.debug("comment-inject: steer failed", exc_info=True)
+        return "delivered_by" in inspect.signature(agent.steer).parameters
+    except (TypeError, ValueError):
         return False
 
 
@@ -680,22 +732,36 @@ def inject_new_comments_from_env(agent: Any) -> bool:
 
 @_kanban_handler("kanban_show")
 def _handle_show(args: dict, **kw) -> str:
-    """Full task state: row, parents, children, comments, runs, last 50 events."""
+    """Full task state: row, parents, children, comments, runs, last 50 events.
+    ``output_control`` projects/routes it before the result exists anywhere else."""
+    # Malformed control or an unusable destination -> ValueError -> tool error before the board
+    # is read: the destination is created exclusively first, so no competing writer can take it
+    # between the read and the write. A failed read removes the still-empty file again.
+    output_control = parse_output_control(args)
+    sink = open_output_destination(output_control)
+    try:
+        return _show(args, output_control, sink)
+    finally:
+        if sink is not None:
+            sink.discard_unused()
+
+
+def _show(args: dict, output_control, sink) -> str:
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         # No dispatcher task in scope and no explicit id: the caller asked "what
         # should I be looking at". A chat profile cannot set HERMES_KANBAN_TASK,
         # so an error naming the env var is dead end (#91431) — answer instead.
-        return json.dumps({
+        return render_json_result({
             "current_task": None,
             "hint": (
                 "No dispatcher-assigned task in this session, so there is no "
                 "task to show by default. Call kanban_list to see task ids on "
                 "the board, then kanban_show(task_id=<id>) for full state."),
-        })
+        }, output_control, sink=sink)
     with _board(args.get("board")) as (kb, conn):
         task = _existing_task(kb, conn, tid)
-        return json.dumps({
+        return render_json_result({
             "task": _fields(task, _TASK_FIELDS),
             "parents": kb.parent_ids(conn, tid),
             # Non-terminal parents; on a running card this means the dependency
@@ -708,7 +774,7 @@ def _handle_show(args: dict, **kw) -> str:
             "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
             "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
             # Same string build_worker_context hands the dispatcher at spawn time.
-            "worker_context": kb.build_worker_context(conn, tid)})
+            "worker_context": kb.build_worker_context(conn, tid)}, output_control, sink=sink)
 
 
 @_kanban_handler("kanban_list")
@@ -741,6 +807,45 @@ def _handle_list(args: dict, **kw) -> str:
             "promoted": promoted})
 
 
+def _vet_external_artifacts(
+    tool_name: str, kb, conn, tid: str, metadata: Any, agent_task_id: Optional[str],
+) -> dict:
+    """Vet each declared artifact the handoff would otherwise keep only as a path outside the
+    task's managed scratch workspace (``kanban_db.external_completion_artifacts``).
+
+    An outside file may become a task attachment, which the notifier then sends, only when the
+    file-sending rule already lets this worker send it off the machine
+    (``tools.connectors.gateway.files._readable_file``: the terminal backend's namespace, and
+    ``validate_media_delivery_path``'s denylist / strict policy) and the Hermes read guard allows
+    reading it. Returns ``{declared: VettedArtifact}``; the first refusal rejects the handoff
+    naming the path before anything changes, so no handoff reads as delivered without its files."""
+    from agent.file_safety import get_read_block_error
+    from hermes_cli.kanban_db import external_completion_artifacts
+    from tools.connectors.gateway.files import FileInputError, _readable_file
+
+    def refuse(declared: str, reason: Any) -> _Reject:
+        return _Reject(
+            f"{tool_name} refused: declared artifact {declared} cannot be attached: {reason}. "
+            f"Your task is still in-flight (no state change) and nothing was attached. Declare "
+            f"only files this worker may send, or attach the content with kanban_attach, then "
+            f"retry {tool_name} with the same handoff.")
+
+    vetted: dict = {}
+    for declared in external_completion_artifacts(conn, tid, metadata):
+        try:
+            readable = _readable_file(declared, agent_task_id)
+        except FileInputError as exc:
+            raise refuse(declared, exc)
+        blocked = get_read_block_error(readable)
+        if blocked:
+            raise refuse(declared, blocked)
+        try:
+            vetted[declared] = VettedArtifact.bind(readable)
+        except ArtifactPreservationError as exc:
+            raise refuse(declared, exc)
+    return vetted
+
+
 @_kanban_handler("kanban_complete")
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
@@ -764,11 +869,13 @@ def _handle_complete(args: dict, **kw) -> str:
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
         task = kb.get_task(conn, tid)
         _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
+        vetted = _vet_external_artifacts("kanban_complete", kb, conn, tid, metadata, kw.get("task_id"))
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
-                created_cards=created_cards, expected_run_id=_worker_run_id(tid))
-        except kb.ArtifactPreservationError as artifact_err:
+                created_cards=created_cards, expected_run_id=_worker_run_id(tid),
+                vetted_artifacts=vetted)
+        except ArtifactPreservationError as artifact_err:
             # Structured rejection — surface the phantom ids so the worker can retry with a corrected list
             # or drop the field. Audit event already landed in the DB. The task itself was NOT mutated (the
             # gate runs before the write txn), so the worker can simply call kanban_complete again. Spell
@@ -813,6 +920,13 @@ def _handle_complete(args: dict, **kw) -> str:
                 raise _Reject(
                     f"could not complete {tid}: unsatisfied parent dependencies: "
                     f"{detail}; complete the parents first (done or archived)")
+            # A state/run refusal is not the card's last_failure_error, which may be an earlier
+            # attempt's (t_234158d0 showed run 6474's quota wall for run 6493's refused completion).
+            own = _worker_run_id(tid)
+            if task and (task.status not in ("running", "ready", "blocked", "review")
+                         or (own is not None and task.current_run_id != own)):
+                raise _Reject(f"could not complete {tid}: status is {task.status}, current run "
+                              f"{task.current_run_id}, this worker's run {own}")
             _check(False, (task.last_failure_error if task else None) or
                    f"could not complete {tid} (unknown id, stale run, or already terminal)")
         run = kb.latest_run(conn, tid)
@@ -915,11 +1029,12 @@ def _handle_request_review(args: dict, **kw) -> str:
                f"Installed profiles: {', '.join(list_profile_names())}")
     with _board(args.get("board")) as (kb, conn):
         _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
+        vetted = _vet_external_artifacts("kanban_request_review", kb, conn, tid, metadata, kw.get("task_id"))
         try:
             ok, fail_reason = kb.request_review(
                 conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
-                expected_run_id=_worker_run_id(tid), with_reason=True)
-        except kb.ArtifactPreservationError as artifact_err:
+                expected_run_id=_worker_run_id(tid), with_reason=True, vetted_artifacts=vetted)
+        except ArtifactPreservationError as artifact_err:
             # Same contract as kanban_complete (#22923): the transition rolled
             # back, the task is untouched and retryable — say so explicitly or
             # the model treats the tool_error as terminal.
@@ -988,6 +1103,9 @@ def _handle_comment(args: dict, **kw) -> str:
     author = _persisted_identity()
     with _board(args.get("board")) as (kb, conn):
         cid = kb.add_comment(conn, tid, author=author, body=str(body))
+        # Recorded before the write's result is reported: this process's live board-note injection
+        # skips exactly this comment, never another process's under the same author.
+        _own_comment_ids.add((_board_file(conn), cid))
         return _ok(task_id=tid, comment_id=cid)
 
 
@@ -1060,7 +1178,6 @@ def _download_url_with_cap(url: str, max_bytes: int) -> tuple[bytes, Optional[st
 @_kanban_handler("kanban_attach_url")
 def _handle_attach_url(args: dict, **kw) -> str:
     """Attach a file fetched server-side from an http(s) URL (shared size cap)."""
-    from hermes_cli import kanban_db as kb
     tid = _worker_guard("kanban_attach_url", args)
     url = str(_require_text(args, "url")).strip()
     filename = args.get("filename") or args.get("title")
@@ -1069,7 +1186,7 @@ def _handle_attach_url(args: dict, **kw) -> str:
         from urllib.parse import unquote, urlparse
         filename = unquote(urlparse(url).path.rsplit("/", 1)[-1]).strip() or "download"
     try:
-        data, fetched_ct = _download_url_with_cap(url, kb.KANBAN_ATTACHMENT_MAX_BYTES)
+        data, fetched_ct = _download_url_with_cap(url, KANBAN_ATTACHMENT_MAX_BYTES)
     except ValueError as e:
         return tool_error(f"kanban_attach_url: {e}")
     except Exception as e:

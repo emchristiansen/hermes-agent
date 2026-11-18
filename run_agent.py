@@ -137,7 +137,7 @@ from agent.codex_responses_adapter import (
 )
 from agent.tool_guardrails import ToolGuardrailDecision, append_toolguard_guidance, toolguard_synthetic_result
 from hermes_cli.observability.shared_metrics_harness import record_guardrail_decision, record_guardrail_warnings
-from utils import base_url_host_matches, base_url_hostname, env_float, model_forces_max_completion_tokens
+from utils import base_url_host_matches, base_url_hostname, env_float
 
 
 _MAX_TOOL_WORKERS = 8
@@ -287,6 +287,8 @@ class AIAgent(
                           "no longer sleep between executions.", DeprecationWarning, stacklevel=2)
         from agent.agent_init import init_agent
         init_agent(self, **init_kwargs)
+        from agent.home_guidance import adopt_stored_prompt
+        adopt_stored_prompt(self)  # an agent built for an existing session continues its recorded home guidance
 
     def _get_session_db_for_recall(self):
         """SessionDB for recall, opening the default state DB when no ``session_db`` was passed so the
@@ -408,6 +410,12 @@ class AIAgent(
         # The workspace snapshot is pinned per session (agent/system_prompt.py::_coding_parts); a
         # /new, /resume or /branch on the same agent must re-snapshot at its own session start.
         self._frozen_workspace_snapshot = None
+        # So are the system prompt and the home-guidance edition it renders, dropped together: the next turn restores
+        # the target session's stored prompt (/resume, /branch) or builds a new one (/new, ACP /reset).
+        from agent.home_guidance import end_conversation
+        from agent.system_prompt import invalidate_system_prompt
+        invalidate_system_prompt(self)
+        end_conversation(self)
 
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
@@ -672,7 +680,7 @@ class AIAgent(
         else ``max_tokens``. URL-first, then model-name fallback for third-party endpoints fronting those models."""
         if self._is_direct_openai_url() or self._is_azure_openai_url():
             return {"max_completion_tokens": value}
-        from agent.provider_route_hooks import route_answer
+        from agent.provider_route_hooks import model_forces_max_completion_tokens, route_answer
         declared = route_answer("max_tokens_param", provider=getattr(self, "provider", "") or "", scope=self,
                                 base_url=getattr(self, "base_url", "") or "", model=self.model or "")
         if declared:

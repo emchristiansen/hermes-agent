@@ -74,6 +74,8 @@ class LoginControl:
     name: str
     type: str
     max_length: Optional[int] = None
+    # Whether the control already holds a value (a boolean from the page; the value itself is never read).
+    has_value: bool = False
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> LoginControl:
@@ -87,6 +89,7 @@ class LoginControl:
             name=str(raw.get("name") or ""),
             type=str(raw.get("type") or ""),
             max_length=int(max_length) if max_length is not None else None,
+            has_value=bool(raw.get("hasValue", raw.get("has_value", False))),
         )
 
 
@@ -153,6 +156,15 @@ def classify_otp_controls(controls: list[LoginControl]) -> list[ClassifiedLoginC
     return out
 
 
+def best_password_control(classified: list[ClassifiedLoginControl]) -> Optional[ClassifiedLoginControl]:
+    """The ``current-password`` control a login fill targets: an actual ``type=password`` input (the fill
+    script writes a password nowhere else, so an ``autocomplete=current-password`` text box is never a
+    target), highest score, ties broken by DOM order. Inspection already drops disabled, read-only and
+    invisible controls."""
+    passwords = [c for c in classified if c.token == "current-password" and c.control.type == "password"]
+    return min(passwords, key=lambda c: (-c.score, c.control.index)) if passwords else None
+
+
 def select_password_fill(
     classified: list[ClassifiedLoginControl],
     password: str,
@@ -165,10 +177,9 @@ def select_password_fill(
     order) and returns ``[{"index": int, "token": "current-password",
     "value": password}]`` or ``[]`` when no password field exists.
     """
-    passwords = [c for c in classified if c.token == "current-password"]
-    if not passwords or not password:
+    best_password = best_password_control(classified)
+    if best_password is None or not password:
         return []
-    best_password = min(passwords, key=lambda c: (-c.score, c.control.index))
     return [
         {
             "index": best_password.control.index,
@@ -240,8 +251,68 @@ def build_otp_fills(otp_controls: list[ClassifiedLoginControl], code: str) -> li
     return [{"index": best.control.index, "token": "one-time-code", "value": code}]
 
 
+_PLACEHOLDER = re.compile(r"__([A-Z][A-Z_]*)__")
+
+
+def _render_js(template: str, **values: Any) -> str:
+    """Substitute each ``__NAME__`` placeholder with ``values[name]`` as a JSON literal, in ONE pass over
+    the template: substituted data is never scanned again, so a value that itself contains a placeholder
+    (a password such as ``x__NONCE__y``) reaches the page byte for byte. ``json.dumps`` escapes quotes,
+    backslashes and every non-ASCII character (including U+2028/U+2029), so each literal is a valid JS
+    expression. A placeholder without a value, or a value without a placeholder, is a template defect."""
+    names = set(_PLACEHOLDER.findall(template))
+    if names != {k.upper() for k in values}:
+        raise ValueError(f"JS template placeholders {sorted(names)} do not match values {sorted(values)}")
+    literals = {k.upper(): json.dumps(v) for k, v in values.items()}
+    return _PLACEHOLDER.sub(lambda m: literals[m.group(1)], template)
+
+
 def build_inspection_js(nonce: str) -> str:
-    return _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE.replace("__NONCE__", json.dumps(nonce))
+    return _render_js(_LOGIN_CONTROL_INSPECTION_JS_TEMPLATE, nonce=nonce)
+
+
+def build_clear_stamps_js(nonce: str) -> str:
+    """Remove the slot stamps of the inspection ``nonce`` (and only those) from every node it stamped,
+    connected or detached, and from stamped nodes in the document and open shadow roots, and retire that
+    inspection's node registry and observer. No values are read."""
+    return _render_js(_CLEAR_STAMPS_JS_TEMPLATE, nonce=nonce)
+
+
+# Shared by the stamp cleanup and the fill script's finally (a hoisted function declaration). The
+# inspection's registry holds the exact nodes it stamped, so a stamped node that is detached when cleanup
+# runs (a page listener may remove a field and reinsert it later) still loses this inspection's stamp; the
+# walk of the document and open shadow roots also reaches a stamp copied onto a clone. A stamp of another
+# inspection stays. Removing a stamp can run page code synchronously (a customized built-in element observing
+# the attribute), so the observer's pending records are noted into the registry only after every removal,
+# then it is disconnected: a caller holding the registry sees a node that left the tree during cleanup too.
+_RETIRE_INSPECTION_JS = """
+  function retireInspection(nonce) {
+    const prefix = nonce + ":";
+    const registry = window["hermesVaultSlots:" + nonce];
+    const stamped = new Set();
+    if (registry) {
+      delete window["hermesVaultSlots:" + nonce];
+      registry.nodes.forEach((n) => stamped.add(n));
+    }
+    (function walk(root) {
+      for (const e of root.querySelectorAll("*")) {
+        if (e.hasAttribute("data-hermes-vault-slot")) stamped.add(e);
+        if (e.shadowRoot) walk(e.shadowRoot);
+      }
+    })(document);
+    let removed = 0;
+    stamped.forEach((n) => {
+      const stamp = n.getAttribute("data-hermes-vault-slot");
+      if (stamp !== null && stamp.startsWith(prefix)) { n.removeAttribute("data-hermes-vault-slot"); removed += 1; }
+    });
+    if (registry) { registry.note(registry.observer.takeRecords()); registry.observer.disconnect(); }
+    return removed;
+  }"""
+
+
+_CLEAR_STAMPS_JS_TEMPLATE = """(() => {
+  return retireInspection(__NONCE__);""" + _RETIRE_INSPECTION_JS + """
+})()"""
 
 
 _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
@@ -253,7 +324,9 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   // would leave its controls ungrouped (formIndex null) and merge split OTP boxes across forms.
   const elements = [];
   const forms = [];
+  const roots = [];
   (function walk(root) {
+    roots.push(root);
     for (const e of root.querySelectorAll("*")) {
       if (e.tagName === "INPUT" || e.tagName === "SELECT") elements.push(e);
       else if (e.tagName === "FORM") forms.push(e);
@@ -261,6 +334,24 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
     }
   })(document);
   elements.forEach((element, index) => element.setAttribute("data-hermes-vault-slot", nonce + ":" + index));
+  // The exact stamped nodes, and which of them have since left the tree: the fill writes only into the
+  // same node, connected throughout (a stamp copied by cloneNode, or a node detached and reinserted,
+  // is not the inspected control). Held in a non-enumerable window property for the fill script of
+  // this inspection, which retires it (as does the stamp cleanup).
+  const nodes = new Map(elements.map((element, index) => [index, element]));
+  const left = new Set();
+  const within = (node, el) => {
+    for (let n = el; n; n = (n instanceof ShadowRoot) ? n.host : n.parentNode) if (n === node) return true;
+    return false;
+  };
+  const note = (records) => records.forEach((r) => r.removedNodes.forEach((node) => nodes.forEach((el, index) => {
+    if (within(node, el)) left.add(index);
+  })));
+  const observer = new MutationObserver(note);
+  roots.forEach((root) => observer.observe(root, { childList: true, subtree: true }));
+  const previous = window["hermesVaultSlots:" + nonce];
+  if (previous) previous.observer.disconnect();
+  Object.defineProperty(window, "hermesVaultSlots:" + nonce, { value: { nodes, left, note, observer }, configurable: true });
   const out = elements.flatMap((element, index) => {
     if (element.disabled || element.readOnly) return [];
     if (["hidden", "submit", "button", "reset", "file", "image", "checkbox", "radio"].includes(element.type)) return [];
@@ -286,13 +377,30 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
       ].join(" "),
       name: [element.name, element.id].join(" "),
       type: element.tagName === "SELECT" ? "select" : (element.type || ""),
+      hasValue: String(element.value || "").length > 0,
     }];
   });
   return JSON.stringify(out);
 })()"""
 
 
-def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str = "") -> str:
+# The fill script's page-clock budget, defence in depth: a script that starts, or reaches one of its checks,
+# more than this long after the anchor read just before it was sent (``performance.now()`` of the same
+# document, same ``performance.timeOrigin``, both read in the same isolated world) writes nothing. That bounds
+# the ordinary late release (a dialog closed after the caller gave up). It is NOT a guarantee that the script
+# cannot write later: a check and the write that follows it are not atomic, so a debugger paused between them
+# can hold the script past its checks and let it write (in the page's own world, on a plugin page backend,
+# page code that replaces the clock or the value setter can too). It must be strictly shorter than the caller's
+# wait for the script's reply (tools.browser_supervisor.EVAL_REPLY_WAIT_S); a test
+# in tests/tools/test_browser_vault_fill_integrity.py asserts the margin.
+FILL_PAGE_BUDGET_S = 3.0
+
+# The non-secret page-clock read sent just before a fill script: its answer is the script's anchor.
+PAGE_CLOCK_JS = "JSON.stringify({timeOrigin: performance.timeOrigin, now: performance.now()})"
+
+
+def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str = "", *,
+                  require_empty: bool = False, anchor: Optional[dict[str, float]] = None) -> str:
     """Build a JS expression that fills the selected controls and reports only a count. The
     returned expression never echoes the values back.
 
@@ -300,54 +408,204 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
     evaluated script, immediately before any write. If the page navigated between inspection and fill
     (TOCTOU), the script writes nothing and returns ``{"refused": "origin_changed", "found": <actual>}``:
     proof scope equals mutation scope (#88706). Targets resolve by the ``<nonce>:<index>`` stamp of
-    THIS inspection; a ``current-password`` fill additionally requires ``type=password``; ``<select>``
-    controls (country, state, expiry month) match an option by value or visible text. No marker is
-    left on filled controls so later model-driven DOM reads cannot address them deterministically.
+    THIS inspection, in the document or any open shadow root; a ``current-password`` fill additionally
+    requires ``type=password``; ``<select>`` controls (country, state, expiry month) match an option by
+    value or visible text. No marker is left on filled controls so later model-driven DOM reads cannot
+    address them deterministically.
+
+    With ``require_empty`` a target control that already holds a value makes the script write nothing and
+    return ``{"refused": "field_not_empty"}``, checked in the same evaluation before any write.
+    ``el.focus()`` runs the page's focus listeners synchronously, so the target (still this inspection's
+    connected, enabled password control on the expected origin) and, with ``require_empty``, its
+    emptiness are checked again after it and immediately before the write; a change refuses
+    (``target_changed`` / ``field_not_empty``) with nothing written. Every exit, including a refusal or an
+    exception, removes this inspection's stamps (only those).
+
+    A target must be the very node this inspection stamped and must not have left the tree since (the
+    inspection registers its nodes and a MutationObserver): a stamped node detached and reinserted, or a
+    clone carrying the stamp, refuses with ``target_changed`` before and after focus. A
+    ``current-password`` write must leave the field holding exactly the stored value (an input strips
+    CR/LF, a page may rewrite it); otherwise what was written is cleared and the script refuses with
+    ``value_mismatch``. The clearing's own input/change notifications, and the stamp cleanup after them, run
+    page code synchronously, so the refusal is built last, after the cleanup: ``intact`` (the original node
+    is still connected and never left the tree, checked after the rollback and again after the cleanup) and
+    ``cleared`` (``intact`` and the field is empty at that point; a page may put a value back or replace the
+    field).
+    Neither refusal is ever reported as filled.
+
+    A ``current-password`` write counts as filled only if, at the very end (after the write's notifications
+    and the stamp cleanup's own callbacks), the original node is intact (the same registered node, never left
+    the tree since inspection, connected, still ``type=password``) and holds exactly the stored value;
+    otherwise the script refuses with ``not_established`` (the page removed, replaced, moved or changed the
+    field). The result object is built last: no claim about the field is computed before any of the
+    script's own DOM mutations that can run page code.
+
+    With ``anchor`` (``{"timeOrigin", "now"}`` from :data:`PAGE_CLOCK_JS` read just before sending), the
+    script refuses with ``expired`` when the page's ``performance.timeOrigin`` differs or more than
+    :data:`FILL_PAGE_BUDGET_S` has passed on the page's clock, checked when it starts, before each field's
+    focus and again as the last gate immediately before each write.
+
+    Every report carries ``written`` and ``roles``: how many fields this script wrote, or attempted to write
+    (counted before the setter runs), and left written (not cleared again), and their tokens in order, never
+    their values. A refusal after earlier writes (split code
+    boxes, checkout fields, a password before its identifier) therefore never claims that nothing was
+    written; ``filled`` counts only fields that still held a value after their events. A ``not_established``
+    whose original the page turned into a non-password control still showing the stored value empties it
+    with the setter, without events, reports ``exposed_cleared`` and no longer counts that field as written. Values are rendered by
+    :func:`_render_js`, so they reach the page unchanged whatever they contain.
     """
-    payload = json.dumps(
-        [{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"]} for f in fills]
+    return _render_js(
+        _FILL_JS_TEMPLATE,
+        anchor=anchor,
+        budget_ms=FILL_PAGE_BUDGET_S * 1000.0,
+        expected_origin=expected_origin,
+        fills=[{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"]} for f in fills],
+        nonce=nonce,
+        require_empty=bool(require_empty),
     )
-    return (_FILL_JS_TEMPLATE.replace("__EXPECTED_ORIGIN__", json.dumps(expected_origin))
-            .replace("__FILLS__", payload).replace("__NONCE__", json.dumps(nonce)))
 
 
 _FILL_JS_TEMPLATE = """(() => {
   const expectedOrigin = __EXPECTED_ORIGIN__;
-  if (window.location.origin !== expectedOrigin) {
-    return JSON.stringify({ refused: "origin_changed", found: window.location.origin });
-  }
   const fills = __FILLS__;
   const nonce = __NONCE__;
-  // Stamped controls may live inside a shadow root (see the inspection script's walk): collect the
-  // document and every open shadow root once, then look each stamp up in those roots.
-  const roots = [];
-  (function walk(root) {
-    roots.push(root);
-    for (const e of root.querySelectorAll("*")) if (e.shadowRoot) walk(e.shadowRoot);
-  })(document);
-  const find = (selector) => roots.flatMap((r) => Array.from(r.querySelectorAll(selector)));
+  const requireEmpty = __REQUIRE_EMPTY__;
+  const anchor = __ANCHOR__;
+  const budgetMs = __BUDGET_MS__;
+  // Past the page-clock budget (or in another document) the script writes nothing: a script queued behind a
+  // dialog that is closed later stops at its next check. Not a guarantee: a debugger pause between a check and
+  // the write is not caught (see FILL_PAGE_BUDGET_S).
+  const late = () => anchor !== null && (performance.timeOrigin !== anchor.timeOrigin
+    || !(performance.now() - anchor.now <= budgetMs));
+  // The value accessors. Run in the vault's isolated world (tools.browser_supervisor_worlds) they are that
+  // world's own, which page code cannot replace; run in the page's world (a plugin page backend) they are
+  // whatever the page left on the prototype.
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+  const current = (el) => String((el.tagName !== "SELECT" && setter && setter.get) ? setter.get.call(el) : (el.value || ""));
+  const slotOf = (f) => find('[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]')[0];
+  const registry = window["hermesVaultSlots:" + nonce];
+  // The stamped node is the very node this inspection stamped, and it never left the tree since.
+  const original = (f, el) => {
+    if (!registry) return false;
+    registry.note(registry.observer.takeRecords());
+    return registry.nodes.get(f.index) === el && !registry.left.has(f.index) && el.isConnected;
+  };
+  // The report waits for the cleanup: no claim about a field is computed before our own DOM mutations
+  // (events, stamp removal) that can run page code. ``passwords``: password writes that landed exactly.
+  // ``wrote``: the role (token) of every field this script wrote and did not clear again, in order; every
+  // report carries it, so a refusal after earlier writes never claims that nothing was written.
+  let mismatch = null;
+  const passwords = [];
+  const wrote = [];
   let filled = 0;
-  const norm = (t) => String(t || "").trim().toLowerCase();
-  for (const f of fills) {
-    const el = find('[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]')[0];
-    if (!el || (f.token === "current-password" && el.type !== "password")) continue;
-    try {
-      if (el.tagName === "SELECT") {
-        const want = norm(f.value);
-        const opt = Array.from(el.options).find((o) => [o.value, o.textContent].some((t) => norm(t) === want || norm(t) === want.replace(/^0/, "")));
-        if (opt) { el.value = opt.value; el.dispatchEvent(new Event("change", { bubbles: true, composed: true })); filled += 1; }
-        continue;
-      }
-      el.focus();
-      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
-      // one-time-code split into single-character boxes: f.value is the slice for THIS box (see build_otp_fills)
-      if (setter && setter.set) { setter.set.call(el, f.value); } else { el.value = f.value; }
-      // composed: a component listening on its shadow host must see the value change too.
-      el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" }));
-      el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-      if (el.value.length > 0) filled += 1;
-    } catch (e) { /* skip */ }
+  const report = (fields) => JSON.stringify({ ...fields, written: wrote.length, roles: wrote.slice() });
+  let early;
+  try { early = (() => {
+    if (window.location.origin !== expectedOrigin) {
+      return report({ refused: "origin_changed", found: window.location.origin });
+    }
+    if (late()) return report({ refused: "expired" });
+    if (requireEmpty && fills.some((f) => {
+      const el = slotOf(f);
+      return el && current(el).length > 0;
+    })) {
+      return report({ refused: "field_not_empty" });
+    }
+    const norm = (t) => String(t || "").trim().toLowerCase();
+    for (const f of fills) {
+      const el = slotOf(f);
+      if (!el || (f.token === "current-password" && el.type !== "password")) continue;
+      if (!original(f, el)) return report({ refused: "target_changed" });
+      try {
+        if (el.tagName === "SELECT") {
+          const want = norm(f.value);
+          const opt = Array.from(el.options).find((o) => [o.value, o.textContent].some((t) => norm(t) === want || norm(t) === want.replace(/^0/, "")));
+          if (opt && late()) return report({ refused: "expired" });
+          if (opt) {
+            wrote.push(f.token);  // before the write: a write that throws still counts as attempted
+            el.value = opt.value;
+            el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+            filled += 1;
+          }
+          continue;
+        }
+        // Each field's budget gate runs before its focus listeners, and again after them (below).
+        if (late()) return report({ refused: "expired" });
+        el.focus();
+        // Focus listeners have just run page code synchronously: re-establish the target and, with
+        // requireEmpty, its emptiness; nothing runs between these checks and the write.
+        const still = el.isConnected && original(f, el) && window.location.origin === expectedOrigin && !el.disabled && !el.readOnly
+          && el.getAttribute("data-hermes-vault-slot") === nonce + ":" + f.index
+          && !(f.token === "current-password" && el.type !== "password");
+        if (!still) {
+          if (requireEmpty || !original(f, el)) return report({ refused: "target_changed" });
+          continue;
+        }
+        if (requireEmpty && current(el).length > 0) return report({ refused: "field_not_empty" });
+        // The last gate before the write: still within the page-clock budget.
+        if (late()) return report({ refused: "expired" });
+        // one-time-code split into single-character boxes: f.value is the slice for THIS box (see build_otp_fills)
+        wrote.push(f.token);  // before the write: a write that throws still counts as attempted
+        if (setter && setter.set) { setter.set.call(el, f.value); } else { el.value = f.value; }
+        // composed: a component listening on its shadow host must see the value change too.
+        el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" }));
+        el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+        // A password must land exactly: an input that strips CR/LF (or a page that rewrites the value)
+        // leaves something else, which is cleared and refused rather than reported as filled.
+        if (f.token === "current-password" && current(el) !== f.value) {
+          if (setter && setter.set) { setter.set.call(el, ""); } else { el.value = ""; }
+          wrote.pop();  // cleared again: reported through value_mismatch, not as left written
+          el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "deleteContent" }));
+          el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+          // Those notifications ran page code synchronously, and so will the stamp cleanup: keep the identity
+          // evidence now; the report itself is built after the cleanup (below the finally).
+          mismatch = { f, el, intact: original(f, el) };
+          return null;
+        }
+        if (current(el).length > 0) {
+          filled += 1;
+          // Final identity and value are re-checked after the cleanup (below the finally).
+          if (f.token === "current-password") passwords.push({ f, el, intact: original(f, el) });
+        }
+      } catch (e) { /* skip */ }
+    }
+    return report({ filled });
+  })(); } finally {
+    retireInspection(nonce);
   }
-  find("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
-  return JSON.stringify({ filled });
+  // Built last. The original is the field only if it was intact when last checked and, after the cleanup's
+  // own callbacks, is still the registered node, never left the tree, connected and a password control.
+  const holds = (w) => w.intact && registry.nodes.get(w.f.index) === w.el && !registry.left.has(w.f.index)
+    && w.el.isConnected && w.el.type === "password";
+  if (mismatch) {
+    const intact = holds(mismatch);
+    return report({ refused: "value_mismatch", intact, cleared: intact && current(mismatch.el).length === 0 });
+  }
+  // A password write counts as filled only while the original still holds exactly the stored value.
+  const unsure = passwords.filter((w) => !(holds(w) && current(w.el) === w.f.value));
+  if (unsure.length) {
+    // The page turned the still-connected original into a non-password control that shows the stored value:
+    // empty it with the native setter, without events (no page code runs), and say so.
+    let exposedCleared = 0;
+    unsure.forEach((w) => {
+      if (w.el.isConnected && w.el.type !== "password" && current(w.el) === w.f.value && setter && setter.set) {
+        setter.set.call(w.el, "");
+        exposedCleared += 1;
+        wrote.splice(wrote.lastIndexOf(w.f.token), 1);  // emptied again: no longer left written
+      }
+    });
+    return report({ refused: "not_established", exposed_cleared: exposedCleared });
+  }
+  return early;
+  // Declared last (hoisted) so the origin check precedes every DOM lookup. Stamped controls may live
+  // inside a shadow root (see the inspection script's walk): look in the document and every open
+  // shadow root, walked afresh on each call since focus listeners may have changed the tree.
+  function find(selector) {
+    const roots = [];
+    (function walk(root) {
+      roots.push(root);
+      for (const e of root.querySelectorAll("*")) if (e.shadowRoot) walk(e.shadowRoot);
+    })(document);
+    return roots.flatMap((r) => Array.from(r.querySelectorAll(selector)));
+  }""" + _RETIRE_INSPECTION_JS + """
 })()"""

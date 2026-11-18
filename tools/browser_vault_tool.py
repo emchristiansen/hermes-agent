@@ -13,7 +13,7 @@ paid per request) and available wherever a browser is. Its actions:
   resolved locally, the page origin must EXACTLY match the item's bound
   origin (pre-checked AND re-asserted synchronously inside the fill script),
   the field is chosen by the ported login-control classifier, injection runs
-  exclusively over the supervisor CDP WebSocket (never argv) — or, for a plugin browser with no CDP
+  exclusively over the supervisor CDP WebSocket (never argv), in an isolated world created for the command — or, for a plugin browser with no CDP
   endpoint, through its registered ``BrowserPageBackend`` (Camofox's REST evaluate) — and the tool
   result reports only ``{filled_fields, kind, origin, success}`` — the
   password never appears in tool results, logs, or the session DB, and its
@@ -29,6 +29,8 @@ autofill (kernel-login-autofill.ts / fill_from_vault.ts).
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import secrets
 import logging
@@ -57,6 +59,22 @@ def _check_vault_available() -> bool:
 # JS evaluation plumbing (server-side; results never carry secret values)
 # ---------------------------------------------------------------------------
 
+# Set by ``supervisor_only()``: every page access goes through the task's registered supervisor and
+# nothing else, never a session attached on demand, a plugin page backend or the preview page.
+_SUPERVISOR_ONLY: contextvars.ContextVar[bool] = contextvars.ContextVar("vault_supervisor_only", default=False)
+
+
+@contextlib.contextmanager
+def supervisor_only():
+    """Confine vault page access to the registered supervisor (``hermes vault fill``): no session attached on
+    demand, no plugin page backend, no preview page. A missing or failing supervisor is a refusal."""
+    token = _SUPERVISOR_ONLY.set(True)
+    try:
+        yield
+    finally:
+        _SUPERVISOR_ONLY.reset(token)
+
+
 # A secret-bearing script runs inside this wrapper on a page backend, so a page exception is answered
 # in-page and its message (which may quote the script) never reaches the backend's error path or logs.
 _PAGE_FILL_FAILED = {"hermes_vault_eval_failed": True}
@@ -65,7 +83,9 @@ _PAGE_FILL_FAILED = {"hermes_vault_eval_failed": True}
 def _page_backend(task_id: str):
     """The page this operation runs on when it is not the task's CDP session: the Desktop in-app browser
     page pinned for a ``target='preview'`` operation, else the plugin browser holding this task's live page
-    (e.g. Camofox), else None."""
+    (e.g. Camofox), else None. Always None under ``supervisor_only()``."""
+    if _SUPERVISOR_ONLY.get():
+        return None
     from agent.browser_page_registry import backend_for_task
     from tools.browser_vault_preview import active_page
     return active_page() or backend_for_task(task_id)
@@ -88,9 +108,10 @@ def _page_eval(backend: Any, task_id: str, expression: str, *, secret: bool) -> 
     return {"success": True, "result": result}
 
 
-def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
+def _eval_js(task_id: str, expression: str, *, timeout: Optional[float] = None) -> dict[str, Any]:
     """Evaluate NON-SECRET JS on the current page (inspection, origin reads): on the plugin browser
-    holding the task's page, else over the task's CDP supervisor. Without either the call reports it."""
+    holding the task's page, else over the task's CDP supervisor (``timeout``: its reply wait, default
+    the supervisor's). Without either the call reports it."""
     page = _page_backend(task_id)
     if page is not None:
         return _page_eval(page, task_id, expression, secret=False)
@@ -98,20 +119,76 @@ def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
     if supervisor is None:
         return {"success": False, "error": "no supervised browser session for this task; open the page with "
                                            "browser_exec first"}
-    sup = supervisor.evaluate_runtime(expression)
+    sup = supervisor.evaluate_runtime(expression, **({"timeout": timeout} if timeout is not None else {}),
+                                      **_world_kwargs())
     if sup.get("ok"):
         return {"success": True, "result": sup.get("result")}
-    return {"success": False, "error": str(sup.get("error") or "evaluate failed")}
+    return {"success": False, "error": str(sup.get("error") or "evaluate failed"), **_markers(sup)}
+
+
+def _markers(sup: dict[str, Any]) -> dict[str, Any]:
+    """The supervisor's typed markers: ``timed_out`` (no reply in time), ``sent: False`` (the command never
+    reached the browser), ``protocol_error`` (the CDP error object's code and message) and ``addressed``
+    (how an isolated-world evaluation was addressed)."""
+    return {**({"timed_out": True} if sup.get("timed_out") is True else {}),
+            **({"sent": False} if sup.get("sent") is False else {}),
+            **({"protocol_error": sup["protocol_error"]} if isinstance(sup.get("protocol_error"), dict) else {}),
+            **({"addressed": sup["addressed"]} if isinstance(sup.get("addressed"), str) else {})}
+
+
+# The isolated world (tools.browser_supervisor_worlds) every page script of the current vault command runs in,
+# when the command runs over a CDP supervisor: inspection, page-clock reads, the fill script and stamp cleanup.
+_WORLD: contextvars.ContextVar[Optional[dict[str, Any]]] = contextvars.ContextVar("vault_world", default=None)
+
+
+def _world_kwargs() -> dict[str, Any]:
+    world = _WORLD.get()
+    return {"world": world} if world is not None else {}
+
+
+@contextlib.contextmanager
+def _page_world(task_id: str, nonce: str, *, nothing: str):
+    """Run the block's page scripts in a new isolated world on the task's page (one per command, named after
+    the inspection ``nonce`` and never reused), yielding None, or yield the refusal when the world cannot be
+    created. Page code cannot replace that world's built-ins (clock, value accessors, JSON) and cannot see its
+    globals (the inspection registry). A plugin page backend has no isolated world: the block runs in the
+    page's own world there (a documented limit). ``nothing``: what the refusal says was not done."""
+    from tools.browser_supervisor_worlds import VAULT_WORLD_PREFIX
+
+    create = None if _page_backend(task_id) is not None else getattr(_ensure_supervisor(task_id),
+                                                                    "create_isolated_world", None)
+    if not callable(create):
+        yield None
+        return
+    made = create(VAULT_WORLD_PREFIX + nonce, timeout=_PAGE_CLOCK_WAIT_S)
+    made = made if isinstance(made, dict) else {}
+    world = made.get("world") if made.get("ok") else None
+    if not isinstance(world, dict) or not world.get("unique_id"):
+        if made.get("timed_out") is True:
+            yield {"success": False, "error_type": "page_unresponsive",
+                   "error": (f"Refused: the page did not answer the creation of the vault's isolated script world "
+                             f"within {_PAGE_CLOCK_WAIT_S:g} s ({_dialog_note(task_id)}); {nothing}.")}
+        else:
+            reason = ("the browser did not report the world's unique context id" if made.get("no_unique_id") is True
+                      or (isinstance(world, dict) and not world.get("unique_id")) else "the browser refused it")
+            yield {"success": False, "error_type": "world_unavailable",
+                   "error": f"Refused: the vault's isolated script world could not be created on the tab ({reason}); {nothing}."}
+        return
+    token = _WORLD.set(world)
+    try:
+        yield None
+    finally:
+        _WORLD.reset(token)
 
 
 def _ensure_supervisor(task_id: str):
     """The supervisor for ``task_id`` (browser_exec attaches one on every call), attaching one on demand to
     the task's session CDP endpoint when none is running. None when no endpoint is known; a fill then
-    refuses rather than touching argv."""
+    refuses rather than touching argv. Under ``supervisor_only()`` only the registered one, never an attach."""
     from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
     supervisor = SUPERVISOR_REGISTRY.get(task_id)
-    if supervisor is not None:
+    if supervisor is not None or _SUPERVISOR_ONLY.get():
         return supervisor
     from tools.browser_session import session_for_task
     from tools.browser_session_cdp import get_dialog_policy_config, resolve_cdp_override
@@ -149,6 +226,7 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
     if page is None and supervisor is None:
         return {
             "success": False,
+            "sent": False,
             "error_type": "supervisor_required",
             "error": (
                 "Vault fill requires the supervised browser session (direct "
@@ -162,16 +240,16 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
     # refuse here, before the credential lands in a page the human is now typing into. The outer
     # epoch check only discards the result, and a fill is a side effect, not a result.
     from tools.browser_vault_preview import active_page
-    if active_page() is None and _bot_desktop_browser_session(task_id):
+    if (_SUPERVISOR_ONLY.get() or active_page() is None) and _bot_desktop_browser_session(task_id):
         from tools.bot_desktop import lease as _bd_lease
         try:
             _bd_lease.assert_agent_may_act()
         except _bd_lease.HumanHasControl as exc:
-            return {"success": False, "error_type": "human_has_control", "error": str(exc)}
+            return {"success": False, "sent": False, "error_type": "human_has_control", "error": str(exc)}
 
     if page is not None:
         return _page_eval(page, task_id, expression, secret=True)
-    sup = supervisor.evaluate_runtime(expression)
+    sup = supervisor.evaluate_runtime(expression, **_world_kwargs())
     if sup.get("ok"):
         return {"success": True, "result": sup.get("result")}
     return {
@@ -180,7 +258,144 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
         if "supervisor" in str(sup.get("error") or "").lower()
         else "eval_failed",
         "error": str(sup.get("error") or "eval failed"),
+        **_markers(sup),
     }
+
+
+# The wait for the non-secret page-clock read sent just before a fill script. A page that cannot answer this
+# quickly is blocked (a dialog, a debugger pause, a print dialog, a long-running script): the secret is never
+# sent. Stamp cleanup on a page known to be blocked waits this long too.
+_PAGE_CLOCK_WAIT_S = 2.0
+
+
+def _open_dialog(task_id: str) -> Optional[dict[str, Any]]:
+    """The native dialog the task's CDP supervisor recorded open on its page (``{"type", "opened_at"}``), or
+    None. Passive: the record comes from Page.javascriptDialogOpening/Closed and nothing acts on the dialog."""
+    if _page_backend(task_id) is not None:
+        return None
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+    probe = getattr(SUPERVISOR_REGISTRY.get(task_id), "open_dialog", None)
+    found = probe() if callable(probe) else None
+    return found if isinstance(found, dict) else None
+
+
+def _dialog_words(dialog: dict[str, Any]) -> str:
+    kind = str(dialog.get("type") or "").strip()
+    return f"a JavaScript {kind} dialog" if kind else "a JavaScript dialog"
+
+
+def _dialog_note(task_id: str) -> str:
+    dialog = _open_dialog(task_id)
+    if dialog is None:
+        return "no dialog was recorded open on the tab"
+    return f"{_dialog_words(dialog)} is open on the tab"
+
+
+def _dialog_refusal(task_id: str, nothing: str) -> Optional[dict[str, Any]]:
+    """The plain refusal for a dialog recorded open on the tab (passive record), else None."""
+    dialog = _open_dialog(task_id)
+    if dialog is None:
+        return None
+    return {"success": False, "error_type": "dialog_open",
+            "error": f"Refused: {_dialog_words(dialog)} is open on the tab; {nothing}. Ask the user to close it, then retry."}
+
+
+# What _page_clock returns when the command's isolated world is gone (the page moved to a new document).
+_WORLD_GONE: dict[str, float] = {}
+
+
+def _world_gone(result: dict[str, Any]) -> bool:
+    """The command's isolated world no longer exists: a typed match on the CDP protocol error of an evaluation
+    addressed by uniqueContextId (tools.browser_supervisor_worlds.world_gone), never on error text."""
+    from tools.browser_supervisor_worlds import world_gone
+
+    return _WORLD.get() is not None and world_gone(result)
+
+
+def _page_clock(task_id: str) -> Optional[dict[str, float]]:
+    """The page's ``performance.timeOrigin`` and ``performance.now()``, read with a short wait (non-secret),
+    or None when the page does not answer in time or answers something else, or ``_WORLD_GONE``."""
+    import math
+
+    from agent.vault_login_classifier import PAGE_CLOCK_JS
+
+    res = _eval_js(task_id, PAGE_CLOCK_JS, timeout=_PAGE_CLOCK_WAIT_S)
+    if _world_gone(res):  # FC-2: the page answered; the isolated world is gone (a new document)
+        return _WORLD_GONE
+    clock = _parse_json_result(res.get("result")) if res.get("success") else None
+    if not isinstance(clock, dict):
+        return None
+    values = (clock.get("timeOrigin"), clock.get("now"))
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in values):
+        return None
+    return {"timeOrigin": float(values[0]), "now": float(values[1])}
+
+
+def _send_gate(task_id: str, *, nothing: str = "the value was not sent; nothing was written"
+               ) -> tuple[Optional[dict[str, float]], Optional[dict[str, Any]]]:
+    """``(anchor, None)`` when the page is free now, else ``(None, refusal)``: a dialog recorded open on the
+    tab, or a page that does not answer a clock read within _PAGE_CLOCK_WAIT_S. Checked before inspection and
+    again just before a secret-bearing fill script is sent, whose budget the anchor starts
+    (agent.vault_login_classifier.FILL_PAGE_BUDGET_S). ``nothing``: what the refusal says was not done."""
+    dialog = _dialog_refusal(task_id, nothing)
+    if dialog is not None:
+        return None, dialog
+    anchor = _page_clock(task_id)
+    if anchor is _WORLD_GONE:
+        return None, {"success": False, "error_type": "page_navigated",
+                      "error": ("Refused: the page moved to a new document (the vault's isolated world for the "
+                                f"inspected page is gone); {nothing}. Inspect the new page again.")}
+    if anchor is None:
+        return None, {"success": False, "error_type": "page_unresponsive",
+                      "error": (f"Refused: the page did not answer within {_PAGE_CLOCK_WAIT_S:g} s "
+                                f"({_dialog_note(task_id)}; a dialog, a debugger pause, a print dialog or a "
+                                f"long-running script can block it); {nothing}.")}
+    return anchor, None
+
+
+def _after_send(task_id: str, result: dict[str, Any]) -> dict[str, Any]:
+    """The result when the fill script was sent and no report came back (FB-2). Only a lost isolated world (the
+    CDP protocol error -32000 "Cannot find context with specified id" or -32602 "uniqueContextId not found" for
+    an evaluation addressed by uniqueContextId, matched on the error object: the page moved to a new document
+    before the script started) means nothing was written. Every other failure after sending (no reply in time, the connection closing,
+    an exception, the document going away while the script ran) leaves the field's state not established:
+    the script may still complete, or may have written before it stopped. Page text is never repeated."""
+    from agent.vault_login_classifier import FILL_PAGE_BUDGET_S
+    from tools.browser_supervisor import EVAL_REPLY_WAIT_S
+
+    error = str(result.get("error") or "")
+    if _world_gone(result):
+        return {"success": False, "error_type": "page_navigated",
+                "error": ("Refused: the page moved to a new document before the fill script started (the vault's "
+                          "isolated world for the old document is gone), so the script never ran. Nothing was "
+                          "written, and the new document carries none of this inspection's stamps.")}
+    logger.debug("vault fill: no report from the fill script after it was sent (%s)", error[:200])
+    if _timed_out(result):
+        kind, cause = "fill_timeout", f"the page did not answer the fill script within {EVAL_REPLY_WAIT_S:g} s"
+    else:
+        kind, cause = "fill_unconfirmed", _SEND_FAILURES.get(next((k for k in _SEND_FAILURES if k in error), ""),
+                                                            "the fill script failed after it was sent")
+    return {"success": False, "error_type": kind, "may_complete_later": True,
+            "error": (f"{cause[0].upper()}{cause[1:]}; {_dialog_note(task_id)}. The script may still complete on "
+                      "this tab, or may have written before it stopped, so what the field holds is not "
+                      "established: check the tab before doing anything else. (The script refuses to write "
+                      f"once {FILL_PAGE_BUDGET_S:g} s have passed on the page clock since the page last answered; "
+                      "that covers a dialog closed later, not a paused debugger.)")}
+
+
+# Our own failure texts (never page text) for a fill script that was sent and gave no report.
+_SEND_FAILURES = {
+    "CDP connection closed before reply": "the connection to the browser closed before the fill script reported",
+    "Inspected target navigated or closed": "the tab navigated or closed while the fill script was running",
+    "Execution was terminated": "the fill script's execution was terminated before it reported",
+    "Execution context was destroyed": "the page's document went away while the fill script was running",
+}
+
+
+def _timed_out(result: dict[str, Any]) -> bool:
+    """The page did not answer in time (the supervisor's typed ``timed_out`` marker, not error text)."""
+    return not result.get("success") and result.get("timed_out") is True
 
 
 def _parse_json_result(raw: Any) -> Any:
@@ -245,6 +460,9 @@ def _bound_page_origin(task_id: str, meta: Any, probe_kind: str) -> str | dict[s
     else the refusal to return. Manager items may bind several websites; matching is exact and
     nothing wildcard or parent-domain is inferred. The caller hands the returned origin to ``build_fill_js``,
     which re-asserts it inside the page immediately before the write (navigation between check and fill)."""
+    blocked = _dialog_refusal(task_id, "nothing was resolved, sent or written")
+    if blocked is not None:  # a blocked tab: answer plainly instead of timing out on origin probes
+        return blocked
     allowed = saved_origins(meta)
     if not allowed:
         return {"success": False, "error_type": "no_origin",
@@ -402,10 +620,6 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     authenticator seed, the code is minted server-side and nobody is asked; otherwise the user is prompted on
     their surface for the code their phone/email/app shows. The code goes into the page over the supervisor
     socket and never enters the conversation. A saved login's code is only minted on its saved origin(s)."""
-    from agent.redact import register_vault_redaction_value
-    from agent.vault_backends.unlock import can_prompt_here, get_code_prompt_callback
-    from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
-
     effective_task_id = task_id or "default"
     backend, meta = _saved_login(handle)
     if meta is not None:
@@ -417,13 +631,50 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
             return json.dumps(bound)
         origin = bound
     else:
+        # N-j: no saved login, so no origin guard ran: the dialog record is consulted before any tab probe.
+        blocked = _dialog_refusal(effective_task_id, "nothing was inspected or written")
+        if blocked is not None:
+            return json.dumps(blocked)
         _focus_bound_origin(effective_task_id, "", "otp")
         origin = _current_page_origin(effective_task_id)
         if not origin:
             return json.dumps({"success": False, "error": "No page with a code field is open."})
-    site = origin.split("://", 1)[-1]
-
     nonce = secrets.token_hex(8)
+    with _page_world(effective_task_id, nonce, nothing="nothing was inspected or written") as refused:
+        if refused is not None:
+            return json.dumps(refused)
+        return _enter_code_on_page(effective_task_id, nonce, origin, backend, handle, meta)
+
+
+def _enter_code_on_page(effective_task_id: str, nonce: str, origin: str, backend: Any, handle: str, meta: Any) -> str:
+    """enter_code once the origin is known, inside the command's isolated world: inspect, get the code (minted
+    or asked of the user) and write it."""
+    site = origin.split("://", 1)[-1]
+    # N-j: a blocked tab (a dialog, an unresponsive page) refuses before inspection, with or without a saved login.
+    _, blocked = _send_gate(effective_task_id, nothing="nothing was inspected or written")
+    if blocked is not None:
+        return json.dumps(blocked)
+    # FC-6: this inspection's stamps, registry and observer are retired on every exit, in the command's world,
+    # unless the fill script ran to completion (its own finally retires them).
+    stamps = _InspectionStamps()
+    with _inspection_stamps(effective_task_id, nonce, stamps):
+        result = _enter_code_inspected(effective_task_id, nonce, origin, site, backend, handle, meta, stamps)
+    if stamps.new_document:
+        out = json.loads(result)
+        out["stamps"] = ("The page had moved to a new document, which carries none of this inspection's stamps; "
+                         "nothing remained to remove.")
+        return json.dumps(out)
+    return result
+
+
+def _enter_code_inspected(effective_task_id: str, nonce: str, origin: str, site: str, backend: Any, handle: str,
+                          meta: Any, stamps: _InspectionStamps) -> str:
+    """enter_code's inspection (stamping with ``nonce``), the code and its write; ``stamps`` records whether the
+    fill script retired the inspection itself."""
+    from agent.redact import register_vault_redaction_value
+    from agent.vault_backends.unlock import can_prompt_here, get_code_prompt_callback
+    from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
+
     inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
     raw_controls = _parse_json_result(inspect.get("result")) if inspect.get("success") else None
     if isinstance(raw_controls, str):
@@ -435,20 +686,26 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
                                      "an approval tap in an app, tell the user to complete it on their device and wait for the page to move on.")})
 
     def write(code: str, source: str) -> str:
+        anchor, refusal = _send_gate(effective_task_id)
+        if refusal is not None:
+            stamps.page_blocked = True
+            return json.dumps(refusal)
         register_vault_redaction_value(code)
         fills = build_otp_fills(otp_controls, code)
-        result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
+        result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce,
+                                                                  anchor=anchor))
         del code
         if not result.get("success"):
-            return json.dumps({"success": False, "error": str(result.get("error") or "fill failed")[:200]})
+            if result.get("sent") is False:  # never reached the page: its own refusal
+                return json.dumps({"success": False, **({"error_type": result["error_type"]} if result.get("error_type") else {}),
+                                   "error": str(result.get("error") or "fill failed")[:200]})
+            stamps.page_blocked = True  # the cleanup is still sent, with the short wait
+            return json.dumps(_after_send(effective_task_id, result))
+        stamps.removed_by_fill_script = True  # the script ran to completion, including its finally
         parsed = _parse_json_result(result.get("result"))
         if isinstance(parsed, str):
             parsed = _parse_json_result(parsed)
-        if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
-            return json.dumps({"success": False, "error_type": "origin_changed", "error": "The page navigated before the code could be entered. Nothing was written."})
-        filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
-        return json.dumps({"success": bool(filled), "filled_fields": filled, "origin": origin, "source": source,
-                           "next": "Submit the form (many sites auto-submit when the last digit lands)."})
+        return json.dumps(_code_write_outcome(parsed, origin, source, len(fills)))
 
     if meta is not None:  # a saved login on its bound origin: mint + write inside the backend's fill_context
         written = write_backend_code(backend, handle, meta, origin, lambda code: write(code, backend.name))
@@ -467,22 +724,35 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
 
 
 @plugin_errors_as_refusal
-def browser_vault_fill(handle: str, task_id: Optional[str] = None, *, with_identifier: bool = False) -> str:
+def browser_vault_fill(handle: str, task_id: Optional[str] = None, *, with_identifier: bool = False,
+                       require_empty: bool = False, backend: Any = None) -> str:
     """Fill the current page's password field from a vault handle.
 
     Password-only: the identifier is agent-visible metadata (see
     browser_vault_list) and is typed by the agent via normal input tools.
     The password is resolved server-side and injected via in-page JS over
     the supervisor CDP WebSocket; the result reports only counts/metadata.
+    ``require_empty`` (logins only) refuses with ``field_not_empty`` when the password field already
+    holds a value, and with ``no_password_field`` when the page has none, both before any value is
+    resolved; the fill script re-checks the field after focus, immediately before it writes. An
+    explicit ``backend`` is the only store consulted (no other backend is enumerated) and must own
+    ``handle``. A login's target is an actual ``type=password`` control. This inspection's slot stamps
+    are removed on every exit after it. A JavaScript dialog recorded open on the tab (passively; the fill never
+    answers one), or a page that does not answer a short clock read, refuses before inspection and again just
+    before the value is sent. Over a CDP supervisor every page script of the command (inspection, clock reads,
+    the fill script, stamp cleanup) runs in one isolated world created for it, whose built-ins page code cannot
+    replace; page listeners still run synchronously on focus and on the fill's events. The fill script refuses
+    at its checks once its page-clock budget has passed (a dialog closed later); that is defence in depth, not a
+    guarantee: on any failure after the script was sent (no reply in time, the connection or document gone) the
+    result says the script may still complete and that the tab must be checked; only a world lost before the
+    script started (``page_navigated``) means nothing was written.
     """
-    from agent.vault_backends import UnlockRequired, backend_for_handle
+    from agent.vault_backends import UnlockRequired
 
     effective_task_id = task_id or "default"
-    backend = backend_for_handle(handle)
-    if backend is not None and backend.needs_unlock and not backend.is_unlocked():
-        unlocked = json.loads(browser_vault_unlock(backend.name))
-        if not unlocked.get("success"):
-            return json.dumps(unlocked)
+    backend, refused = _fill_backend(handle, backend)
+    if refused is not None:
+        return refused
 
     try:
         meta = backend.get_meta(handle) if backend is not None else None
@@ -513,7 +783,30 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, *, with_ident
         refusal = snapshot_refusal(backend, handle, meta, page_origin)
         if refusal is not None:
             return json.dumps(refusal)
-        return _fill_bound_page(backend, handle, meta, page_origin, effective_task_id, with_identifier)
+        return _fill_bound_page(backend, handle, meta, page_origin, effective_task_id, with_identifier,
+                                require_empty)
+
+
+def _fill_backend(handle: str, backend: Any) -> tuple[Any, Optional[str]]:
+    """The store a fill reads, and a refusal when it must not be read. An explicit ``backend`` is used as
+    supplied: it must own ``handle`` and is never unlocked or looked up by name. Without one, the handle
+    picks its backend, which may prompt to unlock."""
+    from agent.vault_backends import backend_for_handle
+
+    if backend is not None:
+        if not backend.owns(handle):
+            return backend, json.dumps({"success": False, "error_type": "backend_mismatch",
+                                        "error": f"Handle {handle!r} does not belong to the {backend.display_name} backend."})
+        if backend.needs_unlock and not backend.is_unlocked():
+            return backend, json.dumps({"success": False, "error_type": "unlock_required",
+                                        "error": f"{backend.display_name} is locked; nothing was read or written."})
+        return backend, None
+    backend = backend_for_handle(handle)
+    if backend is not None and backend.needs_unlock and not backend.is_unlocked():
+        unlocked = json.loads(browser_vault_unlock(backend.name))
+        if not unlocked.get("success"):
+            return backend, json.dumps(unlocked)
+    return backend, None
 
 
 def _identifier_fill(classified: list, password_fill: list[dict[str, Any]], identifier: str) -> list[dict[str, Any]]:
@@ -530,46 +823,40 @@ def _identifier_fill(classified: list, password_fill: list[dict[str, Any]], iden
 
 
 def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, effective_task_id: str,
-                     with_identifier: bool = False) -> str:
+                     with_identifier: bool = False, require_empty: bool = False) -> str:
     """Inspect the page, resolve the item's secret and write it; runs inside the backend's fill_context
-    after the origin guard passed. ``with_identifier`` also writes the login's (non-secret) identifier."""
+    after the origin guard passed. ``with_identifier`` also writes the login's (non-secret) identifier;
+    ``require_empty`` see :func:`browser_vault_fill`."""
+    nonce = secrets.token_hex(8)  # binds this fill to THIS inspection's stamps and names its isolated world
+    nothing = "nothing was inspected, resolved, sent or written"
+    with _page_world(effective_task_id, nonce, nothing=nothing) as refused:
+        if refused is not None:
+            return json.dumps(refused)
+        _, blocked = _send_gate(effective_task_id, nothing=nothing)
+        if blocked is not None:
+            return json.dumps(blocked)
+        stamps = _InspectionStamps()
+        with _inspection_stamps(effective_task_id, nonce, stamps):
+            result = _fill_inspected_page(backend, handle, meta, page_origin, effective_task_id, nonce, stamps,
+                                          with_identifier, require_empty)
+        if stamps.new_document:
+            result = dict(result, stamps=("The page had moved to a new document, which carries none of this "
+                                          "inspection's stamps; nothing remained to remove."))
+        return json.dumps(result)
+
+
+def _fill_inspected_page(backend: Any, handle: str, meta: Any, page_origin: str, effective_task_id: str, nonce: str,
+                         stamps: _InspectionStamps, with_identifier: bool, require_empty: bool) -> dict[str, Any]:
+    """Inspect (stamping with ``nonce``), resolve and write, in the command's isolated world; the tool result
+    as a dict. The caller removes the stamps unless the fill script did."""
     from agent.redact import register_vault_redaction_value
-    from agent.vault_login_classifier import (
-        ClassifiedLoginControl,
-        LoginControl,
-        build_fill_js,
-        build_inspection_js,
-        classify_checkout_control,
-        classify_login_control,
-        select_checkout_fills,
-        select_password_fill,
-    )
+    from agent.vault_login_classifier import build_fill_js, select_checkout_fills, select_password_fill
     from agent.vault_backends import UnlockRequired
-    from agent.vault_store import ADDRESS_FIELDS, PAYMENT_FIELDS, scrub_secret_from_text
+    from agent.vault_store import ADDRESS_FIELDS, PAYMENT_FIELDS
 
-    # ── Inspect + classify page controls ────────────────────────────────────
-    nonce = secrets.token_hex(8)  # binds this fill to THIS inspection's stamps
-    inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
-    if not inspect.get("success"):
-        return json.dumps(
-            {"success": False, "error": f"Could not inspect page inputs: {inspect.get('error', 'eval failed')}"}
-        )
-    raw_controls = _parse_json_result(inspect.get("result"))
-    if isinstance(raw_controls, str):
-        raw_controls = _parse_json_result(raw_controls)
-    if not isinstance(raw_controls, list):
-        return json.dumps({"success": False, "error": "Page input inspection returned no usable controls."})
-
-    classify = classify_login_control if meta.kind == "login" else classify_checkout_control
-    classified: list[ClassifiedLoginControl] = []
-    for raw in raw_controls:
-        if not isinstance(raw, dict):
-            continue
-        result = classify(LoginControl.from_dict(raw))
-        if result is not None:
-            classified.append(result)
-    if not classified:
-        return json.dumps({"success": False, "error": f"No {meta.kind} form fields were found on the current page."})
+    classified, refused = _inspect_fill_targets(effective_task_id, nonce, meta, require_empty, with_identifier)
+    if refused is not None:
+        return json.loads(refused)
 
     # ── Resolve secret and fill (secret never enters any logged string) ─────
     try:
@@ -582,12 +869,17 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
             secret = backend.resolve_secret(handle)
             fills = select_checkout_fills(classified, secret, PAYMENT_FIELDS if meta.kind == "payment" else ADDRESS_FIELDS)
     except UnlockRequired:
-        return json.dumps({"success": False, "error_type": "unlock_required",
-                           "error": f"{backend.display_name} locked again; call browser_vault action=unlock."})
+        return {"success": False, "error_type": "unlock_required",
+                "error": f"{backend.display_name} locked again; call browser_vault action=unlock."}
     if not fills:
-        return json.dumps(
-            {"success": False, "error": f"No fillable {meta.kind} field matched the saved item on this page."}
-        )
+        return {"success": False, "error": f"No fillable {meta.kind} field matched the saved item on this page."}
+
+    # A dialog or a blocked renderer: never send the secret. Otherwise the page's clock (read in the isolated
+    # world) anchors the script's budget (defence in depth against a script released late; FILL_PAGE_BUDGET_S).
+    anchor, refusal = _send_gate(effective_task_id)
+    if refusal is not None:
+        stamps.page_blocked = True
+        return refusal
 
     # Register the secret bytes with the model-egress redaction boundary
     # BEFORE they touch the page: any later browser_* result (including
@@ -598,42 +890,257 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
 
     try:
         fill_result = _eval_js_secret(
-            effective_task_id, build_fill_js(fills, expected_origin=page_origin, nonce=nonce)
+            effective_task_id, build_fill_js(fills, expected_origin=page_origin, nonce=nonce,
+                                             require_empty=require_empty, anchor=anchor)
         )
-    except Exception as exc:  # health: allow BLE001 -- any CDP failure becomes a typed result; its text is scrubbed of the secret
-        return json.dumps(
-            {"success": False, "error": scrub_secret_from_text(str(exc), secret)}
-        )
+    except Exception as exc:  # health: allow BLE001 -- any failure after sending is reported as not established
+        fill_result = {"success": False, "error": f"{type(exc).__name__}"}
     if not fill_result.get("success"):
-        err = scrub_secret_from_text(str(fill_result.get("error") or "fill failed"), secret)
-        out = {"success": False, "error": err}
-        if fill_result.get("error_type"):
-            out["error_type"] = fill_result["error_type"]
-        return json.dumps(out)
+        if fill_result.get("sent") is False:  # never reached the page: its own refusal, nothing written
+            return {"success": False, **({"error_type": fill_result["error_type"]} if fill_result.get("error_type") else {}),
+                    "error": str(fill_result.get("error") or "fill failed")}
+        stamps.page_blocked = True  # the stamp cleanup is still sent, with the short wait
+        return _after_send(effective_task_id, fill_result)
+    stamps.removed_by_fill_script = True  # the script ran to completion, including its finally
+    return json.loads(_fill_outcome(_parse_json_result(fill_result.get("result")), backend, meta, page_origin, fills))
 
-    parsed = _parse_json_result(fill_result.get("result"))
+
+class _InspectionStamps:
+    """Whether this inspection's stamps still need removing: the fill script removes them itself when it
+    runs to completion; on every other exit the caller does."""
+
+    removed_by_fill_script = False
+    page_blocked = False  # the page did not answer: the cleanup is still sent, with a short wait
+    new_document = False  # the cleanup found the isolated world gone: a new document, none of our stamps
+
+
+@contextlib.contextmanager
+def _inspection_stamps(task_id: str, nonce: str, stamps: _InspectionStamps):
+    """Remove the stamps of inspection ``nonce`` (only those) when the block exits, however it exits,
+    unless the fill script already did. The cleanup runs in the command's isolated world, where the
+    inspection's registry lives."""
+    from agent.vault_login_classifier import build_clear_stamps_js
+
+    try:
+        yield stamps
+    finally:
+        if not stamps.removed_by_fill_script:
+            res = _eval_js(task_id, build_clear_stamps_js(nonce), timeout=_PAGE_CLOCK_WAIT_S if stamps.page_blocked else None)
+            stamps.new_document = _world_gone(res)
+
+
+def _inspect_fill_targets(task_id: str, nonce: str, meta: Any, require_empty: bool,
+                          with_identifier: bool = False) -> tuple[list, Optional[str]]:
+    """Inspect and classify the page's controls (stamping them with ``nonce``), and refuse before anything
+    is resolved when there is nothing to fill. A login needs an actual ``type=password`` target (the same
+    control the writer selects) unless ``with_identifier`` fills an identifier-only step, and, with
+    ``require_empty``, one that holds no value."""
+    from agent.vault_login_classifier import (
+        LoginControl,
+        best_password_control,
+        build_inspection_js,
+        classify_checkout_control,
+        classify_login_control,
+    )
+
+    def refuse(error: str, error_type: Optional[str] = None) -> tuple[list, str]:
+        return [], json.dumps({"success": False, **({"error_type": error_type} if error_type else {}), "error": error})
+
+    inspect = _eval_js(task_id, build_inspection_js(nonce))
+    if not inspect.get("success"):
+        return refuse(f"Could not inspect page inputs: {inspect.get('error', 'eval failed')}")
+    raw_controls = _parse_json_result(inspect.get("result"))
+    if isinstance(raw_controls, str):
+        raw_controls = _parse_json_result(raw_controls)
+    if not isinstance(raw_controls, list):
+        return refuse("Page input inspection returned no usable controls.")
+
+    classify = classify_login_control if meta.kind == "login" else classify_checkout_control
+    classified = [c for c in (classify(LoginControl.from_dict(raw)) for raw in raw_controls if isinstance(raw, dict))
+                  if c is not None]
+    if not classified:
+        return refuse(f"No {meta.kind} form fields were found on the current page.")
+    if require_empty and meta.kind != "login":
+        return refuse("require_empty applies to login fills only.", "unsupported")
+    if meta.kind != "login":
+        return classified, None
+    target = best_password_control(classified)
+    if target is None and require_empty:
+        return refuse("No password field on the page. Nothing was resolved or written.", "no_password_field")
+    if target is None and not with_identifier:
+        return refuse("No fillable login field matched the saved item on this page.")
+    if require_empty and target.control.has_value:
+        return refuse("Refused: the password field already holds a value. Nothing was resolved or written.",
+                      "field_not_empty")
+    return classified, None
+
+
+# What the fill script reports when the page changed under it, did not keep the exact value (what was written
+# was cleared; see _VALUE_MISMATCH_NOT_CLEARED for a field the page refilled), or changed the field after the
+# write (not established). The written clause (_written_clause) comes from the script's own count.
+_IN_PAGE_REFUSALS = {
+    "field_not_empty": "Refused: the field gained a value before the fill could write it.",
+    "target_changed": "Refused: the field changed, or was removed, reinserted or replaced, before the fill could write it.",
+    "value_mismatch": ("Refused: the password field did not keep the exact stored value (the field or the page "
+                       "changed it, e.g. a line break a single-line input drops). What was written was cleared; "
+                       "nothing is filled."),
+    "not_established": ("Refused: the value was written, but by the end of the fill the password field was no longer "
+                        "the inspected field holding exactly the stored value (the page removed, replaced, moved or "
+                        "changed it). Whether the page's password field holds the value is not established. It is "
+                        "not filled; do not submit this form."),
+}
+# A value_mismatch the fill script did not report as cleared: the page's own input/change handlers put a value
+# back into the original field ("intact": true), or removed, moved or replaced the original, or the state was
+# not reported (either way the field the page now shows is not claimed to be empty).
+_MISMATCH = ("Refused: the password field did not keep the exact stored value (the field or the page changed it, "
+             "e.g. a line break a single-line input drops). ")
+_VALUE_MISMATCH_NOT_CLEARED = {
+    False: _MISMATCH + ("The fill emptied the field, but the page's own input/change handlers then put a value "
+                        "back: the field is not empty, and what it holds is not established. It is not filled; "
+                        "do not submit this form."),
+    None: _MISMATCH + ("The fill emptied the field, but the page's own input/change handlers then removed, "
+                       "moved or replaced it, or its state was not reported: that the password field on the page "
+                       "is empty is not established. It is not filled; do not submit this form."),
+}
+_ROLE_WORDS = {"current-password": "the password field", "one-time-code": "a one-time-code box",
+               "username": "the identifier field", "email": "the identifier field", "tel": "the identifier field"}
+
+
+def _role_words(role: Any) -> str:
+    """A closed table: our own fill tokens by name, card and address tokens by kind, anything else
+    "another field" (no reported text is ever repeated)."""
+    from agent.vault_login_classifier import ADDRESS_AUTOFILL_TOKENS, PAYMENT_AUTOFILL_TOKENS
+
+    role = role if isinstance(role, str) else ""
+    if role in _ROLE_WORDS:
+        return _ROLE_WORDS[role]
+    if role in PAYMENT_AUTOFILL_TOKENS:
+        return "a card field"
+    if role in ADDRESS_AUTOFILL_TOKENS or role == "country-name":
+        return "an address field"
+    return "another field"
+
+
+def _written_clause(parsed: dict[str, Any], *, before: bool = True) -> str:
+    """What the fill script says it wrote and left written (roles, never values); ``before``: said of a refusal
+    that came after those writes."""
+    count, roles = parsed.get("written"), parsed.get("roles")
+    if count == 0:
+        return "Nothing was written."
+    if isinstance(count, int) and not isinstance(count, bool) and count > 0 and isinstance(roles, list):
+        names = ", ".join(_role_words(r) for r in roles)
+        return (f"{count} field{' was' if count == 1 else 's were'} written (or a write was attempted)"
+                f"{' before this' if before else ''} and {'was' if count == 1 else 'were'} not cleared: {names}.")
+    return "Whether anything was written is not established."
+
+
+def _in_page_refusal(parsed: Any, page_origin: str) -> Optional[dict[str, Any]]:
+    """The tool result for a refusal the fill script reported (None when it reported none): never success,
+    never a Submit hint, and it says what was written, from the script's own count. Shared by fill and
+    enter_code."""
+    from agent.vault_login_classifier import FILL_PAGE_BUDGET_S
+
+    refused = parsed.get("refused") if isinstance(parsed, dict) else None
+    if refused is None:
+        return None
+    written = _written_clause(parsed)
+    if refused == "origin_changed":
+        error = ("Refused: the page navigated away from the bound origin "
+                 f"({page_origin}) before the fill could write. " + written)
+        return {"success": False, "error_type": refused, "error": error}
+    if refused == "value_mismatch":
+        cleared = parsed.get("cleared") is True and parsed.get("intact") is True
+        refilled = parsed.get("cleared") is False and parsed.get("intact") is True
+        error = (_IN_PAGE_REFUSALS[refused] if cleared
+                 else _VALUE_MISMATCH_NOT_CLEARED[False if refilled else None])
+        if parsed.get("written") != 0:  # other fields: say what remains written, or that it is unknown
+            error += " Other fields: " + written
+        return {"success": False, "error_type": refused, "field_cleared": cleared, "error": error}
+    if refused == "expired":
+        error = (f"Refused: the fill script reached the page more than {FILL_PAGE_BUDGET_S:g} s (page clock) after "
+                 "the page last answered, or in another document; the page was blocked (e.g. by a dialog). " + written)
+        return {"success": False, "error_type": refused, "error": error}
+    if refused == "not_established":
+        exposed = parsed.get("exposed_cleared")
+        emptied = (" The page had turned the field into a non-password field that showed the value; it was emptied "
+                   "without page events (a framework's own state may still hold the value)."
+                   if isinstance(exposed, int) and not isinstance(exposed, bool) and exposed > 0 else "")
+        if emptied:  # FB-3: the emptied field no longer counts as written; the clause covers the others only
+            written = "No other field was left written." if parsed.get("written") == 0 else "Other fields: " + written
+        return {"success": False, "error_type": refused, "error": _IN_PAGE_REFUSALS[refused] + emptied + " " + written,
+                "exposed_cleared": bool(emptied)}
+    if refused in _IN_PAGE_REFUSALS:
+        return {"success": False, "error_type": refused, "error": _IN_PAGE_REFUSALS[refused] + " " + written}
+    return {"success": False, "error_type": "fill_refused",
+            "error": "Refused by the fill script for an unrecognised reason. " + written}
+
+
+def _counts(parsed: Any) -> tuple[int, Optional[int]]:
+    """``(filled, written)`` from the fill script's report; ``written`` None when not reported."""
+    fields = parsed if isinstance(parsed, dict) else {}
+    filled, written = fields.get("filled", 0), fields.get("written")
+    ok = lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= 0
+    return (filled if ok(filled) else 0), (written if ok(written) else None)
+
+
+def _partial(filled: int, written: Optional[int], expected: int, what: str) -> str:
+    """N-k: the words for a fill that did not write and keep every field it targeted."""
+    wrote = (f"{written} written" if written is not None else "how many were written is not established")
+    return (f"Only {filled} of the {expected} {what} hold a value after the fill ({wrote}); it is not complete. "
+            "Do not submit this form.")
+
+
+def _code_write_outcome(parsed: Any, origin: str, source: str, expected: int) -> dict[str, Any]:
+    """enter_code's result for the fill script's report: refusals as for the password fill; the code counts as
+    entered only when every box it targeted (``expected``) was written and still held a value after its events
+    ("written" is not "held"; five of six boxes is not entered)."""
+    refused = _in_page_refusal(parsed, origin)
+    if refused is not None:
+        return refused
+    filled, count = _counts(parsed)
+    complete = expected > 0 and filled == expected and count == expected
+    out: dict[str, Any] = {"success": complete, "filled_fields": filled, "origin": origin, "source": source}
+    if complete:
+        out["next"] = "Submit the form (many sites auto-submit when the last digit lands)."
+        return out
+    if filled:
+        out["error_type"] = "partial_fill"
+        out["error"] = _partial(filled, count, expected, "code boxes" if expected > 1 else "code fields")
+    elif count is not None and count > 0:
+        out["error"] = (f"{count} code box{' was' if count == 1 else 'es were'} written, but none held a value after "
+                        "the page's own events (the page emptied or changed it); the code is not entered.")
+    elif count == 0:
+        out["error"] = "No code field was written."
+    else:
+        out["error"] = "No code field holds a value; whether anything was written is not established."
+    return out
+
+
+def _fill_outcome(parsed: Any, backend: Any, meta: Any, page_origin: str, fills: list) -> str:
+    """The tool result for the fill script's report: counts and metadata, never values."""
     if isinstance(parsed, str):
         parsed = _parse_json_result(parsed)
-    if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
-        return json.dumps(
-            {
-                "success": False,
-                "error_type": "origin_changed",
-                "error": (
-                    "Refused: the page navigated away from the bound origin "
-                    f"({page_origin}) before the fill could run "
-                    f"(now on {parsed.get('found') or 'unknown'}). "
-                    "Nothing was written."
-                ),
-            }
-        )
-    filled = parsed.get("filled", 0) if isinstance(parsed, dict) else 0
+    refusal = _in_page_refusal(parsed, page_origin)
+    if refusal is not None:
+        return json.dumps(refusal)
+    filled, written = _counts(parsed)
+    complete = bool(fills) and filled == len(fills) and written == len(fills)  # N-k: every targeted field
 
-    out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
-           "kind": meta.kind, "origin": page_origin}
-    if meta.kind == "login":
+    out: dict[str, Any] = {"success": complete, "filled_fields": filled, "backend": backend.name,
+                           "kind": meta.kind, "origin": page_origin}
+    if meta.kind == "login" and complete:
         out["next"] = ("Submit. If the site then asks for a verification code, call browser_vault action=enter_code with this handle"
                        + (" (a code will be generated automatically)." if meta.has_otp else "."))
+    elif filled:
+        out["error_type"] = "partial_fill"
+        out["error"] = _partial(filled, written, len(fills), "targeted fields")
+    elif written is not None and written > 0:  # FC-1: written (or attempted), but nothing held a value
+        out["error"] = (f"{_written_clause(parsed, before=False)} None of the targeted fields held a value after the page's own "
+                        "events (the page emptied or changed it); nothing is filled. Do not submit this form.")
+    elif written == 0:
+        out["error"] = "No targeted field was written."
+    else:
+        out["error"] = "No targeted field holds a value; whether anything was written is not established."
     if meta.kind != "login":
         out["fields"] = sorted(f["token"] for f in fills)  # which controls were targeted, never the values
     return json.dumps(out)

@@ -159,7 +159,10 @@ def worker_lineage_context(db, conn, sid, payload):
 
 
 def worker_lineage(db, conn, sid, payload):
-    _fields(payload, ('target',))
+    _fields(payload, ('target',), ('strict',))
+    strict = payload.get('strict', False)
+    if type(strict) is not bool:
+        raise RuntimeStoreError('invalid_params')
     view = CompressionSnapshot(db, conn)
     target = payload['target']
     view.authorize(sid, target)
@@ -167,7 +170,7 @@ def worker_lineage(db, conn, sid, payload):
             'lineage': view.get_compression_lineage(target),
             'root': view.get_conversation_root(target),
             'tip': view.get_compression_tip(target),
-            'resume': view.resolve_resume_session_id(target),
+            'resume': view.resolve_resume_session_id(target, strict=strict),
             'identity': view.declared_scope_identity(target),
             'tool_root': view.get_tool_rotation_root(target)}
 
@@ -443,6 +446,16 @@ def worker_compression_append(db, conn, sid, payload):
     return {'count': count, 'annotations': row_annotations(payload['messages'])}
 
 
+def worker_conversation_end(db, conn, sid, payload):
+    """A reset in place (``SessionDB.end_conversation_in_place``) of one session in the worker's readable
+    lineage, on the receipt's own transaction."""
+    _fields(payload, ('target',))
+    target = _text(payload['target'])
+    CompressionSnapshot(db, conn).authorize(sid, target)
+    db._end_conversation_in_transaction(conn, target)
+    return {'value': None}
+
+
 def worker_turn_cleanup(db, conn, sid, payload):
     _fields(payload, ('target', 'holder'))
     target = _text(payload['target'])
@@ -458,6 +471,7 @@ def worker_turn_cleanup(db, conn, sid, payload):
 WORKER_COMPRESSION_HANDLERS = {
     'turn.cleanup': worker_turn_cleanup,
     'compression.append': worker_compression_append,
+    'conversation.end': worker_conversation_end,
     'compression.reopen': worker_reopen,
     'compression.cleanup': worker_compression_cleanup,
     'compression.watermark': worker_watermark,

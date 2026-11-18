@@ -66,16 +66,22 @@ def _send_media_via_adapter(
                 future.cancel()
                 raise
             raw = getattr(result, "raw_response", None)
-            if result and getattr(result, "success", False) and isinstance(raw, dict) and raw.get("ambiguous"):
-                # Sent but the ack was lost: possibly delivered, so never an error (a re-run
-                # would duplicate it); _live_send_media records the target as unverified.
-                job["_media_ack_lost"] = True
-            elif result and not getattr(result, "success", True):
+            if not result or not getattr(result, "success", True):
+                # No result is no confirmation either (as for text: _confirm_adapter_delivery).
                 _note_target_error(
                     job_ref,
-                    f"media send failed for {media_path}: {getattr(result, 'error', 'unknown')}",
+                    f"media send failed for {media_path}: "
+                    f"{getattr(result, 'error', 'unknown') if result else 'no response from adapter'}",
                     errors,
                 )
+            elif isinstance(raw, dict) and raw.get("ambiguous"):
+                # Sent but the ack was lost: possibly delivered, possibly not. Unconfirmed is not
+                # delivered (at least once: a duplicate is acceptable, a loss is not), so it is an
+                # error that keeps a queued message retryable (MR-DELIVERY-16); _live_send_media also
+                # records the target as unverified.
+                job["_media_ack_lost"] = True
+                _note_target_error(
+                    job_ref, f"media send for {media_path} unconfirmed (acknowledgment lost)", errors)
         except Exception as e:
             # TimeoutError etc. have an empty str(); fall back to the class name.
             _note_target_error(

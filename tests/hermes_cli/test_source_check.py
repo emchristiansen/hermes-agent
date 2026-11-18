@@ -473,20 +473,19 @@ def test_embedded_revision_keeps_https_ref_advertisement_recovery(installation, 
     monkeypatch.setattr("hermes_cli.config.get_project_root", lambda: home)
     monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda root: "nix")
     responses[MAIN_CHANNEL] = (200, source_channel("main", "NousResearch/hermes-agent"))
-    original = subprocess.run
     probes = []
 
     def advertise(args, **kwargs):
-        if "ls-remote" in args:
-            probes.append((args, kwargs))
-            return subprocess.CompletedProcess(args, 0, head + "\trefs/heads/main\n", "")
-        return original(args, **kwargs)
+        probes.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, head + "\trefs/heads/main\n", "")
 
-    monkeypatch.setattr(subprocess, "run", advertise)
+    # The remote probe runs owned and bounded (stdin is always DEVNULL there).
+    monkeypatch.setattr("hermes_cli._subprocess_compat.bounded_probe_run", advertise)
     assert check_for_updates(home=home)["behind"] == 0
     assert len(probes) == 1
+    assert "ls-remote" in probes[0][0]
     assert "https://github.com/NousResearch/hermes-agent.git" in probes[0][0]
-    assert probes[0][1]["stdin"] == subprocess.DEVNULL
+    assert probes[0][1]["owned"] is True
     assert probes[0][1]["env"]["GIT_TERMINAL_PROMPT"] == "0"
 
 
@@ -581,6 +580,8 @@ def test_stable_release_the_checkout_already_contains_is_a_rollback(installation
     git("tag", "v1.2.3", shas[release], cwd=bare)
     git("remote", "set-url", "origin", str(bare))
     git("checkout", "-q", "--detach", shas[on])
+    # An embedded build's upstream base is no fact about a checkout: its Git history decides.
+    (root / "install-stamp.json").write_text(json.dumps({"upstreamCommit": shas[release]}))
     api = "/repos/NousResearch/hermes-agent"
     responses[f"{api}/releases/latest"] = (200, {"draft": False, "prerelease": False, "tag_name": "v1.2.3"})
     responses[f"{api}/commits/v1.2.3"] = (200, {"sha": shas[release]})
@@ -590,6 +591,150 @@ def test_stable_release_the_checkout_already_contains_is_a_rollback(installation
     assert status.get("targetSha") == shas[release], status
     assert status["updateAvailable"] is True
     assert status["rollback"] is rollback
+
+
+RELEASE_BASE, NEWER_RELEASE, FORK_REVISION = "b0" * 20, "c1" * 20, "d5" * 20
+
+
+@pytest.fixture
+def embedded_build(installation, monkeypatch):
+    """The running Nix build of a fork: HERMES_REVISION and its stamp name the fork's revision,
+    and the stamp may name the official commit it was built on. No checkout exists to ask."""
+    _root, _linked, home, _base, _head, responses, requests, _git = installation
+    tree = home / "nix-install"
+    tree.mkdir()
+    monkeypatch.setenv("HERMES_REVISION", FORK_REVISION)
+    monkeypatch.setattr("hermes_cli.config.get_project_root", lambda: tree)
+    monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda root: "nix")
+    api = "/repos/NousResearch/hermes-agent"
+
+    def build(*, upstream=None, release=RELEASE_BASE, compare=None, stable_default=True):
+        stamp = {"schemaVersion": 2, "commit": FORK_REVISION, "dirty": False, "baseVersion": "0.22.5",
+                 "displayVersion": "0.22.5", "distance": 0, "source": "nix", "distribution": "nix",
+                 "updateMechanism": "external", "payload": "bootstrap", "tag": None}
+        if upstream:
+            stamp["upstreamCommit"] = upstream
+        (tree / "install-stamp.json").write_text(json.dumps(stamp))
+        if stable_default:
+            # The deployed Nix build defaults to stable (nix-config's stable-notifications patch).
+            monkeypatch.setattr("hermes_cli.update_channel.default_channel", lambda root=None: "stable")
+        responses[f"{api}/releases/latest"] = (200, {"draft": False, "prerelease": False, "tag_name": "v0.22.6"})
+        responses[f"{api}/commits/v0.22.6"] = (200, {"sha": release})
+        compare_path = f"{api}/compare/{release}...{upstream or FORK_REVISION}"
+        if compare is not None:
+            responses[compare_path] = (200, compare)
+        return compare_path
+
+    return home, requests, build
+
+
+@pytest.mark.parametrize("upstream,release,compare,offered", [
+    (RELEASE_BASE, RELEASE_BASE, None, False),  # the stable release IS the fork's upstream base
+    (RELEASE_BASE, NEWER_RELEASE, {"status": "behind"}, True),  # a release after that base
+    (RELEASE_BASE, NEWER_RELEASE, {"status": "ahead"}, False),  # an older release the base contains
+    (RELEASE_BASE, NEWER_RELEASE, None, False),  # GitHub never answered: unknown keeps the build
+    (None, RELEASE_BASE, None, False),  # a fork revision GitHub does not know: unknown keeps it
+], ids=["base", "newer", "older", "unanswered", "undeclared"])
+def test_embedded_fork_is_not_offered_the_release_it_is_built_on(embedded_build, upstream, release, compare,
+                                                                 offered):
+    """INT-01: an embedded fork already containing the stable release was offered it as an update
+    (SHA inequality). Its stamp's upstream base stands in for Git ancestry, as the forward-only
+    guard does for a checkout, while the reported revision stays the fork's own."""
+    from hermes_cli.source_check import UPDATE_AVAILABLE_NO_COUNT, check_for_updates
+
+    home, requests, build = embedded_build
+    compare_path = build(upstream=upstream, release=release, compare=compare)
+
+    status = check_for_updates(home=home)
+
+    assert status["supported"] is True and status["channel"] == "stable", status
+    assert status["currentSha"] == FORK_REVISION
+    assert status["updateAvailable"] is offered, status
+    assert status["rollback"] is False
+    assert status["aheadOfRelease"] is not offered
+    assert status["targetSha"] == (release if offered else FORK_REVISION)
+    assert status["behind"] == (UPDATE_AVAILABLE_NO_COUNT if offered else 0)
+    # Equality with the declared base is proof without asking GitHub.
+    assert (compare_path in requests) is (upstream != release)
+
+
+@pytest.mark.parametrize("release,rollback", [(RELEASE_BASE, True), (NEWER_RELEASE, False)])
+def test_non_default_stable_names_an_embedded_forks_base_a_rollback(embedded_build, release, rollback):
+    """Stable that is not the default subscription may move back, as for a checkout: the base is
+    then named a rollback, not a newer release."""
+    from hermes_cli.source_check import check_for_updates
+
+    home, _requests, build = embedded_build
+    build(upstream=RELEASE_BASE, release=release, stable_default=False)
+
+    status = check_for_updates(home=home, channel="stable")
+
+    assert status["currentSha"] == FORK_REVISION and status["targetSha"] == release, status
+    assert status["updateAvailable"] is True and status["aheadOfRelease"] is False
+    assert status["rollback"] is rollback
+
+
+def test_declaring_an_upstream_base_is_not_answered_from_the_old_cache(embedded_build):
+    from hermes_cli.source_check import check_for_updates
+
+    home, _requests, build = embedded_build
+    build(release=NEWER_RELEASE)
+    assert check_for_updates(home=home)["updateAvailable"] is False  # unknown relation, cached
+    build(upstream=RELEASE_BASE, release=NEWER_RELEASE, compare={"status": "behind"})
+    assert check_for_updates(home=home)["updateAvailable"] is True
+
+
+@pytest.mark.parametrize("code", [403, 429, 404])
+def test_an_unanswered_compare_is_retried_after_the_failure_ttl_not_hidden_for_a_day(
+        installation, embedded_build, monkeypatch, code):
+    """INT01-CACHE-01: with a declared upstream base, a newer release whose compare GitHub refuses
+    (rate limit, 404) keeps the build but is no proof the build contains it. It is reported as an
+    unknown relation and cached only for the failure TTL, so the next passive check asks again and
+    offers the release once GitHub answers ``behind`` (not after 24 hours, or only on force)."""
+    from hermes_cli import source_check
+    from hermes_cli.source_check import UPDATE_AVAILABLE_NO_COUNT, check_for_updates
+
+    clock = [1_000_000.0]
+    monkeypatch.setattr(source_check.time, "time", lambda: clock[0])
+    home, requests, build = embedded_build
+    compare_path = build(upstream=RELEASE_BASE, release=NEWER_RELEASE)
+    responses = installation[5]
+    responses[compare_path] = (code, {"message": "refused"})
+
+    status = check_for_updates(home=home)
+    assert compare_path in requests
+    assert status["updateAvailable"] is False and status["rollback"] is False, status
+    assert status["releaseRelation"] == "unknown"
+
+    # GitHub recovers. Within the failure TTL the cached unknown answer stands, with no request...
+    responses[compare_path] = (200, {"status": "behind"})
+    clock[0] += source_check._UPDATE_CHECK_FAILURE_CACHE_SECONDS - 1
+    del requests[:]
+    assert check_for_updates(home=home)["updateAvailable"] is False
+    assert requests == []
+    # ...and once it expires the relation is asked again and the newer release is offered.
+    clock[0] += 2
+    status = check_for_updates(home=home)
+    assert compare_path in requests
+    assert status["updateAvailable"] is True and status["targetSha"] == NEWER_RELEASE, status
+    assert status["behind"] == UPDATE_AVAILABLE_NO_COUNT and "releaseRelation" not in status
+
+
+def test_a_known_containing_relation_is_still_cached_for_a_day(embedded_build, monkeypatch):
+    """The settled answer keeps the 24-hour cache: only an unknown relation is retried early."""
+    from hermes_cli import source_check
+    from hermes_cli.source_check import check_for_updates
+
+    clock = [1_000_000.0]
+    monkeypatch.setattr(source_check.time, "time", lambda: clock[0])
+    home, requests, build = embedded_build
+    compare_path = build(upstream=RELEASE_BASE, release=NEWER_RELEASE, compare={"status": "ahead"})
+    status = check_for_updates(home=home)
+    assert status["updateAvailable"] is False and "releaseRelation" not in status, status
+    clock[0] += source_check._UPDATE_CHECK_FAILURE_CACHE_SECONDS + 1
+    del requests[:]
+    assert check_for_updates(home=home)["updateAvailable"] is False
+    assert compare_path not in requests and requests == []
 
 
 @pytest.mark.parametrize("ledgered", [True, False])

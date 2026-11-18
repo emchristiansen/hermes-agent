@@ -20,6 +20,8 @@ from typing import Any, Iterator, Mapping, Optional
 from agent.delegation_provider import (
     RESERVED_TASK_PARAMETERS, ROUTE_KEYS, DelegationProvider, DelegationRouteError,
 )
+from tools.delegate_tool_config import ResolvedReasoning, _resolve_delegation_credentials
+from tools.delegate_tool_inherit import inherited_route
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
 
@@ -196,17 +198,51 @@ def _refuse_under_worker_snapshot(home: Path) -> None:
             f"cannot run as the profile at {home}. Delegate without a profile.")
 
 
-def _profile_route(home: Path) -> TaskRoute:
-    """The profile's own primary route, resolved inside its scope (its config.yaml + secrets). The
-    child never borrows the launching profile's key, pool, fallback chain or reasoning level."""
+def _profile_pinned_request(cfg: Mapping[str, Any], route: Mapping[str, Any]) -> dict[str, Any]:
+    """A raw child model may change only the model, never the profile's route or policy.
+
+    Do not resolve aliases here: an alias can select another endpoint and read its credentials.
+    Qualified/aggregator model IDs and other route overrides require a separate routing contract.
+    """
+    pin = route.get("model")
+    if not isinstance(pin, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", pin) is None:
+        raise DelegationRouteError("A profile model pin must be a nonempty raw model ID, not a qualified route.")
+    from hermes_cli.model_switch import MODEL_ALIASES
+    model_cfg = cfg.get("model")
+    aliases = [cfg.get("model_aliases"), model_cfg.get("aliases") if isinstance(model_cfg, dict) else None,
+               MODEL_ALIASES]
+    if any(isinstance(names, Mapping) and pin.lower() in {str(k).strip().lower() for k in names}
+           for names in aliases):
+        raise DelegationRouteError("A profile model pin must name the raw model, not an alias.")
+    conflicts = [name for name in ("provider", "base_url", "api_key", "api_mode", "request_overrides",
+                                   "reasoning_effort", "service_tier") if route.get(name) not in (None, "", {})]
+    fallback = cfg.get("fallback_providers")
+    fallback = fallback if isinstance(fallback, list) else []
+    if route.get("fallback_providers") is not None and route["fallback_providers"] != fallback:
+        conflicts.append("fallback_providers")
+    if conflicts:
+        raise DelegationRouteError("A profile model pin keeps profile-owned routing; remove overrides: "
+                                   + ", ".join(conflicts) + ".")
+    request = _profile_model_request(cfg)
+    provider = request.get("requested") or (model_cfg.get("provider") if isinstance(model_cfg, dict) else None)
+    if not isinstance(provider, str) or provider.strip().lower() in ("", "auto"):
+        raise DelegationRouteError("A profile model pin requires an explicit profile-owned provider.")
+    return {**request, "target_model": pin}
+
+
+def _profile_route(home: Path, route: Optional[Mapping[str, Any]] = None) -> TaskRoute:
+    """The profile's route, resolved inside its scope (its config.yaml + secrets). The child never borrows the
+    launching profile's key, pool, fallback chain or reasoning level; a raw ``model`` pin on ``route`` changes
+    only the child model (:func:`_profile_pinned_request`)."""
     from hermes_cli.config import load_config_readonly
     from hermes_cli.runtime_provider import resolve_runtime_provider
     from hermes_constants import resolve_reasoning_config
-    from tools.delegate_tool_config import ResolvedReasoning, _credential_bundle, _require_pinned_command
+    from tools.delegate_tool_config import _credential_bundle, _require_pinned_command
     _refuse_under_worker_snapshot(home)
     with delegated_profile_scope(home):
         cfg = load_config_readonly() or {}
-        request = _profile_model_request(cfg)
+        pinned = route is not None and route.get("model") not in (None, "")
+        request = _profile_pinned_request(cfg, route) if pinned else _profile_model_request(cfg)
         try:
             rt = resolve_runtime_provider(**request)
         except Exception as exc:
@@ -241,8 +277,7 @@ def _with_inherited_fallback(route: dict[str, Any], config: Mapping[str, Any]) -
 
 def _resolve_route(route: dict[str, Any], parent_agent: Any, backend: str) -> TaskRoute:
     if route.get("profile"):
-        return replace(_profile_route(_profile_home(route["profile"])), backend=backend)
-    from tools.delegate_tool import _resolve_delegation_credentials  # the facade is the patch seam
+        return replace(_profile_route(_profile_home(route["profile"]), route), backend=backend)
     creds = _resolve_delegation_credentials(route, parent_agent)
     if route.get("service_tier") not in (None, ""):
         from tools.delegate_tool_tuning import task_service_tier
@@ -336,8 +371,14 @@ def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, An
             route = _route_one(provider, declared, i, task, config)
             _check_backend_effort(i, route, config)
             request = {name: task[name] for name in declared if task.get(name) is not None}
-            routes.append(replace(_route_to_task_route(route, parent_agent, cache, config, provider.name),
-                                  request=request))
+            inherited = inherited_route(route, config, parent_agent, provider.name)
+            if inherited is None:
+                resolved = _route_to_task_route(route, parent_agent, cache, config, provider.name)
+            else:
+                child_route, reasoning = inherited
+                resolved = replace(_route_to_task_route(child_route, parent_agent, cache, config, provider.name),
+                                   reasoning_effort=ResolvedReasoning(reasoning))
+            routes.append(replace(resolved, request=request))
         except ValueError as exc:  # DelegationRouteError, the credential resolver's and the tier check's refusals
             routes.append(TaskRoute({}, {}, backend=provider.name, error=str(exc)))
     return routes, None
@@ -346,5 +387,4 @@ def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, An
 def route_for_config(routing_cfg: dict[str, Any], parent_agent: Any) -> TaskRoute:
     """The route an internal caller's explicit config block describes (``/review`` ->
     ``auxiliary.review``); bypasses the provider, as those callers own their route."""
-    from tools.delegate_tool import _resolve_delegation_credentials  # the facade is the patch seam
     return TaskRoute(_resolve_delegation_credentials(routing_cfg, parent_agent), routing_cfg)

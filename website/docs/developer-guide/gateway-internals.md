@@ -184,11 +184,119 @@ cached agent/system prompt. Other config keys are not handled by this adapter.
 steer uses the ordinary correction drain; redirect cancels an active model request
 and continues the same turn (or steers at a tool boundary). They never create a
 queued admission or silently fall back to a new turn. `queued` (steer) and
-`redirected` acknowledge runtime acceptance, not crash-durable delivery; do not
-automatically retry an ambiguous reply. `rejected` means the runtime missed the
+`redirected` acknowledge runtime acceptance, not crash-durable delivery. Delivery
+is at-least-once: an ambiguous reply may be resent, and a duplicate correction is
+acceptable where a lost one is not. `rejected` means the runtime missed the
 active correction window, while `stale_generation` rejects settled/replaced work.
-Managed-worker corrections currently return `unsupported_control`; normal durable
-queue submission and Stop remain separate controls.
+
+A managed worker (`gateway.managed_workers`, Kanban and bypass sessions) runs its
+agent in a child process. The owner first keeps each correction durably, then
+sends it over the worker's private control pipe as a `correct` frame; nothing is
+acknowledged that only a process's memory holds. The kept copy is a queued
+admission of the session (request `correction:<id>`, the sender's own next
+prompt, as `prompt.submit` admits it) or, for a running Kanban card attempt, a
+comment on its task (a queued turn there would run against an ended claim). If
+that write fails the reply is an error (`correction_not_kept`, or the admission's
+own refusal), never an ACK; resend it. The ACK is then the child's own verdict,
+its `correction` frame. `redirected` means only that the child's in-flight model
+request was cancelled: its response is fenced (never published, its tool calls
+never run) while the same turn rebuilds around the text. Tools, background
+processes and delegated children are not interrupted. `queued`: the text was
+taken for the next boundary, as a steer, or as a redirect that met a tool batch
+(steered at the tool boundary, tool workers asked to yield to the background),
+Codex's native turn steer or no live request. Before the child reports ready the
+text is latched for the agent it is building and the ACK is `queued` at once.
+These are receipts, not consumption. Consumption is confirmed only by the
+child's `consumed` frame, sent before its result after a completed turn whose
+final usage flush succeeded and which ran every correction it accepted; the
+owner then settles those admissions `steered` with the turn (`admission_id` in
+the ACK names one). Every correction not so confirmed (the child killed or lost,
+a Stop, a failed turn or flush) stays queued and runs as the session's own next
+turn, after an unknown turn's resolution where one pauses the session; a card
+attempt's stays on its task for the next attempt. A correction can therefore
+reach the model twice; it is never lost with the process that accepted it. When
+the running turn did not take the text (it had settled, or the child refused
+it), the ACK says where it will still be delivered: `queued` with its
+`admission_id`, or for a card `rejected`, `delivered: false`, `kept:
+task_comment`. A child lost before answering, a failed application or no verdict
+within 5 seconds is the error `correction_outcome_unknown`; the kept copy is
+delivered regardless, and a resend is a harmless duplicate. Controls on one
+socket dispatch in arrival order, so that window bounds how long a later control
+on the same socket waits behind an unanswered correction; another socket never
+waits. A steer that lands after the turn's final model call runs as a follow-up
+turn of the same admission, as in process; for a Kanban worker only while its
+claim is live. The admission's result is then the follow-up's, marked
+`user_intervened`, because the original prompt alone no longer shaped its final.
+A final usage flush that fails is reported as the failed turn it is
+(`session_persistence_failed:<cause>`), never as a completed one; if the worker
+then cannot finish its execution either, the owner records it unknown. A Kanban
+attempt books its `worker_result` exit from the result after that flush
+(`run_worker_turns(finalize=...)`), so a turn whose persistence failed books the
+failure and its submitter exits nonzero. A correction kept on a card's task is
+shown whole in the task's next attempt's context, however long or old; ordinary
+comments keep their caps. The running worker's board-note injection may steer the
+kept comment in as well, a duplicate that is accepted: it skips only comments its
+own process wrote (by comment id), never a same-profile peer's; its first poll
+delivers every comment after the task's last comment at its run's claim (the
+claim event's `comment_floor`; comment ids only grow), because its context was
+built after the claim (a duplicate of a note the context held is accepted). Wall
+time is never the proof a note was seen; with no recorded floor the first poll
+delivers the whole thread. A TUI or Desktop client that hears a correction was
+kept on the task (`kept: task_comment`) settles it as kept and never re-sends it
+as a fresh, unbound prompt. A TUI correction whose reply failed or was lost stays
+in its queue and an explicit retry sends it again as the same correction for the
+same generation (a duplicate is accepted), never as a prompt. A Desktop
+correction on the canonical owner whose reply failed or was lost stays a
+correction too: the composer offers to send it again, as the same correction to
+the session it was captured for, instead of queueing it as a prompt; only a
+refusal the owner confirms undelivered becomes the next prompt; any other reply
+on the canonical owner (a plain `rejected`, a missing or unrecognised one) is
+treated as uncertain. Every send of one Desktop correction presents the owner
+session, profile and execution generation its first send named (a client-only
+`correction_id`, never on the wire), so a retry after a later run started is
+kept or refused for the original execution, never taken by the later one; a
+retry that would reach another session (a resumed runtime) is sent nowhere and
+its words return to the draft they were typed in (the draft loaded when they
+were taken) only when that draft is empty, judged on the live editor, never into
+another session's composer or over words typed since; otherwise they stay in a
+persistent notice. A correction an external request sends (the review pane's
+ship bar, the plugin SDK) settles the same way and is queued as a prompt only
+after a refusal the owner confirms undelivered. When the composer still believes a canonical
+turn busy just after it ended, the correction goes to the owner fenced to that
+ended generation, without a bubble, instead of becoming a prompt: a card session
+keeps it on its task, any other session refuses it and the words become the
+next prompt as before. A correction
+naming a Kanban session's own past claim that has since ended (closed or
+replaced), or reaching its running claim before any agent or worker is attached
+(where the owner would otherwise answer `delivered: false`), is kept on the
+card's task and answered `kept: task_comment`;
+any other session's stale correction is still refused `stale_generation`. Corrections a lost worker had confirmed consumed settle
+`interrupted` with its unknown fence and never run again; one whose hand-over
+was not confirmed (its write may have committed) is queued again, a duplicate,
+never left in transfer. When that settlement cannot be written, the supported
+resolution of the lost turn (`prompt.resolve_unknown`) settles the same transfers
+in its own transaction; a resolution the store refuses (the claim still runs, or
+another generation) leaves the running agent's buffered steer untouched. A
+confirmed consumption is also recorded durably beside its row, so after an owner
+restart only such a transfer settles `interrupted`; every other transfer the lost
+claim held is queued again in its own place and runs once the lost turn is
+resolved, while the lost turn's own input is never replayed.
+A private peer message to a managed Kanban worker (`ManagedWorker.peer_message`)
+is never a correction: it is not kept on the board, latched before the worker is
+ready or turned into a prompt. The worker takes it only while its correction
+intake is open, the message names exactly its profile, session, generation,
+board, task and run, and its bound claim is the card's live run (checked under
+the board's write lock), all under the intake lock its turn end closes; each
+attempt is buffered under its own ticket. When intake closes, an attempt no turn
+read is withdrawn and settled `unconsumed`; one a turn read is settled `consumed`
+only after that turn completed, flushed and left nothing unrun; any other
+outcome is never settled (unknown). The worker writes each verdict before
+releasing the intake lock, so a verdict always precedes its settlement on the
+wire; the owner still resolves an attempt whose settlement arrives first
+(`steered`), and runs the settlement of an attempt whose waiter gave up.
+Request cancellation is a local socket abort: it fences the stale response, not
+the provider's remote computation.
+Normal durable queue submission and Stop remain separate controls.
 
 ## Shared authority setup readiness
 

@@ -18,7 +18,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait as wait_futures
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -26,6 +26,7 @@ from hermes_constants import get_hermes_home, hermes_home_key
 from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.thread_context import propagate_context_to_thread
 from tools.async_delegation_worker import worker_ledger, require_ledger_owner
+from tools.delegate_tool_progress import SUBAGENT_FAILURE_STATUSES
 from tools.delegation_redaction import redact_child_result, redact_completion_event
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,13 @@ _records: dict[str, dict[str, Any]] = {}
 _refused: dict[Any, frozenset] = {}
 _refused_by: dict[tuple, set] = {}
 _FENCED_FIELDS = ("session_key", "parent_session_id")
+# Process shutdown (``shutdown_all``): every new dispatch is refused for the rest of the process.
+_shutdown_fenced = False
+# Each admitted unit's writer lifetime, from the lock hold that publishes its record (the one the
+# shutdown fence is checked under) until its worker future completes: its runner AND its finalizer
+# have returned, so every write the unit makes is done. A record can turn terminal (a forced stall)
+# while its worker still runs, so this, not the record status, is what a closing SessionDB waits for.
+_worker_futures: set[Future] = set()
 
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
 # Completed records retained (in memory and in the ledger) for status queries.
@@ -251,20 +259,20 @@ def _prune_durable_records() -> None:
         conn.execute(
             "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?" + keep, (cutoff,))
         terminal_count = conn.execute(
-            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')" + keep).fetchone()[0]
+            "SELECT COUNT(*) FROM async_delegations WHERE state!='running'" + keep).fetchone()[0]
         if terminal_count > _MAX_RETAINED_COMPLETED:
             conn.execute(f"""DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing'){keep}
+                     WHERE state!='running'{keep}
                      ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
                               updated_at ASC LIMIT ?
                    )""", (terminal_count - _MAX_RETAINED_COMPLETED,))
         pending_count = conn.execute("""SELECT COUNT(*) FROM async_delegations
-               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'""").fetchone()[0]
+               WHERE state!='running' AND delivery_state='pending'""").fetchone()[0]
         if pending_count > _MAX_DURABLE_PENDING:
             conn.execute("""DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
+                     WHERE state!='running' AND delivery_state='pending'
                      ORDER BY updated_at ASC LIMIT ?
                    )""", (pending_count - _MAX_DURABLE_PENDING,))
 
@@ -351,7 +359,7 @@ def recover_abandoned_delegations() -> int:
         rows = conn.execute("""SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
                       owner_started_at, task_json, origin_session_id, result_json, state
-               FROM async_delegations WHERE state IN ('running','finalizing')""").fetchall()
+               FROM async_delegations WHERE state='running'""").fetchall()
         for row in rows:
             delegation_id, session_key, origin_ui, parent_id, dispatched_at, pid, started, task_json, origin_sid, result_json, last_state = row
             if alive(pid, started):
@@ -585,7 +593,7 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
         rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at,
                       owner_pid, owner_started_at, delivery_attempts, updated_at
                FROM async_delegations
-               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
+               WHERE state!='running' AND delivery_state='pending'
                  AND event_json IS NOT NULL AND updated_at < ?
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)
                ORDER BY completed_at, delegation_id""", (now - _ORPHAN_STALE_S, now - _CLAIM_LEASE_S)).fetchall()
@@ -633,15 +641,6 @@ def _update_delivery(sql: str, params: tuple) -> bool:
     """Run one UPDATE on the ledger; True iff exactly one row changed."""
     with _DB_LOCK, _transaction() as conn:
         return conn.execute(sql, params).rowcount == 1
-
-
-def mark_completion_delivered(delegation_id: str) -> bool:
-    """Atomically acknowledge successful injection of a durable completion."""
-    require_ledger_owner()
-    now = time.time()
-    return _update_delivery(
-        """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
-           WHERE delegation_id=? AND delivery_state!='delivered'""", (now, now, delegation_id))
 
 
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -816,7 +815,7 @@ def get_durable_delegation(delegation_id: str) -> Optional[dict[str, Any]]:
         "delivery_attempts": row[6], "origin_session_id": row[7] or ""}
 
 
-_FAILED_TASK_STATES = frozenset({"error", "failed", "failure", "timeout", "stalled", "unknown", "interrupted"})
+_FAILED_TASK_STATES = SUBAGENT_FAILURE_STATUSES | {"stalled", "unknown", "interrupted"}
 _FAILURE_SURFACE_WINDOW_S = 24 * 3600.0
 
 
@@ -847,7 +846,7 @@ def failed_delegations_for_session(
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             f"""SELECT delegation_id, state, dispatched_at, completed_at, task_json, result_json FROM async_delegations
-                WHERE ({owner_sql}) AND state NOT IN ('running','finalizing') AND completed_at >= ?
+                WHERE ({owner_sql}) AND state!='running' AND completed_at >= ?
                 ORDER BY completed_at DESC LIMIT ?""",
             (*(val for _, val in selectors), cutoff, limit)).fetchall()
     failed: list[dict[str, Any]] = []
@@ -969,8 +968,7 @@ def _batch_crash(error: str, duration: float) -> dict[str, Any]:
 def _batch_status(combined: dict[str, Any]) -> str:
     """Batch status: completed unless every child errored/was interrupted."""
     child_results = combined.get("results") or []
-    ok = ("completed", "success")
-    return "error" if child_results and all(r.get("status") not in ok for r in child_results) else "completed"
+    return "error" if child_results and all(r.get("status") != "completed" for r in child_results) else "completed"
 
 
 def _dispatch(**kwargs) -> dict[str, Any]:
@@ -1022,12 +1020,15 @@ def _dispatch_admitted(
         "_progress_token": None, "_progress_ts": dispatched_at, "_interrupted_at": None,
         "_home": hermes_home_key(get_hermes_home())}  # the profile that dispatched it (``active_count(home=...)``)
     with _records_lock:
+        if _shutdown_fenced:
+            return {"status": "rejected", "error": "The gateway is shutting down: no new background work."}
         if any((field, record[field]) in _refused_by for field in _FENCED_FIELDS):
             return {"status": "rejected", "error": "This session was closed (exit or /new): no new background work."}
         active_slots = {r.get("slot_key") or r["delegation_id"] for r in _records.values() if r.get("status") in _ACTIVE_STATES}
         if record["slot_key"] not in active_slots and len(active_slots) >= max_async_children:
             return {"status": "rejected", "error": capacity_error}
         _records[delegation_id] = record
+        admission = _admit_worker_locked()  # a writer from publication on, before persist and submit
         live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
     _persist_dispatch(record)
     # Units of one call share a slot, so live units can exceed slots: size the pool by units or a
@@ -1061,19 +1062,42 @@ def _dispatch_admitted(
     # The outer dispatch reservation prevents a freeze during this handoff. Retain a worker
     # reservation too: the stall monitor may finalize its registry record before it really exits.
     retirement.acquire()
+    claim = _RunClaim()
+
+    def _claimed_worker() -> None:
+        # A submit that raises AFTER enqueueing (a failed worker-thread start) leaves the item to a
+        # surviving worker: it runs only if the dispatcher has not revoked it, and then owns its release.
+        if not claim.start():
+            return
+        try:
+            _worker()
+        finally:
+            retirement.release()
+            _settle_admission(admission)
+
     try:
-        future = executor.submit(propagate_context_to_thread(_worker))
+        future = executor.submit(propagate_context_to_thread(_claimed_worker))
+
         def worker_done(completed):
-            try:
-                lease.release()
-                if completed.cancelled():
+            # The approval-notify lease ends with the worker. A pool item cancelled before it started
+            # never ran ``_claimed_worker``: finalize it, and release what that worker would have.
+            lease.release()
+            if completed.cancelled() and claim.revoke():
+                try:
                     _finalize(delegation_id, crash_result("Worker cancelled before start", 0), "interrupted")
-            finally:
-                retirement.release()
+                finally:
+                    retirement.release()
+                    _settle_admission(admission)
 
         future.add_done_callback(worker_done)
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
+        if not claim.revoke():  # a surviving worker already started it: dispatched, and still counted
+            logger.warning("Async delegation%s %s started despite a submit error: %s", label, delegation_id, exc)
+            if progress_fn is not None:
+                _ensure_stale_monitor()
+            return {"status": "dispatched", "delegation_id": delegation_id}
         retirement.release()
+        _settle_admission(admission)
         lease.release()
         with _records_lock:
             _records.pop(delegation_id, None)
@@ -1086,6 +1110,58 @@ def _dispatch_admitted(
     if progress_fn is not None:
         _ensure_stale_monitor()
     return {"status": "dispatched", "delegation_id": delegation_id}
+
+
+class _RunClaim:
+    """One-shot race between a queued unit starting and its dispatcher revoking it: the first wins."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state: Optional[str] = None
+
+    def _take(self, state: str) -> bool:
+        with self._lock:
+            if self._state is None:
+                self._state = state
+            return self._state == state
+
+    def start(self) -> bool:
+        return self._take("started")
+
+    def revoke(self) -> bool:
+        return self._take("revoked")
+
+
+def _admit_worker_locked() -> Future:
+    """The admitted unit's writer lifetime; caller holds ``_records_lock``. Resolved when its worker
+    returns (or its submit fails and the unit is revoked before any worker started it). An exception
+    before submit leaves it pending: conservative, the SessionDB close is then skipped for the rest of
+    the process."""
+    admission: Future = Future()
+    _worker_futures.add(admission)
+    admission.add_done_callback(_untrack_worker)
+    return admission
+
+
+def _settle_admission(admission: Future) -> None:
+    if not admission.done():
+        admission.set_result(None)
+
+
+def _untrack_worker(future: Future) -> None:
+    with _records_lock:
+        _worker_futures.discard(future)
+
+
+def join_workers(timeout: float) -> int:
+    """Wait up to ``timeout`` seconds for every admitted unit's worker to finish (runner and
+    finalizer, so all of its writes); returns how many are still being dispatched, queued or
+    running (#101093)."""
+    with _records_lock:
+        pending = set(_worker_futures)
+    if pending and timeout > 0:
+        wait_futures(pending, timeout=timeout)
+    return sum(1 for future in pending if not future.done())
 
 
 def dispatch_async_delegation(
@@ -1169,7 +1245,12 @@ def _finalize(delegation_id: str, result: Any, status: str) -> None:
     ``result`` is a dict or a callable receiving the record snapshot (stall path). The record
     stays active ("finalizing") until durable persistence and queue publication finish; otherwise
     process shutdown can kill this daemon worker after status flips but before SQLite commits.
-    A second call for the same id (late runner return after a forced stall) is a no-op."""
+    A second call for the same id (late runner return after a forced stall) is a no-op.
+
+    The claiming actor is a physical writer until persistence and publication finish (V3-ASYNC-01): the claim
+    admits it in ``_worker_futures`` (the same accounting ``join_workers`` gives the close gate), so a stale
+    monitor that finalizes a record whose worker has already returned and settled its own admission still keeps
+    SessionDB open, or is waited for within the quiesce's bound, until its completion write is done."""
     with _records_lock:
         record = _records.get(delegation_id)
         if record is None or record.get("status") not in _ACTIVE_STATES:
@@ -1181,19 +1262,23 @@ def _finalize(delegation_id: str, result: Any, status: str) -> None:
         record["interrupt_fn"] = None  # drop the closure; child is done
         record["progress_fn"] = None  # stop stale-monitor sampling
         snapshot = dict(record)
-    lease = snapshot.get("_approval_lease")
-    if lease is not None:
-        lease.release()
-    final = result(snapshot) if callable(result) else result
-    _push_completion_event(snapshot, _keep_finished_children(snapshot, final, status), status)
-    with _records_lock:
-        if delegation_id in _records:
-            _records[delegation_id]["status"] = status
-            # Only an active record is ever force-finalized under its dispatcher's Context; a
-            # retained completed one would otherwise pin that turn's agent and history.
-            _records[delegation_id].pop("_context", None)
-            _records[delegation_id].pop("_finished_children", None)
-        _prune_completed_locked()
+        finalizer = _admit_worker_locked()
+    try:
+        lease = snapshot.get("_approval_lease")
+        if lease is not None:
+            lease.release()
+        final = result(snapshot) if callable(result) else result
+        _push_completion_event(snapshot, _keep_finished_children(snapshot, final, status), status)
+        with _records_lock:
+            if delegation_id in _records:
+                _records[delegation_id]["status"] = status
+                # Only an active record is ever force-finalized under its dispatcher's Context; a
+                # retained completed one would otherwise pin that turn's agent and history.
+                _records[delegation_id].pop("_context", None)
+                _records[delegation_id].pop("_finished_children", None)
+            _prune_completed_locked()
+    finally:
+        _settle_admission(finalizer)
 
 
 def completion_event(record: dict[str, Any], result: dict[str, Any], status: str) -> tuple[dict, dict, bool]:
@@ -1525,6 +1610,18 @@ def interrupt_all(reason: str = "shutdown", *, resumable: bool = False) -> int:
     return _interrupt_records(targets, "interrupt_all", reason, "Interrupted %d async delegation(s) (%s)")
 
 
+def shutdown_all(reason: str = "shutdown", *, resumable: bool = False) -> int:
+    """Process shutdown: refuse every new dispatch from now on, then ``interrupt_all``. Fenced first,
+    so a dispatch admitted before it is interrupted and a later one refused. ``join_workers`` then
+    tells the closing SessionDB whether the interrupted units have really finished writing.
+    ``resumable`` passes through to ``interrupt_all`` (a gateway shutdown is a restart, not a person
+    stopping the children, so each keeps its resumable record)."""
+    global _shutdown_fenced
+    with _records_lock:
+        _shutdown_fenced = True
+    return interrupt_all(reason, resumable=resumable)
+
+
 def interrupt_for_session(
     session_key: str = "", origin_ui_session_id: str = "", parent_session_id: str = "", reason: str = "session_end",
 ) -> int:
@@ -1577,7 +1674,7 @@ def _unfence(token: Any) -> None:
 
 def _reset_for_tests() -> None:
     """Test-only: clear all state and tear down the executor + monitor."""
-    global _executor, _executor_max_workers, _monitor_thread
+    global _executor, _executor_max_workers, _monitor_thread, _shutdown_fenced
     with _executor_lock:
         if _executor is not None:
             _executor.shutdown(wait=False)
@@ -1592,6 +1689,8 @@ def _reset_for_tests() -> None:
         _records.clear()
         _refused.clear()
         _refused_by.clear()
+        _worker_futures.clear()
+        _shutdown_fenced = False
     with _orphan_lock:
         _offered.clear()
         _startup_replayed.clear()

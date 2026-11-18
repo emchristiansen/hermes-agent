@@ -427,18 +427,23 @@ def admission_media_references(payload):
 def _held_media_paths(conn):
     # Project only references, not potentially large inline-image/history payloads; a live hosted
     # row's prompt is projected too, because its documents are held by text, not by a reference.
-    rows = conn.execute("""SELECT status, request_id, json_extract(payload_json,
-            '$.attachments_v1.media', '$.native_text_v1.media', '$.api_turn_v1.media'),
-            CASE WHEN status!='terminal' AND request_id LIKE 'hosted:%'
-                 THEN json_extract(payload_json, '$.text') END
-            FROM session_admissions WHERE status!='terminal'
-            OR json_type(payload_json, '$.api_turn_v1.media') IS NOT NULL""").fetchall()
+    # A terminal row that is owed a redelivery will run again, so it holds its inputs like a live row
+    # until the next owner queues it (MR-MEDIA-18; ``session_message_redelivery``).
+    from gateway.session_message_redelivery import owed_admissions
+    rows = conn.execute("""WITH owed(id) AS (SELECT value FROM json_each(?))
+            SELECT holding, request_id, json_extract(payload_json,
+                '$.attachments_v1.media', '$.native_text_v1.media', '$.api_turn_v1.media'),
+            CASE WHEN holding AND request_id LIKE 'hosted:%' THEN json_extract(payload_json, '$.text') END
+            FROM (SELECT *, status!='terminal' OR admission_id IN (SELECT id FROM owed) AS holding
+                  FROM session_admissions)
+            WHERE holding OR json_type(payload_json, '$.api_turn_v1.media') IS NOT NULL""",
+                        (json.dumps(sorted(owed_admissions(conn))),)).fetchall()
     held = set()
-    for status, request_id, encoded, text in rows:
+    for holding, request_id, encoded, text in rows:
         attachments, native, api = json.loads(encoded)
         # API images remain canonical history context after the turn completes.
         references = list(api or ())
-        if status != 'terminal':
+        if holding:
             references.extend(attachments or ())
             references.extend(native or ())
             references.extend(hosted_document_references(request_id, {'text': text}))

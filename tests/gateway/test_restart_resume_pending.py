@@ -86,9 +86,9 @@ def _make_store(tmp_path):
 def _build_agent_history(history: list) -> list:
     """Mirror gateway/run.py's ``history → agent_history`` conversion.
 
-    This is the transformation that strips ``timestamp`` off tool/tool_call
-    rows before the agent sees them.  Tests that check the freshness gate
-    must go through this conversion so they exercise the *real* data the
+    Tool/tool_call rows keep their durable ``timestamp`` (persistence-only:
+    the send path pops it from every outgoing copy).  Tests that check the
+    freshness gate go through this conversion so they exercise the data the
     note-injection code sees.
     """
     agent_history: list = []
@@ -100,7 +100,7 @@ def _build_agent_history(history: list) -> list:
         has_tool_call_id = "tool_call_id" in msg
         is_tool_message = role == "tool"
         if has_tool_calls or has_tool_call_id or is_tool_message:
-            agent_history.append({k: v for k, v in msg.items() if k != "timestamp"})
+            agent_history.append({k: v for k, v in msg.items() if k != "observed"})
         else:
             content = msg.get("content")
             if content:
@@ -119,7 +119,7 @@ def _simulate_note_injection(
     """Mirror the note-injection logic in gateway/run.py _run_agent().
 
     The freshness signal reads ``history[-1].timestamp`` (the raw transcript
-    row), NOT ``agent_history[-1].timestamp`` (which has been stripped).
+    row), NOT ``agent_history[-1].timestamp`` (a rebuilt replay view).
     Tests pass the raw ``history`` — ``agent_history`` is derived from it
     via the real conversion if not supplied explicitly.
     """
@@ -393,15 +393,15 @@ class TestResumePendingSystemNote:
         """Regression guard for #16802: exercise the REAL production path
         where ``agent_history`` has been stripped of timestamps.
 
-        The original PR #16802 fix read ``agent_history[-1].get("timestamp")``
-        — which is always ``None`` at runtime because the gateway strips
-        ``timestamp`` off tool/tool_call rows in ``history → agent_history``.
-        This test builds a stale history, runs it through the real
+        The original PR #16802 fix read ``agent_history[-1].get("timestamp")``,
+        which was ``None`` at runtime while the gateway stripped ``timestamp``
+        off tool/tool_call rows in ``history → agent_history``.  The replay
+        view now keeps it (a context engine recognises restored rows by it).
+        This test builds a stale history, runs it through the
         ``_build_agent_history`` conversion, then asserts:
 
-          1. The stripped ``agent_history`` carries NO timestamp (protects
-             against someone "fixing" the original PR by re-adding the
-             stripped field — which would break the API contract).
+          1. The replayed timestamp never reaches the provider copy (the API
+             contract: ``timestamp`` is a persistence-only field).
           2. The freshness gate still correctly classifies the transcript
              as stale because the signal is read from ``history`` BEFORE
              the strip.
@@ -420,12 +420,12 @@ class TestResumePendingSystemNote:
         ]
         agent_history = _build_agent_history(history)
 
-        # Invariant 1: strip contract preserved
+        # Invariant 1: the provider copy never carries the replayed timestamp
+        from agent.message_metadata import without_persistence_fields
+
         assert agent_history[-1]["role"] == "tool"
-        assert "timestamp" not in agent_history[-1], (
-            "agent_history tool rows must NOT carry a timestamp — the "
-            "freshness gate must read from raw history, not agent_history"
-        )
+        assert agent_history[-1]["timestamp"] == history[-1]["timestamp"]
+        assert "timestamp" not in without_persistence_fields(agent_history[-1])
 
         # Invariant 2+3: stale classification, no note injection
         result = _simulate_note_injection(

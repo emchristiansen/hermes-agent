@@ -1095,6 +1095,8 @@ def build_cache_parity_fork(
     review_agent.session_id = agent.session_id
     # No DB, so the fork can't walk to the root itself: plugin tool hooks get the parent's conversation.
     review_agent._inherited_conversation_id = conversation_id(agent)
+    if getattr(agent, "_session_skip_memory", False) is True:  # the fork shares the parent's id and policy (SKM-05)
+        review_agent._session_skip_memory = True
     # Same model only: share the warm cached system prompt (~26% cost cut; a rebuilt prompt misses
     # the byte-exact prefix key) and pin session_start so any re-render (compression, plugin
     # hooks) stays byte-identical.

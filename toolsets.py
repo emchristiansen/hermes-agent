@@ -465,10 +465,12 @@ def tool_selection_key(enabled: Optional[list[str]], disabled: Optional[list[str
 
 
 def agent_tool_drops(agent: Any) -> frozenset:
-    """Tool names *agent* never carries, whatever its toolsets resolved to: the side-agent drops and
-    the toolsets its session platform does not get. Applied at load, MCP refresh and prefix restore."""
+    """Tool names *agent* never carries, whatever its toolsets resolved to: the side-agent drops, the
+    toolsets its session platform does not get, and ``memory`` in a ``--skip-memory`` session
+    (``agent.agent_init_skip_memory.apply_session_skip_memory``). Applied at load, MCP refresh and prefix restore."""
     from tools.connectors.turn import side_agent_tool_drops
-    return side_agent_tool_drops(agent) | session_platform_tool_drops(getattr(agent, "platform", None))
+    skip = frozenset({"memory"}) if getattr(agent, "_session_skip_memory", False) is True else frozenset()
+    return side_agent_tool_drops(agent) | session_platform_tool_drops(getattr(agent, "platform", None)) | skip
 
 
 def agent_tool_surface(agent: Any, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:

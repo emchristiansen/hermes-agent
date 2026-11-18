@@ -102,6 +102,42 @@ def _set_steer_parts(agent, parts: list) -> None:
     agent._pending_steer = "\n".join(text for _, text in parts) or None
 
 
+class DrainedSteer(str):
+    """Drained steer text that holds a delivered message (``steer(..., delivered_by=...)``): ``segments``
+    are its parts in order as ``(sender, text)``, ``sender`` None for the user's own text. The renderer
+    frames each part by this record, never by what the text says (``prompt_builder.format_steer_marker``).
+    A drain of only the user's text stays a plain ``str``."""
+
+    segments: tuple = ()
+
+
+class DeliveredText(str):
+    """A ticketless steer's text another principal delivered (a producer notice the surface holds itself,
+    not a gateway transfer): it carries its ``sender`` with it."""
+
+    sender: dict = {}
+
+
+def _steer_senders(agent) -> dict:
+    """``{ticket: sender}`` for ticketed steers another principal delivered (a Bot Chat delivery, a
+    producer notice); ``sender`` is that author (``{}`` for Hermes automation). Kept until settlement."""
+    return vars(agent).setdefault("_steer_ticket_senders", {})
+
+
+def _drained_text(agent, parts: list):
+    text = "\n".join(part_text for _, part_text in parts) or None
+    senders = _steer_senders(agent)
+
+    def sender(ticket, part_text):
+        return senders.get(ticket) if ticket is not None else getattr(part_text, "sender", None)
+    segments = tuple((sender(ticket, part_text), part_text) for ticket, part_text in parts)
+    if text is None or all(who is None for who, _ in segments):
+        return text
+    drained = DrainedSteer(text)
+    drained.segments = segments
+    return drained
+
+
 def _steer_fates(agent) -> dict:
     """``{ticket: consumed}`` for ticketed steers that left the buffer: True when a drain handed the text
     to the turn, False when it was dropped unread. ``withdraw_steer`` reads each one once."""
@@ -307,14 +343,21 @@ class InterruptControlMixin:
                 _set_steer_parts(self, [])
         return True
 
-    def steer(self, text: str, *, ticket=None) -> bool:
+    def steer(self, text: str, *, ticket=None, delivered_by=None) -> bool:
         """Queue user text for delivery as its own user row after the current tool batch finishes (no
         interrupt); multiple calls concatenate with newlines. Returns False for empty text. ``ticket``
-        names the submission, so ``withdraw_steer`` can settle exactly it, whatever text others carry."""
+        names the submission, so ``withdraw_steer`` can settle exactly it, whatever text others carry.
+        ``delivered_by``: the text is another principal's delivered message, not the user's: that author
+        dict, or ``{}`` for Hermes automation (recorded by ticket, or carried by a ticketless text)."""
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        if delivered_by is not None and ticket is None:
+            cleaned = DeliveredText(cleaned)
+            cleaned.sender = dict(delivered_by)
         with _ic_lock(self, "_pending_steer_lock"):
+            if delivered_by is not None and ticket is not None:
+                _steer_senders(self)[ticket] = dict(delivered_by)
             _set_steer_parts(self, _steer_parts(self) + [(ticket, cleaned)])
         # The turn no longer ran on its own (first-task-done detection reads this off the result).
         self._turn_user_intervened = True
@@ -325,23 +368,29 @@ class InterruptControlMixin:
         request is cancelled (completed messages kept, partial reasoning becomes assistant context, the
         correction is appended as a real user message, the loop retries); during tool execution it degrades
         to ``steer()``; Codex app-server uses native ``turn/steer``. False when no live turn / empty text."""
+        return self.redirect_outcome(text) is not None
+
+    def redirect_outcome(self, text: str) -> Optional[str]:
+        """``redirect`` naming the path that took the text: ``"model"`` (the in-flight model request was
+        cancelled; its response can no longer be used), ``"tools"`` (steered at the tool boundary, tool
+        workers asked to yield), ``"native"`` (Codex app-server ``turn/steer``); None when not taken."""
         if not text or not text.strip():
-            return False
+            return None
         cleaned = text.strip()
 
         _native_steer = _ic_codex_method(self, "request_steer")
         if _native_steer is not None:
             with _ic_lock(self, "_pending_redirect_lock"):
                 if self._interrupt_requested:
-                    return False
+                    return None
             try:
                 accepted = bool(_native_steer(cleaned))
                 if accepted:
                     self._turn_user_intervened = True
-                return accepted
+                return "native" if accepted else None
             except Exception:
                 logger.debug("Codex app-server turn/steer failed", exc_info=True)
-                return False
+                return None
 
         # Never kill a tool to deliver guidance; the steer drain puts it on the final tool result.
         # A foreground terminal command would park that delivery until it exits (a 5-minute
@@ -357,15 +406,15 @@ class InterruptControlMixin:
                         worker_tids = list(tracker)
                     for tid in worker_tids:
                         _request_yield(tid)
-            return accepted
+            return "tools" if accepted else None
 
         _model_active = getattr(self, "_model_request_active", None)
         with _ic_lock(self, "_pending_redirect_lock"):
             if _model_active is None or not _model_active.is_set():
-                return False  # response completed before we got the lock: surface queues a new turn
+                return None  # response completed before we got the lock: surface queues a new turn
             existing = _ic_slot(self, "_pending_redirect_lock", "_pending_redirect")
             if self._interrupt_requested and not existing:
-                return False
+                return None
             self._pending_redirect = (
                 f"{existing}\n\n[Additional user correction]\n{cleaned}" if existing else cleaned
             )
@@ -381,7 +430,7 @@ class InterruptControlMixin:
         else:
             self._interrupt_thread_signal_pending = True
         _ic_abort_active_request(self, "redirect_abort", "Failed to abort request for redirect")
-        return True
+        return "model"
 
     def _has_pending_redirect(self) -> bool:
         """Return whether an active-turn redirect is waiting to be applied."""
@@ -400,6 +449,7 @@ class InterruptControlMixin:
         with _ic_lock(self, "_pending_steer_lock"):
             text = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
             parts = _steer_parts(self)
+            text = _drained_text(self, parts) if text else text
             _set_steer_parts(self, [])
             for ticket, _ in parts:
                 if ticket is not None:
@@ -414,7 +464,11 @@ class InterruptControlMixin:
         with _ic_lock(self, "_pending_steer_lock"):
             parts = _steer_parts(self)
             _set_steer_parts(self, [part for part in parts if part[0] is not None])
-        return "\n".join(text for ticket, text in parts if ticket is None) or None
+        from agent.prompt_builder import format_delivered_message  # a delivered text keeps its sender
+
+        def leftover(text):
+            return format_delivered_message(text, text.sender) if isinstance(text, DeliveredText) else text
+        return "\n".join(leftover(text) for ticket, text in parts if ticket is None) or None
 
     def withdraw_steer(self, ticket) -> bool:
         """Settle one ``steer(text, ticket=...)`` by identity (the gateway's transfer of a queued prompt):
@@ -426,6 +480,7 @@ class InterruptControlMixin:
             parts = _steer_parts(self)
             kept = [part for part in parts if part[0] != ticket]
             consumed = _steer_fates(self).pop(ticket, True)
+            _steer_senders(self).pop(ticket, None)
             if len(kept) == len(parts):
                 return consumed is False
             _set_steer_parts(self, kept)

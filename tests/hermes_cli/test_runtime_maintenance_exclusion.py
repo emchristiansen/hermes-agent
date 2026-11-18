@@ -50,8 +50,17 @@ def test_restore_refuses_live_authority_without_changing_data(tmp_path):
             await rpc(ws, 'prompt.submit', session_id=session, input_id='started', text='BLOCK_STARTED')
             assert await asyncio.to_thread(peer.blocked.wait, 25)
             await rpc(ws, 'prompt.submit', session_id=session, input_id='queued', text='FOLLOWER')
+            # The steering pass runs after the admission commits, so wait for the hand-off to land.
+            await async_wait_until(lambda: dict(rows()).get('queued') == 'terminal', timeout=30, interval=.05,
+                                   what='the follower to be handed to the running claim')
             before = rows()
-            assert dict(before) == {'warm': 'terminal', 'started': 'started', 'queued': 'queued'}
+            # Eric's rule (gateway/session_busy_ingress.py): every message to a busy session steers into its
+            # running turn, so the follower is already handed to the running claim (terminal, outcome
+            # ``steering``), not left ``queued`` behind it as upstream had it. It stays on disk, unsettled
+            # with its claim, which is what the exclusion must preserve.
+            assert dict(before) == {'warm': 'terminal', 'started': 'started', 'queued': 'terminal'}
+            with sqlite3.connect(f'file:{home / "state.db"}?mode=ro', uri=True) as db:
+                assert db.execute("SELECT outcome FROM session_admissions WHERE request_id='queued'").fetchone() == ('steering',)
             import hashlib
             bundle = [Path(str(home / 'state.db') + suffix) for suffix in ('', '-wal', '-shm')]
             hashes = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in bundle if p.exists()}

@@ -157,8 +157,100 @@ def _export_timings(messages: list[dict[str, Any]], session_id: Optional[str] = 
     }
 
 
+# The key, inside ``origin_json`` ``imported_from``, of the last message row an import of a foreign transcript wrote:
+# rows after it were written here. Row ids only grow, and every rewrite inserts new rows, so a later row never reads
+# as imported (``agent/home_guidance.py::continues_without_prompt``). Imports from before it was recorded have none.
+FOREIGN_IMPORT_THROUGH = "through_message_id"
+# A CLI import of a foreign transcript (``hermes_cli/foreign_sessions.py``, v0.23.1) is an ordinary ``cli`` row with no
+# ``origin_json``: ``hermes --resume`` continues it writable, and the history authorizer refuses a row carrying one
+# (``hermes_state_mutation_binding.authorize_history``). Its ``imported_from`` record, boundary included, is kept beside
+# the row under this key + session id instead, for home guidance only (``agent/home_guidance.py::foreign_import_view``).
+FOREIGN_IMPORT_META_PREFIX = "hermes.foreign_import.v1:"
+_FOREIGN_ORIGIN_KEYS = ("tool", "path", "foreign_session_id")
+
+
+def record_foreign_import_meta(conn, session_id, origin: Any) -> None:
+    """In the import's own transaction, once it wrote *session_id*'s whole transcript: keep the ``imported_from`` record
+    of a foreign transcript (*origin*: ``tool``, ``path``, ``foreign_session_id``) with its boundary at the session's last
+    message row. Anything but an origin naming its tool records nothing."""
+    if not isinstance(origin, dict) or not isinstance(origin.get("tool"), str) or not origin["tool"]:
+        return
+    record = {key: origin[key] for key in _FOREIGN_ORIGIN_KEYS if isinstance(origin.get(key), str)}
+    record[FOREIGN_IMPORT_THROUGH] = conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ?",
+                                                  (session_id,)).fetchone()[0]
+    conn.execute("INSERT OR REPLACE INTO state_meta(key, value) VALUES (?, ?)",
+                 (FOREIGN_IMPORT_META_PREFIX + session_id, json.dumps(record)))
+
+
+# The export/move field carrying a CLI foreign import's record (:data:`FOREIGN_IMPORT_META_PREFIX`) with the session:
+# its boundary is the source store's row id, remapped to the destination's on import (AGENT-02).
+FOREIGN_IMPORT_EXPORT_FIELD = "foreign_import"
+
+
+def _moved_through(through: int, moved: dict[int, int]) -> int:
+    """A boundary row id of the source store as the destination's: the destination id of the last moved row at or
+    before it (0 when none moved). *moved*: source row id -> destination row id, both ascending together."""
+    return max((new for old, new in moved.items() if old <= through), default=0)
+
+
+def record_moved_foreign_import_meta(conn, session_id, record: Any, moved: dict[int, int]) -> None:
+    """In the import's own transaction, once it wrote *session_id*'s rows (*moved*: source row id -> the id written
+    here): keep a CLI foreign import's record (*record*, as exported beside the session) under this store's key, its
+    boundary remapped to this store's rows. Anything but a record naming its tool writes nothing."""
+    if not isinstance(record, dict) or not isinstance(record.get("tool"), str) or not record["tool"]:
+        return
+    clean = {key: record[key] for key in _FOREIGN_ORIGIN_KEYS if isinstance(record.get(key), str)}
+    through = record.get(FOREIGN_IMPORT_THROUGH)
+    if type(through) is int:
+        clean[FOREIGN_IMPORT_THROUGH] = _moved_through(through, moved)
+    conn.execute("INSERT OR REPLACE INTO state_meta(key, value) VALUES (?, ?)",
+                 (FOREIGN_IMPORT_META_PREFIX + session_id, json.dumps(clean)))
+
+
+def moved_foreign_origin(origin_json: Any, moved: dict[int, int]) -> Optional[str]:
+    """The ``origin_json`` of a session whose message rows moved to another store (*moved*: source row id -> target
+    row id, both ascending together): a foreign import's boundary (:data:`FOREIGN_IMPORT_THROUGH`) is a row id of the
+    store it was recorded in, so it moves to the target id of the last row at or before it (0 when none moved).
+    ``None`` when *origin_json* records no boundary, so there is nothing to change."""
+    origin = safe_json_loads(origin_json, default=None) if isinstance(origin_json, str) else None
+    imported = origin.get("imported_from") if isinstance(origin, dict) else None
+    through = imported.get(FOREIGN_IMPORT_THROUGH) if isinstance(imported, dict) else None
+    if type(through) is not int:
+        return None
+    imported[FOREIGN_IMPORT_THROUGH] = _moved_through(through, moved)
+    return json.dumps(origin)
+
+
 class SessionPortabilityMixin:
     """See module docstring — mixin for SessionDB (Port cluster)."""
+
+    @staticmethod
+    def _foreign_origin_on_conn(conn, session_id, origin, rows=None):
+        """The ``origin_json`` payload of a foreign import whose transcript *session_id* now holds: *origin* plus the
+        boundary (:data:`FOREIGN_IMPORT_THROUGH`) at the last row of that transcript. Without *rows* the import wrote
+        the session's whole transcript in this transaction: its last message row. *rows* are the ids of the rows an
+        import appended in transactions of their own, while another writer could already resume the session: the
+        boundary is the last row of the session's leading run of those ids, so a row any other writer added (even
+        between two imported rows) is never inside it; imported rows after such a row then read as written here."""
+        if rows is None:
+            through = conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ?",
+                                   (session_id,)).fetchone()[0]
+        else:
+            imported, through = set(rows), 0
+            for (row_id,) in conn.execute("SELECT id FROM messages WHERE session_id = ? ORDER BY id", (session_id,)):
+                if row_id not in imported:
+                    break
+                through = row_id
+        return {"imported_from": {**origin, FOREIGN_IMPORT_THROUGH: through}}
+
+    def record_foreign_import(self, session_id, origin, rows):
+        """Record that *session_id* holds the transcript imported from *origin* (the ``imported_from`` provenance),
+        written as the message rows *rows* (the ids ``append_message`` returned): call it once the import has written
+        them. The boundary binds to those rows, never to whatever the session holds by then
+        (:meth:`_foreign_origin_on_conn`)."""
+        self._execute_write(lambda conn: conn.execute(
+            "UPDATE sessions SET origin_json = ? WHERE id = ?",
+            (json.dumps(self._foreign_origin_on_conn(conn, session_id, origin, rows)), session_id)))
 
     @staticmethod
     def _find_foreign_import_on_conn(conn, origin):
@@ -203,7 +295,7 @@ class SessionPortabilityMixin:
                 item["session"]["title"] = f"{title} ({session_id[-12:]})"
             self._import_session_row(conn, item["session"], item["messages"], session_id)
             conn.execute("UPDATE sessions SET origin_json = ?, profile_name = ? WHERE id = ?",
-                         (json.dumps({"imported_from": origin}), profile, session_id))
+                         (json.dumps(self._foreign_origin_on_conn(conn, session_id, origin)), profile, session_id))
             return {"session_id": session_id, "already_imported": False}
 
         return self._execute_write(_do)
@@ -340,9 +432,25 @@ class SessionPortabilityMixin:
     # ── Export ─────────────────────────────────────────────────────────────
 
     def _with_messages(self, session: dict[str, Any], include_compacted: bool = False,
-                       include_inactive: bool = False) -> dict[str, Any]:
+                       include_inactive: bool = False, records: Optional[dict[str, dict]] = None) -> dict[str, Any]:
         messages = self.get_messages(session["id"], include_inactive=include_inactive, include_compacted=include_compacted)
-        return {**session, "messages": messages, "timings": _export_timings(messages, session["id"])}
+        record = (self._foreign_import_records([session["id"]]) if records is None else records).get(session["id"])
+        return {**session, "messages": messages, "timings": _export_timings(messages, session["id"]),
+                **({FOREIGN_IMPORT_EXPORT_FIELD: record} if record and not session.get("origin_json") else {})}
+
+    def _foreign_import_records(self, session_ids: list[str]) -> dict[str, dict]:
+        """``{session_id: record}``: each CLI foreign import's kept ``imported_from`` record
+        (:data:`FOREIGN_IMPORT_META_PREFIX`), exported beside its session so a restore keeps the import's boundary
+        (AGENT-02); its message rows carry their source ``id``, which the import remaps."""
+        wanted = set(session_ids)
+        records: dict[str, dict] = {}
+        for row in self._read_all("SELECT key, value FROM state_meta WHERE key LIKE ?",
+                                  (FOREIGN_IMPORT_META_PREFIX + "%",)):
+            session_id = row["key"][len(FOREIGN_IMPORT_META_PREFIX):]
+            record = safe_json_loads(row["value"], default=None)
+            if session_id in wanted and isinstance(record, dict):
+                records[session_id] = record
+        return records
 
     def export_session(self, session_id: str, include_compacted: bool = False,
                        include_inactive: bool = False) -> Optional[dict[str, Any]]:
@@ -378,8 +486,9 @@ class SessionPortabilityMixin:
         Backups that go back through :meth:`import_sessions` pass ``include_inactive`` so
         compaction-archived turns survive the round trip as archived rows."""
         sessions = self.search_sessions(source=source, limit=100000)
+        records = self._foreign_import_records([session["id"] for session in sessions])
         if include_compacted:
-            return [self._with_messages(session, True, include_inactive) for session in sessions]
+            return [self._with_messages(session, True, include_inactive, records) for session in sessions]
         messages_by_session = {session["id"]: [] for session in sessions}
         session_ids = list(messages_by_session)
         active_clause = self._active_clause(include_inactive, False)
@@ -396,7 +505,10 @@ class SessionPortabilityMixin:
                     self._row_to_message_dict(row, warn_context="get_messages", summary_flag=True)
                 )
         return [{**session, "messages": messages_by_session[session["id"]],
-                 "timings": _export_timings(messages_by_session[session["id"]], session["id"])} for session in sessions]
+                 "timings": _export_timings(messages_by_session[session["id"]], session["id"]),
+                 **({FOREIGN_IMPORT_EXPORT_FIELD: records[session["id"]]}
+                    if session["id"] in records and not session.get("origin_json") else {})}
+                for session in sessions]
 
     def adopt_session_lineage_from(self, donor_db: Any, session_id: str, *, retire_donor: bool = True) -> dict[str, Any]:
         """Adopt *session_id*'s full compression lineage from *donor_db* (stranded-bot-session
@@ -712,8 +824,9 @@ class SessionPortabilityMixin:
             raise ValueError("messages exceeds the total import limit")
         return item
 
-    def _import_session_row(self, conn, raw: dict[str, Any], messages: list[dict[str, Any]], session_id: str) -> None:
-        """INSERT one normalized session + its messages; counts fixed up after."""
+    def _import_session_row(self, conn, raw: dict[str, Any], messages: list[dict[str, Any]], session_id: str) -> dict:
+        """INSERT one normalized session + its messages; counts fixed up after. Returns ``{source row id: row id
+        written here}`` for the messages that carried their exported ``id``."""
         started_at = coerce_epoch(raw.get("started_at"), session_id=session_id, field="started_at")
         params = {
             "id": session_id, "source": str(raw.get("source") or "import"),
@@ -750,6 +863,8 @@ class SessionPortabilityMixin:
         conn.execute("UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                      (len(live), sum(_tool_calls_count(_parse_tool_calls(msg.get("tool_calls"))) for msg in live),
                       session_id))
+        return {msg["id"]: msg["_row_id"] for msg in sanitized_messages
+                if type(msg.get("id")) is int and type(msg.get("_row_id")) is int}
 
     @staticmethod
     def _attach_import_parents(conn, parent_updates: list[tuple]) -> int:
@@ -826,7 +941,9 @@ class SessionPortabilityMixin:
                 if conn.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)).fetchone():
                     skipped_ids.append(session_id)
                     continue
-                self._import_session_row(conn, raw, item["messages"], session_id)
+                moved = self._import_session_row(conn, raw, item["messages"], session_id)
+                if not raw.get("origin_json"):  # a CLI foreign import's boundary, remapped to the rows written here
+                    record_moved_foreign_import_meta(conn, session_id, raw.get(FOREIGN_IMPORT_EXPORT_FIELD), moved)
                 parent_id = str(raw.get("parent_session_id") or "").strip()
                 if parent_id:
                     parent_updates.append((session_id, parent_id))

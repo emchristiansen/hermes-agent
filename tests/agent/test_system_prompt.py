@@ -523,7 +523,8 @@ def test_coding_prompt_orders_shared_context_before_workspace(monkeypatch):
         "WORKSPACE",
         "Operator instructions (from config):\nOPERATOR",
         expected_profile,
-        "Conversation started: Friday, January 02, 2026",
+        # The trailer's last line records the home-guidance decision (agent/home_guidance.py::state_line).
+        'Conversation started: Friday, January 02, 2026\n<!-- Hermes home guidance: {"state":"none","v":1} -->',
     ))
 
     with (

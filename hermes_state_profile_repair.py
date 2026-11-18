@@ -225,8 +225,13 @@ class SessionProfileRepairMixin:
                 "SELECT * FROM messages WHERE session_id = ? ORDER BY id", (session_id,))]
             usage = [dict(r) for r in conn.execute(
                 "SELECT * FROM session_model_usage WHERE session_id = ?", (session_id,))]
+            from hermes_state_portability import FOREIGN_IMPORT_EXPORT_FIELD, FOREIGN_IMPORT_META_PREFIX
+            from utils import safe_json_loads
+            meta = conn.execute("SELECT value FROM state_meta WHERE key = ?",
+                                (FOREIGN_IMPORT_META_PREFIX + session_id,)).fetchone()
+            record = safe_json_loads(meta[0], default=None) if meta else None
             return {"session": dict(session), "system_prompt": prompt, "tool_pin": tool_pin, "messages": messages,
-                    "usage": usage}
+                    "usage": usage, **({FOREIGN_IMPORT_EXPORT_FIELD: record} if isinstance(record, dict) else {})}
         payload = self._read_retrying_ioerr(_read)
         if payload is not None and session_id in self._ledgered_session_ids():
             # Re-checked at apply time: the scan may predate a turn, and copying first would leave
@@ -261,19 +266,30 @@ class SessionProfileRepairMixin:
                 # A pin hash means nothing in this store: re-store the pin, or drop an unresolvable ref.
                 session["tool_names"] = self._store_system_prompt(conn, payload.get("tool_pin"))
             self._insert_row(conn, "sessions", session, skip=frozenset())
+            moved = {}  # source message id -> the id this store assigned
             for message in payload.get("messages") or []:
-                self._insert_row(conn, "messages", {**message, "session_id": session_id}, skip=_MESSAGE_MOVE_SKIP)
+                moved[message["id"]] = self._insert_row(
+                    conn, "messages", {**message, "session_id": session_id}, skip=_MESSAGE_MOVE_SKIP)
+            # A foreign import's boundary is a message id of the source store: renumber it with the rows, in
+            # origin_json or, for a CLI import, in its kept record (AGENT-02).
+            from hermes_state_portability import (
+                FOREIGN_IMPORT_EXPORT_FIELD, moved_foreign_origin, record_moved_foreign_import_meta)
+            if (origin := moved_foreign_origin(session.get("origin_json"), moved)) is not None:
+                conn.execute("UPDATE sessions SET origin_json = ? WHERE id = ?", (origin, session_id))
+            if not session.get("origin_json"):
+                record_moved_foreign_import_meta(conn, session_id, payload.get(FOREIGN_IMPORT_EXPORT_FIELD), moved)
             for usage in payload.get("usage") or []:
                 self._insert_row(conn, "session_model_usage", {**usage, "session_id": session_id}, skip=frozenset())
             return "imported"
         return self._execute_write(_do)
 
     @staticmethod
-    def _insert_row(conn, table: str, values: dict[str, Any], *, skip: frozenset) -> None:
+    def _insert_row(conn, table: str, values: dict[str, Any], *, skip: frozenset) -> int:
+        """INSERT *values* (the columns *table* has, minus *skip*); returns the new row's id."""
         columns = [c for c in _table_columns(conn, table) if c in values and c not in skip]
-        conn.execute(
+        return conn.execute(
             f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
-            [values[c] for c in columns])
+            [values[c] for c in columns]).lastrowid
 
     def delete_moved_session(self, session_id: str) -> bool:
         """Remove a session this store no longer owns after the target confirmed it. Children left
@@ -285,6 +301,8 @@ class SessionProfileRepairMixin:
             conn.execute("UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?", (session_id,))
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM session_model_usage WHERE session_id = ?", (session_id,))
+            from hermes_state_portability import FOREIGN_IMPORT_META_PREFIX
+            conn.execute("DELETE FROM state_meta WHERE key = ?", (FOREIGN_IMPORT_META_PREFIX + session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             self._delete_unreferenced_system_prompts(conn)
             return True

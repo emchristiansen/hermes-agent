@@ -567,10 +567,13 @@ def strip_launch_profile_env(env: dict, target_home: str | Path | None = None) -
     from hermes_cli.config_backend import deployment_env_names
     from hermes_cli.env_loader import launch_dotenv_keys, managed_dotenv_keys, source_supplied_names
     managed_names = {key.upper() for key in managed_dotenv_keys()} | set(deployment_env_names())
+    # TERMINAL_DOCKER_IMAGE_PINNED is no config key: ``apply_terminal_config_to_env`` synthesizes it
+    # from the LAUNCH profile's image provenance, so it goes with the image. The child bridges the
+    # target's own config and derives the target's pin (``tools.terminal_scope`` rule).
     residue_names = {
         key.upper() for key in
         set(load_env_file(launch_home / ".env")) | set(launch_dotenv_keys())
-        | set(TERMINAL_CONFIG_ENV_MAP.values()) | set(source_supplied_names())
+        | set(TERMINAL_CONFIG_ENV_MAP.values()) | {"TERMINAL_DOCKER_IMAGE_PINNED"} | set(source_supplied_names())
         if not _is_global_env(key.upper()) or key.upper().startswith("TERMINAL_")} - managed_names
     drop_bridge_markers(env)  # the LAUNCH profile's YAML values and their markers, never the target's
     for key in [k for k in env if k.upper() in residue_names]:
@@ -630,7 +633,7 @@ def _compute_git_bash_bin_dirs() -> list[str]:
         return []
     parent = os.path.dirname(os.path.dirname(bash))  # bash in <root>\bin or <root>\usr\bin (MinGit)
     root = os.path.dirname(parent) if os.path.basename(parent).lower() == "usr" else parent
-    subs = ("mingw64/bin", "mingw32/bin", "usr/local/bin", "usr/bin", "bin")
+    subs = ("ucrt64/bin", "clangarm64/bin", "mingw64/bin", "mingw32/bin", "usr/local/bin", "usr/bin", "bin")
     dirs = (os.path.join(root, *sub.split("/")) for sub in subs)
     return list(dict.fromkeys(d for d in dirs if os.path.isdir(d)))
 
@@ -1182,6 +1185,24 @@ class LocalEnvironment(BaseEnvironment):
     def _quote_shell_path(self, path: str) -> str:
         """Rewrite native/mixed Windows paths before quoting for Git Bash."""
         return _quote_bash_path(path)
+
+    def _usable_cwd(self, cwd: str) -> tuple[str, dict | None]:
+        """The directory ``execute`` embeds in the wrapper's ``cd``: ``cwd`` if enterable, else
+        what ``_resolve_safe_cwd`` picks. Recovering only ``self.cwd`` (inside ``_run_bash``)
+        came too late — the script was already built and exited 126 at ``cd`` on every call —
+        and missed the explicit cwd the terminal tool passes from the session record. A real
+        fallback (not a benign MSYS→Windows normalization) is returned for ``execute`` to report,
+        because relative paths now resolve somewhere the model did not ask for.
+
+        A relative or ``~`` cwd is checked where bash's ``cd`` resolves it (``self.cwd``, the
+        Popen cwd; ``$HOME``), not against this process's cwd, and kept as written when usable."""
+        resolved = os.path.expanduser(cwd)
+        if resolved and not os.path.isabs(_msys_to_windows_path(resolved)):
+            resolved = os.path.join(self.cwd, resolved)
+        safe_cwd = _resolve_safe_cwd(resolved)
+        if safe_cwd == resolved or safe_cwd == _msys_to_windows_path(resolved):
+            return (cwd if resolved != cwd else safe_cwd), None
+        return safe_cwd, {"requested": cwd, "used": safe_cwd}
 
     def _recover_cwd(self) -> None:
         """Swap ``self.cwd`` for a usable directory if it vanished or is inaccessible

@@ -7,6 +7,8 @@ from agent.credential_pool_model_cooldowns import CredentialPoolModelCooldownMix
 from agent.credential_pool_errors import _normalize_error_context, redact_error_text
 from agent.credential_pool_selection import CredentialPoolSelectionMixin
 from agent.credential_pool_timestamps import _parse_absolute_timestamp
+from agent.credential_display_names import display_name
+from agent.credential_pool_identity import _codex_principal_identity, label_from_token
 
 import logging
 import os
@@ -37,7 +39,6 @@ from hermes_cli.auth import (
     SINGLE_USE_REFRESH_POOL_PROVIDERS,
     _auth_store_lock,
     _codex_access_token_is_expiring,
-    _decode_jwt_claims,
     _global_auth_file_path,
     _load_auth_store,
     _load_provider_state,
@@ -314,32 +315,6 @@ class PooledCredential:
             # (client_lifecycle._swap_credential), or a rotation silently leaves the proxy.
             return get_secret_str("HERMES_CODEX_BASE_URL", "").strip().rstrip("/") or self.base_url
         return self.base_url
-
-
-def label_from_token(token: str, fallback: str) -> str:
-    claims = _decode_jwt_claims(token)
-    for key in ("email", "preferred_username", "upn"):
-        value = claims.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return fallback
-
-
-def _codex_principal_identity(access_token: Any) -> Optional[tuple[str, str]]:
-    """``(chatgpt_account_id, sub)`` of a Codex access token, or None when either claim is missing.
-
-    Decoded without signature verification: this only decides whether two credentials Hermes
-    already holds belong to the same principal, never whether a token is valid. Both claims are
-    required because members of one ChatGPT workspace share ``chatgpt_account_id`` yet have their
-    own subjects and quotas.
-    """
-    claims = _decode_jwt_claims(access_token)
-    auth_claims = claims.get("https://api.openai.com/auth") if isinstance(claims, dict) else None
-    account_id = auth_claims.get("chatgpt_account_id") if isinstance(auth_claims, dict) else None
-    subject = claims.get("sub") if isinstance(claims, dict) else None
-    if not (isinstance(account_id, str) and account_id.strip() and isinstance(subject, str) and subject.strip()):
-        return None
-    return account_id.strip(), subject.strip()
 
 
 def _codex_entry_tracks_singleton(entry: PooledCredential, singleton_tokens: dict[str, Any]) -> bool:
@@ -2027,7 +2002,7 @@ class CredentialPool(CredentialPoolSelectionMixin, CredentialPoolAdminMixin, Cre
                         logger.warning(
                             "credential pool: pruning DEAD manual entry %s "
                             "(reason=%s, age=%.1fh) — re-add via `hermes auth add %s`",
-                            entry.label or entry.id[:8],
+                            display_name(entry),
                             entry.last_error_reason or "unknown",
                             (now - dead_at) / 3600.0,
                             self.provider,
@@ -2115,8 +2090,8 @@ class CredentialPool(CredentialPoolSelectionMixin, CredentialPoolAdminMixin, Cre
                         "credential pool: credential_id %s runtime key "
                         "does not match api_key_hint; attributing failure "
                         "to key-matched entry %s instead (#79156)",
-                        (entry.label or entry.id[:8]),
-                        (hint_entry.label or hint_entry.id[:8]),
+                        display_name(entry),
+                        display_name(hint_entry),
                     )
                 # Otherwise the id is stale and the request key is not in the
                 # pool — drop the id so we do not mark the wrong entry.
@@ -2188,7 +2163,7 @@ class CredentialPool(CredentialPoolSelectionMixin, CredentialPoolAdminMixin, Cre
                 entry = self._current_unlocked() or self._select_unlocked(refresh=False)[0]
             if entry is None:
                 return None
-            _label = entry.label or entry.id[:8]
+            _label = display_name(entry)
             if self._is_model_scoped_failure(status_code, model, failure_reason):
                 # A generic Anthropic 429 (per-model rate limit) or a Codex account model
                 # entitlement rejection: bench this model only, the credential stays
@@ -2242,7 +2217,7 @@ class CredentialPool(CredentialPoolSelectionMixin, CredentialPoolAdminMixin, Cre
                 self._current_id = None
                 return None
             if next_entry:
-                logger.info("credential pool: rotated to %s", next_entry.label or next_entry.id[:8])
+                logger.info("credential pool: rotated to %s", display_name(next_entry))
             return next_entry
 
     # ---- leases ------------------------------------------------------------

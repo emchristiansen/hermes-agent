@@ -111,6 +111,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, reason) in res.respawn_guarded
             ],
             "rate_limited": res.rate_limited,
+            "owner_restarted": res.owner_restarted,
             "skipped_locked": res.skipped_locked,
             "memory_pressure": res.memory_pressure,
         }, ascii=True)
@@ -304,7 +305,6 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 def _cmd_gc(args: argparse.Namespace) -> int:
     """Remove archived tasks' scratch workspaces, old events, and old worker logs."""
-    import shutil
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)
     if event_days < 0 or log_days < 0:
@@ -322,9 +322,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
                 # Same safety predicate: only clean, fully-pushed worktrees go.
                 wt_path = row["workspace_path"]
                 if wt_path and Path(wt_path).is_dir():
-                    if kbw._defer_shared_worktree_cleanup(conn, row["id"], wt_path):
-                        continue
-                    kbw._cleanup_worktree_workspace(row["id"], wt_path, row["branch_name"])
+                    kbw._remove_worktree_dir(conn, row["id"], wt_path, row["branch_name"])
                     if not Path(wt_path).is_dir():
                         removed_ws += 1
                 continue
@@ -337,10 +335,8 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             # completion, and rmtree refuses a symlink (so it must not be counted).
             if not path.is_dir() or path.is_symlink() or not kbw._is_managed_scratch_path(path):
                 continue
-            if kbw._defer_shared_workspace_cleanup(conn, row["id"], path):
-                continue
-            shutil.rmtree(path, ignore_errors=True)
-            if not path.exists():
+            # In-use (incl. retained) check and rmtree under the removal fence; gc never released LSP.
+            if kbw._remove_scratch_dir(conn, row["id"], path, release_lsp=False) and not path.exists():
                 removed_ws += 1
 
     removed_events = 0

@@ -9,7 +9,7 @@
  */
 
 import type { AppendMessage, ThreadMessage } from '@assistant-ui/react'
-import { isUndeliveredCorrectionRefusal } from '@hermes/shared'
+import { isUndeliveredCorrectionRefusal, randomUuid } from '@hermes/shared'
 import { useCallback, useMemo, useRef } from 'react'
 
 import type { ClientSessionState } from '@/app/types'
@@ -18,8 +18,10 @@ import { useI18n } from '@/i18n'
 import { type ChatMessage, textPart } from '@/lib/chat-messages'
 import { isSlashCommandText } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
+import { CorrectionTargetChanged, UncertainCorrection, UnsentCorrection } from '@/lib/uncertain-correction'
 import { clearClarifyRequest } from '@/store/clarify'
 import type { ComposerAttachment } from '@/store/composer'
+import { serverOwnsComposerQueue } from '@/store/composer-queue'
 import { resetSessionBackground } from '@/store/composer-status'
 import { confirm } from '@/store/confirm'
 import { notify, notifyError } from '@/store/notifications'
@@ -28,6 +30,7 @@ import { clearAllPrompts } from '@/store/prompts'
 import { $sessions, knownSessionOwner, ownerLookupSessionRows, sessionMatchesStoredId } from '@/store/session'
 import {
   requestForSessionProfile,
+  type SessionOwnerRoute,
   type SessionOwnerScope,
   type SessionProfileRoute
 } from '@/store/session-request-router'
@@ -44,6 +47,7 @@ import { flushStreamDeltas } from '@/store/stream-delta-flush'
 import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
 import { setSessionDraftingTool } from '@/store/tool-drafting'
+import { sendJournaledCorrection } from '@/store/unresolved-corrections'
 import type { SessionInfo } from '@/types/hermes'
 
 import type { GatewayRequester } from '../contrib/types'
@@ -193,19 +197,20 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
 
   // Tile session RPCs must follow the tile's composite owner even when the
   // active gateway has moved to a same-named profile on another source.
+  const tileOwnerRoute = useCallback((): SessionOwnerRoute | null => {
+    const knownOwner: SessionOwnerScope =
+      sessionTileOwnerRoute(storedIdRef.current) ?? knownSessionOwner(ownerLookupSessionRows(), storedIdRef.current)
+
+    // A bare profile is the legacy/unknown tile shape. Preserve its ambient
+    // behavior; only a composite route is strong enough to retarget a tile
+    // across same-named sources.
+    return knownOwner && typeof knownOwner === 'object' ? knownOwner : null
+  }, [])
+
   const requestSessionGateway = useCallback(
-    <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal) => {
-      const knownOwner: SessionOwnerScope =
-        sessionTileOwnerRoute(storedIdRef.current) ?? knownSessionOwner(ownerLookupSessionRows(), storedIdRef.current)
-
-      // A bare profile is the legacy/unknown tile shape. Preserve its ambient
-      // behavior; only a composite route is strong enough to retarget a tile
-      // across same-named sources.
-      const owner: SessionOwnerScope = knownOwner && typeof knownOwner === 'object' ? knownOwner : undefined
-
-      return requestForSessionProfile<T>(owner, requestGateway, method, params ?? {}, timeoutMs, signal)
-    },
-    [requestGateway]
+    <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal) =>
+      requestForSessionProfile<T>(tileOwnerRoute() ?? undefined, requestGateway, method, params ?? {}, timeoutMs, signal),
+    [requestGateway, tileOwnerRoute]
   )
 
   // A ⌘T tab's session is unlisted until its first turn persists — seed the
@@ -436,91 +441,129 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
         return false
       }
 
-      const messageId = `user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      // Its retries present the execution generation its first send named (NC13-CLIENT-01).
+      // randomUuid, not crypto.randomUUID: that exists only in secure contexts (a plain-HTTP Webapp has none).
+      const correctionId = randomUuid()
 
-      const mutate = (updater: (state: ClientSessionState) => ClientSessionState) =>
-        sessionTileDelegate()?.updateSession(sessionId, updater)
+      // The exact owner this correction is for, captured once, here, at the intent: every attempt (the
+      // first, each same-page retry, its session-not-found resume) goes through this route, never the
+      // tile's owner as later re-read (review22981 UI-R5: a tile whose owner lookup moved from registry
+      // connection X to Y must not retry on Y, whose same-named profile, session and generation would
+      // pass the canonical pin). The journal keeps the same route for a restored retry.
+      const owner = tileOwnerRoute()
+      const storedId = storedIdRef.current
+      const canonical = serverOwnsComposerQueue(storedId ?? sessionId)
 
-      // Reserve the correction's arrival position without sealing the stream.
-      // Deltas arriving during a refused RPC must keep their live bubble.
-      mutate(state => {
-        const message = { id: messageId, role: 'user' as const, parts: [textPart(text)] }
+      const ownerRequest = <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal) =>
+        requestForSessionProfile<T>(owner ?? undefined, requestGateway, method, params ?? {}, timeoutMs, signal)
 
-        return { ...state, messages: [...state.messages, message] }
-      })
+      // One delivery attempt to this tile's session; a failure retries this same correction there.
+      const attempt = async (): Promise<boolean> => {
+        const messageId = `user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
-      const discardOptimisticMessage = () =>
-        mutate(state => ({
-          ...state,
-          messages: state.messages.filter(message => message.id !== messageId)
-        }))
+        const mutate = (updater: (state: ClientSessionState) => ClientSessionState) =>
+          sessionTileDelegate()?.updateSession(sessionId, updater)
 
-      const moveOptimisticMessageToEnd = () =>
+        // Reserve the correction's arrival position without sealing the stream.
+        // Deltas arriving during a refused RPC must keep their live bubble.
         mutate(state => {
-          const message = state.messages.find(candidate => candidate.id === messageId)
+          const message = { id: messageId, role: 'user' as const, parts: [textPart(text)] }
 
-          return message
-            ? { ...state, messages: [...state.messages.filter(candidate => candidate.id !== messageId), message] }
-            : state
+          return { ...state, messages: [...state.messages, message] }
         })
 
-      try {
-        const { result } = await withSessionNotFoundResume(
-          sessionId,
-          storedIdRef.current,
-          liveId =>
-            requestSessionGateway<{ status?: string }>(mode === 'steer' ? 'session.steer' : 'session.redirect', {
-              session_id: liveId,
-              text
-            }),
-          {
-            requestGateway: requestSessionGateway,
-            onRecovered: bindRecoveredRuntime
+        const discardOptimisticMessage = () =>
+          mutate(state => ({
+            ...state,
+            messages: state.messages.filter(message => message.id !== messageId)
+          }))
+
+        const moveOptimisticMessageToEnd = () =>
+          mutate(state => {
+            const message = state.messages.find(candidate => candidate.id === messageId)
+
+            return message
+              ? { ...state, messages: [...state.messages.filter(candidate => candidate.id !== messageId), message] }
+              : state
+          })
+
+        try {
+          const { result } = await withSessionNotFoundResume(
+            sessionId,
+            storedId,
+            liveId =>
+              ownerRequest<{ delivered?: boolean; kept?: 'task_comment' | null; status?: string }>(
+                mode === 'steer' ? 'session.steer' : 'session.redirect',
+                { session_id: liveId, text, correction_id: correctionId }
+              ),
+            {
+              requestGateway: ownerRequest,
+              onRecovered: bindRecoveredRuntime
+            }
+          )
+
+          if (result?.status === 'redirected') {
+            if (mode === 'interrupt') {
+              flushStreamDeltas(sessionId)
+              mutate(state => sealAcceptedCorrection(state, messageId))
+            }
+
+            triggerHaptic('submit')
+
+            return true
           }
-        )
 
-        if (result?.status === 'redirected') {
-          if (mode === 'interrupt') {
-            flushStreamDeltas(sessionId)
-            mutate(state => sealAcceptedCorrection(state, messageId))
+          // A card attempt's correction its running turn never took is kept on the card's task (the
+          // next attempt reads it): accepted and durable like a queued one, never sent again as a
+          // fresh, unbound prompt.
+          if (result?.status === 'queued' || result?.kept === 'task_comment') {
+            // A redirect queued in the build window is the next turn; an
+            // accepted steer joins this one after its running tool.
+            if (mode === 'steer') {
+              flushStreamDeltas(sessionId)
+              mutate(state => sealAcceptedCorrection(state, messageId, { keepRunningTools: true }))
+            } else {
+              moveOptimisticMessageToEnd()
+            }
+
+            triggerHaptic('submit')
+
+            return true
           }
 
-          triggerHaptic('submit')
+          // Only an owner-confirmed undelivered refusal hands the words back; on the canonical owner
+          // any other reply is uncertain and the correction stays a correction (NC12-CLIENT-01).
+          if (canonical && !(result?.status === 'rejected' && result.delivered === false)) {
+            throw new Error(`Correction outcome unconfirmed: ${JSON.stringify(result ?? null)}`)
+          }
+        } catch (err) {
+          discardOptimisticMessage()
 
-          return true
+          // Refused before any agent saw it: the composer re-queues the words (#141644).
+          if (isUndeliveredCorrectionRefusal(err)) {
+            return false
+          }
+
+          // Its session changed under it (a resumed runtime): never sent there; the words go back.
+          if (err instanceof CorrectionTargetChanged) {
+            throw new UnsentCorrection('its session changed since it was first sent')
+          }
+
+          notifyError(err, copy.promptFailed)
+          // Uncertain (the owner may hold it): it stays a correction, retried to this tile's session.
+          throw new UncertainCorrection(err, attempt, { id: correctionId, mode, text, sessionId })
         }
 
-        if (result?.status === 'queued') {
-          // A redirect queued in the build window is the next turn; an
-          // accepted steer joins this one after its running tool.
-          if (mode === 'steer') {
-            flushStreamDeltas(sessionId)
-            mutate(state => sealAcceptedCorrection(state, messageId, { keepRunningTools: true }))
-          } else {
-            moveOptimisticMessageToEnd()
-          }
-
-          triggerHaptic('submit')
-
-          return true
-        }
-      } catch (err) {
         discardOptimisticMessage()
 
-        // Refused before any agent saw it: the composer re-queues the words (#141644).
-        if (isUndeliveredCorrectionRefusal(err)) {
-          return false
-        }
-
-        notifyError(err, copy.promptFailed)
-        throw err
+        return false
       }
 
-      discardOptimisticMessage()
-
-      return false
+      // On the canonical owner the correction is journaled with this tile's owner route before its first
+      // request leaves (review22815 UI-R2/R3): a restart while that request is pending still delivers it.
+      return canonical ? sendJournaledCorrection({ id: correctionId, mode, text, sessionId }, owner, attempt) : attempt()
     },
-    [bindRecoveredRuntime, copy.promptFailed, requestSessionGateway]
+    [bindRecoveredRuntime, copy.promptFailed, requestGateway, tileOwnerRoute]
   )
 
   // Rewind primitive (interrupt-first for live turns, busy-retry) — shared with

@@ -389,6 +389,8 @@ export const jaOverrides = {
       mcp: 'MCP',
       archivedChats: 'アーカイブ済みチャット',
       sessions: 'セッション',
+      backup: 'バックアップと移行',
+      backupOnly: 'バックアップ',
       about: '情報',
       billing: '請求',
       notifications: '通知',
@@ -2474,6 +2476,13 @@ export const jaOverrides = {
     queueStuckTitle: 'キュー内のメッセージを送信できません',
     queueStuckBody:
       'キューに入れたターンの送信が繰り返し失敗しました。まだキューに残っています。もう一度送信してください。',
+    correctionUnconfirmedTitle: '修正を確認できません',
+    correctionUnconfirmedBody:
+      'すでに実行に届いている可能性があります。実行が確認するまで、同じ修正として自動的に再送信されます。「再送信」を押すとすぐに送信します。重複しても問題ありません。',
+    correctionSendAgain: '再送信',
+    correctionNotSentTitle: '訂正は送信されませんでした',
+    correctionNotSentBody:
+      '送信されず、現在の下書きはそのままです。内容は下にあります。まだ有効なら、ご自身で再送してください。',
     queueDroppedTitle: 'キューのエントリを破棄しました',
     queueDroppedBody:
       'このバックグラウンドのエントリは、セッションを繰り返し再開できなかったため破棄されました。キューの他のエントリには影響しません。',

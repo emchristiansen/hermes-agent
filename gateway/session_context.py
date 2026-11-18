@@ -149,6 +149,12 @@ def bound_session_key() -> str:
     return "" if value is _UNSET else value
 
 
+def bound_session_id() -> str:
+    """Return only this task's session identity, never another turn's environment."""
+    value = _SESSION_ID.get()
+    return "" if value is _UNSET else value
+
+
 def source_route_metadata(source: Any, metadata: dict | None) -> dict | None:
     """Keep inbound route anchors for durable deliveries after the source is gone."""
     anchors = {key: str(value) for key in ("scope_id", "parent_chat_id")

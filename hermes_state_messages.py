@@ -24,6 +24,7 @@ from hermes_state_common import (
     _MERGE_DISPLAY_META, _json_or, _legacy_reset_child_sql, _placeholders, _sql_json_extract)
 from hermes_state_compaction_display import later_tool_copy_ids, not_a_later_tool_copy_sql
 from hermes_state_detached_results import SessionDetachedResultsMixin
+from hermes_state_messages_conversation import SessionMessageConversationMixin
 from hermes_state_todo import SessionTodoResultMixin
 from hermes_state_stored_reads import SessionStoredReadsMixin
 from hermes_state_identity import (
@@ -121,7 +122,8 @@ def _stale_holder(row, now: float) -> bool:
     return float(row["expires_at"]) <= now or _compression_lock_holder_process_is_dead(row["holder"])
 
 
-class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, SessionStoredReadsMixin):
+class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, SessionStoredReadsMixin,
+                           SessionMessageConversationMixin):
     """Message append/replace/rewind, reactions, resume conversations, replay dedupe (detached results: the base)."""
 
     def _bump_conversation_generation(self, conn, session_id: str, end_reason: str) -> None:
@@ -1465,7 +1467,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         # before_rows includes the anchor itself.
         return {"window": window_msgs, "messages_before": max(0, len(before_rows) - 1), "messages_after": len(after_rows)}
 
-    def resolve_resume_session_id(self, session_id: str) -> str:
+    def resolve_resume_session_id(self, session_id: str, *, strict: bool = False) -> str:
         """Redirect a resume target to the descendant holding the messages: follow the compression chain to
         the live tip (lineage-aware, so delegate/branch children never hijack it), then walk
         ``parent_session_id`` forward to the DEEPEST node with messages (a continuation may hold newer
@@ -1475,13 +1477,17 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         ``parent_session_id``). The flush cursor is reset, so the child is where new messages actually land
         — the parent ends up with ``message_count = 0`` rows unless messages had already been flushed to it
         before compression. See #15000.
+
+        A read failure leaves the input id (best effort for readers); *strict* raises it instead, for a caller
+        that must know the selection is complete (a reset ending what resumes read).
         """
         if not session_id:
             return session_id
         try:
             session_id = self.get_compression_tip(session_id) or session_id
         except Exception:
-            pass
+            if strict:
+                raise
         with self._read_ctx() as conn:
             current = session_id
             seen = {current}
@@ -1499,6 +1505,8 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
                         "  AND COALESCE(child.source, '') != 'tool' "
                         "ORDER BY child.started_at DESC, child.id DESC LIMIT 1", (current,)).fetchone()
                 except Exception:
+                    if strict:
+                        raise
                     return session_id
                 if child_row is None or not child_row["id"] or child_row["id"] in seen:
                     break

@@ -217,7 +217,16 @@ def _import(db, conn, session_id, payload):
         if conn.execute('SELECT 1 FROM sessions WHERE id=?', (sid,)).fetchone():
             skipped.append(sid)
             continue
-        db._import_session_row(conn, raw, item['messages'], sid)
+        moved = db._import_session_row(conn, raw, item['messages'], sid)
+        if 'imported_from' in raw:  # a foreign transcript (hermes_cli/foreign_sessions.py): its home-guidance boundary
+            from hermes_state_portability import record_foreign_import_meta
+            record_foreign_import_meta(conn, sid, raw['imported_from'])
+        elif not raw.get('origin_json'):
+            # A restored export of such an import (the dashboard's restore runs here, not through
+            # SessionDB.import_sessions): its exported record, boundary remapped to the rows written in
+            # this receipt's own transaction, so a rollback leaves neither (review22815 AGENT-02).
+            from hermes_state_portability import FOREIGN_IMPORT_EXPORT_FIELD, record_moved_foreign_import_meta
+            record_moved_foreign_import_meta(conn, sid, raw.get(FOREIGN_IMPORT_EXPORT_FIELD), moved)
         if raw.get('parent_session_id'):
             parents.append((sid, raw['parent_session_id']))
         imported.append(sid)

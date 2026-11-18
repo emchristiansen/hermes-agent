@@ -542,6 +542,8 @@ export const zhOverrides = {
       mcp: 'MCP',
       archivedChats: '已归档对话',
       sessions: '会话',
+      backup: '备份与迁移',
+      backupOnly: '备份',
       about: '关于',
       billing: '账单',
       notifications: '通知',
@@ -3406,6 +3408,13 @@ export const zhOverrides = {
     queueResumeTip: '已被停止操作暂停 — 继续发送排队的回合',
     queueStuckTitle: '排队消息未发送',
     queueStuckBody: '排队的对话多次发送失败。它仍在队列中，请重试发送。',
+    correctionUnconfirmedTitle: '更正未确认',
+    correctionUnconfirmedBody:
+      '它可能已送达运行。系统会自动将其作为同一更正再次发送，直到运行确认为止；点击“再次发送”可立即发送。重复也没关系。',
+    correctionSendAgain: '再次发送',
+    correctionNotSentTitle: '更正未发送',
+    correctionNotSentBody:
+      '它未被发送，你当前的草稿保持不变。其内容在下方；如仍适用，请自行再次发送。',
     queueDroppedTitle: '已丢弃排队内容',
     queueDroppedBody: '该后台队列条目因会话多次尝试后仍无法恢复而被丢弃。队列中的其他内容不受影响。',
     terminalSelectionMissingTitle: '无法使用终端选区',

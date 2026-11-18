@@ -89,7 +89,7 @@ configured engine — the packaged Chromium from `browser_launcher.launch_chromi
 Lightpanda only when `browser.engine: lightpanda` is set (never tried automatically). That browser
 is fresh unless a persistent profile is configured (`browser.user_data_dir`, Bot Desktop). One
 browser per cache key (`--remote-debugging-port=0` + `DevToolsActivePort`). State lives in
-`browser_session.py`; siblings late-import it inside functions. Every launched Chromium is stopped
+`browser_session.py`. Every launched Chromium is stopped
 parent-first and recorded in a private 0700 dir (a throwaway profile's in
 `<HERMES_HOME>/cache/browser/chromium-records`; a persistent profile's per OS user under the host lock dir,
 one for every home pinning it) so a later process reaps a crashed owner's browser after checking pid + start
@@ -159,7 +159,10 @@ no `delegate_task`, `clarify`, `memory`, `send_message`, `cronjob`; keeps `execu
 `orchestrator` (keeps `delegate_task`; gated by `delegation.orchestrator_enabled`, bounded by
 `delegation.max_spawn_depth`, default 2). Config knobs under `delegation:`:
 `max_concurrent_children, independent_completions, gateway_mode, max_spawn_depth, child_timeout_seconds, orchestrator_enabled,
-subagent_auto_approve, inherit_mcp_toolsets, max_iterations, backend, backends`. **Routes:** `delegation.backend` picks a
+subagent_auto_approve, inherit_mcp_toolsets, max_iterations, backend, backends, inherit_parent, parent_child_models`
+(`inherit_parent: true`: a default child takes the parent's running model and reasoning on the parent's own route,
+`parent_child_models` mapping a parent model to its child model; explicit route fields and other profiles keep their
+route — `tools/delegate_tool_inherit.py`). **Routes:** `delegation.backend` picks a
 delegation provider (`agent/delegation_provider.py`, `ctx.register_delegation_provider`; its settings live in
 `delegation.backends.<name>`) that answers each task's route (`tools/delegate_tool_routes.py`: model/provider fields
 resolved like the `delegation` section, `service_tier` checked like `/fast` in `delegate_tool_tuning.py`, or `profile` →

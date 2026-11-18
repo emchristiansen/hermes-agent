@@ -54,6 +54,11 @@ def _execute(frame, monkeypatch, base=object, built=None, result=None, sent=None
             self.finish.set()
         def approval(self, data): pass
         def clarify(self, questions): pass
+        def adopt(self, agent): self.agent = agent
+        def settle(self, result, **kwargs): return None
+        def consumed(self, result): return []  # confirms no correction: none was sent
+        def accept_peer_messages(self, destination): pass  # a card worker: no peer message is sent
+        def peer_settlements(self, result): return []
 
     monkeypatch.setattr(worker, 'bind_worker_policy', lambda frame: None)
     monkeypatch.setattr(worker, 'discover_profile_mcp', lambda policy: None)

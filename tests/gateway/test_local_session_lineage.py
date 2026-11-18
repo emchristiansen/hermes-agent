@@ -91,12 +91,33 @@ async def test_local_lineage_transitions_preserve_owner_or_roll_back(tmp_path, m
     assert policy.cwd == params['cwd'] and policy.source == params['source']
     # An interrupted claim remains owned by the logical conversation, even after another rotation.
     claimed = claim_session_input(recovered.db, epoch=recovered.epoch, session_id=ref.session_id)
+    recovered.db.append_message(reset.session_id, 'tool', 'done', tool_call_id='c1', tool_name='terminal')  # it ran a tool: a business turn, never re-run
     compress(reset.session_id, 'compressed-again')
     fourth = runner()
     restarted = await initialize_session_authority(fourth, profile_id='fixture', instance_id='fourth')
-    assert get_session_admission(restarted.db, admission_id=claimed['admission_id'])['status'] == 'unknown'
-    with pytest.raises(RuntimeStoreError, match='unknown_execution'):
-        claim_session_input(restarted.db, epoch=restarted.epoch, session_id=ref.session_id)
+    retained = get_session_admission(restarted.db, admission_id=claimed['admission_id'])
+    # Recovery changes only the lost claim's status, not its logical owner or execution identity.
+    expected = {key: value for key, value in claimed.items() if key != 'transcript_mark'}
+    assert retained == dict(expected, status='unknown')
+    assert retained['target_session_id'] == ref.session_id
+    assert retained['owner_epoch'] == recovered.epoch != restarted.epoch
+    assert retained['generation'] == claimed['generation']
+    assert list_session_admissions(restarted.db, session_id=ref.session_id) == [retained]
+    # No input remains queued. An empty claim returns no work, never reclaims the old
+    # business turn, advances a generation, or mutates its receipt/physical lineage.
+    def no_work_state():
+        with restarted.db._read_ctx() as conn:
+            return {
+                table: [tuple(row) for row in conn.execute(f'SELECT * FROM {table} ORDER BY 1')]
+                for table in ('sessions', 'messages', 'session_admissions', 'worker_executions',
+                              'state_meta', 'gateway_routing')
+            }
+    before_no_work = no_work_state()
+    receipt_before_no_work = local_receipt(restarted.db, ref.session_id)
+    assert claim_session_input(restarted.db, epoch=restarted.epoch, session_id=ref.session_id) is None
+    assert no_work_state() == before_no_work
+    assert local_receipt(restarted.db, ref.session_id) == receipt_before_no_work
+    assert get_session_admission(restarted.db, admission_id=claimed['admission_id']) == retained
     assert len(list_session_admissions(restarted.db, session_id=ref.session_id)) == 1
     receipt = local_receipt(db, ref.session_id)
     db.set_meta('gateway.local_policy.v1:' + ref.session_id, json.dumps(dict(receipt, profile_id='foreign')))
@@ -134,3 +155,44 @@ async def test_local_lineage_transitions_preserve_owner_or_roll_back(tmp_path, m
 def test_real_local_lineage_survives_cold_daemon(tmp_path):
     from tests.gateway.fixtures.local_lineage_probe import probe
     print(json.dumps(probe(tmp_path)))
+
+
+@pytest.mark.asyncio
+async def test_a_claim_that_ran_no_tool_is_queued_again_on_its_logical_owner_after_a_rotation(tmp_path, monkeypatch):
+    """msg-retry contract change (was: ``unknown`` after the rotation): the interrupted claim ran no tool,
+    so the next owner delivers it again, still owned by the logical conversation across the rotation."""
+    from gateway import run
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+    from gateway.session_authority import initialize_session_authority
+    from gateway.session_contract import SessionActor
+    from gateway.session_local import create_local_session
+    from hermes_state_runtime import admit_session_input, claim_session_input, get_session_admission
+
+    monkeypatch.setattr(run, '_load_gateway_config', dict)
+    def runner():
+        store = SessionStore(tmp_path / 'sessions', GatewayConfig())
+        return SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False)
+    first = runner()
+    authority = await initialize_session_authority(first, profile_id='fixture', instance_id='first')
+    actor = SessionActor('owner', 'fixture', frozenset({'session:create', 'session:read'}), 'socket')
+    ref = create_local_session(authority, actor, dict(request_id='lineage', source='gui', cwd=str(tmp_path),
+                                                      model='frozen', toolsets=[]))
+    db = authority.db
+    admit_session_input(db, epoch=authority.epoch, principal_id=actor.subject, session_id=ref.session_id,
+                        request_id='lost', payload={'text': 'lost'})
+    claimed = claim_session_input(db, epoch=authority.epoch, session_id=ref.session_id)
+    db.append_message(ref.session_id, 'user', 'lost')  # the turn's own user row: not a tool step
+    assert db.try_acquire_compression_lock(ref.session_id, 'fixture')
+    try:  # the transcript the turn ran on rotates away before the next owner
+        db.publish_compression_child(parent_session_id=ref.session_id, child_session_id='rotated', source='gui',
+                                     messages=[{'role': 'user', 'content': 'lost'}], compression_lock_holder='fixture')
+    finally:
+        db.release_compression_lock(ref.session_id, 'fixture')
+    second = runner()
+    restarted = await initialize_session_authority(second, profile_id='fixture', instance_id='second')
+    assert get_session_admission(restarted.db, admission_id=claimed['admission_id'])['status'] == 'queued'
+    again = claim_session_input(restarted.db, epoch=restarted.epoch, session_id=ref.session_id)
+    assert again['admission_id'] == claimed['admission_id']
+    second.session_store.close_all_db_handles()
+    first.session_store.close_all_db_handles()

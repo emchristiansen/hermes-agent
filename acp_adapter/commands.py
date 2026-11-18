@@ -238,16 +238,22 @@ class SlashCommandsMixin:
         return "\n".join(lines)
 
     def _cmd_reset(self, args: str, state: SessionState) -> str:
+        ended = list(state.history)
         state.history.clear()
         try:
             reset_session_state = getattr(state.agent, "reset_session_state", None)
             if callable(reset_session_state):
                 reset_session_state()
+                # The row keeps the session, not the ended conversation's prompt (and its home-guidance decision).
+                from agent.home_guidance import forget_stored_prompt
+                forget_stored_prompt(state.agent, state.session_id)
         except Exception:
             logger.warning("ACP session state reset failed for %s", state.session_id, exc_info=True)
-            return "Conversation history cleared. Agent session state reset failed; see logs."
-        finally:
-            self.session_manager.save_session(state.session_id)
+            # The conversation was not ended on disk, so it stays the session's history: saving the cleared one
+            # would replace its rows; a retry ends it.
+            state.history[:] = ended
+            return "Conversation history was not cleared: agent session state reset failed; see logs."
+        self.session_manager.save_session(state.session_id)
         return "Conversation history cleared."
 
     def _cmd_compress(self, args: str, state: SessionState) -> str:

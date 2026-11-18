@@ -8560,6 +8560,31 @@
             ],
             "default": null,
             "title": "Delivered"
+          },
+          "admission_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Admission Id"
+          },
+          "kept": {
+            "anyOf": [
+              {
+                "const": "task_comment",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Kept"
           }
         },
         "required": [
@@ -8776,6 +8801,11 @@
           "ignore_rules": {
             "default": false,
             "title": "Ignore Rules",
+            "type": "boolean"
+          },
+          "skip_memory": {
+            "default": false,
+            "title": "Skip Memory",
             "type": "boolean"
           },
           "yolo": {
@@ -14236,6 +14266,18 @@
             ],
             "default": null,
             "title": "Already Installed"
+          },
+          "upstream_repo": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Upstream Repo"
           }
         },
         "required": [
@@ -16068,7 +16110,7 @@
       },
       "CronJobRow": {
         "additionalProperties": true,
-        "description": "``tools/cronjob_job_args.py::_format_job``.",
+        "description": "``cron/job_args.py::_format_job``.",
         "properties": {
           "job_id": {
             "title": "Job Id",
@@ -25727,6 +25769,154 @@
         "title": "NotificationShowPayload",
         "type": "object"
       },
+      "NousUsageBar": {
+        "additionalProperties": false,
+        "description": "``agent.billing_usage.UsageBar``: one dollar bar (``topup`` has no cap, so total == remaining).",
+        "properties": {
+          "kind": {
+            "enum": [
+              "plan",
+              "topup"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "remaining_usd": {
+            "title": "Remaining Usd",
+            "type": "number"
+          },
+          "total_usd": {
+            "title": "Total Usd",
+            "type": "number"
+          },
+          "spent_usd": {
+            "default": 0.0,
+            "title": "Spent Usd",
+            "type": "number"
+          }
+        },
+        "required": [
+          "kind",
+          "remaining_usd",
+          "total_usd"
+        ],
+        "title": "NousUsageBar",
+        "type": "object"
+      },
+      "NousUsageDollars": {
+        "additionalProperties": false,
+        "description": "``agent.billing_usage.UsageModel`` in numbers: the classic CLI's two-bar Nous balance block.",
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "status": {
+            "default": "free",
+            "title": "Status",
+            "type": "string"
+          },
+          "plan_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Plan Name"
+          },
+          "renews_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Renews At"
+          },
+          "renews_display": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Renews Display"
+          },
+          "subscription_remaining_usd": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Subscription Remaining Usd"
+          },
+          "topup_remaining_usd": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Topup Remaining Usd"
+          },
+          "total_spendable_usd": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Total Spendable Usd"
+          },
+          "plan_bar": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NousUsageBar"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "topup_bar": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NousUsageBar"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "available"
+        ],
+        "title": "NousUsageDollars",
+        "type": "object"
+      },
       "OkResult": {
         "additionalProperties": false,
         "properties": {
@@ -25933,7 +26123,7 @@
       },
       "OnboardingStartParams": {
         "additionalProperties": false,
-        "description": "``rerun``: start a new onboarding chat even when one is in progress (Settings, Run onboarding\nagain; it never claims the welcome trial). ``fresh_launch``: the app's once-per-launch start; a run\nthe app was closed on does not count, so its chat is deleted and the run starts over.\n``facts_source``: whether the backend runs on the user's own computer. ``locale``: the desktop's UI\nlanguage, preferred over the backend OS locale. ``assume_fresh``: as on ``onboarding.state``. A new\nrun on a first install claims the welcome trial before its chat exists; a failed claim is error\n5079 and leaves no guest and no chat. A claim that is blocked (another install took the trial) with\nno trial or provider to run on is error 5080 and opens no chat.",
+        "description": "``rerun``: start a new onboarding chat even when one is in progress (Settings, Run onboarding\nagain; it never claims the welcome trial). ``fresh_launch``: the app's once-per-launch start; a run\nthe app was closed on does not count, so it ends as ``replaced`` (its chat stays in the history) and\nthe run starts over in a new chat.\n``facts_source``: whether the backend runs on the user's own computer. ``locale``: the desktop's UI\nlanguage, preferred over the backend OS locale. ``assume_fresh``: as on ``onboarding.state``. A new\nrun on a first install claims the welcome trial before its chat exists; a failed claim is error\n5079 and leaves no guest and no chat. A claim that is blocked (another install took the trial) with\nno trial or provider to run on is error 5080 and opens no chat.",
         "properties": {
           "rerun": {
             "default": false,
@@ -29785,7 +29975,7 @@
       },
       "PreviewClosePayload": {
         "additionalProperties": false,
-        "description": "``tools/preview_tool.py`` / ``tools/close_preview_tool.py``; ``url`` '' closes every tab.",
+        "description": "``tools/preview_tool.py``; ``url`` '' closes every tab.",
         "properties": {
           "url": {
             "default": "",
@@ -33416,6 +33606,82 @@
         "title": "ProjectsUpdateParams",
         "type": "object"
       },
+      "PromptCacheWindow": {
+        "additionalProperties": false,
+        "description": "``agent.prompt_cache_clock.cache_window``: until when the session's cached prompt prefix is warm.\n``guaranteed_until``: the whole prefix is warm before it (a documented minimum or a proven tier);\n``estimated_until``: certainly gone after it; between the two it may still be warm. ``coverage``\nmaps each cached tier to its deadline. ``confidence`` is ``proven`` | ``declared`` | ``assumed`` |\n``unknown``; times are epoch seconds.",
+        "properties": {
+          "guaranteed_until": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Guaranteed Until"
+          },
+          "estimated_until": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Until"
+          },
+          "tier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tier"
+          },
+          "confidence": {
+            "title": "Confidence",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "refreshed_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Refreshed At"
+          },
+          "coverage": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "default": {},
+            "title": "Coverage",
+            "type": "object"
+          }
+        },
+        "required": [
+          "guaranteed_until",
+          "estimated_until",
+          "tier",
+          "confidence",
+          "reason"
+        ],
+        "title": "PromptCacheWindow",
+        "type": "object"
+      },
       "PromptCancelParams": {
         "additionalProperties": false,
         "properties": {
@@ -36455,6 +36721,62 @@
         "title": "SeedMessage",
         "type": "object"
       },
+      "SessionAccountUsage": {
+        "additionalProperties": false,
+        "description": "``gateway/session_usage.py::account_usage``: the account blocks of ``/usage``. ``lines``: the\nroute's provider plan limits. ``nous_lines``: the Nous balance whenever Nous is signed in on the\nprofile, after them (headed as a separate account off a Nous route). ``nous_route``: the route is\nNous inference, so the ``/topup`` CTA applies. ``nous_usage``: on a Nous route, the same account\nread's dollar model, so the CLI draws its two bars without reading the account again.",
+        "properties": {
+          "lines": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Lines",
+            "type": "array"
+          },
+          "nous_lines": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Nous Lines",
+            "type": "array"
+          },
+          "nous_route": {
+            "title": "Nous Route",
+            "type": "boolean"
+          },
+          "nous_usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NousUsageDollars"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "lines",
+          "nous_route"
+        ],
+        "title": "SessionAccountUsage",
+        "type": "object"
+      },
+      "SessionAccountUsageParams": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "SessionAccountUsageParams",
+        "type": "object"
+      },
       "SessionActivateParams": {
         "additionalProperties": false,
         "properties": {
@@ -37662,6 +37984,17 @@
             },
             "title": "Context Files",
             "type": "array"
+          },
+          "prompt_cache": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PromptCacheWindow"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
         "required": [
@@ -39148,6 +39481,104 @@
           "status"
         ],
         "title": "SessionInterruptResult",
+        "type": "object"
+      },
+      "SessionKanbanRunOwner": {
+        "additionalProperties": false,
+        "properties": {
+          "profile_id": {
+            "title": "Profile Id",
+            "type": "string"
+          },
+          "instance_id": {
+            "title": "Instance Id",
+            "type": "string"
+          },
+          "epoch": {
+            "title": "Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "profile_id",
+          "instance_id",
+          "epoch"
+        ],
+        "title": "SessionKanbanRunOwner",
+        "type": "object"
+      },
+      "SessionKanbanRunParams": {
+        "additionalProperties": false,
+        "properties": {
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "board": {
+            "title": "Board",
+            "type": "string"
+          },
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "board",
+          "task_id",
+          "run_id"
+        ],
+        "title": "SessionKanbanRunParams",
+        "type": "object"
+      },
+      "SessionKanbanRunResult": {
+        "additionalProperties": false,
+        "properties": {
+          "board": {
+            "title": "Board",
+            "type": "string"
+          },
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "integer"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "execution_generation": {
+            "title": "Execution Generation",
+            "type": "integer"
+          },
+          "owner": {
+            "$ref": "#/components/schemas/SessionKanbanRunOwner"
+          }
+        },
+        "required": [
+          "board",
+          "task_id",
+          "run_id",
+          "session_id",
+          "execution_generation",
+          "owner"
+        ],
+        "title": "SessionKanbanRunResult",
         "type": "object"
       },
       "SessionListParams": {
@@ -41262,6 +41693,18 @@
             ],
             "default": null,
             "title": "Credits Usage Window"
+          },
+          "nous_route": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Nous Route"
           }
         },
         "title": "SessionUsageResult",
@@ -50546,6 +50989,24 @@
       }
     },
     {
+      "name": "session.account_usage",
+      "summary": "The /usage account blocks for this session's route: provider plan limits, then the Nous balance.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SessionAccountUsageParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionAccountUsage"
+        }
+      }
+    },
+    {
       "name": "session.automation",
       "summary": "The classic CLI's /goal, /subgoal, /loop, /heartbeat manager calls (state writes, the goal judge, quality gates), run by the owner on the session's row.",
       "params": [
@@ -50668,6 +51129,24 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/CanonicalSessionHandle"
+        }
+      }
+    },
+    {
+      "name": "session.kanban_run",
+      "summary": "Read-only: the live finite session and execution generation of one card's CURRENT run (``stale_kanban_claim`` for an ended, replaced or unclaimed run); carry both into ``session.steer`` / ``session.redirect``.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SessionKanbanRunParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionKanbanRunResult"
         }
       }
     },

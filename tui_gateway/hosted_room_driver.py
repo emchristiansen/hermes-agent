@@ -197,6 +197,14 @@ class HostedRoomRuntime:
             room_thread.join(max(0.0, deadline - time.monotonic()))
         return not any(t.is_alive() for t in (thread, *room_threads))
 
+    def live_threads(self) -> tuple[threading.Thread, ...]:
+        """The supervisor and room threads alive right now (read-only). A thread may end just after
+        this read, so a caller deciding whether this runtime's store is still written errs toward
+        "still written"."""
+        with self._status_lock:
+            threads = (self._thread, *self._room_threads.values())
+        return tuple(t for t in threads if t is not None and t.is_alive())
+
     def wakeup(self) -> None:
         """Wake the worker after task admission or a room-state change."""
         with self._status_lock:

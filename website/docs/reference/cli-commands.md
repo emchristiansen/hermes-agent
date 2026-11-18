@@ -32,8 +32,8 @@ hermes [global-options] <command> [subcommand/options]
 | `--worktree`, `-w` | Start in an isolated git worktree for parallel-agent workflows. |
 | `--yolo` | Bypass dangerous-command approval prompts. |
 | `--pass-session-id` | Include the session ID in the agent's system prompt. |
-| `--ignore-user-config` | Ignore `~/.hermes/config.yaml` and fall back to built-in defaults. Credentials in `.env` are still loaded. |
-| `--ignore-rules` | Skip auto-injection of `AGENTS.md`, `SOUL.md`, `.cursorrules`, memory, and preloaded skills. |
+| `--ignore-user-config` | Ignore `~/.hermes/config.yaml` and fall back to built-in defaults. Credentials in `.env` and an administrator-managed `agent.home_guidance_file` are still loaded. |
+| `--ignore-rules` | Skip auto-injection of `AGENTS.md`, `SOUL.md`, `.cursorrules`, memory, and preloaded skills. The operating home guidance file set by `agent.home_guidance_file` still loads. |
 | `--tui` | Launch the [TUI](../user-guide/tui.md) instead of the classic CLI. Equivalent to `HERMES_TUI=1`. Always wins over `display.interface`. |
 | `--cli` | Force the classic prompt_toolkit REPL. Use this to override `display.interface: tui` for a single invocation. |
 | `--dev` | With `--tui`: run the TypeScript sources directly via `tsx` instead of the prebuilt bundle (for TUI contributors). |
@@ -141,9 +141,9 @@ Common options:
 | `--checkpoints` | Enable filesystem checkpoints before destructive file changes. |
 | `--yolo` | Skip approval prompts. |
 | `--pass-session-id` | Pass the session ID into the system prompt. |
-| `--ignore-user-config` | Ignore `~/.hermes/config.yaml` and use built-in defaults. Credentials in `.env` are still loaded. Useful for isolated CI runs, reproducible bug reports, and third-party integrations. |
-| `--ignore-rules` | Skip auto-injection of `AGENTS.md`, `SOUL.md`, `.cursorrules`, persistent memory, and preloaded skills. Combine with `--ignore-user-config` for a fully isolated run. |
-| `--safe-mode` | Troubleshooting mode: disable ALL customizations — user config, rules/memory injection, plugins, shell hooks, and MCP servers (implies `--ignore-user-config` and `--ignore-rules`). The gateway freezes code defaults plus your explicit options into the session and runs the turn in an isolated worker process that never reads the profile, so a broken `config.yaml` cannot block it. Requires an explicit `--model` (there is no profile default to inherit); pair with `--provider custom --base-url <url> --api-key <key>` for a fully explicit endpoint. |
+| `--ignore-user-config` | Ignore `~/.hermes/config.yaml` and use built-in defaults. Credentials in `.env` and an administrator-managed `agent.home_guidance_file` are still loaded. Useful for isolated CI runs, reproducible bug reports, and third-party integrations. |
+| `--ignore-rules` | Skip auto-injection of `AGENTS.md`, `SOUL.md`, `.cursorrules`, persistent memory, and preloaded skills; the operating home guidance file set by `agent.home_guidance_file` still loads. Combine with `--ignore-user-config` to also ignore your config file; an administrator-managed `agent.home_guidance_file` still loads. |
+| `--safe-mode` | Troubleshooting mode: disable customizations — user config, rules/persona/memory injection, plugins, shell hooks, and MCP servers (implies `--ignore-user-config` and `--ignore-rules`); an administrator-managed `agent.home_guidance_file` still loads. The gateway freezes code defaults plus your explicit options into the session and runs the turn in an isolated worker process that never reads the profile, so a broken `config.yaml` cannot block it. Requires an explicit `--model` (there is no profile default to inherit); pair with `--provider custom --base-url <url> --api-key <key>` for a fully explicit endpoint. |
 | `--base-url <url>` / `--api-key <key>` | Explicit OpenAI-compatible endpoint and launch-only key for `--provider custom`. The key is held in the running gateway's memory for this session and never written to disk. |
 | `--source <tag>` | Session source tag for filtering (default: `cli`; one-shot runs default to `oneshot`, which pickers hide). Use `tool` for third-party integrations that should not appear in user session lists. An explicit `--source` is always stored as given, even for a one-shot run launched from inside a TUI or Desktop session. |
 | `--max-turns <N>` | Maximum tool-calling iterations per conversation turn (default: unlimited, or `agent.max_turns` in config). |
@@ -1225,10 +1225,32 @@ Restore a previously created Hermes backup into your Hermes home directory. All 
 | Option | Description |
 |--------|-------------|
 | `-f`, `--force` | Skip the existing-installation confirmation prompt. |
+| `--keep-host` | Replace this agent with the backup but keep what its host set up (a Hermes Cloud agent's Nous Portal sign-in and platform settings). Takes a full backup of this agent first: the undo point. See below. |
+| `--messaging-off` | With `--keep-host`: every messaging bot the backup would run arrives switched off, with its token and settings. See below. |
 
 :::warning
-Stop the gateway before importing to avoid conflicts with running processes.
+Stop the gateway before importing to avoid conflicts with running processes. `--keep-host` inside the Docker image (Hermes Cloud) pauses and restarts the gateway itself.
 :::
+
+### `--keep-host`: replace an agent but keep its host's setup
+
+This is how Settings ▸ [Backup & Transfer](../user-guide/backup-and-transfer.md) replaces a Hermes Cloud agent with a local one. The backup's memory, persona, skills, conversations, scheduled jobs, settings, `.env` keys and `auth.json` logins all come over. The agent keeps:
+
+- **`auth.json`** (the root's and each profile's): its own Nous Portal sign-in (`providers.nous`, the `nous` credential-pool rows, and `active_provider` when either side uses Nous). The backup's Nous tokens are never written. `shared/nous_auth.json`, `webapp/` (the Webapp's sign-in state), `install_id` and lock files are never taken from the backup.
+- **`config.yaml`** (the root home's): its own top-level `model`, `providers`, `fallback_providers`, `fallback`, `auxiliary`, `nous`, `auth`, `web`, `image_gen`, `video_gen`, `tts`, `stt`, `dashboard`, `webapp`, `cron` (scheduler settings; the jobs come from the backup), `max_concurrent_sessions` and `max_live_sessions`. Every other key comes from the backup, and the file keeps the backup's comments.
+- **`.env`** (the root home's): its own `NOUS_*`, `HERMES_*`, `TOOL_GATEWAY_*` and `API_SERVER_KEY` lines.
+
+Only the root home is the host's: a named profile's `config.yaml` and `.env` arrive whole, and so does any other file with those names (a skill's `templates/config.yaml`).
+
+The result is a replacement, not a merge. In the root home and in every profile the backup carries, a file the backup does not have is removed, and when the backup has no `auth.json`, `.env` or `config.yaml`, the agent's copy keeps only its host-owned part. Databases, logs and the gateway's runtime records stay. A profile that only the agent has is left exactly as it is (the import lists it). A folder the backup writes into that is a symlink refuses the import before anything is written. Messaging bot tokens come over too. A bot token answers to one running Hermes at a time, so stop the gateway on the old machine, or add `--messaging-off`.
+
+`--messaging-off` (the Desktop transfer always passes it) brings every messaging bot over switched off. In the root home and in each profile the backup carries, a bot the backup would run (`platforms.<id>.enabled: true`, or a token in `.env` with no `enabled` setting) gets `platforms.<id>.enabled: false`, the switch the **Messaging** page turns on and off, written into the restored `config.yaml`. Its token, allowlists and other settings come over unchanged, and the gateway does not connect it until you switch it on. The import prints `Messaging switched off: Telegram, Discord`. Inbound endpoints (`api_server`, `webhook`) are left alone. An undo does not pass the flag, so it puts the agent's own bots back as they were.
+
+Once the gateway has drained, and before writing anything, it backs up the agent, the memory provider's files outside the home included, to `backups/pre-transfer-<time>.zip` and prints `Undo point: <path>`. The last three are kept. To put the agent back, run `hermes import <that zip> --force --keep-host`: that restores it with the same replace rule, so files the transfer added (the backup's scheduled jobs, its skills, a profile it brought) go again. If a restore fails part-way, the next `--keep-host` import (a retry) reuses that first undo point instead of backing up the half-restored agent.
+
+Inside the Docker image the gateway owns `state.db`, so a plain `hermes import` refuses the session database while it runs. `--keep-host` asks the gateway to finish its in-flight turns and exit (the `pause-for-update` control-socket request `hermes update` uses). It first marks the gateway's s6 slot run-once so the supervisor does not restart it during the restore, then starts the slot again afterwards. If it cannot tell whether that gateway is running, it refuses. Outside a container nothing is paused; stop the gateway first, as with any import.
+
+**Exit status** for `--keep-host`: `Import refused; no files restored` appears only when it stopped before the first write (a linked folder, the undo point could not be written, the gateway would not pause). Any later failure lists what was not restored and prints the undo point again.
 
 **Exit status:** `1` when the archive is damaged — before anything is written, every member is decompressed once and its CRC checked; if any fail, the command prints `Error: backup archive is damaged (N member(s) …)` with the offending members and stops with the Hermes home untouched. Also `1` when any file from the archive could not be restored (listed under `Warnings (N files skipped)` and summarised as `Import incomplete: …`). The files that did land stay in place, but a script or the dashboard will not report a partial restore as success. Runtime files the import deliberately keeps from this machine (`gateway.pid`, `gateway_state.json`, …) and the older-backup session warning below do not change the exit status.
 
@@ -1251,6 +1273,7 @@ Importing an older backup over newer work is still allowed, but it is no longer 
 ```bash
 hermes import ~/hermes-backup-20260423.zip           # Prompts before overwriting existing config
 hermes import ~/hermes-backup-20260423.zip --force   # Overwrite without prompting
+hermes import ~/hermes-backup-20260423.zip --keep-host --messaging-off   # Replace a cloud agent, keep its Nous sign-in, bots arrive off
 ```
 
 ## `hermes logs`
@@ -1864,7 +1887,7 @@ Subcommands:
 | `optimize-storage` | Migrate the full-text search index to the compact v23 external-content layout; on large databases this reclaims a large fraction of `state.db`. |
 | `repair` | Repair a malformed `state.db` schema (e.g. `table messages_fts already exists`) so hidden sessions reappear; a backup is made first. |
 | `repair-routing` | Re-attach gateway conversations stranded in session rows that lost their routing identity (a chat "jumping back in time" after a restart). Dry-run by default; `--apply` performs the adoptions (stop the gateway first); `--max-gap-seconds N` tunes the contiguity window. Only unambiguous cases are repaired. See [Sessions → Repair Stranded Gateway Sessions](../user-guide/sessions.md#repair-stranded-gateway-sessions). |
-| `repair-prompts` | Report stored system prompts provably degraded by the pre-#122822 maintenance-compaction bug. Report-only by default; `--apply` clears verified rows so the next turn rebuilds them, `--json` is machine-readable (and non-interactive when combined with `--apply`), and an explicit `session_id` is a destructive override that can clear even a healthy prompt. Rows without a readable tools[] pin, or with a memory-only pin, are reported as unverifiable and left unchanged by the scan (a resumed memory-only session re-pins its full tool surface, after which a scan can clear it). Restart a running gateway after `--apply` so repaired rows take effect. See [Sessions → Repair Degraded Stored Prompts](../user-guide/sessions.md#repair-degraded-stored-prompts). |
+| `repair-prompts` | Report stored system prompts provably degraded by the pre-#122822 maintenance-compaction bug. Report-only by default; `--apply` clears verified rows so the next turn rebuilds them (a conversation already under way then carries no home-guidance edition — an explicit notice where `agent.home_guidance_file` is configured — until a new conversation), `--json` is machine-readable (and non-interactive when combined with `--apply`), and an explicit `session_id` is a destructive override that can clear even a healthy prompt. Rows without a readable tools[] pin, or with a memory-only pin, are reported as unverifiable and left unchanged by the scan (a resumed memory-only session re-pins its full tool surface, after which a scan can clear it). Restart a running gateway after `--apply` so repaired rows take effect. See [Sessions → Repair Degraded Stored Prompts](../user-guide/sessions.md#repair-degraded-stored-prompts). |
 | `refresh-prompts` | Make continuing sessions rebuild their stored system prompt from the current `SOUL.md`, skills and context files on their next turn, keeping conversation history and session ids. Run it after updating a profile's prompt sources. `--session ID` (id or unique prefix) limits the request to one session, `--json` prints the recorded epoch and the session count, `-p/--profile` targets another profile. Works with the gateway running (no restart needed) and survives restarts. Each refreshed session pays one prompt-cache miss. See [Sessions → Refresh Prompts After a Profile Update](../user-guide/sessions.md#refresh-prompts-after-a-profile-update). |
 | `repair-profiles` | Settle session, routing, Telegram-topic and voice-mode state that landed under the wrong profile (rows in another profile's store, labels disagreeing with the session key, parent links crossing profiles, index rows for deleted profiles). Dry-run by default; `--apply` performs the repairs after snapshotting every store (stop the gateway first); `--legacy-main rekey\|move` decides what `agent:main` rows inside a named profile's store are; `--json` for automation. See [Sessions → Repair State Crossed Between Profiles](../user-guide/sessions.md#repair-state-crossed-between-profiles). |
 | `recover` | Offline, non-destructive recovery of a damaged `state.db` into a separate clean database. |

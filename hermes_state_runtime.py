@@ -210,14 +210,17 @@ def admit_session_input(db, *, epoch: int, principal_id: str, session_id: str,
             if _replay_guard is not None:
                 _replay_guard(conn)
             return _row(old)
+        # The guard runs before the cap is counted: a replacement cancels the queued rows it
+        # supersedes inside this transaction, so it needs only the room they leave (a fold of a
+        # full FIFO's waiting wakes). Any refusal below rolls those cancellations back.
+        if _authorize_write is not None:
+            _authorize_write(conn)
         queued = conn.execute('''SELECT COUNT(*) FROM session_admissions WHERE target_session_id=?
             AND status='queued' ''', (session_id,)).fetchone()[0]
         # Main's cap holds in both states: a FIFO paused behind an unknown turn runs every accepted
         # input after Discard, so it must not grow without bound while nobody resolves it.
         if queued >= ADMISSION_QUEUE_MAX:
             raise RuntimeStoreError('queue_full')
-        if _authorize_write is not None:
-            _authorize_write(conn)
         admission_id = uuid.uuid4().hex
         conn.execute('''INSERT INTO session_admissions(admission_id,request_id,principal_id,
             target_session_id,lineage_json,payload_json,payload_digest,intent,status,owner_epoch)
@@ -250,6 +253,20 @@ def list_session_admissions(db, *, session_id: str, pending_only: bool = True) -
         return [_row(row) for row in conn.execute(sql, (session_id,))]
 
 
+def list_session_admissions_containing(db, *, session_id: str, needle: str) -> list[dict]:
+    """The session's admissions, any status, whose stored payload JSON contains *needle*, in
+    ``seq`` order. A prefilter, never an identity: callers verify the parsed payload exactly.
+
+    The (target, status, seq) index bounds the scan to the session and ``instr`` runs inside
+    SQLite, so only matching rows are returned and decoded; they are ordered here, so no temp
+    B-tree sorts (and on a large session spills) the session's whole history."""
+    with db._read_ctx() as conn:
+        rows = [_row(row) for row in conn.execute(
+            'SELECT * FROM session_admissions WHERE target_session_id=? AND instr(payload_json, ?) > 0',
+            (session_id, needle))]
+    return sorted(rows, key=lambda row: row['seq'])
+
+
 _ADMISSION_STATUSES = ('queued', 'started', 'unknown', 'terminal')  # the table's status CHECK
 
 
@@ -272,7 +289,8 @@ _ANY_HEAD = object()
 
 
 def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_ANY_HEAD) -> dict | bool | None:
-    """Claim the FIFO head. ``_guard(conn)`` (owner admission gate) raises to refuse inside the
+    """Claim the first queued input, never an earlier unknown business operation.
+    ``_guard(conn)`` (owner admission gate) raises to refuse inside the
     write transaction, so a drain that began while this waited on the writer still wins.
     ``head`` is the admission id the caller's preclaim checks validated (None: it saw nothing
     queued); if the head is another row by the time this write runs, nothing is claimed and False
@@ -282,12 +300,12 @@ def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_A
         if _guard is not None:
             _guard(conn)
         session = _session(conn, session_id)
-        blocked = conn.execute("SELECT status FROM session_admissions WHERE target_session_id=? AND status IN ('started','unknown')", (session_id,)).fetchall()
-        if any(row[0] == 'unknown' for row in blocked):
-            raise RuntimeStoreError('unknown_execution')
-        from hermes_state_runtime_workers import worker_states
-        workers = worker_states(conn, session_id)
-        if 'unknown' in workers:
+        blocked = conn.execute("SELECT 1 FROM session_admissions WHERE target_session_id=? AND status='started'", (session_id,)).fetchone()
+        from hermes_state_runtime_workers import claim_worker_states
+        workers = claim_worker_states(conn, session_id, epoch)
+        if 'unknown' in workers or (workers and conn.execute(
+                "SELECT 1 FROM session_admissions WHERE target_session_id=? AND status='unknown'",
+                (session_id,)).fetchone()):
             raise RuntimeStoreError('unknown_execution')
         if blocked or workers:
             return None
@@ -296,6 +314,16 @@ def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_A
             return False
         if row is None:
             return None
+        # The old business claim stays unknown, but its open transcript is not a
+        # new instruction. Close it AFTER the worker/policy fences and BEFORE this
+        # claim's mark, in this same transaction. A failed boundary write rolls
+        # back the claim and cannot launch inference on the unsafe history.
+        lost = conn.execute("SELECT * FROM session_admissions WHERE target_session_id=? "
+                            "AND status='unknown' AND seq<? ORDER BY seq DESC LIMIT 1",
+                            (session_id, row['seq'])).fetchone()
+        if lost is not None:
+            from gateway.session_results import close_discarded_turn
+            close_discarded_turn(db, conn, lost)
         generation = session['runtime_generation'] + 1
         conn.execute('UPDATE sessions SET runtime_generation=? WHERE id=?', (generation, session_id))
         changed = conn.execute("UPDATE session_admissions SET status='started',owner_epoch=?,generation=? WHERE admission_id=? AND status='queued'", (epoch, generation, row['admission_id']))
@@ -306,8 +334,26 @@ def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_A
         # session): a row above it on this conversation was written by this turn, so settlement can
         # tell this turn's own failed-turn boundary from an earlier turn's (#134889 GW-21).
         claimed['transcript_mark'] = conn.execute('SELECT COALESCE(MAX(id), 0) FROM messages').fetchone()[0]
+        conn.execute('INSERT OR REPLACE INTO state_meta(key,value) VALUES(?,?)', (CLAIM_MARK_PREFIX + row['admission_id'],
+                     _json({'epoch': epoch, 'generation': generation, 'mark': claimed['transcript_mark'],
+                            'physical': _claim_transcript(conn, row['target_session_id'])})))
         return claimed
     return db._execute_write(write)
+
+
+# The claim's transcript mark, durable: a turn lost with its owner is only queued again when nothing
+# above the mark is a tool step (gateway.session_message_redelivery).
+CLAIM_MARK_PREFIX = 'gateway.admission.claim_mark.v1.'
+
+
+def _claim_transcript(conn, session_id):
+    """The physical transcript a claim of ``session_id`` writes to (a local owner's current target), kept
+    with its mark: the turn's tool steps are found there even once it is compressed or rotated away."""
+    from hermes_state_local_lineage import local_physical_target
+    try:
+        return local_physical_target(conn, session_id)
+    except RuntimeStoreError:
+        return session_id
 
 
 def settle_session_input(db, *, epoch: int, admission_id: str, generation: int, outcome: str,
@@ -326,9 +372,12 @@ def settle_session_input(db, *, epoch: int, admission_id: str, generation: int, 
                 or type(generation) is not int or row['generation'] != generation
                 or session['runtime_generation'] != generation):
             raise RuntimeStoreError('stale_generation')
-        _retire_admission_workers(conn, row, epoch)
+        # The owner's effect reads the claim's worker rows as they stood (an owner-stop redelivery
+        # needs every one already ended, ``session_message_redelivery``), so it runs before this
+        # settlement retires them, as in ``resolve_unknown_session_input``.
         if _terminal_write is not None:
             _terminal_write(conn, row)
+        _retire_admission_workers(conn, row, epoch)
         if result is not None:
             from hermes_state_terminal import RESULT_PREFIX
             encoded = _json(encode_result(compact_result(result, user_message=json.loads(row['payload_json']).get('text'))))
@@ -336,6 +385,7 @@ def settle_session_input(db, *, epoch: int, admission_id: str, generation: int, 
                          'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
                          (RESULT_PREFIX + admission_id, encoded))
         conn.execute("UPDATE session_admissions SET status='terminal',outcome=? WHERE admission_id=?", (outcome, admission_id))
+        conn.execute('DELETE FROM state_meta WHERE key=?', (CLAIM_MARK_PREFIX + admission_id,))
         settle_steer_transfers(conn, epoch=epoch, generation=generation, transfers=_transfers, outcome=outcome)
         conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (row['target_session_id'],))
         return _row(_admission(conn, admission_id))
@@ -366,11 +416,43 @@ def cancel_session_input(db, *, epoch: int, admission_id: str) -> dict:
 # back to ``queued`` (its own FIFO place) when the text never reached the claim's agent.
 STEERING = 'steering'
 
+# An ``unknown`` Kanban card attempt lost because its owner itself ended (stopping, or a predecessor
+# that left it running): the cause it still owes its board (``session_unattended_unknown``), committed
+# in the same transaction as its loss fence so no cancellation or later owner loss can drop it. It
+# reads as in flight until it settles ``interrupted``, which replaces it.
+OWNER_RESTART = 'owner_restart'
+OWE_OWNER_RESTART = ("UPDATE session_admissions SET outcome='" + OWNER_RESTART + "' WHERE outcome IS NULL "
+                     "AND json_type(payload_json, '$.kanban_card_v1') IS NOT NULL")
+
 
 def steer_replayed(row) -> bool:
     """``row`` is a committed transfer (still in flight, or settled ``steered``): an exact retry of
     ``prompt.steer_queued`` replays it."""
     return row['status'] == 'terminal' and row['outcome'] in (STEERING, 'steered')
+
+
+# A transfer whose text its receiving managed child confirmed consumed (``confirm_steer_transfer``):
+# the only steering row an owner restart may settle ``interrupted`` instead of queueing it again.
+CONFIRMED_STEER_PREFIX = 'gateway.steer_confirmed.v1.'
+
+
+def confirm_steer_transfer(db, *, epoch: int, admission_id: str, generation: int) -> bool:
+    """Durably record that the transfer bound to the claim ``(epoch, generation)`` reached its agent.
+    False (nothing written) once the row is no longer that claim's transfer."""
+    def write(conn):
+        _epoch(conn, epoch)
+        if conn.execute("SELECT 1 FROM session_admissions WHERE admission_id=? AND status='terminal' AND outcome=? "
+                        "AND owner_epoch=? AND generation=?", (admission_id, STEERING, epoch, generation)).fetchone() is None:
+            return False
+        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                     (CONFIRMED_STEER_PREFIX + admission_id, _json({'epoch': epoch, 'generation': generation})))
+        return True
+    return db._execute_write(write)
+
+
+def _confirmed_transfer(conn, row) -> bool:
+    mark = conn.execute('SELECT value FROM state_meta WHERE key=?', (CONFIRMED_STEER_PREFIX + row['admission_id'],)).fetchone()
+    return mark is not None and json.loads(mark[0]) == {'epoch': row['owner_epoch'], 'generation': row['generation']}
 
 
 def _requeue_transfer(conn, *, admission_id: str, epoch: int, generation: int) -> bool:
@@ -407,6 +489,7 @@ def settle_steer_transfers(conn, *, epoch: int, generation: int, transfers, outc
     its text reached the claim's agent (``transfers[id]``) and the claim completed; a delivered text
     under any other ending is ``interrupted`` (never replayed); an undelivered one is queued again."""
     for admission_id, delivered in (transfers or {}).items():
+        conn.execute('DELETE FROM state_meta WHERE key=?', (CONFIRMED_STEER_PREFIX + admission_id,))
         if not delivered:
             _requeue_transfer(conn, admission_id=admission_id, epoch=epoch, generation=generation)
             continue
@@ -525,9 +608,23 @@ def recover_session_inputs(db, *, epoch: int) -> int:
         from hermes_state_runtime_workers import retire_stale_children
         retire_stale_children(conn, epoch)
         conn.execute("UPDATE worker_executions SET status='unknown' WHERE status IN ('registered','running') AND owner_epoch!=?", (epoch,))
-        # A steer handed to a lost claim may or may not have reached its agent: never replayed.
-        conn.execute("UPDATE session_admissions SET outcome='interrupted' WHERE status='terminal' AND outcome=? "
-                     "AND owner_epoch!=?", (STEERING, epoch))
+        # A steer handed to a lost claim: one its agent confirmed consumed is never run again; any other
+        # may never have reached a model, so it is queued again in its own FIFO place (at least once:
+        # a duplicate, never a loss). The lost claim itself is never replayed (below).
+        for row in conn.execute("SELECT admission_id, owner_epoch, generation FROM session_admissions "
+                                "WHERE status='terminal' AND outcome=? AND owner_epoch!=?", (STEERING, epoch)).fetchall():
+            if _confirmed_transfer(conn, row):
+                conn.execute("UPDATE session_admissions SET outcome='interrupted' WHERE admission_id=?", (row['admission_id'],))
+            else:
+                _requeue_transfer(conn, admission_id=row['admission_id'], epoch=row['owner_epoch'], generation=row['generation'])
+            conn.execute('DELETE FROM state_meta WHERE key=?', (CONFIRMED_STEER_PREFIX + row['admission_id'],))
+        # A card attempt a previous owner left running was lost to that owner's end: its cause
+        # commits with this fence (``OWNER_RESTART``).
+        conn.execute(OWE_OWNER_RESTART + " AND status='started' AND owner_epoch!=?", (epoch,))
+        # A person's lost turn that reached no tool is owed its redelivery in this same commit, so a boot
+        # cut short after the fence still runs it (MR-RECOVERY-17; ``session_message_redelivery``).
+        from gateway.session_message_redelivery import owe_lost_turns
+        owe_lost_turns(conn, epoch)
         return conn.execute("UPDATE session_admissions SET status='unknown' WHERE status='started' AND owner_epoch!=?", (epoch,)).rowcount
     return db._execute_write(write)
 
@@ -950,7 +1047,7 @@ def _worker_usage(db, conn, session_id, payload, *, auxiliary=False):
         raw = payload.get('source')
         source = raw if isinstance(raw, str) else None
         payload = {k: v for k, v in payload.items() if k != 'source'}
-    allowed = (_MODEL_USAGE_FIELDS - {'billing_mode', 'actual_cost_usd', 'cost_status', 'cost_source'} | {'task'}) if auxiliary else (_MODEL_USAGE_FIELDS | {'pricing_version', 'absolute', 'task'})
+    allowed = (_MODEL_USAGE_FIELDS - {'billing_mode', 'actual_cost_usd', 'cost_status', 'cost_source'} | {'task'}) if auxiliary else (_MODEL_USAGE_FIELDS | {'pricing_version', 'absolute', 'task', 'prompt_cache_clock'})
     if set(payload) - allowed:
         raise RuntimeStoreError('invalid_params')
     for key, value in payload.items():
@@ -969,6 +1066,10 @@ def _worker_usage(db, conn, session_id, payload, *, auxiliary=False):
             raise RuntimeStoreError('invalid_params')
         db._record_model_usage(conn, session_id, **({'api_call_count': 1} | payload))
     else:
+        if payload.get('prompt_cache_clock') is not None:
+            from hermes_state_worker_context import stamp_cache_generation
+            payload = dict(payload, prompt_cache_clock=stamp_cache_generation(conn, session_id,
+                                                                              payload['prompt_cache_clock']))
         db._update_token_counts_in_transaction(conn, session_id, **payload)
         # The managed worker's platform is the policy label (gui), not the in-process
         # agent surface (desktop). Stamp the same created_surface the insert uses.

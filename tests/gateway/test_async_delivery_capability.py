@@ -30,6 +30,15 @@ from gateway.session_context import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _unbind_session_vars():
+    """``clear_session_vars`` binds every var to ``""`` in the test's own context, which a sync test
+    shares with every later test: an env-driven reader (``HERMES_SESSION_SOURCE``) would then see
+    ``""``. Leave them unbound, as a fresh process has them."""
+    yield
+    reset_session_vars()
+
+
 # ---------------------------------------------------------------------------
 # Capability helper
 # ---------------------------------------------------------------------------
@@ -126,7 +135,7 @@ class TestStatelessChannelForcesSyncDelegation:
         }
         monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
         monkeypatch.setattr(dt, "_run_single_child", _child)
-        monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+        monkeypatch.setattr("tools.delegate_tool_routes._resolve_delegation_credentials", lambda *a, **k: creds)
         monkeypatch.setattr(
             "tools.async_delegation.dispatch_async_delegation_batch", _fake_dispatch
         )

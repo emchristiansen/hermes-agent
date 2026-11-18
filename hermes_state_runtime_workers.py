@@ -1,5 +1,6 @@
 """Worker exclusion follows the logical conversation and its physical transcript lineage."""
 import json
+from enum import Enum
 
 
 def runtime_lineage(conn, session_id):
@@ -30,6 +31,43 @@ def worker_states(conn, session_id):
         "AND status IN ('registered','running','unknown')", (json.dumps(sorted(runtime_lineage(conn, session_id))),))}
 
 
+def claim_worker_states(conn, session_id, epoch):
+    """Workers that exclude a NEW admission, not the session's unresolved history.
+
+    Only a previous owner's private admission worker with positive unknown-claim
+    ownership may be passed. It stays unknown: its old owner epoch fences writes
+    and its private adoption cannot cross epochs (adopt_worker_execution). Neither
+    fact authorizes replay of its admission or any of its business operations.
+    All other workers keep the ordinary exclusion, including orphan/ambiguous
+    ownership and current-epoch unknown workers that could still adopt.
+    Reset/register callers deliberately keep using worker_states instead.
+    """
+    from gateway.session_worker_reservation import ADMISSION_WORKER_PREFIX, WorkerOwnershipConflict, admission_worker_rows
+    from hermes_state_runtime import RuntimeStoreError, _linked_worker_admission
+    states = set()
+    for worker in conn.execute(
+            "SELECT * FROM worker_executions WHERE session_id IN (SELECT value FROM json_each(?)) "
+            "AND status IN ('registered','running','unknown')",
+            (json.dumps(sorted(runtime_lineage(conn, session_id))),)).fetchall():
+        if (worker['status'] == 'unknown' and worker['kind'] == 'compute'
+                and worker['owner_epoch'] != epoch
+                and worker['execution_id'].startswith(ADMISSION_WORKER_PREFIX)):
+            try:
+                admission = _linked_worker_admission(conn, worker['session_id'], worker['generation'],
+                                                      worker['owner_epoch'], ('started', 'unknown'))
+            except RuntimeStoreError as exc:
+                if exc.reason != 'admission_conflict':
+                    raise
+                raise WorkerOwnershipConflict('ambiguous retained worker admission link') from exc
+            if (admission is not None and admission['status'] == 'unknown'
+                    and admission['target_session_id'] == session_id
+                    and any(key == worker['execution_id'] for key, _status, _generation
+                            in admission_worker_rows(conn, admission['admission_id']))):
+                continue
+        states.add(worker['status'])
+    return states
+
+
 def discard_orphan_workers_on_reset(conn, session_ids):
     """An explicit reset revokes unlinked unknown compute; it never replays its side effects.
 
@@ -45,8 +83,8 @@ def discard_orphan_workers_on_reset(conn, session_ids):
 
 
 RETIRED_RECEIPT = {'retired': True}
-# A delegated child's execution id is its parent's plus this and a random suffix, so every
-# descendant of an execution is one prefix probe away (gateway/session_worker_child.py).
+# Only an owner-minted kind='child' row gives its final separator an
+# ownership meaning. Retained compute identities are opaque, including '/child:'.
 CHILD_SEPARATOR = '/child:'
 
 
@@ -54,15 +92,62 @@ def retire_child_executions(conn, execution_id):
     """A child never outlives the execution that reserved it: every live descendant goes terminal
     with it, its read receipts shrink and its open session row is ended. A late child write is
     then refused ``stale_generation`` like any write after retirement."""
-    _retire_children(conn, conn.execute("SELECT execution_id,session_id FROM worker_executions "
-                                        "WHERE execution_id>=? AND execution_id<? AND status!='terminal'",
-                                        descendant_range(execution_id)).fetchall())
+    candidates = conn.execute("SELECT execution_id,session_id FROM worker_executions "
+                              "WHERE execution_id>=? AND execution_id<? AND status!='terminal'",
+                              descendant_range(execution_id)).fetchall()
+    # Prefixes find candidates, never prove ownership: another retained compute
+    # root can itself contain '/child:' and have a genuine subtree beneath it.
+    owned = [row for row in candidates
+             if child_ownership(conn, row['execution_id'], execution_id) is ChildOwnership.OWNED]
+    _retire_children(conn, owned)
 
 
 def descendant_range(execution_id):
-    """``(low, high)`` bounds every descendant id of ``execution_id`` on the primary key index
-    (';' sorts right after the separator's ':'), so a no-child finish costs one index probe."""
+    """Indexed bounds of possible descendant spellings; not proof of ownership."""
     return execution_id + CHILD_SEPARATOR, execution_id + CHILD_SEPARATOR[:-1] + ';'
+
+
+def execution_lineage(conn, execution_id):
+    """Known owner-minted edges, nearest execution first, stopping at a root.
+
+    Only a stored child row permits stripping its last separator. A compute
+    root is opaque even when its ID contains that separator. A missing edge
+    ends the proof rather than manufacturing a parent; callers needing a
+    complete root must also check that the final row is not itself a child.
+    """
+    rows = []
+    while True:
+        row = conn.execute('SELECT execution_id,session_id,kind FROM worker_executions WHERE execution_id=?',
+                           (execution_id,)).fetchone()
+        if row is None:
+            return tuple(rows)
+        rows.append(row)
+        if row['kind'] != 'child':
+            return tuple(rows)
+        parent, separator, _suffix = execution_id.rpartition(CHILD_SEPARATOR)
+        if not separator:
+            return tuple(rows)
+        execution_id = parent
+
+
+class ChildOwnership(Enum):
+    OWNED = 'owned'
+    FOREIGN = 'foreign'
+    UNKNOWN = 'unknown'
+
+
+def child_ownership(conn, execution_id, ancestor_id):
+    """Positive stored ancestry, a distinct opaque root, or an incomplete proof.
+
+    Retirement may touch only OWNED; replay must also refuse UNKNOWN. Treating
+    either missing proof as ownership or missing ownership as absence is unsafe.
+    """
+    lineage = execution_lineage(conn, execution_id)
+    if any(row['execution_id'] == ancestor_id for row in lineage[1:]):
+        return ChildOwnership.OWNED
+    if lineage and lineage[-1]['kind'] != 'child':
+        return ChildOwnership.FOREIGN
+    return ChildOwnership.UNKNOWN
 
 
 def retire_stale_children(conn, epoch):
@@ -82,7 +167,8 @@ def _retire_children(conn, rows):
 def _end_child_row(conn, execution_id):
     import time
     conn.execute("UPDATE sessions SET ended_at=?,end_reason='agent_close' WHERE ended_at IS NULL "
-                 "AND id=(SELECT session_id FROM worker_executions WHERE execution_id=?)", (time.time(), execution_id))
+                 "AND id=(SELECT session_id FROM worker_executions WHERE execution_id=? AND kind='child')",
+                 (time.time(), execution_id))
 
 
 def compact_terminal_receipts(conn, execution_id):
@@ -95,10 +181,9 @@ def compact_terminal_receipts(conn, execution_id):
     conflicts. Mutation acknowledgements (counts, row annotations, assignments) stay replayable."""
     retire_child_executions(conn, execution_id)
     _compact(conn, execution_id)
-    if CHILD_SEPARATOR in execution_id:
-        # A child that finished itself (an early close: failed constructor, refused sibling) never
-        # reaches _retire_children, which only selects live children: its row ends here.
-        _end_child_row(conn, execution_id)
+    # Self-finish also closes a real child row; the stored role, never spelling,
+    # decides this. Compute roots with legacy '/child:' IDs keep their session.
+    _end_child_row(conn, execution_id)
 
 
 def _compact(conn, execution_id):

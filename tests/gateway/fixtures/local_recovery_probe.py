@@ -184,6 +184,10 @@ def probe(tmp_path):
             db.execute('UPDATE state_meta SET value=? WHERE key=?', (json.dumps(row), prefix + sessions['tampered']))
             db.execute('DELETE FROM state_meta WHERE key=?', (prefix + sessions['missing'],))
             db.execute('UPDATE state_meta SET value=? WHERE key=?', ('{}', prefix + sessions['corrupt']))
+            # The lost turn ran a tool: a business turn, never re-run, so it stays ``unknown`` (msg-retry
+            # delivers again one that ran none).
+            db.execute("INSERT INTO messages(session_id,role,content,tool_call_id,tool_name,timestamp) "
+                       "VALUES(?,'tool','done','c1','terminal',?)", (sessions['unknown'], time.time()))
         cfg['model']['default'] = 'changed-default'
         cfg['platform_toolsets']['cli'] = ['terminal']
         (home / 'config.yaml').write_text(json.dumps(cfg))

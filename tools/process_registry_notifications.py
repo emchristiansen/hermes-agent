@@ -7,8 +7,10 @@ import time
 from dataclasses import dataclass
 from contextlib import suppress
 
+from tools import delegate_tool_config
+
 _DONE = ("completed", "success")
-_REASON_STATUS = {"lost": "marked lost because the process backend disappeared", "failed_start": "failed to start"}
+_REASON_STATUS = {"lost": "marked lost because the process backend disappeared"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,10 +102,9 @@ def _model_not_found_patterns() -> list[str]:
 
 
 def _delegation_config() -> dict:
-    """Active delegation config; ``{}`` on any error. Lazy: delegate_tool is heavy."""
+    """Active delegation config; ``{}`` on any error."""
     try:
-        from tools.delegate_tool import _load_config as _cfg
-        return _cfg() or {}
+        return delegate_tool_config._load_config() or {}
     except Exception:
         return {}
 
@@ -444,11 +445,12 @@ def process_completion_display_text(events: list) -> str:
     if reason == "killed":
         outcome = "Terminated"
     elif reason in _REASON_STATUS:
-        outcome = "Lost" if reason == "lost" else "Failed to Start"
+        outcome = "Lost"
     else:
         outcome = "Finished" if exit_code == 0 else "Failed"
     cmd = _short_command(evt.get("command"))
-    detail = f" (exit {exit_code})" if reason not in ("killed", *_REASON_STATUS) and exit_code != 0 else ""
+    oom = ", kernel OOM kill" if evt.get("scope_oom_killed") else ""
+    detail = f" (exit {exit_code}{oom})" if reason not in ("killed", *_REASON_STATUS) and exit_code != 0 else ""
     return f"Background Process {outcome}{detail}: {cmd}" if cmd else f"Background Process {outcome}{detail}"
 
 
@@ -534,11 +536,26 @@ def _delegation_attribution_line(evt: dict) -> str | None:
             + (f' Task: "{goal}"' if goal else ""))
 
 
+def scope_oom_note(evt: dict) -> str:
+    """Why a completion ended when the kernel OOM-killed in its scope, else "": one wording for a single
+    notice and a coalesced batch (gateway.run_notifications), so neither shows it as a plain 143."""
+    if not evt.get("scope_oom_killed"):
+        return ""
+    unit = evt.get("scope_unit")
+    return "the kernel OOM killer killed a process in its systemd scope" + (f" {unit}" if unit else "")
+
+
 def _completion_status(evt: dict) -> str:
     reason = evt.get("completion_reason") or "exited"
+    note = scope_oom_note(evt)
     if reason == "killed":
-        return f"terminated by {evt.get('termination_source') or 'Hermes'}"
-    return _REASON_STATUS.get(reason) or ("completed normally" if evt.get("exit_code", "?") == 0 else "exited")
+        killer = f"terminated by {evt.get('termination_source') or 'Hermes'}"
+        return f"{killer}; {note}" if note else killer
+    if reason in _REASON_STATUS:  # a lost exit stays unknown (-1); the scope's OOM kill is still known
+        return f"{_REASON_STATUS[reason]}; {note}" if note else _REASON_STATUS[reason]
+    if note:
+        return f"exited after {note}"
+    return "completed normally" if evt.get("exit_code", "?") == 0 else "exited"
 
 
 def format_process_notification(evt: dict) -> str | None:

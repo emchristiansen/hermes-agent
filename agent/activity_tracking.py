@@ -78,7 +78,7 @@ class ActivityTrackingMixin:
                     heartbeat_current_worker_from_env, inject_new_comments_from_env
                 )
                 heartbeat_current_worker_from_env()
-                # Fold new operator notes into the running turn (OUT-OF-BAND steer).
+                # Fold new board notes into the running turn as delivered messages (never the user frame).
                 inject_new_comments_from_env(self)
         if force_persist or is_terminal_compression_provenance(resolved_provenance):
             # A terminal compression stamp must land durably NOW. The heartbeat wrote "context compression

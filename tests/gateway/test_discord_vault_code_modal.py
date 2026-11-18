@@ -22,6 +22,10 @@ from gateway.config import Platform, PlatformConfig
 from plugins.platforms.discord.adapter import DiscordAdapter, VaultCodeView, _t_discord
 from tests.waiting import wait_until
 
+# The page-clock read the fill sends just before a secret-bearing script (tools.browser_vault_tool._page_clock).
+_PAGE_CLOCK = json.dumps({"timeOrigin": 1.0, "now": 0.0})
+
+
 AUTHOR, OTHER, CODE = "4242", "7777", "954145"
 
 
@@ -104,13 +108,15 @@ def _enter_code_page(seen):
     from tools import browser_vault_tool
     controls = [{"index": 0, "type": "text", "name": "otp", "label": "Code", "autocomplete": "one-time-code"}]
 
-    def fake_eval(_task, expr):
+    def fake_eval(_task, expr, **_):
+        if "performance.timeOrigin" in expr:
+            return {"success": True, "result": _PAGE_CLOCK}
         return {"success": True, "result": json.dumps(controls) if "querySelectorAll" in expr
                 else "https://login.example.com/2fa"}
 
     def fake_secret(_task, expr):
         seen["expr"] = expr
-        return {"success": True, "result": json.dumps({"filled": 1})}
+        return {"success": True, "result": json.dumps({"filled": 1, "written": 1, "roles": ["one-time-code"]})}
     return (patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None),
             patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval),
             patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_secret))

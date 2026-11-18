@@ -60,12 +60,20 @@ async def test_cancel_queued_settles_native_waiter_and_publishes_terminal_comple
 
 
 @pytest.mark.asyncio
-async def test_cancelling_the_head_of_a_paused_fifo_resumes_its_successor(tmp_path, monkeypatch):
+@pytest.mark.parametrize('schedule', ['successor-running', 'successor-retired'])
+async def test_cancelling_the_head_of_a_paused_fifo_resumes_its_successor(tmp_path, monkeypatch, schedule):
+    """cancel_queued reschedules the drain, then awaits its off-loop media release. Meanwhile the
+    successor may still be running, or may have finished and the API session retired at idle
+    (``retire_at_idle`` removes it from ``authority.sessions``). Both schedules are forced; the drain
+    is observed through the LiveSession it runs on, never by indexing the live map again."""
+    import threading
     from gateway.config import Platform
-    from gateway import session_api_turn, session_finite
+    from gateway import session_api_turn, session_finite, session_ingress_media, session_retirement
 
     db, authority = _authority(tmp_path, monkeypatch, platform=Platform.API_SERVER)
     executed = []
+    release_successor = asyncio.Event()
+    retired = threading.Event()
 
     def check_api_turn(authority, ref, payload):
         if payload['text'] == 'blocked':
@@ -74,22 +82,46 @@ async def test_cancelling_the_head_of_a_paused_fifo_resumes_its_successor(tmp_pa
 
     async def execute(authority, ref, row):
         executed.append(row['payload']['text'])
+        if schedule == 'successor-running':
+            await release_successor.wait()
         return 'done'
     monkeypatch.setattr(session_finite, 'execute_finite_admission', execute)
+
+    real_retire_idle = session_retirement.retire_idle
+
+    def retire_idle(*args):
+        result = real_retire_idle(*args)
+        if result:
+            retired.set()
+        return result
+    monkeypatch.setattr(session_retirement, 'retire_idle', retire_idle)
+
+    if schedule == 'successor-retired':
+        real_release = session_ingress_media.release_admission_media
+
+        def release_after_retirement(db, admission_id):
+            # Off-loop (asyncio.to_thread): the rescheduled drain runs and retires meanwhile.
+            assert retired.wait(5), 'the successor did not run and retire during the media release'
+            return real_release(db, admission_id)
+        monkeypatch.setattr(session_ingress_media, 'release_admission_media', release_after_retirement)
 
     with db:
         head = await _submit(authority, 'blocked')
         await _submit(authority, 'follower')
         # The drain pauses on the head's preclaim refusal and its task ends.
-        paused = authority.sessions['s'].task
+        live = authority.sessions['s']
+        paused = live.task
         await asyncio.wait_for(paused, 5)
         assert executed == []
 
         await authority.cancel_queued(ACTOR, REF, head.admission_id)
-        # cancel_queued awaits its off-loop media release after rescheduling, so the new drain
-        # may already have finished: assert it is a NEW task, not that it is still running.
-        task = authority.sessions['s'].task
+        task = live.task
         assert task is not None and task is not paused, 'cancelling the blocking head must reschedule the drain'
+        if schedule == 'successor-running':
+            assert not task.done() and authority.sessions.get('s') is live
+            release_successor.set()
+        else:
+            assert task.done() and 's' not in authority.sessions  # legitimately retired at idle
         await asyncio.wait_for(task, 5)
         assert executed == ['follower']
         statuses = {r['request_id']: (r['status'], r['outcome'])

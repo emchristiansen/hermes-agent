@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import Dict, Iterator, Optional
@@ -28,6 +29,12 @@ logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 _snapshot: Optional[dict[str, str]] = None
+# Per (profile home key, name): a secret-source write the frozen launch env holds — (source, value the
+# source put in the snapshot, the snapshot's value before the source's first write or None). Kept apart
+# from env_loader's ``os.environ`` write record on purpose: that record is dropped or retargeted whenever
+# ``os.environ`` diverges (another writer's value, a failed fetch, a default source displaced), while the
+# snapshot never sees those changes and must still lose the source's value when the source goes.
+_source_writes: dict[tuple[str, str], tuple[str, str, Optional[str]]] = {}
 
 
 def capture_launch_env() -> dict[str, str]:
@@ -36,11 +43,75 @@ def capture_launch_env() -> dict[str, str]:
     Called at activation, immediately before the first secondary home is registered as
     served — the last moment ambient env is provably the launch profile's.
     """
-    global _snapshot
+    global _snapshot, _source_writes
     with _lock:
         if _snapshot is None:
             _snapshot = dict(os.environ)
+            _source_writes = _source_writes_held_by(_snapshot)
         return dict(_snapshot)
+
+
+def _source_writes_held_by(snapshot: dict[str, str]) -> dict[tuple[str, str], tuple[str, str, Optional[str]]]:
+    """The secret-source writes still in ``os.environ`` at capture, which the snapshot now holds too.
+    Before activation ``os.environ`` IS the launch env, so a write's ``os.environ`` prior is the
+    snapshot's pre-write value."""
+    loader = sys.modules.get("hermes_cli.env_loader")
+    if loader is None:
+        return {}
+    return {(home, name): (source, value, prior)
+            for home, name, source, value, prior in loader._recorded_environ_writes()
+            if snapshot.get(name) == value}
+
+
+def _launch_env_captured() -> bool:
+    """For ``env_loader`` only: whether the launch env is frozen yet."""
+    with _lock:
+        return _snapshot is not None
+
+
+def _launch_env_source_writes(home: str) -> dict[str, str]:
+    """For ``env_loader`` only: name → source of every write the snapshot holds for *home*."""
+    with _lock:
+        if _snapshot is None:
+            return {}
+        return {name: rec[0] for (key, name), rec in _source_writes.items() if key == home}
+
+
+def _track_launch_env_write(home: str, name: str, source: str, published: str, prior: Optional[str],
+                            *, adopt: bool) -> None:
+    """For ``env_loader`` only: *source* published *published* for *name* into ``os.environ``.
+
+    With a record for *name*, the snapshot follows a rotation while it still holds that source's
+    last value; the record keeps the ORIGINAL pre-write value. Without one, *adopt* (activation landed
+    during this pass, after the publish) records the write when the snapshot froze it, with *prior*
+    (the pre-activation ``os.environ`` value). Any other write never reaches the snapshot."""
+    key = (home, name)
+    with _lock:
+        if _snapshot is None:
+            return
+        rec = _source_writes.get(key)
+        if rec is not None:
+            if rec[0] == source and _snapshot.get(name) == rec[1] and published != rec[1]:
+                _snapshot[name] = published
+                _source_writes[key] = (source, published, rec[2])
+        elif adopt and _snapshot.get(name) == published:
+            _source_writes[key] = (source, published, prior)
+
+
+def _revoke_launch_env_write(home: str, name: str) -> None:
+    """For ``env_loader`` only: the source behind *home*'s write of *name* is gone. While the
+    snapshot still holds the value it put there, the snapshot gets back its own pre-write value or
+    loses the name. It never receives any other value: a value another writer put in ``os.environ``
+    after activation never enters it. A value the operator set and a source merely also supplied
+    was never written (``skipped_existing``), so it is never recorded here."""
+    with _lock:
+        rec = _source_writes.pop((home, name), None)
+        if rec is None or _snapshot is None or _snapshot.get(name) != rec[1]:
+            return
+        if rec[2] is None:
+            _snapshot.pop(name, None)
+        else:
+            _snapshot[name] = rec[2]
 
 
 def activate_multi_profile_hosting() -> None:
@@ -147,13 +218,19 @@ def launch_secret_scope(launch_home: str | Path) -> dict[str, str]:
     two values it sees. Env-only keys (systemd ``Environment=``, ``op run``, Compose) are unaffected:
     nothing in the files shadows them.
     """
-    from agent.secret_scope import _is_global_env, build_profile_secret_scope
+    from agent.secret_scope import build_profile_secret_scope
+    return _over_launch_env(build_profile_secret_scope(Path(launch_home)))
+
+
+def _over_launch_env(files_scope: dict[str, str]) -> dict[str, str]:
+    """The launch env's profile secrets with *files_scope* (the launch home's files) layered on top."""
+    from agent.secret_scope import _is_global_env
     from gateway.bridged_env import follow_bridged_env
     scope = {k: v for k, v in _launch_env().items() if not _is_global_env(k)}
     # The frozen env's config.yaml-bridged lists follow the live bridge, or a user removed from the
     # launch profile's config.yaml stays admitted until a restart; operator values stay frozen.
     follow_bridged_env(scope)
-    scope.update(build_profile_secret_scope(Path(launch_home)))
+    scope.update(files_scope)
     return scope
 
 
@@ -178,11 +255,14 @@ def owner_secret_scope(home: str | Path) -> dict[str, str]:
     no file to rebuild from), else the profile's own files (``build_profile_secret_scope``). Every
     per-home binding point (routed gateway turns, cron fires, kanban ticks) builds through here, so
     the launch profile keeps its env-only credentials when a single-profile gateway starts
-    multiplexing in place."""
-    from agent.secret_scope import _is_process_home, build_profile_secret_scope
-    if _is_process_home(Path(home)):
-        return launch_secret_scope(home)
-    return build_profile_secret_scope(Path(home))
+    multiplexing in place.
+
+    The launch-env credentials are added on the verdict the files were READ under (one opened
+    directory), never on a separate identity check: a home whose files are another profile's
+    cannot come back holding the launch profile's credentials."""
+    from agent.secret_scope import build_profile_secret_scope, read_as_launch_home
+    files_scope = build_profile_secret_scope(Path(home))
+    return _over_launch_env(files_scope) if read_as_launch_home(files_scope) else files_scope
 
 
 @contextlib.contextmanager

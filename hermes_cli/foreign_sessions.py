@@ -255,7 +255,10 @@ def import_foreign_session(source: str, path) -> str:
     session_id = new_session_id()
     cwd = parsed.get("cwd")
     # Resume refuses a folder missing here (another machine's, or deleted), as the Desktop import does.
-    row = {"id": session_id, "source": "cli", "cwd": cwd if cwd and Path(cwd).is_dir() else None, "messages": turns}
+    row = {"id": session_id, "source": "cli", "cwd": cwd if cwd and Path(cwd).is_dir() else None, "messages": turns,
+           # Not a column (no ``origin_json``, which resume refuses): the gateway keeps it beside the row so home
+           # guidance knows the transcript was decided by no build here (hermes_state_portability).
+           "imported_from": {"tool": source, "path": str(path), "foreign_session_id": parsed.get("session_id")}}
     receipt = store.call("session.mutate", session_id=session_id, request_id=uuid.uuid4().hex, expected_revision=0,
                          operation="import", payload={"sessions": [row]})
     # Titles are UNIQUE (a re-import's is taken), so the title is a separate, cosmetic rename.

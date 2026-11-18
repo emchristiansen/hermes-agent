@@ -114,12 +114,6 @@ function prepareQueueItem(
   show: boolean
 ): void {
   item.preparedText ??= submitText
-
-  // Busy controls have no deduplication receipt: never replay after an ambiguous reply.
-  if (item.controlMethod) {
-    item.legacyAttempted = true
-  }
-
   item.attachments ??= opts.attachments?.map(attachment => ({ ...attachment }))
 
   if (opts.behindTurn) {
@@ -185,7 +179,24 @@ function settleControlReply(
     return true
   }
 
-  const control = r as PromptSubmitResponse & { delivered?: false; execution_generation?: number }
+  const control = r as PromptSubmitResponse & {
+    delivered?: false
+    execution_generation?: number
+    kept?: 'task_comment' | null
+  }
+
+  // Kept on the running card's task (``kept: 'task_comment'``): the task's next attempt reads it
+  // whatever became of this claim (ended, replaced). A fresh prompt would carry no claim binding,
+  // so it is settled as kept, never re-admitted.
+  if (control?.kept === 'task_comment') {
+    item.settle?.(true)
+
+    if (focused()) {
+      deps.sys(t('canonical.submit.correction', 'kept on its task'))
+    }
+
+    return true
+  }
 
   // Only a 'rejected' the owner marks undelivered (no live agent took it) becomes the next prompt. A
   // plain 'rejected' can follow delivery (a Codex steer whose ACK timed out): re-sending it would
@@ -360,8 +371,10 @@ export function submitPrompt(
     return deps.sys('session not ready yet')
   }
 
-  // An identityless write cannot be deduplicated, even after the owner upgrades.
-  if (opts.queueItem?.legacyAttempted) {
+  // An identityless prompt write cannot be deduplicated, even after the owner upgrades. A busy
+  // correction may be sent again (same generation, the owner still decides): at least once, a
+  // duplicate correction is acceptable, a stranded one is not.
+  if (opts.queueItem?.legacyAttempted && !opts.queueItem.controlMethod) {
     opts.queueItem.settle?.(false)
 
     if (focused()) {

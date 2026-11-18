@@ -1,7 +1,7 @@
 """GW-10 (#139532): an ``unknown`` admission no person is waiting on settles as interrupted.
 
-A turn lost across an owner restart is fenced ``unknown`` and pauses the session's FIFO until a
-person resolves it, because only they know whether to resend it. An automation delivery (a cron
+A tool-bearing turn lost across an owner restart stays fenced ``unknown`` until a person resolves
+it, without blocking independent followers or replaying uncertain work. An automation delivery (a cron
 run, a ``local_automation_v1`` completion, a native automation envelope) has nobody to ask: it
 settles ``interrupted`` (never replayed), the transcript gets a notice, and the FIFO moves on.
 Real ``SessionStore`` SQLite, two real owner epochs; no store monkeypatching.
@@ -45,9 +45,11 @@ def _runner(tmp_path, monkeypatch, executed):
     return store, runner
 
 
-async def _lost_head_then_restart(tmp_path, monkeypatch, executed, admit_head):
+async def _lost_head_then_restart(tmp_path, monkeypatch, executed, admit_head, *, tool_step=False):
     """Owner 1 admits a head (via ``admit_head``) and a person's follower, claims the head, dies.
-    Owner 2 starts on the same store. Returns (store, owner2, head_id, follower_id)."""
+    ``tool_step``: the lost turn had reached a tool (a person's such turn is never run again,
+    gateway.session_message_redelivery). Owner 2 starts on the same store.
+    Returns (store, owner2, head_id, follower_id)."""
     store, runner = _runner(tmp_path, monkeypatch, executed)
     db = store._db
     source = SessionSource(platform=Platform.TELEGRAM, chat_id='gw10')
@@ -62,6 +64,10 @@ async def _lost_head_then_restart(tmp_path, monkeypatch, executed, admit_head):
     claimed = claim_session_input(db, epoch=first.epoch, session_id='s')
     assert claimed['admission_id'] == head_id
     db.append_message('s', 'user', 'HEAD')  # the lost turn got as far as its user row
+    if tool_step:
+        db.append_message('s', 'assistant', None, tool_calls=[{'id': 'c1', 'type': 'function', 'function': {
+            'name': 'terminal', 'arguments': '{}'}}])
+        db.append_message('s', 'tool', 'done', tool_call_id='c1', tool_name='terminal')
     second = await initialize_session_authority(runner, profile_id='p', instance_id='owner-2')
     second.sessions['s'] = LiveSession(source, 's')
     return store, second, head_id, follower.admission_id
@@ -125,15 +131,23 @@ async def test_unknown_automation_settles_interrupted_and_fifo_moves_on(tmp_path
 
 @pytest.mark.asyncio
 async def test_a_persons_unknown_turn_still_pauses_the_fifo(tmp_path, monkeypatch):
+    """The old pause oracle now requires FOLLOWER delivery, never replay of the tool-bearing HEAD."""
+    from gateway.session_message_redelivery import REDELIVER_PREFIX
+    from hermes_state_runtime import get_session_admission
     executed = []
-    store, authority, head_id, follower_id = await _lost_head_then_restart(tmp_path, monkeypatch, executed, _person_head)
+    store, authority, head_id, follower_id = await _lost_head_then_restart(tmp_path, monkeypatch, executed, _person_head,
+                                                                           tool_step=True)
     try:
         assert _statuses(authority.db)[head_id] == ('unknown', None)
+        retained = get_session_admission(authority.db, admission_id=head_id)
         authority._schedule(SessionRef('p', 's'))
         live = authority.sessions['s']
-        await async_wait_until(lambda: live.task is not None and live.task.done(), what='drain paused')
-        assert executed == []
-        assert _statuses(authority.db)[follower_id] == ('queued', None)
+        await async_wait_until(lambda: live.task is not None and live.task.done(), what='follower completed')
+        assert executed == ['FOLLOWER']
+        assert _statuses(authority.db)[follower_id] == ('terminal', 'completed')
+        assert _statuses(authority.db)[head_id] == ('unknown', None)
+        assert get_session_admission(authority.db, admission_id=head_id) == retained
+        assert authority.db._read_one('SELECT 1 FROM state_meta WHERE key=?', (REDELIVER_PREFIX + head_id,)) is None
     finally:
         store.close_all_db_handles()
 
@@ -181,7 +195,8 @@ async def test_messaging_pause_notice_names_discard_and_discard_resumes_the_fifo
     from gateway.session_ingress import pause_notice
     from gateway.slash_commands_session import discard_lost_turns
     executed = []
-    store, authority, head_id, _follower_id = await _lost_head_then_restart(tmp_path, monkeypatch, executed, _person_head)
+    store, authority, head_id, _follower_id = await _lost_head_then_restart(tmp_path, monkeypatch, executed, _person_head,
+                                                                            tool_step=True)
     try:
         notice = pause_notice(authority, SessionRef('p', 's'), 'unknown_execution')
         assert '/discard' in notice and 'restarted' in notice, notice

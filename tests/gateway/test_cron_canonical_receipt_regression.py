@@ -101,14 +101,20 @@ def test_cron_tracks_real_canonical_receipt(canonical_bot, phase):
     def owned_rows():
         return [row for row in admissions(bot.home) if content in row['payload_json']]
 
+    # The steering pass runs after the admission commits; wait for the hand-off to land.
+    wait_for(lambda: [(row['status'], row['outcome']) for row in owned_rows()] == [('terminal', 'steering')])
     before = owned_rows()
-    assert len(before) == 1 and before[0]['status'] == 'queued', (initial, before)
+    # Eric's standing rule (gateway/session_busy_ingress.py): a Bot Chat delivery that reaches a busy session
+    # steers into its running turn at once instead of waiting behind it. The admitted row is handed to the
+    # running claim (terminal, outcome ``steering``) and settles ``steered`` with that claim; it is never
+    # dropped and never runs as a second, separate turn. Upstream left it ``queued`` behind the turn.
+    assert len(before) == 1 and (before[0]['status'], before[0]['outcome']) == ('terminal', 'steering'), (initial, before)
     admission_id = before[0]['admission_id']
     if phase == 'settled':
         from tools.bot_live_delivery import read_delivery_result
         key = job['_bot_chat_delivery_receipts']['bot-chat:(own)']['delivery_id']
         bot.model.release.set()
-        wait_for(lambda: owned_rows()[0]['status'] == 'terminal')
+        wait_for(lambda: owned_rows()[0]['outcome'] in ('steered', 'completed'))
         # The owner republishes the receipt cron reads from an async refresh AFTER the row commits;
         # until then cron correctly reports "claimed ... do not resend". Sync on the published receipt.
         wait_for(lambda: (read_delivery_result(bot.home, key) or {}).get('status') == 'settled')
@@ -124,7 +130,12 @@ def test_cron_tracks_real_canonical_receipt(canonical_bot, phase):
     if phase == 'queued':
         assert observed and 'queued' in observed, observed
         assert job['_bot_chat_delivery_receipts']['bot-chat:(own)']['status'] == 'queued'
-        assert _deliver_to_bot_chat(job, content, '') == observed
+        # Handed to the running turn the delivery is bound to the running claim: the receipt the owner publishes
+        # reads ``queued`` until its asynchronous refresh and ``claimed`` after it (both timings occur), and
+        # either way it says "do not resend" and never makes a second admission.
+        again = _deliver_to_bot_chat(job, content, '')
+        assert again and 'do not resend' in again and ('queued' in again or 'claimed' in again), again
+        assert job['_bot_chat_delivery_receipts']['bot-chat:(own)']['status'] in ('queued', 'claimed')
     else:
         assert observed is None, observed
         assert job['_bot_chat_delivery_receipts']['bot-chat:(own)']['status'] == 'settled'

@@ -54,6 +54,14 @@ def _unlink_quietly(path) -> None:
 class CLIVoiceMixin:
     """Voice mode (recording, STT, TTS, full-duplex barge-in) and wake-word listener handlers for the interactive CLI"""
 
+    def _submit_voice_transcript(self, message) -> None:
+        """A transcript is the user's message: while a turn runs it steers into that turn as the Enter path
+        does (every message steers, Eric 2026-11-04); otherwise, or when the turn does not take it, it is
+        the next voice turn, as before."""
+        if getattr(self, "_agent_running", False) and self._tui_steer_running_turn(message.text):
+            return  # taken by the running turn (or consumed as a voice stop)
+        self._pending_input.put(message)
+
     def _voice_invalidate(self) -> None:
         """Repaint the TUI (audio level indicator / status) when the app is live."""
         if hasattr(self, '_app') and self._app:
@@ -229,7 +237,7 @@ class CLIVoiceMixin:
                     return
                 self._attached_images.clear()
                 self._voice_invalidate()
-                self._pending_input.put(_VoiceInputMessage(transcript))
+                self._submit_voice_transcript(_VoiceInputMessage(transcript))
                 submitted = True
             elif result.get("success"):
                 _cprint(f"{_DIM}{t('cli.voice.no_speech')}{_RST}")
@@ -455,6 +463,8 @@ class CLIVoiceMixin:
                             "Dropping playback-phase barge transcript as TTS echo: %r", transcript)
                         _cprint(f"\n{_DIM}{t('cli.voice.echo_ignored')}{_RST}")
                         return
+                # A barge-in is the explicit interrupt control (its trigger cut the turn or its speech):
+                # the transcript is the redirect that runs next, never a steer into the turn it stopped.
                 self._pending_input.put(_VoiceInputMessage(transcript))
                 submitted = True
             elif not result.get("success"):

@@ -12,6 +12,7 @@ Hermes process that reaps the owned children's process groups the moment Hermes 
 
 from __future__ import annotations
 
+import enum
 import functools
 import hashlib
 import json
@@ -102,6 +103,29 @@ def worker_birth(proc) -> float:
     if getattr(psutil, "LINUX", False):
         return float(proc._proc.create_time(monotonic=True))
     return process_birth(proc)
+
+
+class Identity(enum.Enum):
+    """What a recorded process identity says about the live process now holding its pid.
+
+    ``SAME``: positively the recorded process. ``GONE``: positively not running any more, because the
+    pid is absent or exited, or a reliable identity reading differs (a recycled pid). ``UNKNOWN``:
+    neither can be proven. Only ``GONE`` is proof of death; only ``SAME`` permits a signal."""
+
+    SAME = "same"
+    GONE = "gone"
+    UNKNOWN = "unknown"
+
+
+def birth_is_boot_relative(birth) -> bool:
+    """True when the recorded ``birth`` is positively a Linux :func:`worker_birth` of THIS boot.
+
+    A boot-relative birth is seconds from boot to the process's start, so it is at most the time
+    since boot now (``CLOCK_BOOTTIME``, which no clock step moves). An epoch :func:`process_birth`
+    is seconds since 1970, so it is far larger. Only a birth of this kind can positively mismatch
+    the live process: an epoch one moves with every ``/proc/stat`` btime re-anchor. Raises
+    ``TypeError``/``ValueError`` for a non-numeric ``birth``."""
+    return float(birth) <= time.clock_gettime(time.CLOCK_BOOTTIME)
 
 
 def boot_start(proc) -> Optional[float]:

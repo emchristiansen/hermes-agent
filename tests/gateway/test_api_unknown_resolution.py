@@ -50,7 +50,9 @@ def _adapter(runner, db):
     return adapter
 
 
-async def _restarted_api_runs(tmp_path, monkeypatch, *, idempotent=True):
+async def _restarted_api_runs(tmp_path, monkeypatch, *, idempotent=True, tool_step=True):
+    # ``tool_step``: the lost head ran a tool (a business turn, never run again: ``unknown`` for its
+    # resolution); without one the next owner delivers it again (msg-retry) and it is ``queued``.
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     store = SessionStore(tmp_path / "sessions", GatewayConfig())
     db = SessionDB(tmp_path / "state.db")
@@ -104,13 +106,15 @@ async def _restarted_api_runs(tmp_path, monkeypatch, *, idempotent=True):
         rows = list_session_admissions(db, session_id="api-session")
         head = claim_session_input(db, epoch=first.epoch, session_id="api-session")
         assert head["admission_id"] == rows[0]["admission_id"]
+        if tool_step:
+            db.append_message("api-session", 'tool', 'done', tool_call_id='c1', tool_name='terminal')
 
         restarted = await initialize_session_authority(
             runner, profile_id="default", instance_id="api-owner-2"
         )
         restore_api_session(restarted, "api-session")
         rows = list_session_admissions(db, session_id="api-session")
-        assert [row["status"] for row in rows] == ["unknown", "queued"]
+        assert [row["status"] for row in rows] == ["unknown" if tool_step else "queued", "queued"]
         await client.close()
 
         # A process restart constructs a new API adapter.  Keeping the original
@@ -312,5 +316,18 @@ async def test_http_poll_reports_unknown_head_as_non_terminal_until_resolved(
         after = await (await client.get(path, headers=_AUTH_HEADERS)).json()
         print("POLL_AFTER_RESOLVE", json.dumps({"status": after.get("status")}))
         assert after["status"] in TERMINAL_STATUSES, after
+    finally:
+        await _close_fixture(client, adapters, store, tasks)
+
+
+@pytest.mark.asyncio
+async def test_http_lost_head_that_ran_no_tool_is_queued_again_not_left_unknown(tmp_path, monkeypatch):
+    """msg-retry contract change (was: ``unknown`` until resolve-unknown): a lost head that ran no tool is
+    delivered again by the restarted owner, ahead of its follower."""
+    client, adapters, store, _owner, head, follower, _executed, tasks = (
+        await _restarted_api_runs(tmp_path, monkeypatch, tool_step=False)
+    )
+    try:
+        assert (head["status"], follower["status"]) == ("queued", "queued")
     finally:
         await _close_fixture(client, adapters, store, tasks)

@@ -21,6 +21,15 @@ from textwrap import dedent
 
 import pytest
 
+# The page-clock read the fill sends just before a secret-bearing script (tools.browser_vault_tool._page_clock).
+_PAGE_CLOCK = json.dumps({"timeOrigin": 1.0, "now": 0.0})
+
+
+def _clock_or(expr, result):
+    """A fake _eval_js answer: the page clock for the clock read, else ``result``."""
+    return {"success": True, "result": _PAGE_CLOCK if "performance.timeOrigin" in expr else result}
+
+
 SECRET = "plugin-dummy-pw-81"
 LEAK = "plugin-leak-canary-93"
 ORIGIN = "https://example.com"
@@ -181,11 +190,11 @@ def page(monkeypatch):
     state = SimpleNamespace(origin=ORIGIN, secret_evals=secret_evals)
     monkeypatch.setattr(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None)
     monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task_id: state.origin)
-    monkeypatch.setattr(browser_vault_tool, "_eval_js", lambda task_id, expr: {"success": True, "result": json.dumps(_CONTROLS)})
+    monkeypatch.setattr(browser_vault_tool, "_eval_js", lambda task_id, expr, **_: _clock_or(expr, json.dumps(_CONTROLS)))
 
     def secret_eval(task_id, expression):
         secret_evals.append(expression)
-        return {"success": True, "result": json.dumps({"filled": 1})}
+        return {"success": True, "result": json.dumps({"filled": 1, "written": 1, "roles": ["current-password"]})}
 
     monkeypatch.setattr(browser_vault_tool, "_eval_js_secret", secret_eval)
     return state
@@ -420,12 +429,12 @@ def test_plugin_otp_is_minted_and_written_inside_the_backends_fill_context(vault
     load(["ctx_vault"], {"ctxvault": "true"})
     backend = _backend("ctxvault")
     otp_field = {"autocomplete": "one-time-code", "formIndex": 0, "index": 0, "label": "", "name": "otp", "type": "text"}
-    monkeypatch.setattr(browser_vault_tool, "_eval_js", lambda task_id, expr: {"success": True, "result": json.dumps([otp_field])})
+    monkeypatch.setattr(browser_vault_tool, "_eval_js", lambda task_id, expr, **_: _clock_or(expr, json.dumps([otp_field])))
 
     def secret_eval(task_id, expression):
         backend.calls.append("write")
         page.secret_evals.append(expression)
-        return {"success": True, "result": json.dumps({"filled": 1})}
+        return {"success": True, "result": json.dumps({"filled": 1, "written": 1, "roles": ["current-password"]})}
 
     monkeypatch.setattr(browser_vault_tool, "_eval_js_secret", secret_eval)
 
@@ -443,7 +452,7 @@ def _ctx_backend(vault_home, page, monkeypatch, code="739251"):
     load(["ctx_vault"], {"ctxvault": "true"})
     otp_field = {"autocomplete": "one-time-code", "formIndex": 0, "index": 0, "label": "", "name": "otp", "type": "text"}
     monkeypatch.setattr(browser_vault_tool, "_eval_js",
-                        lambda task_id, expr: {"success": True, "result": json.dumps(_CONTROLS + [otp_field])})
+                        lambda task_id, expr, **_: _clock_or(expr, json.dumps(_CONTROLS + [otp_field])))
     return _backend("ctxvault")
 
 

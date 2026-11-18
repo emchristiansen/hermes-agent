@@ -260,13 +260,17 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
     """A running task whose elapsed time exceeds max_runtime_seconds gets
     SIGTERM'd, emits a ``timed_out`` event, and goes back to ready."""
     killed = []
+    # Only a live worker whose fingerprint matches (SAME) is signalled; an absent pid is released
+    # without a signal (tree-13d). The worker reads live until the SIGTERM, then gone, so the
+    # grace-poll exits fast. The hook only records.
+    state = {"alive": True}
     def _signal_fn(pid, sig):
         killed.append((pid, sig))
+        state["alive"] = False
 
-    # We bypass _pid_alive by stubbing it so the grace-poll exits fast.
     import hermes_cli.kanban_db as _kb
     original_alive = _kb._pid_alive
-    _kb._pid_alive = lambda pid: False  # pretend SIGTERM worked immediately
+    _kb._pid_alive = lambda pid: state["alive"] and original_alive(pid)  # gone once SIGTERM'd
 
     try:
         conn = kbc.connect()
@@ -1110,13 +1114,18 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
 # Recovery helpers (reclaim + reassign)
 # ---------------------------------------------------------------------------
 
-def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
+@pytest.mark.parametrize("recorded", ["boot:1|777", None], ids=["verified-worker", "no-fingerprint"])
+def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch, recorded):
     """Manual reclaim releases the claim, resets status, and emits a
-    ``reclaimed`` event even when claim_expires has not passed."""
+    ``reclaimed`` event even when claim_expires has not passed. Only a worker whose recorded
+    fingerprint matches (SAME) is signalled; a legacy row with no fingerprint is released (the
+    operator's override) but its live pid is never signalled: existence proves nothing."""
     import signal
     import time
     import secrets
     import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
+    monkeypatch.setattr(_kbd, "_process_fingerprint", lambda _pid: "boot:1|777")
     conn = kbc.connect()
     try:
         t = kb.create_task(conn, title="stuck", assignee="broken")
@@ -1134,13 +1143,13 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: state["alive"])
         conn.execute(
             "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
-            "worker_pid=? WHERE id=?",
-            (lock, future, 12345, t),
+            "worker_pid=?, worker_started_at=? WHERE id=?",
+            (lock, future, 12345, recorded, t),
         )
         conn.execute(
             "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
-            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
-            (t, lock, future, 12345, int(time.time())),
+            "worker_pid, worker_started_at, started_at) VALUES (?, 'running', ?, ?, ?, ?, ?)",
+            (t, lock, future, 12345, recorded, int(time.time())),
         )
         run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, t))
@@ -1171,9 +1180,14 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         assert len(reclaim_evs) == 1
         assert reclaim_evs[0].get("manual") is True
         assert reclaim_evs[0].get("reason") == "test reason"
-        assert reclaim_evs[0].get("termination_attempted") is True
-        assert reclaim_evs[0].get("terminated") is True
-        assert killed == [signal.SIGTERM]
+        if recorded is None:
+            assert reclaim_evs[0].get("signal_refused") is True
+            assert not reclaim_evs[0].get("termination_attempted")
+            assert killed == []
+        else:
+            assert reclaim_evs[0].get("termination_attempted") is True
+            assert reclaim_evs[0].get("terminated") is True
+            assert killed == [signal.SIGTERM]
     finally:
         conn.close()
 

@@ -684,9 +684,9 @@ DEFAULT_CONFIG = {
     },
     # Anthropic prompt caching (Claude via OpenRouter or native API). cache_ttl: "5m" | "1h" | "auto"
     # (auto = 1h for human-paced sessions — cli/tui/desktop/messaging — and 5m for subagent, cron,
-    # oneshot, webhook, kanban, api, tool, batch); other non-falsy values are ignored; falsy (false, null, "off",
-    # "disabled", "no", "none") disables caching.
-    "prompt_caching": {"cache_ttl": "5m"},
+    # oneshot, webhook, kanban, api, tool, batch); falsy (false, null, "off", "disabled", ...) disables caching.
+    # route_ttl_ceilings {<provider>: "5m"|"1h"} overrides a profile's prompt_cache_max_ttl (Nous ships "5m").
+    "prompt_caching": {"cache_ttl": "5m", "route_ttl_ceilings": {}},
     # OpenRouter settings. response_cache: X-OpenRouter-Cache header — identical requests return
     # cached responses at zero billing; independent of Anthropic prompt caching. response_cache_ttl:
     # seconds (1-86400), only used when response_cache is on. min_coding_score (0.0-1.0):
@@ -1825,10 +1825,10 @@ DEFAULT_CONFIG = {
         # cron.scheduler.DEFAULT_FAILURE_REPEAT_ALERT_HOURS.
         "failure_repeat_alert_hours": 6,
     },
-    # Kanban multi-agent coordination. The dispatcher ticks every N seconds, reclaims stale claims,
-    # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
-    # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.
+    # Kanban coordination: one dispatcher per profile promotes ready tasks and starts assignees.
     "kanban": {
+        # Session-identified worker/child board grant; preserves dispatcher/run ownership.
+        "worker_board_management": False,
         # Auto-subscribe the originating gateway/TUI session to completion + block events when
         # kanban_create is called from a session with a persistent delivery channel. Disable for
         # profiles that prefer explicit kanban_notify-subscribe calls per task.

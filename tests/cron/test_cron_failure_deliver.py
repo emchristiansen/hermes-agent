@@ -87,7 +87,10 @@ def run_env(monkeypatch, tmp_path):
         assert s.drain_delivery_queue(adapters={}, loop=None) == 1
         result = delivery_queue.get_status("exec-t")
         assert result is not None
-        assert result["status"] == ("delivered" if transport["success"] else "failed")
+        # msg-retry-on-13f-6 (ea298f05): a refused send is retried with its payload, never terminal "failed".
+        assert result["status"] == ("delivered" if transport["success"] else "pending")
+        if not transport["success"]:
+            assert result["content"] and result["retry_after"] and "transport refused" in result["error"]
         assert s.drain_delivery_queue(adapters={}, loop=None) == 0
 
     state["drain"] = drain
@@ -224,6 +227,7 @@ class TestEscapedExceptionPath:
         })
 
         assert ok is False
+        run_env["drain"](for_failure=True)
         assert [c["chat_id"] for c in run_env["send"]] == ["D0ALERTS"]
 
     def test_escaped_failure_with_failure_deliver_local_is_silent(
@@ -429,10 +433,22 @@ class TestOutcomeBookkeeping:
         run_env["drain"](for_failure=True)
         assert [c["chat_id"] for c in run_env["send"]] == ["D0OPS"]
         assert "failed" in run_env["send"][0]["message"].lower()
-        assert self._outcome(run_env) == ("delivered" if transport_success else "failed")
+        assert self._outcome(run_env) == ("delivered" if transport_success else "retrying")
         assert alerted == (["inc-b1"] if transport_success else []), (
             "only a delivered failure ping may mark the incident alerted"
         )
+        if not transport_success:
+            # msg-retry-on-13f-7 (MR-TEST-11, ea298f05): the retry actually delivers the same notice to the same
+            # target (duplicate accepted); the outcome settles delivered and only now is the incident alerted.
+            from cron import delivery_queue
+            run_env["transport"]["success"] = True
+            later = delivery_queue._now_seconds() + delivery_queue.RETRY_BACKOFF_MAX_SECONDS + 1
+            monkeypatch.setattr(delivery_queue, "_now_seconds", lambda: later)
+            assert s.drain_delivery_queue(adapters={}, loop=None) == 1
+            assert delivery_queue.get_status("exec-t")["status"] == "delivered"
+            assert [c["chat_id"] for c in run_env["send"]] == ["D0OPS", "D0OPS"]
+            assert run_env["send"][1]["message"] == run_env["send"][0]["message"]
+            assert self._outcome(run_env) == "delivered"
 
     def test_success_outcome_still_reads_deliver_lane(self, run_env, monkeypatch):
         """Success bookkeeping is untouched: fd set, success delivers to

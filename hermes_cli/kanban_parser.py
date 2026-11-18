@@ -257,6 +257,20 @@ _SPECS = [
              help="Provider the model belongs to (worker is spawned with "
                   "--provider <name>). Cleared together with the model."),
     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
+    _cmd("set-skills", [
+        _TASK_ID,
+        _arg("skills", nargs="*", metavar="SKILL",
+             help="Skill names that replace the binding (separate words, no commas)"),
+        _arg("--clear", action="store_true",
+             help="Reset to the create-time default: no forced skills (stored NULL)"),
+        _arg("--none", dest="explicit_none", action="store_true",
+             help="Store an explicit empty list (also loads no forced skills)"),
+        _arg("--expected", metavar="JSON",
+             help='Compare-and-set: the current binding as JSON (null, [] or ["a","b"]); refused when it differs'),
+        _reason("Audit reason recorded on the skills_set event"),
+        _json_flag(help="Emit JSON output"),
+    ], help="Replace or clear a task's force-loaded skills (takes effect on the next claimed attempt; "
+            "refused while an attempt holds the task; orchestrator-only)"),
     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
     _cmd("reassign", [
         _TASK_ID,
@@ -283,6 +297,13 @@ _SPECS = [
         _arg("--author", help="Author name (default: $HERMES_PROFILE or 'user')"),
         _arg("--max-len", type=int, help="Trim the stored comment body to this many characters"),
     ], help="Append a comment"),
+    *[_cmd(verb, [
+        _TASK_ID,
+        _arg("text", nargs="+", help="The correction"),
+        _arg("--run", type=int, help="The run to correct (default: the task's current run)"),
+    ], help=help) for verb, help in (
+        ("redirect", "Redirect the live attempt of a running task (refused if that run is no longer current)"),
+        ("steer", "Inject text into the live attempt of a running task at its next tool result"))],
     _cmd("attach", [
         _TASK_ID,
         _arg("path", help="Path to the local file to attach"),
@@ -310,6 +331,8 @@ _SPECS = [
         _arg("--body", help="Replace the task body"),
         _arg("--priority", type=int, help="Replace the task priority"),
         _arg("--result", help="Backfilled task result text for a done task"),
+        _arg("--max-retries", type=int, choices=[1], help="Tighten a stopped task to first-failure hold; no other edit fields"),
+        _arg("--expected-terminal-run", type=int, help="Exact latest terminal run required for retry-policy tightening"),
         *_STEP_HANDOFF,
     ], help="Edit task fields or recovery fields on an already-completed task"),
     _cmd("block", [
@@ -323,6 +346,37 @@ _SPECS = [
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
     ], help="Mark one or more tasks blocked"),
+    _cmd("settle-triage", [
+        _TASK_ID,
+        _arg("--expected-terminal-run", type=int, required=True, help="Exact completed loop run id"),
+        _arg("--kind", choices=["capability", "needs_input"], required=True, help="Actual external wait classification"),
+        _arg("--owner", required=True, help="Existing producer that owes the input"),
+        _arg("--required-input", required=True, help="Concrete missing input"),
+        _arg("--event", required=True, help="Substantive owner event needed before guarded unblock"),
+    ], help="Orchestrator-only: settle terminal loop triage into a sticky external-event wait"),
+    _cmd("settle-delivered", [
+        _TASK_ID,
+        _arg("--expected-terminal-run", type=int, required=True,
+             help="Exact latest run, ended by a schedule, whose own worker then delivered (exit 0)"),
+        _arg("--verdict", choices=["changes_required", "rejected"], required=True,
+             help="The delivered negative verdict (there is no passing verdict here)"),
+        _arg("--result", required=True, help="The delivered assessment: verdict, report path and digest"),
+        _arg("--metadata", help="JSON object of structured facts stored on the settlement record and "
+                                "handed to dependents; scratch artifacts it or --result names are preserved"),
+    ], help="Orchestrator-only: settle a local-only Scheduled card whose ended run's worker already "
+            "delivered a negative assessment; never readies or dispatches it"),
+    _cmd("settle-record-only", [
+        _TASK_ID,
+        _arg("--expected-terminal-run", type=int, required=True,
+             help="Exact latest ended run of the card; it keeps its own profile and history"),
+        _arg("--result", required=True, help="The accepted outcome being recorded"),
+        _arg("--accepted-by", required=True,
+             help="Where the outcome was accepted (comment, review or decision locator)"),
+        _arg("--custody", required=True,
+             help="What stays in unknown or separate custody (sessions, admissions, the workspace)"),
+        _arg("--metadata", help="JSON object of structured facts stored on the bookkeeping run"),
+    ], help="Orchestrator-only: record an already-accepted, stopped blocked/ready card Done with no "
+            "cleanup, durably retaining its workspace; writes a bookkeeping run that performed no work"),
     _cmd("schedule", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
@@ -331,6 +385,7 @@ _SPECS = [
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
+        _arg("--expected-terminal-run", type=int, help="Fence the single selected first-failure task's release; retain failure history"),
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
     _cmd("request-review", [
         _TASK_ID,
@@ -353,7 +408,16 @@ _SPECS = [
         _bulk_ids("promote"),
         _arg("--dry-run", action="store_true", help="Validate the promotion without mutating state"),
         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
-    ], help="Manually move one or more todo/blocked tasks to ready (recovery path)"),
+        _arg("--expected-terminal-run", type=int,
+             help="Continue ONE ready card held by the active_pr respawn guard: its exact latest ended run "
+                  "(no live claim, owner terminal; orchestrator-only). The card stays ready and respawns. "
+                  "Also moves ONE triage card to ready when that run tripped the loop breaker and was "
+                  "either interrupted with no worker result or finished with its own bound worker's "
+                  "result (workers provably dead, owner admission terminal; the event records which); "
+                  "the reason must name the awaited input that has arrived. A result whose input is "
+                  "still missing is settle-triage's"),
+    ], help="Manually move one or more todo/blocked tasks to ready, or continue a guarded ready task "
+            "or a triage loop whose awaited input has arrived (recovery path)"),
     _cmd("archive", [
         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
         _arg("--rm", dest="purge_ids", nargs="+",

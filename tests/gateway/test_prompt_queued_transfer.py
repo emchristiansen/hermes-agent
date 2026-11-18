@@ -23,6 +23,15 @@ from tests.waiting import async_wait_until, wait_until
 pytestmark = pytest.mark.usefixtures("authority_cwd_in_tmp")  # symbolic profile ids are relative homes
 
 
+@pytest.fixture(autouse=True)
+def _explicit_controls_only(monkeypatch):
+    """These are the explicit ``prompt.steer_queued``/``replace_queued`` windows. The automatic busy pass
+    (``session_busy_ingress``, covered in ``test_every_message_steers``) writes through the same
+    ``transfer`` and would take each queued row before the control under test runs."""
+    from gateway import session_busy_ingress
+    monkeypatch.setattr(session_busy_ingress, 'steer_soon', lambda *args: None)
+
+
 async def _drained(authority):
     task = authority.sessions['s'].task
     if task is not None:
@@ -363,8 +372,9 @@ async def test_a_turn_that_ends_between_the_steer_commit_and_delivery_gets_its_p
     assert _ledger(db) == [('running', 'terminal', 'completed'), ('follow-up', 'terminal', 'completed')]
 
 
-def test_an_owner_restart_mid_transfer_settles_the_steered_admission_interrupted(tmp_path, monkeypatch):
-    """Committed but not confirmed consumed when the owner died: interrupted, never auto-replayed."""
+def test_an_owner_restart_mid_transfer_queues_the_unconfirmed_steer_again(tmp_path, monkeypatch):
+    """Committed but not confirmed consumed when the owner died: it may never have reached a model, so
+    it is queued again in its own place (at least once); the lost claim itself is never replayed."""
     from hermes_state_runtime import admit_session_input
     db, authority = _authority(tmp_path, monkeypatch)
     with db:
@@ -377,7 +387,7 @@ def test_an_owner_restart_mid_transfer_settles_the_steered_admission_interrupted
                                                     generation=running['generation'])
         epoch = begin_runtime_epoch(db, instance_id='next')
         recover_session_inputs(db, epoch=epoch)
-    assert _ledger(db) == [('running', 'unknown', None), ('follow-up', 'terminal', 'interrupted')]
+    assert _ledger(db) == [('running', 'unknown', None), ('follow-up', 'queued', None)]
 
 
 @pytest.mark.asyncio

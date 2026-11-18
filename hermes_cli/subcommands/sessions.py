@@ -261,8 +261,8 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
         description="Repair session rows degraded by the pre-#122822 gateway hygiene/compress bug. "
             "Automatic repair requires positive tools[] evidence; rows without a readable pin are "
             "reported as unverifiable and never changed by a scan. Clearing a prompt makes the next "
-            "turn rebuild and persist healthy bytes. Reports without touching anything unless --apply "
-            "is given; a session_id is an explicit destructive override and can clear even a healthy prompt.")
+            "turn rebuild and persist healthy bytes; a conversation already under way then carries no home-guidance edition (a notice where agent.home_guidance_file is set) until /new. "
+            "Reports without touching anything unless --apply is given; a session_id is an explicit destructive override and can clear even a healthy prompt.")
     _flag(sessions_repair_prompts, "--apply", help="Clear the verified prompts (default: report only)")
     _flag(sessions_repair_prompts, "--json",
         help="Machine-readable output; with --apply, apply without an interactive confirmation")

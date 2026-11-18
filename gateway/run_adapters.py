@@ -8,6 +8,7 @@ adapters for GatewayRunner (mixin bound via the MRO).
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING
 import asyncio
 import contextlib
@@ -111,9 +112,9 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
         Both ``cancel_background_tasks()`` and ``disconnect()`` can block indefinitely when a platform's
         network state is half-dead (e.g. a wedged Feishu/Lark WebSocket thread waiting on I/O). See #14128.
         """
-        timeout = self._adapter_disconnect_timeout_secs()
         suffix = f" (profile: {profile})" if profile else ""
         started_at = time.monotonic()
+        timeout = self._adapter_teardown_timeout()
         try:
             if not await self._await_adapter_cleanup_with_timeout(adapter.cancel_background_tasks(), timeout):
                 logger.warning(
@@ -122,6 +123,7 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
                 )
         except Exception as e:
             logger.debug("✗ %s background-task cancel error%s: %s", platform.value, suffix, e)
+        timeout = self._adapter_teardown_timeout()
         with _log_suppressed(
             logging.ERROR, "✗ %s disconnect error after %.2fs%s: %s",
             platform.value, time.monotonic() - started_at, suffix,
@@ -147,6 +149,15 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
         except ValueError:
             logger.warning("Ignoring invalid %s=%r", name, raw)
             return None
+
+    def _adapter_teardown_timeout(self) -> float:
+        """The per-wait adapter teardown bound; during a stop, clamped to the leash the executor quiesce
+        and the SessionDB close need after it. Never 0 there: 0 means "wait forever" to the caller."""
+        from gateway.run_shutdown_budget import quiesce_reserve, stop_wait_budget
+        timeout = self._adapter_disconnect_timeout_secs()
+        if getattr(self, "_stop_deadline", None) is None:
+            return timeout
+        return max(stop_wait_budget(self, timeout or math.inf, reserve=quiesce_reserve()), 0.001)
 
     def _adapter_disconnect_timeout_secs(self) -> float:
         """Return the per-adapter disconnect timeout used during shutdown."""

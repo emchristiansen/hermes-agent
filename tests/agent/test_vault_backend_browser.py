@@ -113,9 +113,11 @@ def test_fill_is_password_blind_and_redaction_registered(real_profile):
          patch("tools.browser_session_real_profile.real_profile_cdp", return_value=("ws://x", None)), \
          patch("agent.redact.register_vault_redaction_value", side_effect=registered.append), \
          patch("tools.browser_vault_tool._bound_page_origin", return_value="https://example.com"), \
-         patch("tools.browser_vault_tool._eval_js", return_value={"success": True, "result": json.dumps(
-             [{"index": 0, "tag": "input", "type": "password", "name": "password", "autocomplete": "current-password"}])}), \
-         patch("tools.browser_vault_tool._eval_js_secret", return_value={"success": True, "result": json.dumps({"filled": 1})}):
+         patch("tools.browser_vault_tool._eval_js", side_effect=lambda task_id, expression, **_: (
+             {"success": True, "result": json.dumps({"timeOrigin": 1.0, "now": 0.0})} if "performance.timeOrigin" in expression
+             else {"success": True, "result": json.dumps(
+                 [{"index": 0, "tag": "input", "type": "password", "name": "password", "autocomplete": "current-password"}])})), \
+         patch("tools.browser_vault_tool._eval_js_secret", return_value={"success": True, "result": json.dumps({"filled": 1, "written": 1, "roles": ["current-password"]})}):
         out = browser_vault_tool.browser_vault_fill(handle, task_id="t")
 
     result = json.loads(out)

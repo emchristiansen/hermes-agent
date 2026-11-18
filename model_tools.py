@@ -166,9 +166,7 @@ except Exception as e:
     logger.debug("Plugin discovery failed: %s", e)
 
 
-# Backward-compat constants (built once after discovery)
-TOOL_TO_TOOLSET_MAP: dict[str, str] = registry.get_tool_to_toolset_map()
-
+# Backward-compat constant (built once after discovery)
 TOOLSET_REQUIREMENTS: dict[str, dict] = registry.get_toolset_requirements()
 
 # Tool names from the last get_tool_definitions() call (execute_code sandbox fallback).
@@ -276,9 +274,9 @@ def _tool_defs_cache_key(
     """Memo key for get_tool_definitions, or None when caching must be bypassed.
 
     Covers every argument plus everything that changes the result without one:
-    registry generation, check_fn cache epoch, config.yaml stat signature (dynamic
-    schemas), kanban context, profile scope. check_fn verdicts expire the entry
-    itself (see get_tool_definitions).
+    ``agent.disabled_tools``, registry generation, check_fn cache epoch, config.yaml stat
+    signature (dynamic schemas), kanban context, profile scope. check_fn verdicts
+    expire the entry itself (see get_tool_definitions).
     """
     profile_scope = check_fn_cache_scope()
     if profile_scope == CHECK_FN_CACHE_BYPASS:
@@ -292,7 +290,8 @@ def _tool_defs_cache_key(
     from tools.environments.sandbox_scope import hosted_scope
     return (
         registry.current_scope_key(), frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
-        frozenset(disabled_toolsets) if disabled_toolsets else None, registry._generation, cfg_fp,
+        frozenset(disabled_toolsets) if disabled_toolsets else None, configured_disabled_tools() or None,
+        registry._generation, cfg_fp,
         bool(os.environ.get("HERMES_KANBAN_TASK")), bool(skip_tool_search_assembly),
         _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope, check_fn_cache_epoch(),
         hosted_scope() is not None,
@@ -354,7 +353,73 @@ def _select_tool_names(enabled_toolsets: Optional[list[str]], disabled_toolsets:
     # disabled toolset are strictly stripped out. See issue #17309.
     if disabled_toolsets:
         _apply_toolset_selection(tools, disabled_toolsets, quiet_mode, disable=True)
+    _subtract_disabled_tools(tools, quiet_mode)
     return tools
+
+
+class DisabledToolsUnknown(RuntimeError):
+    """``agent.disabled_tools`` could not be determined for this profile: its config.yaml cannot be read
+    and the config loader has no last good reading of it, or the key is neither a tool name nor a list
+    of tool names. Never treated as "nothing disabled": tool selection raises and dispatch refuses."""
+
+
+def configured_disabled_tools() -> frozenset:
+    """Tool names the active profile's ``agent.disabled_tools`` removes (legacy aliases mapped to the
+    current name). Removes one tool where a toolset would take its neighbours too (``[skill_manage]``
+    keeps skills_list and skill_view). Read here, not threaded beside ``disabled_toolsets``: schemas, the
+    Tool Search bridge catalog, MCP refresh and delegate children all select through
+    :func:`_select_tool_names`, and dispatch refuses the name.
+
+    Read only from the config loader: a readable config.yaml, or the loader's own last-known-good
+    fallback when the file no longer parses (the newest good reading any consumer made). Empty only when
+    that config has no such key or an empty one. A fallback of defaults, a loader failure or another
+    value shape raises :class:`DisabledToolsUnknown`."""
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.config_read_errors import FailedConfigRead
+
+    try:
+        config = load_config_readonly()
+    except Exception as e:
+        raise DisabledToolsUnknown(f"config.yaml could not be read: {e}") from e
+    if isinstance(config, FailedConfigRead) and not getattr(config, "last_known_good", False):
+        raise DisabledToolsUnknown(f"config.yaml could not be read and has no last good reading: {config.read_error}")
+    return _parse_disabled_tools(config)
+
+
+def _parse_disabled_tools(config) -> frozenset:
+    """The tool names in a readable config's ``agent.disabled_tools``; a scalar name or a quoted list is
+    read like ``disabled_toolsets``. Absent, null or empty is the empty set; any other shape raises."""
+    agent_cfg = config.get("agent") if isinstance(config, dict) else None
+    if agent_cfg is None:
+        return frozenset()
+    if not isinstance(agent_cfg, dict):
+        raise DisabledToolsUnknown(f"agent is a {type(agent_cfg).__name__}, not a mapping")
+    value = agent_cfg.get("disabled_tools")
+    if value is None or value == "" or value == []:
+        return frozenset()
+    items = value if isinstance(value, list) else None
+    if isinstance(value, str):
+        from agent.skill_utils import parse_config_string_list
+        items = parse_config_string_list(value)
+    if items is None or not all(isinstance(name, str) for name in items):
+        raise DisabledToolsUnknown(f"agent.disabled_tools must be a tool name or a list of tool names, "
+                                   f"not {value!r}")
+    names = (name.strip() for name in items)
+    return frozenset(_LEGACY_TOOL_ALIASES.get(name, name) for name in names if name)
+
+
+def _subtract_disabled_tools(tools: set, quiet_mode: bool) -> None:
+    """Remove ``agent.disabled_tools`` from *tools*, after the toolset subtraction so no composite
+    re-adds one; a name no registered tool has is reported like an unknown toolset."""
+    disabled = configured_disabled_tools()
+    if not disabled:
+        return
+    tools.difference_update(disabled)
+    if not quiet_mode:
+        for name in sorted(disabled):
+            if registry.get_entry(name) is None:
+                print(f"⚠️  Unknown tool in agent.disabled_tools: {name}")
+        print(f"🚫 Disabled tools: {', '.join(sorted(disabled))}")
 
 
 # --- Dynamic schema rewrites -------------------------------------------------
@@ -927,6 +992,15 @@ def handle_function_call(
         function_args = {}
     trace = list(tool_request_middleware_trace or [])
     function_name = _LEGACY_TOOL_ALIASES.get(function_name, function_name)
+    try:
+        disabled = configured_disabled_tools()
+    except DisabledToolsUnknown as e:
+        # Which tools this profile removed is unknown, so no call may pass for a tool that might be one.
+        return tool_error(f"Tool calls are unavailable: agent.disabled_tools is unknown ({e})")
+    if function_name in disabled:
+        # Never in this profile's schemas or catalog: a hallucinated or replayed call, or one from
+        # outside the agent loop, meets the registry's unknown-tool refusal before any hook runs.
+        return tool_error(f"Unknown tool: {function_name}")
     ids = _CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id, conversation_id)
     start = time.monotonic()
     from tools.hosted_tool_policy import hosted_tool_refusal

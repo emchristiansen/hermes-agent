@@ -1,5 +1,6 @@
 """Managed turns carry finite approval policy, accounting, and live tool details."""
 import asyncio
+import contextvars
 from dataclasses import replace
 import json
 import os
@@ -7,6 +8,15 @@ import threading
 from types import SimpleNamespace
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _unbind_session_vars():
+    """A worker turn clears its session vars to ``""`` in the test's own context on the way out; leave
+    them unbound for later tests, as a fresh process has them."""
+    yield
+    from gateway.session_context import reset_session_vars
+    reset_session_vars()
 
 
 def assignment(tmp_path, monkeypatch, *, finite=True, unattended=False, yolo=False):
@@ -69,6 +79,9 @@ def test_child_executes_under_finite_policy_and_preserves_receipt(tmp_path, monk
             self.finish.set()
         def approval(self, data): pytest.fail('unexpected approval')
         def clarify(self, questions): pytest.fail('unexpected question')
+        def adopt(self, agent): self.agent = agent
+        def settle(self, result, **kwargs): return None
+        def consumed(self, result): return []  # confirms no correction: none was sent
 
     monkeypatch.setattr(worker, 'bind_worker_policy', lambda frame: None)
     monkeypatch.setattr(worker, 'discover_profile_mcp', lambda policy: None)
@@ -80,7 +93,10 @@ def test_child_executes_under_finite_policy_and_preserves_receipt(tmp_path, monk
     monkeypatch.setattr('run_agent.AIAgent', Agent)
     monkeypatch.setattr('agent.title_generator.wait_for_title_upgrades', lambda: None)
     clear_session('managed-contract')  # the child owns a fresh approval registry
-    worker.execute(frame, SimpleNamespace(send=lambda kind, **payload: frames.append({'type': kind, **payload})))
+    # The child's entry binds its session and approval context for the rest of its process; here that
+    # process is pytest's, so run it in a copy and leave no binding to later tests.
+    contextvars.copy_context().run(
+        worker.execute, frame, SimpleNamespace(send=lambda kind, **payload: frames.append({'type': kind, **payload})))
     assert observed == [(True, unattended, unattended)]
     # The worker's one turn runs under the fence its owner claimed it with.
     assert [(s.session, s.turn, s.fence) for s in scopes] == [('sid', 'x', Fence(3, 8))]
@@ -152,6 +168,8 @@ async def test_stop_during_environment_preparation_prevents_bootstrap(tmp_path, 
             self.stop_cause = None
         def interrupt(self):
             self.stop.set()
+        def abandon_corrections(self, **kwargs): pass
+        transferred = ()  # no correction is ever consumed here
         async def next_frame(self, *args, **kwargs):
             from hermes_state_runtime import RuntimeStoreError
             assert self.stop.is_set(), 'pending Stop was not adopted'

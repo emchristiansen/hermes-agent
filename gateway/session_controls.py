@@ -99,6 +99,7 @@ _PROFILE_IMPLICIT = frozenset({'session.create', 'session.list', 'session.info',
                                'prompt.submit', 'prompt.receipt', 'prompt.cancel', 'prompt.resolve_unknown',
                                'prompt.steer_queued', 'prompt.replace_queued',
                                'session.interrupt', 'session.events.since', 'session.mutate', 'session.stats',
+                               'session.account_usage',
                                'approval.respond', 'clarify.respond'})
 
 
@@ -267,10 +268,13 @@ class AuthorityConnection:
         handlers['complete.path'] = partial(complete_path, self)
         from gateway.session_prune import prune
         handlers['session.prune'] = partial(prune, self)
-        from gateway.session_usage import stats
+        from gateway.session_usage import account_usage, stats
         handlers['session.stats'] = partial(stats, self)
+        handlers['session.account_usage'] = partial(account_usage, self)
         from gateway.session_active_list import active_list
         handlers['session.active_list'] = partial(active_list, self)
+        from gateway.session_kanban_discovery import kanban_run
+        handlers['session.kanban_run'] = partial(kanban_run, self)
         from gateway.session_viewer_automation import automation
         handlers['session.automation'] = partial(automation, self)
         from gateway.session_reactions import react
@@ -340,7 +344,11 @@ class AuthorityConnection:
         original_params = dict(params)
         contract = contract or METHODS.get(method)
         authority = self.authority
-        if (isinstance(ref.session_id, str) and ref.session_id and not getattr(authority, 'retiring', False)
+        # Adopt/persist authenticate a durable execution, not a restored viewer session.
+        # A reserved child has no live session or local receipt. Probing for one here
+        # takes a synchronous DB lock before the handler's off-loop verification.
+        if (method not in {'worker.adopt', 'worker.persist'}
+                and isinstance(ref.session_id, str) and ref.session_id and not getattr(authority, 'retiring', False)
                 and ref.profile_id == getattr(authority, 'profile_id', None)
                 and ref.session_id not in getattr(authority, 'sessions', {ref.session_id: None})):
             # A first read of a session recovery never restored: its compression catch-up (#140060)
@@ -912,7 +920,8 @@ class AuthorityConnection:
             # a finite viewer reads its ledger (tokens, cost, model, exit reason) from here, the same
             # dict the in-process one-shot wrote from `run_conversation`.
             from gateway.session_results import admission_result
-            saved = admission_result(self.authority.db, receipt.admission_id)
+            saved = await asyncio.to_thread(admission_result, self.authority.db, receipt.admission_id)
+            self.authority.authorize(self.actor, ref, 'session:submit')
             if saved is not None:
                 out['result'] = saved['result']
                 out['usage'] = saved.get('usage') or {}

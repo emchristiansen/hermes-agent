@@ -967,16 +967,33 @@ def test_dispatch_failure_opens_incident_and_delivers_failure_notice(
            "deliver": "telegram:123"}
     assert scheduler.run_one_job(job, adapters=None) is True
 
+    # The fork's contract (at-least-once): the notice is ACCEPTED into the durable delivery queue under
+    # the fire fence, never sent inline, so an uncertain send cannot lose it. The incident is booked
+    # alerted only when the queue's drain actually sends it.
+    from cron import delivery_queue
+
     rows = incidents.list_incidents()
     assert len(rows) == 1
     assert rows[0]["job_id"] == "job-dispatch"
-    assert rows[0]["state"] == "alerted"
+    assert rows[0]["state"] == "detected"
     assert "Restart-safe cron worker dispatch failed" in rows[0]["error"]
-    assert len(delivered) == 1 and delivered[0].strip()
+    assert delivered == []
+    queued = delivery_queue.get_status(record["id"])
+    assert queued["status"] == "pending" and queued["for_failure"] == 1
+    assert "Restart-safe cron worker dispatch failed" in queued["content"] and queued["content"].strip()
+    assert json.loads(queued["job_json"])["_failure_incident_id"] == rows[0]["id"]
     finished = execution_ledger.get_execution(record["id"])
     assert finished["status"] == "failed"
     assert "Restart-safe cron worker dispatch failed" in finished["error"]
-    assert finished["delivery_outcome"] == "delivered"
+    assert finished["delivery_outcome"] == "queued"
+
+    # The gateway's own drain sends it (a duplicate would be acceptable, a loss is not) and only then
+    # does the incident read alerted.
+    assert scheduler.drain_delivery_queue(None, None) == 1
+    assert len(delivered) == 1 and delivered[0].strip()
+    assert incidents.list_incidents()[0]["state"] == "alerted"
+    assert delivery_queue.get_status(record["id"])["status"] == "delivered"
+    assert execution_ledger.get_execution(record["id"])["delivery_outcome"] == "delivered"
 
     # The same dispatch failure again: same signature -> incident dedup, and the
     # alerted cooldown withholds the repeat ping.
@@ -1019,12 +1036,7 @@ def test_dispatch_failure_notice_resolves_the_owning_profiles_home_channel(
         monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda _job: False)
         monkeypatch.setattr(scheduler, "claim_dispatch", _handoff_boom)
     monkeypatch.setattr(scheduler, "mark_job_run", lambda *_a, **_k: True)
-    resolved = []
-
-    def _deliver(job, content, **_kw):
-        resolved.append(delivery._env_home_target_chat_id("telegram"))
-
-    monkeypatch.setattr(scheduler, "_deliver_result", _deliver)
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_a, **_k: pytest.fail("notice must be queued, not sent inline"))
 
     record = execution_ledger.create_execution("job-scoped", source="builtin")
     job = {"id": "job-scoped", "execution_id": record["id"], "deliver": "telegram"}
@@ -1036,10 +1048,17 @@ def test_dispatch_failure_notice_resolves_the_owning_profiles_home_channel(
     finally:
         secret_scope.set_multiplex_active(False)
 
-    assert resolved == ["111111111"]
+    # The notice is accepted into the durable queue with the destination resolved NOW, under the
+    # owning profile's scope; retrying later never reinterprets it from another profile's home.
+    from cron import delivery_queue
+
+    queued = delivery_queue.get_status(record["id"])
+    assert queued["status"] == "pending" and queued["for_failure"] == 1
+    pinned = json.loads(queued["job_json"])["_queued_delivery_targets"]
+    assert [(t["platform"], t["chat_id"]) for t in pinned] == [("telegram", "111111111")]
     assert len(incidents.list_incidents()) == 1
     finished = execution_ledger.get_execution(record["id"])
-    assert finished["delivery_outcome"] == "delivered"
+    assert finished["delivery_outcome"] == "queued"
 
 
 def test_shutdown_does_not_interrupt_restart_safe_waiter():

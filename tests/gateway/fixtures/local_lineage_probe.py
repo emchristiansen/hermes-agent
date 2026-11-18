@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sqlite3
 import threading
+import time
 
 from tests.gateway.fixtures.local_recovery_probe import Model, daemon, rpc, websocket
 from tests.waiting import async_wait_until
@@ -111,6 +112,9 @@ def probe(tmp_path):
                     route_targets[name] = route['session_id']
                     row = db.execute('SELECT cwd FROM sessions WHERE id=?', (targets[name],)).fetchone()
                     assert row[0] == params[name]['cwd'], row
+                    if name == 'unknown':  # the lost turn ran a tool: a business turn, never re-run (msg-retry)
+                        db.execute("INSERT INTO messages(session_id,role,content,tool_call_id,tool_name,timestamp) "
+                                   "VALUES(?,'tool','done','c1','terminal',?)", (targets[name], time.time()))
                 else:
                     receipt['profile_id'] = str(user)
                     db.execute('UPDATE state_meta SET value=? WHERE key=?',

@@ -748,7 +748,7 @@ def test_request_non_json_error_sanitized(monkeypatch):
             return b"\x1b[2Jnot-json\x07"
 
     @contextlib.contextmanager
-    def _fake_open(req, timeout=None):
+    def _fake_open(req, timeout=None, opener_factory=None):
         yield _Resp()
 
     import hermes_cli.urllib_security as us

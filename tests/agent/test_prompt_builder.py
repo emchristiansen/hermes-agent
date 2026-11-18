@@ -3,6 +3,7 @@
 import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -1078,18 +1079,24 @@ class TestContextFileReadTimeout:
         pb_mod = sys.modules[build_context_files_prompt.__module__]
         monkeypatch.setattr(pb_mod, "_get_context_file_read_timeout", lambda: 0.05)
 
-        original_read_text = Path.read_text
+        # The reader blocks in Path.open (_read_text_with_timeout opens the file itself); the slow
+        # .hermes.md read hangs until the test ends, so only the timeout can return it.
+        original_open = Path.open
+        release = threading.Event()
 
-        def slow_read_text(self, *args, **kwargs):
+        def slow_open(self, *args, **kwargs):
             if self.name == ".hermes.md":
-                time.sleep(0.6)
-            return original_read_text(self, *args, **kwargs)
+                release.wait(timeout=5)
+            return original_open(self, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "read_text", slow_read_text)
+        monkeypatch.setattr(Path, "open", slow_open)
 
         start = time.monotonic()
-        with caplog.at_level(logging.WARNING, logger=pb_mod.__name__):
-            result = build_context_files_prompt(cwd=str(tmp_path))
+        try:
+            with caplog.at_level(logging.WARNING, logger=pb_mod.__name__):
+                result = build_context_files_prompt(cwd=str(tmp_path))
+        finally:
+            release.set()
         elapsed = time.monotonic() - start
 
         assert elapsed < 0.4, f"context load blocked for {elapsed:.2f}s"

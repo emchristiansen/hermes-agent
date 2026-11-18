@@ -156,7 +156,10 @@ class DialogSupervisionMixin:
         """Install the dialog-bridge init script + Fetch interceptor on a session. Idempotent at
         the CDP level (Chromium de-dupes identical add-script calls; Fetch.enable replaces prior
         patterns); the final Runtime.evaluate injects into the already-loaded document so
-        existing pages pick up the override on reconnect."""
+        existing pages pick up the override on reconnect. A supervisor with ``dialog_bridge=False``
+        installs nothing."""
+        if not getattr(self, "dialog_bridge", True):
+            return
         sid = (session_id or "")[:16]
         steps = (
             ("Page.addScriptToEvaluateOnNewDocument", {"source": _DIALOG_BRIDGE_SCRIPT, "runImmediately": True},
@@ -171,7 +174,29 @@ class DialogSupervisionMixin:
 
     # ── Capture ──────────────────────────────────────────────────────────────
 
+    def _note_dialog_state(self, session_id: Optional[str], opening: Optional[dict[str, Any]]) -> None:
+        """Passive record of which page sessions have a native dialog open (``opening`` None: closed). It
+        only observes: nothing here answers, dismisses or bridges a dialog."""
+        with self._state_lock:
+            open_dialogs = self.__dict__.setdefault("_open_native_dialogs", {})
+            if opening is None:
+                open_dialogs.pop(session_id or "", None)
+            else:
+                open_dialogs[session_id or ""] = {"type": str(opening.get("type") or ""), "opened_at": time.time()}
+
+    def open_dialog(self) -> Optional[dict[str, Any]]:
+        """The native dialog open on the attached page session, as recorded from
+        ``Page.javascriptDialogOpening``/``Closed`` (``{"type", "opened_at"}``), or None. With or without the
+        dialog bridge; reading it never acts on the dialog."""
+        with self._state_lock:
+            recorded = dict(self.__dict__.get("_open_native_dialogs", {}))
+            session_id = getattr(self, "_page_session_id", None) or ""
+        return recorded.get(session_id)
+
     async def _on_dialog_opening(self, params: dict[str, Any], session_id: Optional[str]) -> None:
+        self._note_dialog_state(session_id, params)
+        if not getattr(self, "dialog_bridge", True):
+            return  # no automatic dialog choice: a native dialog stays with whoever is at the browser
         self._admit_dialog(
             type=str(params.get("type") or ""), message=str(params.get("message") or ""),
             default_prompt=str(params.get("defaultPrompt") or ""), session_id=session_id, frame_id=params.get("frameId"),
@@ -293,6 +318,7 @@ class DialogSupervisionMixin:
         # ``Page.javascriptDialogClosed`` carries only ``result``/``userInput``: match by
         # session id and clear the oldest native dialog on it (the JS thread blocks while
         # a dialog is up, so at most one is in flight). Bridge dialogs resolve via Fetch.
+        self._note_dialog_state(session_id, None)
         with self._state_lock:
             candidate = next((d.id for d in self._pending_dialogs.values()
                               if d.cdp_session_id == session_id and d.bridge_request_id is None), None)

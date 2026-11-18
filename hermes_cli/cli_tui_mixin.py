@@ -1472,6 +1472,22 @@ class CLITuiMixin:
         event.app.invalidate()
         return True
 
+    def _tui_steer_running_turn(self, text: str):
+        """``agent.steer(text)`` into the running turn, announced: True, False (refused, failed or no agent:
+        the caller keeps the text for the next turn) or ``"voice_stopped"`` (TUI-26: consumed as a voice stop)."""
+        from cli import _ACCENT, _DIM, _RST, _cprint
+        accepted = False
+        try:
+            if self.agent is not None and hasattr(self.agent, "steer"):
+                accepted = self.agent.steer(text)
+        except Exception as exc:  # health: allow BLE001 -- moved from _tui_enter_while_busy: a failed steer queues the text
+            _cprint(f"  {_DIM}{t('cli.tui.steer_failed_queued', error=exc)}{_RST}")
+            accepted = False
+        if accepted and accepted != "voice_stopped":
+            preview = text[:80] + ("..." if len(text) > 80 else "")
+            _cprint(f"  {_ACCENT}{t('cli.tui.steered', preview=preview)}{_RST}")
+        return accepted
+
     def _tui_enter_while_busy(self, text: str, images: list, payload, mode: str | None = None) -> None:
         """Route a submission typed while the agent runs, per ``busy_input_mode``.
 
@@ -1485,19 +1501,10 @@ class CLITuiMixin:
             if images or not text:
                 _effective_mode = "queue"
             else:
-                accepted = False
-                try:
-                    if self.agent is not None and hasattr(self.agent, "steer"):
-                        accepted = self.agent.steer(text)
-                except Exception as exc:
-                    _cprint(f"  {_DIM}{t('cli.tui.steer_failed_queued', error=exc)}{_RST}")
-                    accepted = False
+                accepted = self._tui_steer_running_turn(text)
                 if accepted == "voice_stopped":  # TUI-26: consumed as a voice stop; nothing to queue
                     return
-                if accepted:
-                    preview = text[:80] + ("..." if len(text) > 80 else "")
-                    _cprint(f"  {_ACCENT}{t('cli.tui.steered', preview=preview)}{_RST}")
-                else:
+                if not accepted:
                     _effective_mode = "queue"
         if _effective_mode == "queue" and text and not images and self._gateway_queue_store() is not None:
             self._queue_enqueue(text)

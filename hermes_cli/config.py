@@ -167,8 +167,8 @@ def validate_env_var_name_for_write(key: str) -> None:
 # read_user_config_raw() + save_config()). save_config itself no longer re-enters via
 # read_raw_config; it takes its raw mapping from require_readable_config_before_write.
 _CONFIG_LOCK = threading.RLock()
-# path -> last successfully loaded (expanded) config; served after a parse failure so a
-# mid-edit broken YAML never silently drops user overrides (e.g. approvals.deny rules).
+# path -> last successfully loaded (expanded) USER config, before the managed overlay; served with
+# the CURRENT overlay after a parse failure so broken YAML never drops user overrides (approvals.deny).
 _LAST_EXPANDED_CONFIG_BY_PATH: dict[str, Any] = {}
 # path -> (user_mtime_ns, user_size, managed_mtime_ns, managed_size, merged, env_ref_snapshot).
 # load_config() returns a deepcopy of the cached value while the signature matches (skips
@@ -1064,7 +1064,7 @@ def validate_config_structure(config: Optional[dict[str, Any]] = None) -> list[C
             return [config_load_issue(exc)]
 
     from hermes_cli.config_value_checks import (
-        _validate_quoted_containers, _validate_timezone, _validate_voice, _validate_web_backends)
+        _validate_quoted_containers, _validate_timezone, _validate_voice)
     issues: list[ConfigIssue] = []
     _validate_voice(config, issues)
     _validate_timezone(config, issues)
@@ -1093,7 +1093,6 @@ def validate_config_structure(config: Optional[dict[str, Any]] = None) -> list[C
                    f"Root-level key '{key}' looks misplaced — should it be under 'model:' or inside a 'custom_providers' entry?",
                    f"Move '{key}' under the appropriate section")
 
-    _validate_web_backends(config, issues)
     _validate_quoted_containers(config, issues)
     return issues
 
@@ -2038,7 +2037,7 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
         # Fresh process (CLI restart, `hermes config get`): nothing loaded yet in this process, so
         # fall back to the newest byte-exact copy the last successful parse left in backups/config/.
         # It holds the raw file (``${VAR}`` templates intact), so it goes through the same
-        # canonicalize -> expand -> managed-overlay pipeline as a normal load.
+        # canonicalize -> expand pipeline as a normal load; the overlay is applied below.
         from hermes_cli.config_backups import load_newest_good_backup
         from hermes_cli.moa_config import apply_user_moa_presets
         raw_good = load_newest_good_backup(config_path)
@@ -2046,16 +2045,15 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
             merged_good = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), raw_good)
             apply_user_moa_presets(merged_good, raw_good)
             normalized = _canonicalize_config(merged_good)
-            expanded_good: dict[str, Any] = _expand_env_vars(normalized)  # type: ignore[assignment]
-            lkg, _ = _merge_managed_overlay(expanded_good)
+            lkg = _expand_env_vars(normalized)
             fallback = "last-known-good-backup"
     _warn_config_parse_failure(
         config_path, exc, fallback=fallback if lkg is not None else "defaults")
     if lkg is None:
         return None
-    # save_config() stores the pre-expansion dict (templates preserved); the load path stores the
-    # expanded one. Expand defensively — idempotent when already expanded.
-    lkg_copy = FailedConfigRead(_expand_env_vars(copy.deepcopy(lkg)), error=exc)
+    # save_config() stores the pre-expansion dict, the load path the expanded user layer: expand
+    # (idempotent), then apply the CURRENT managed overlay — the one cache_sig's managed half names.
+    lkg_copy = FailedConfigRead(_merge_managed_overlay(_expand_env_vars(copy.deepcopy(lkg)))[0], error=exc, last_known_good=True)
     if cache_sig is not None:
         # Cache under the failed file's signature (empty env snapshot: always valid) so repeated
         # loads don't re-parse the fallback; fixing the file changes the signature and reloads
@@ -2177,8 +2175,9 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
                 return copy.deepcopy(fallback) if want_deepcopy else fallback
 
         normalized = _canonicalize_config(config)
-        expanded, managed_config = _merge_managed_overlay(_expand_env_vars(normalized))
-        _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
+        user_expanded = _expand_env_vars(normalized)  # last-known-good is the pre-overlay user layer
+        _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(user_expanded)
+        expanded, managed_config = _merge_managed_overlay(user_expanded)
         _note_policy("note_config_policy", (expanded.get("security") or {}).get("redact_secrets"))
         if cache_sig is not None:
             # The cache stores its own deepcopy so load_config() callers can mutate freely while

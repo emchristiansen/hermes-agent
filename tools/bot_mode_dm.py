@@ -51,7 +51,7 @@ _DM_DIR_NAME = "hermes-dm"
 _DM_STALE_SECONDS = 24 * 60 * 60
 _LIVE_WAIT_SECONDS = 300
 # A live owner may run a turn past one wait window, but each waiting runner holds ~46 MB and the
-# sender's notify slot: past this the runner reports pending (do not resend) and exits.
+# sender's notify slot: past this the runner reports pending and exits, leaving the caller free to follow up.
 _LIVE_WAIT_MAX_SECONDS = 30 * 60
 
 # '<peer>/<agent>' — peer names are lowercase (``hermes peer`` normalizes them).
@@ -131,11 +131,14 @@ def message_agent_authorized(agent: Any) -> bool:
     try:
         if not getattr(agent, "_bot_mode_protocol", True):
             return False
-        from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
+        from tools.bot_mode_probe import session_is_canonical_bot_chat, is_bot_mode_managed
 
         # Managed-install check, NOT section non-emptiness: a SOUL.md carrying the
         # legacy protocol text gets an empty section but must still get the tool.
-        return _session_title(agent) == BOT_CHAT_TITLE and is_bot_mode_managed(_agent_home(agent))
+        return session_is_canonical_bot_chat(
+            getattr(agent, "_session_db", None), getattr(agent, "session_id", None),
+            _session_title(agent),
+        ) and is_bot_mode_managed(_agent_home(agent))
     except Exception:  # pragma: no cover — must never break a turn
         logger.debug("message_agent_authorized failed", exc_info=True)
         return False
@@ -258,11 +261,14 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
     home = _agent_home(agent)
     try:
         from tools.bot_mode_probe import (
-            BOT_CHAT_TITLE, NO_REPLY_MARKER, _display_name, _handle, _hermes_root, _peers,
-            _profile_name as _self_profile_name, _roster, is_bot_mode_managed,
+            NO_REPLY_MARKER, _display_name, _handle, _hermes_root, _peers,
+            _profile_name as _self_profile_name, _roster, is_bot_mode_managed, session_is_canonical_bot_chat,
         )
 
-        if _session_title(agent) != BOT_CHAT_TITLE:
+        if not session_is_canonical_bot_chat(
+            getattr(agent, "_session_db", None), getattr(agent, "session_id", None),
+            _session_title(agent),
+        ):
             return _err("message_agent is only available in a Bot Mode 'Bot Chat' session. "
                         "This session is not one; do not retry.")
         if not is_bot_mode_managed(home):
@@ -432,13 +438,13 @@ def _try_relay_delivery(root: Path, raw_target: str, content: str, me: str, *,
         if not waiter_error:
             return raw
         # The envelope is already queued and the Desktop drains it on its own, so a waiter that
-        # failed to start loses only the reply wake-up. Reporting a hard failure here makes the
-        # sender resend and deliver the message twice. Same shape as the live-owner branch of
+        # failed to start loses only the reply wake-up. Keep that distinction accurate even though the
+        # sender may retry its message. Same shape as the live-owner branch of
         # _start_delivery: queued + notification_error.
         return json.dumps({
             "status": "queued", "delivery_id": envelope["id"], "to": label, "notification_error": waiter_error,
             "detail": (f"Message queued for {label}; the relay delivers it on its own, but the reply "
-                       "waiter did not start, so the reply will NOT wake you. Do NOT resend."),
+                       "waiter did not start, so the reply will NOT wake you. Retry promptly if delivery fails, times out or remains uncertain; duplicate messages do not authorize repeated effects."),
         })
     except Exception:
         logger.debug("relay delivery attempt failed", exc_info=True)
@@ -664,7 +670,7 @@ def _wait_live_dm(home: str, delivery_id: str, *, dm_file: str | os.PathLike | N
     payload = {key: record[key] for key in ("reply", "error", "reason") if record and record.get(key)}
     payload.update(status=status, delivery_id=delivery_id)
     if status in ("queued", "claimed", "ambiguous"):
-        payload["detail"] = "Delivery remains pending or its outcome is unknown. Do not resend; receipt is retained."
+        payload["detail"] = "Delivery remains pending or its outcome is unknown. The receipt is retained; retry the message promptly if needed, without repeating execution effects."
         state = _live_target_state(dm_file) or ("unreachable" if unreachable else None)
         if state:
             # A bound that lapses on a teammate parked on its own user is that, never a silent timeout.
@@ -707,7 +713,7 @@ def _local_delivery_home(argv: list[str]) -> Path | None:
 def _live_outcome_unknown(dm_file: str, cause: object) -> str:
     """The runner's stdout when a live admission may have happened but its outcome is unknown."""
     return json.dumps({"status": "ambiguous", "delivery_id": _dm_delivery_id(dm_file),
-                       "error": f"Live admission outcome unknown: {cause}. Do not resend.",
+                       "error": f"Live admission outcome unknown: {cause}. Retry the message promptly if needed; repeated messages do not authorize repeated effects.",
                        "evidence_file": dm_file})
 
 
@@ -798,7 +804,7 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
             return _settled_no_send(dm_file, exc)
         except Exception as exc:
             return json.dumps({"status": "ambiguous", "delivery_id": _dm_delivery_id(dm_file),
-                "error": f"Live delivery admission could not be confirmed: {exc}. Do not resend.",
+                "error": f"Live delivery admission could not be confirmed: {exc}. Retry the message promptly if needed; repeated messages do not authorize repeated effects.",
                 "evidence_file": dm_file})
         if record is not None:
             if wake == "none":
@@ -813,7 +819,7 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
             notification = json.loads(_spawn_delivery(command, label, delivery_id=record["delivery_id"],
                                                       task_id=task_id, agent=agent, wake=wake))
             result = dict(status=record["status"], delivery_id=record["delivery_id"], to=label,
-                          detail="Durably queued for the live Bot Chat owner. Do NOT wait or resend; finish your turn.")
+                          detail="Durably queued for the live Bot Chat owner. Finish your turn to receive the reply notification; retry promptly if delivery fails or remains uncertain.")
             if notification.get("error"):
                 result["notification_error"] = notification["error"]
             elif notification.get("process_id"):
@@ -822,7 +828,7 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
                 if result["reply_delivery"] == "poll":
                     # Same runner, same stdout-borne reply (#101142): a non-push sender must get
                     # the poll instruction here too, not 'finish your turn'.
-                    result["detail"] = f"Durably queued for the live Bot Chat owner. Do NOT resend. {notification['detail']}"
+                    result["detail"] = f"Durably queued for the live Bot Chat owner. Retry promptly if delivery fails, times out or remains uncertain; duplicate messages do not authorize repeated effects. {notification['detail']}"
             return json.dumps(_with_target_state(result, record, label))
     try:
         command = _delivery_command(argv, dm_file, stdin_file=stdin_file, profile_home=profile_home, author=author)
@@ -832,7 +838,10 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
     return _spawn_delivery(command, label, dm_file=dm_file, task_id=task_id, agent=agent, wake=wake)
 
 
-_NOTIFY_ONLY_DETAIL = "Sent as notify-only: no reply comes back and nothing will wake you. Do not resend."
+# Queued, not uncertain: nothing to resend for. Retry only on failure or uncertainty (97facaa730 guidance).
+_NOTIFY_ONLY_DETAIL = ("Sent as notify-only: no reply comes back and nothing will wake you. It is queued, so there is "
+                       "nothing to resend; retry promptly only if delivery fails or remains uncertain; duplicate "
+                       "messages do not authorize repeated effects.")
 # What a sender should tell its user when the teammate's turn is parked on that teammate's own user.
 _BLOCKED_DETAIL = {
     "waiting_approval": "is waiting for its user to approve a command in its own Bot Chat",
@@ -991,7 +1000,7 @@ def _wait_reply_main(reply_path: str, label: str, budget_seconds: str) -> int:
         # 250ms cadence: stat is cheap and a longer sleep is pure dead air.
         time.sleep(0.25)
     print(f"No reply from {label} within {budget_seconds}s. The message may still be delivered when "
-          "the Desktop reconnects; do not resend blindly.")
+          "the Desktop reconnects; retry promptly if the reply is still needed; a repeated message does not authorize repeated effects.")
     return 1
 
 

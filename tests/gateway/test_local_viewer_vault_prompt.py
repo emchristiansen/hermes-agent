@@ -12,6 +12,10 @@ import pytest
 from gateway.config import Platform
 from tests.waiting import wait_until
 
+# The page-clock read the fill sends just before a secret-bearing script (tools.browser_vault_tool._page_clock).
+_PAGE_CLOCK = json.dumps({"timeOrigin": 1.0, "now": 0.0})
+
+
 
 class _Peer:
     def __init__(self):
@@ -176,13 +180,15 @@ def _enter_code_with_a_fake_page():
     controls = [{'index': 0, 'type': 'text', 'name': 'otp', 'label': 'Security code', 'autocomplete': 'one-time-code'}]
     seen = {}
 
-    def fake_eval(task_id, expr):
+    def fake_eval(task_id, expr, **_):
+        if "performance.timeOrigin" in expr:
+            return {"success": True, "result": _PAGE_CLOCK}
         return {'success': True, 'result': json.dumps(controls) if 'querySelectorAll' in expr
                 else 'https://www.epicgames.com/id/login/mfa'}
 
     def fake_secret(task_id, expr):
         seen['expr'] = expr
-        return {'success': True, 'result': json.dumps({'filled': 1})}
+        return {'success': True, 'result': json.dumps({'filled': 1, 'written': 1, 'roles': ['one-time-code']})}
 
     with patch.object(browser_vault_tool, '_focus_bound_origin', lambda *a, **k: None), \
          patch.object(browser_vault_tool, '_eval_js', side_effect=fake_eval), \

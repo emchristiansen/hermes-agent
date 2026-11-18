@@ -28,6 +28,7 @@ from gateway.run_busy import approval_input_words
 from gateway.run_inbound_media import rehome_inbound_media
 from gateway.run_inbound_hooks import GatewayInboundHooksMixin
 from gateway.run_inbound_moa import GatewayInboundMoaMixin
+from gateway.run_inbound_steer import GatewayInboundSteerMixin
 from gateway.run_inbound_transcription import GatewayInboundTranscriptionMixin
 from gateway.run_plugin_injection import GatewayPluginInjectionMixin
 from gateway.run_turn_setup_guard import cancel_preagent_setup, pending_setup_busy_notice
@@ -76,6 +77,7 @@ def strip_discord_triggering_note(event: Any, message_text: Any) -> Any:
 
 class GatewayInboundMixin(
     GatewayInboundHooksMixin, GatewayInboundTranscriptionMixin, GatewayPluginInjectionMixin, GatewayInboundMoaMixin,
+    GatewayInboundSteerMixin,
 ):
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
 
@@ -846,9 +848,11 @@ class GatewayInboundMixin(
         busy_input_mode queue/steer, subagent and compression protection demote to queue."""
         from gateway.run import _AGENT_PENDING_SENTINEL
         if getattr(event, "internal", False) and not event.get_command():
-            # Main's rule (run_busy's busy handler, which the shared runtime's busy dispatch skips):
-            # an internal synthetic event never interrupts or steers the running turn.
-            self._queue_or_replace_pending_event(_quick_key, event)
+            # An internal synthetic event never interrupts the running turn (main's rule). Every message
+            # steers (Eric, 2026-11-04): it reaches that turn as its sender's, never the user's, and is
+            # queued as before only when nothing running can take it.
+            if not self._hm_steer_delivered(event, _quick_key):
+                self._queue_or_replace_pending_event(_quick_key, event)
             return None
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)
         if not _handled:
@@ -1330,6 +1334,7 @@ class GatewayInboundMixin(
             return True, _consumer_reply
         if getattr(event, "_fifo_only", False) and event._stop_epoch != self._route_stop_epoch(_quick_key):
             return True, None  # a /stop or /new came after its command, as it clears the slot
+        self._hm_steer_at_adoption(event, source, _quick_key)
         # A failed admit stays the authority's answer (refusal notice or turn error), never a
         # pending legacy turn: that would run unadmitted, outside the FIFO's order.
         if busy and getattr(event, "_gateway_pending_stt_clips", None):

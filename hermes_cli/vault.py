@@ -8,6 +8,8 @@ Subcommands:
   handles. Passwords are never shown.
 - ``hermes vault rm``    remove an item by handle/id.
 - ``hermes vault key``   where the vault key lives; ``key migrate --to keychain|file`` moves it.
+- ``hermes vault fill``  fill one login's password into one exact tab of an already running browser
+  (CDP endpoint + target id), outside any agent session; see ``_cmd_fill``.
 
 The vault backs the password-blind browser autofill tools
 (``browser_vault`` list / fill): the agent sees handles
@@ -246,6 +248,66 @@ def _set_key_storage(value: str) -> None:
     save_config(cfg)
 
 
+def _cmd_fill(args) -> None:
+    """Fill a login's password into exactly one CDP page target of a browser someone else is using.
+
+    The supervisor attaches only ``--target-id`` and installs no dialog bridge on any tab
+    (``CDPSupervisor(attach_target_id=..., dialog_bridge=False)``); the fill runs the normal
+    ``browser_vault`` guards (listed handle, exact saved origin, re-check in the writing script), refuses
+    a non-empty or missing password field before any value is resolved, never submits, and the
+    supervisor is stopped before exit. Page access is ``supervisor_only()``: no browser session attached or
+    started on demand, no plugin page backend and no preview page. Only the ``--backend`` store is constructed
+    and read: no other manager, plugin or browser-profile source is enumerated. Prints the tool's JSON result (counts and
+    metadata only); exits 0 when a field was filled, 1 otherwise."""
+    import json
+    import secrets
+    import sys
+
+    from agent.vault_backends.base import _cfg, external_backend_classes
+    from agent.vault_backends.local import LocalLoginBackend
+    from tools.browser_session_cdp import resolve_cdp_override
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+    from tools.browser_vault_tool import _fenced_page_op, browser_vault_fill, supervisor_only
+
+    def _finish(result: dict) -> None:
+        print(json.dumps(result))
+        sys.exit(0 if result.get("success") else 1)
+
+    if args.backend == LocalLoginBackend.name:
+        backend = LocalLoginBackend()
+    else:
+        cls = next(c for c in external_backend_classes() if c.name == args.backend)
+        section = _cfg().get(cls.name) or {}
+        backend = cls(section if isinstance(section, dict) else {})
+    if not backend.owns(args.handle):
+        _finish({"success": False, "error_type": "backend_mismatch",
+                 "error": f"Handle {args.handle!r} does not belong to the {backend.display_name} backend."})
+
+    cdp_url = resolve_cdp_override(args.cdp)
+    if "/devtools/browser/" not in cdp_url.lower():
+        _finish({"success": False, "error_type": "cdp_unresolved",
+                 "error": "Could not resolve the browser's CDP websocket endpoint; nothing was attached."})
+    task_id = f"vault-fill-{secrets.token_hex(6)}"
+    try:
+        SUPERVISOR_REGISTRY.get_or_start(task_id, cdp_url, attach_target_id=args.target_id, dialog_bridge=False)
+    except (RuntimeError, TimeoutError, ValueError) as exc:  # the attach failures get_or_start raises; nothing was filled
+        blocked = ("; the tab did not answer in time (a JavaScript dialog, a debugger pause or a long-running script "
+                   "can block it)") if "timeout" in str(exc).lower() else ""
+        _finish({"success": False, "error_type": "attach_failed",
+                 "error": f"Could not attach to the tab: {exc}{blocked}. Nothing was resolved, sent or written."})
+    try:
+        with supervisor_only():
+            raw = _fenced_page_op(task_id, lambda: browser_vault_fill(args.handle, task_id, require_empty=True,
+                                                                        backend=backend))
+    finally:
+        SUPERVISOR_REGISTRY.stop(task_id)
+    try:
+        result = json.loads(raw)
+    except (TypeError, ValueError):
+        result = {"success": False, "error": "unparseable fill result"}
+    _finish(result)
+
+
 def register_cli(subparser) -> None:
     """Build the ``hermes vault`` argparse tree (called from main.py)."""
     subs = subparser.add_subparsers(dest="vault_action")
@@ -280,6 +342,18 @@ def register_cli(subparser) -> None:
         "migrate", help="Move the vault key to the OS keychain or back to vault.key (verified before the old copy is removed)")
     p_migrate.add_argument("--to", choices=["keychain", "file"], required=True, help="Destination for the key")
     p_migrate.set_defaults(_vault_handler=_cmd_key)
+
+    p_fill = subs.add_parser(
+        "fill",
+        help="Fill a login's password into one exact tab of a running browser (no dialog bridge, never submits)",
+    )
+    p_fill.add_argument("handle", help="Item handle (see `hermes vault list`)")
+    p_fill.add_argument("--cdp", required=True,
+                        help="The browser's CDP endpoint: http://host:port, ws://host:port or its devtools/browser URL")
+    p_fill.add_argument("--target-id", required=True, help="The CDP page target id of the tab to fill")
+    p_fill.add_argument("--backend", required=True, choices=["local", "onepassword", "bitwarden"],
+                        help="The one store to read the handle from; no other source is consulted")
+    p_fill.set_defaults(_vault_handler=_cmd_fill)
 
 
 def vault_command(args) -> None:

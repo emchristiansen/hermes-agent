@@ -26,7 +26,9 @@ def test_claim_stolen_after_the_ownership_sample_queues_no_ghost_send(tmp_path, 
     assert execution["status"] == "failed"
 
 
-def test_dead_drain_owner_settles_the_run_it_fenced_unknown(tmp_path, monkeypatch):
+def test_dead_drain_owners_send_is_resent_and_settles_the_run(tmp_path, monkeypatch):
+    """At least once (msg-retry-on-13f-1; was: fenced unknown, never retried, run settled failed): the
+    uncertain send is queued again, resent after its backoff, and the run settles delivered."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(scheduler, "run_job", lambda job, **kw: (True, "raw", "the result", None))
     job = jobs.create_job(prompt="p", schedule="every 1h", deliver="telegram:fixture")
@@ -40,10 +42,13 @@ def test_dead_drain_owner_settles_the_run_it_fenced_unknown(tmp_path, monkeypatc
                      "WHERE execution_id=?", (execution["id"],))
     sent = []
     delivery_queue.drain(lambda *args: sent.append(args))
-    saved = jobs.get_job(job["id"])
-    assert sent == [], "an uncertain send is never retried"
-    assert saved["last_status"] == "delivery_failed" and "unknown" in saved["last_delivery_error"]
-    assert executions.get_execution(execution["id"])["delivery_outcome"] == "failed"
+    assert sent == [], "queued again, waiting out its backoff"
+    assert jobs.get_job(job["id"])["last_status"] == "delivery_queued"
+    monkeypatch.setattr(delivery_queue, "_now_seconds", lambda: 10.0 ** 12)
+    delivery_queue.drain(lambda *args: sent.append(args))
+    assert len(sent) == 1, "the uncertain send is sent again"
+    assert jobs.get_job(job["id"])["last_status"] != "delivery_failed"
+    assert executions.get_execution(execution["id"])["delivery_outcome"] == "delivered"
 
 
 def test_origin_with_no_resolvable_target_is_not_configured_never_delivered(tmp_path, monkeypatch):

@@ -21,6 +21,7 @@ from agent.credential_pool import (
 from agent.credential_pool_admin import CredentialNotSavedError
 import hermes_cli.auth as auth_mod
 from hermes_cli.auth import PROVIDER_REGISTRY
+from hermes_cli.auth_principals import auth_principals_command
 from hermes_cli.auth_plugin_providers import (
     canonical_registry_rows, dispatch_plugin_auth, is_refreshable_oauth_provider, plugin_missing_auth_handler_error)
 from hermes_constants import OPENROUTER_BASE_URL
@@ -547,15 +548,18 @@ def auth_list_command(args) -> None:
             print()
             continue
         print(f"{provider} ({len(entries)} credentials):")
+        from agent.credential_display_names import display_name, listing_notes
         for idx, entry in enumerate(entries, start=1):
             marker = "← " if current is not None and entry.id == current.id else "  "
             status = _format_exhausted_status(entry)
             source = _display_source(entry.source)
             row = (
-                f"  #{idx}  {entry.label:<20} {entry.auth_type:<7} "
+                f"  #{idx}  {display_name(entry, entry.label):<20} {entry.auth_type:<7} "
                 f"id={entry.id} priority={entry.priority} {source}{status} {marker}"
             )
             print(row.rstrip())
+        for note in listing_notes(provider, (e.id for e in entries)):
+            print(f"  {note}")
         print()
     if not provider_filter or provider_filter in EXTERNAL_LOGIN_PROVIDERS:
         _print_external_login_notice()
@@ -919,7 +923,8 @@ def auth_upgrade_command(args) -> None:
 _AUTH_ACTIONS = {
     "add": auth_add_command, "list": auth_list_command, "remove": auth_remove_command,
     "reset": auth_reset_command, "priority": auth_priority_command, "refresh": auth_refresh_command, "status": auth_status_command,
-    "logout": auth_logout_command, "upgrade": auth_upgrade_command}
+    "logout": auth_logout_command, "upgrade": auth_upgrade_command,
+    "principals": auth_principals_command}
 
 
 def auth_command(args) -> None:

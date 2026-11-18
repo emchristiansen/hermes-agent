@@ -196,13 +196,18 @@ def _write_snapshot(out: Path, prompts: dict[str, dict[str, str]], tools_by_surf
 
 def render(out: Path) -> int:
     """Render into *out* from a fresh child process and home, so nothing from the caller's
-    environment, config or imported modules reaches the bytes."""
+    environment, config or imported modules reaches the bytes. The host's administrator scope
+    (``/etc/hermes``) is host config too: the child reads an empty managed directory instead, so
+    a managed host renders the stock install (and never writes its managed files into the snapshot)."""
     with tempfile.TemporaryDirectory(prefix="prompt-surface-") as tmp:
         home = Path(tmp) / "home"
         home.mkdir()
+        managed = Path(tmp) / "managed"
+        managed.mkdir()
         staging = Path(tmp) / "out"
         env = {
             "PATH": os.environ.get("PATH", ""), "HOME": str(home), "HERMES_HOME": str(home / ".hermes"),
+            "HERMES_MANAGED_DIR": str(managed),
             "TZ": "UTC", "LANG": "C.UTF-8", "PYTHONHASHSEED": "0", "PYTHONPATH": str(ROOT),
             "TMPDIR": tmp, "PYTHONDONTWRITEBYTECODE": "1",
         }

@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -29,6 +29,7 @@ except ImportError:
 from gateway.platforms.api_server_room_grants import _json_error, _room_grant_error_response, room_run_claims
 from gateway.turn_executor import _UnboundedThreadExecutor
 from gateway.platforms.api_server_run_idempotency import TERMINAL_STATUSES
+from gateway.platforms.api_server_runs_owner import _lookup_for_replay, _stale_owner_status
 
 
 logger = logging.getLogger("gateway.platforms.api_server")
@@ -41,6 +42,11 @@ logger = logging.getLogger("gateway.platforms.api_server")
 # in the worker thread's own ``finally``, which also keeps it visible past ``adapters.clear()``.
 _API_WORKER_LOCK = threading.Lock()
 _API_WORKER_LIVE = 0
+# Serializes a run status mutation with the durable snapshot it enqueues: the loop and agent
+# worker threads (approval prompts, tool events) both publish statuses, and the store keeps the
+# newest ENQUEUED snapshot, so mutation order and enqueue order must be the same order. Held only
+# for dict updates and a JSON encode, never across I/O.
+_RUN_STATUS_LOCK = threading.RLock()
 # API-server agent turns and cron fires run on their own executor, as Desktop and messaging turns
 # do (``GatewayRunner._get_executor``). asyncio's default pool is ``min(32, cpu_count + 4)`` threads
 # shared with every ``asyncio.to_thread`` SessionDB read in the session handlers, so once live
@@ -308,8 +314,31 @@ def _close_run_state(self) -> None:
         logger.debug("Failed to close run idempotency store for %s", self.name, exc_info=True)
 
 
+async def _close_run_state_async(self) -> None:
+    """``_close_run_state`` for the event loop: queued status commits drain on the store's own
+    worker before its connection closes, and the loop is never the thread that waits for them."""
+    retire_api_turn_executor()
+    try:
+        store = getattr(self, "_run_idempotency_store", None)
+        aclose = getattr(store, "aclose", None)
+        if aclose is not None:
+            await aclose()
+        elif store is not None:
+            store.close()
+    except Exception:
+        logger.debug("Failed to close run idempotency store for %s", self.name, exc_info=True)
+
+
 def _set_run_status(self, run_id: str, status: str, **fields: Any) -> dict[str, Any]:
-    """Update pollable run status without exposing private agent objects."""
+    """Update pollable run status without exposing private agent objects.
+
+    A keyed run's status is persisted write-behind (``enqueue_status``): this may run on the
+    event loop or on an agent worker thread, and neither waits for the commit's fsync."""
+    with _RUN_STATUS_LOCK:
+        return _set_run_status_locked(self, run_id, status, **fields)
+
+
+def _set_run_status_locked(self, run_id: str, status: str, **fields: Any) -> dict[str, Any]:
     now = time.time()
     current = self._run_statuses.get(run_id, {})
     previous_status = str(current.get("status") or "")
@@ -330,7 +359,7 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> dict[str, 
             "output", "error", "usage", "pending_steer", "session_id", "shutdown_requested_at"}))
     if run_id in self._run_idempotency_ids and should_persist:
         try:
-            self._run_idempotency_store.update_status(run_id, current)
+            self._run_idempotency_store.enqueue_status(run_id, current)
         except Exception:
             logger.exception("[api_server] failed to persist idempotent run status %s", run_id)
     return current
@@ -456,16 +485,74 @@ def _owner_alive(owner_pid: int, owner_started: int) -> bool:
         return False
 
 
-def _durable_run_status(self, request: web.Request, run_id: str) -> dict[str, Any] | None:
-    """Hydrate a scoped run status and fail stale owners closed."""
+def _canonical_run_status(self, run_id: str) -> dict[str, Any] | None:
     from gateway.platforms.api_server_authority_runs import run_projection
     canonical = run_projection(self, run_id)
+    if canonical is None:
+        return None
+    # The documented poll shape: the canonical projection decides status/output/usage; the
+    # retained run record still names the object, the requested model and the served runtime.
+    retained = self._run_statuses.get(run_id) or {}
+    return {"object": "hermes.run", **{key: retained[key] for key in ("model", "runtime", "created_at")
+                                       if key in retained}, **canonical}
+
+
+def _load_durable_record(store, scope: str, run_id: str, retention_until: float):
+    """Store-worker half of a durable status hydration: the scoped read (with its retention
+    extension) and the stale-owner check, whose ``interrupted`` status is committed here. A
+    provisional reservation (``admitted: False``) whose owner still lives is not a run yet: its
+    owner may still release it, so it is not reported (an owner that died undecided is answered
+    by the stale-owner rule, as before)."""
+    record = store.status_for_run(scope, run_id, retention_until=retention_until)
+    if record is None:
+        return None
+    if record.get("admitted") is False and _owner_alive(
+            int(record.get("owner_pid") or 0), int(record.get("owner_started") or 0)):
+        return None
+    stale = _stale_owner_status(record)
+    if stale is not None:
+        store.update_status(run_id, stale)
+    return stale or dict(record["status"])
+
+
+def _adopt_durable_status(self, run_id: str, scope: str, status: dict[str, Any]) -> dict[str, Any]:
+    self._run_statuses[run_id] = status
+    self._run_idempotency_ids.add(run_id)
+    self._run_owners[run_id] = scope
+    return status
+
+
+async def _durable_run_status_async(self, request: web.Request, run_id: str) -> dict[str, Any] | None:
+    """``_durable_run_status`` with every run-store commit and read on the store's worker."""
+    canonical = _canonical_run_status(self, run_id)
     if canonical is not None:
-        # The documented poll shape: the canonical projection decides status/output/usage; the
-        # retained run record still names the object, the requested model and the served runtime.
-        retained = self._run_statuses.get(run_id) or {}
-        return {"object": "hermes.run", **{key: retained[key] for key in ("model", "runtime", "created_at")
-                                           if key in retained}, **canonical}
+        return canonical
+    store = self._run_idempotency_store
+    status = self._run_statuses.get(run_id)
+    if status is not None:
+        if run_id in self._run_idempotency_ids:
+            if status.get("status") in TERMINAL_STATUSES:
+                await _terminal_status_durable(self, run_id)
+            scope = self._run_idempotency_scope(request)
+            await store.extend_retention_async(scope, run_id, _room_retention_until(request))
+        return status
+    scope = self._run_idempotency_scope(request)
+    hydrated = await asyncio.wrap_future(store.submit(
+        _load_durable_record, store, scope, run_id, _room_retention_until(request)))
+    # Another request (or this process's own run) may have published the status meanwhile:
+    # the live record wins over the durable one, exactly as it does before the read.
+    current = self._run_statuses.get(run_id)
+    if current is not None:
+        return current
+    return None if hydrated is None else _adopt_durable_status(self, run_id, scope, hydrated)
+
+
+def _durable_run_status(self, request: web.Request, run_id: str) -> dict[str, Any] | None:
+    """Hydrate a scoped run status and fail stale owners closed (synchronous; the HTTP handlers
+    use ``_durable_run_status_async``)."""
+    canonical = _canonical_run_status(self, run_id)
+    if canonical is not None:
+        return canonical
     status = self._run_statuses.get(run_id)
     if status is not None:
         if run_id in self._run_idempotency_ids:
@@ -473,21 +560,9 @@ def _durable_run_status(self, request: web.Request, run_id: str) -> dict[str, An
             self._run_idempotency_store.extend_retention(scope, run_id, _room_retention_until(request))
         return status
     scope = self._run_idempotency_scope(request)
-    record = self._run_idempotency_store.status_for_run(
-        scope, run_id, retention_until=_room_retention_until(request))
-    if record is None:
-        return None
-    status = dict(record["status"])
-    if status.get("status") not in TERMINAL_STATUSES and not _owner_alive(
-        int(record.get("owner_pid") or 0), int(record.get("owner_started") or 0)):
-        status.update(
-            status="interrupted", error="The gateway restarted before this run settled.",
-            last_event="run.interrupted", updated_at=time.time())
-        self._run_idempotency_store.update_status(run_id, status)
-    self._run_statuses[run_id] = status
-    self._run_idempotency_ids.add(run_id)
-    self._run_owners[run_id] = scope
-    return status
+    hydrated = _load_durable_record(
+        self._run_idempotency_store, scope, run_id, _room_retention_until(request))
+    return None if hydrated is None else _adopt_durable_status(self, run_id, scope, hydrated)
 
 
 def _resolve_conversation_history(
@@ -555,15 +630,213 @@ def _accepted_response(run_id: str, status: str, gateway_session_key, *, replaye
         {"run_id": run_id, "status": status, "replayed": replayed}, status=202, headers=headers)
 
 
-def _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error) -> web.Response:
-    """409 for a fingerprint conflict, else a 202 replay of the already-admitted run."""
-    if outcome == "conflict":
-        return _json_error(
-            _openai_error, "Idempotency-Key was already used with a different request payload",
-            code="idempotency_key_conflict", status=409)
-    original_id = str(record["run_id"])
-    status = self._durable_run_status(request, original_id) or record["status"]
-    return _accepted_response(original_id, status.get("status", "queued"), gateway_session_key, replayed=True)
+# Rounds of join / look up / answer one keyed request may take before it answers "retry": each
+# round either waits for an in-process reservation to be decided or reads the key once more.
+_KEY_SETTLE_ROUNDS = 8
+
+
+class _KeyReservation:
+    """One in-process ``(scope, key)`` reservation, from the moment its commit is submitted until its
+    request is decided (admitted, refused, abandoned) or its row is released. A same-key request
+    joins it instead of replaying a row that a cancelled or refused admission may yet delete.
+
+    A release that did not delete the row (``failed``) is still owed: the entry stays registered,
+    so no same-key request treats the key as admitted or as free, and the next one retries it."""
+
+    __slots__ = ("failed", "future", "identity", "releasing")
+
+    def __init__(self, identity: tuple[str, str], loop: asyncio.AbstractEventLoop):
+        self.identity = identity
+        self.future = loop.create_future()
+        self.releasing = False  # a release owns settlement: it settles once the row is gone
+        self.failed = False
+
+
+def _key_reservations(self) -> dict:
+    registry = getattr(self, "_run_key_reservations", None)
+    if registry is None:  # bare ``__new__`` fixtures skip _initialize_run_state
+        registry = self._run_key_reservations = {}
+    return registry
+
+
+def _wake_key_joiners(entry: _KeyReservation) -> None:
+    if not entry.future.done():
+        entry.future.set_result(None)
+
+
+def _settle_key_reservation(self, entry: _KeyReservation) -> None:
+    """Event-loop thread only: the key's decision is final; joiners read the key afresh."""
+    registry = _key_reservations(self)
+    if registry.get(entry.identity) is entry:
+        del registry[entry.identity]
+    _wake_key_joiners(entry)
+
+
+def _release_key_reservation(self, entry: _KeyReservation, loop):
+    """Event-loop thread only. Delete a committed reservation whose request was not admitted.
+    Joiners resume only once the DELETE has committed (then the key is free) or failed (then the
+    release is still owed: ``failed``, retried by the next same-key request). -> the release's
+    future (its exception is the failure), or None when the store no longer accepts work."""
+    entry.releasing, entry.failed = True, False
+    if entry.future.done():
+        entry.future = loop.create_future()
+    store = self._run_idempotency_store
+    try:
+        released = store.submit(store.forget, *entry.identity)
+    except RuntimeError as exc:  # closed: the row stays provisional; its owner's death answers it
+        _key_release_done(self, entry, exc)
+        return None
+
+    def _done(done) -> None:
+        error = None if not done.cancelled() and done.exception() is None else (
+            done.exception() if not done.cancelled() else asyncio.CancelledError())
+        with suppress(RuntimeError):  # the loop is closed: nobody is left to join it
+            loop.call_soon_threadsafe(_key_release_done, self, entry, error)
+    released.add_done_callback(_done)
+    return released
+
+
+def _key_release_done(self, entry: _KeyReservation, error: Optional[BaseException]) -> None:
+    entry.releasing = False
+    if error is None:
+        _settle_key_reservation(self, entry)
+        return
+    logger.warning("[api_server] an unadmitted run reservation was not released (%s); it stays "
+                   "owed and same-key requests are refused as retryable until it is", error)
+    entry.failed = True
+    _wake_key_joiners(entry)
+
+
+def _confirm_key_admission(self, entry: Optional[_KeyReservation], run_id: str) -> None:
+    """The run exists now: its provisional reservation becomes an admission for every reader, in
+    any process (write-behind and owed until it commits; until then another process answers a
+    retryable 503, never a replay of a row this one could still release)."""
+    if entry is None:
+        return
+    try:
+        self._run_idempotency_store.enqueue_confirmation(*entry.identity, run_id)
+    except RuntimeError:
+        logger.warning("[api_server] could not confirm an admitted run reservation (store closed)")
+
+
+async def _admitted_by_authority(self, run_id: str) -> bool:
+    """Whether the session authority durably admitted *run_id* (off the loop). An admission it
+    committed is the run's truth whatever became of the HTTP request that asked for it -- a
+    cancelled caller never confirms its reservation, yet the shielded admission completes and
+    runs -- and the refusal path never releases a reservation whose admission exists.
+
+    The state.db read is owned by the gateway runner until its thread has finished
+    (``owned_offload``): a caller cancelled mid-read leaves it counted by the shutdown close gate,
+    so SessionDB is never closed under it."""
+    runner = getattr(self, "gateway_runner", None)
+    if getattr(runner, "session_authority", None) is None:
+        return False
+    from gateway.platforms.api_server_authority_runs import run_admission
+    from gateway.run_notifications_offload import owned_offload
+    try:
+        return await owned_offload(runner, run_admission, self, run_id) is not None
+    except Exception as exc:  # health: allow BLE001 -- unknown is answered as still pending
+        logger.debug("[api_server] admission lookup for run %s failed: %s", run_id, exc)
+        return False
+
+
+async def _confirm_recognized_admission(self, identity, run_id: str) -> bool:
+    """Confirm the provisional reservation of *run_id*, whose durable admission was recognized ->
+    committed (a no-op if the key names another run by now: the caller reads the key again);
+    a failed commit stays owed (``enqueue_confirmation``) and the caller answers 503 retry."""
+    store = self._run_idempotency_store
+    try:
+        await asyncio.wrap_future(store.submit(store.confirm_admission, *identity, run_id))
+        return True
+    except Exception as exc:  # health: allow BLE001 -- owed, and the request is answered retryable
+        logger.warning("[api_server] failed to confirm a recognized run admission (%s); still owed", exc)
+        with suppress(RuntimeError):
+            store.enqueue_confirmation(*identity, run_id)
+        return False
+
+
+async def _join_key_reservation(entry: _KeyReservation) -> None:
+    # Shielded: a joiner's own cancellation never settles the reservation it waits for.
+    await asyncio.shield(entry.future)
+
+
+@contextmanager
+def _key_reservation_held(self, entry: Optional[_KeyReservation]):
+    """Joiners of *entry* resume once this request is decided, whichever way; a release in
+    progress (or still owed) settles them itself."""
+    try:
+        yield
+    finally:
+        if entry is not None and not entry.releasing and not entry.failed:
+            _settle_key_reservation(self, entry)
+
+
+def _replayable(self, record: dict[str, Any]) -> bool:
+    """Whether a reused row names a run that may be acknowledged as admitted. A provisional row
+    may still be released by its owner: only that owner (this process, which knows the decision)
+    or the stale-owner rule (its owner died undecided -> ``interrupted``) may answer for it."""
+    if record.get("admitted") is not False:
+        return True
+    mine = (record["owner_pid"], record["owner_started"]) == (
+        getattr(self, "_run_owner_pid", None), getattr(self, "_run_owner_started", None))
+    if mine:
+        return str(record["run_id"]) in self._run_statuses
+    return not record.get("owner_alive", True)
+
+
+def _key_in_flight(_openai_error) -> web.Response:
+    response = _json_error(
+        _openai_error, "Idempotency-Key is still being settled by another request; retry",
+        code="idempotency_key_in_flight", status=503)
+    response.headers["Retry-After"] = "1"
+    return response
+
+
+async def _keyed_answer(self, request, identity, fingerprint, gateway_session_key, _openai_error, found=None):
+    """The answer to a keyed POST whose key is taken (202 replay, 409 conflict, 503 retry), or None
+    once the key is free to reserve -- and then no in-process reservation of it is pending.
+
+    A replay is only ever answered for an admitted reservation: one still being decided in this
+    process is joined first (an owed release is retried first), a provisional row another live
+    process may still release is answered 503 retry, and a row that is gone by the time its run is
+    read is looked up again rather than acknowledged from the stale record."""
+    registry, store = _key_reservations(self), self._run_idempotency_store
+    loop = asyncio.get_running_loop()
+    for _ in range(_KEY_SETTLE_ROUNDS):
+        pending = registry.get(identity)
+        if pending is not None:
+            if pending.failed:
+                _release_key_reservation(self, pending, loop)
+            await _join_key_reservation(pending)
+            found = None
+            continue
+        if found is None:
+            found = await asyncio.wrap_future(store.submit(
+                _lookup_for_replay, store, *identity, fingerprint, _room_retention_until(request)))
+            continue  # look at the registry again: a reservation may have started meanwhile
+        outcome, record = found
+        if outcome == "missing":
+            return None
+        if outcome == "conflict":
+            return _json_error(
+                _openai_error, "Idempotency-Key was already used with a different request payload",
+                code="idempotency_key_conflict", status=409)
+        if record.get("admitted") is False and "owner_alive" not in record:
+            found = None  # a provisional row from ``reserve``: read it with its owner's liveness
+            continue
+        if not _replayable(self, record):
+            recognized = str(record["run_id"])
+            if await _admitted_by_authority(self, recognized) and \
+                    await _confirm_recognized_admission(self, identity, recognized):
+                found = None  # now admitted for every reader: read it again
+                continue
+            return _key_in_flight(_openai_error)
+        original_id = str(record["run_id"])
+        status = await _durable_run_status_async(self, request, original_id)
+        if status is not None and identity not in registry:
+            return _accepted_response(original_id, status.get("status", "queued"), gateway_session_key, replayed=True)
+        found = None  # released (or re-reserved) meanwhile: decide again from the store
+    return _key_in_flight(_openai_error)
 
 
 @dataclass(slots=True)
@@ -730,7 +1003,7 @@ def _run_user_message(raw_input, _openai_error) -> tuple:
 
 async def _admit_run_to_authority(
     self, launch, run_id, session_history_delivery, _declared_selected,
-    idempotency_scope, idempotency_key, _openai_error,
+    idempotency_scope, idempotency_key, _openai_error, reservation: Optional[_KeyReservation] = None,
 ) -> Optional[web.Response]:
     """Admit a /v1/runs turn to the session authority FIFO -> ``None``, or the refusal."""
     from gateway.platforms.api_server_authority_runs import run_admission, store_error_response
@@ -759,10 +1032,96 @@ async def _admit_run_to_authority(
         _forget_run(
             self, run_id, self._run_streams, self._run_streams_created, self._run_approval_sessions,
             self._run_statuses, self._run_owners, self._run_idempotency_ids)
-        if idempotency_key:
-            self._run_idempotency_store.forget(idempotency_scope, idempotency_key)
+        if reservation is not None:
+            released = _release_key_reservation(self, reservation, asyncio.get_running_loop())
+            if released is not None:
+                with suppress(Exception):  # a failed release stays owed (``_KeyReservation``)
+                    await asyncio.shield(asyncio.wrap_future(released))
+        elif idempotency_key:
+            await self._run_idempotency_store.forget_async(idempotency_scope, idempotency_key)
         return store_error_response(_openai_error, exc)
     return None
+
+
+async def _reserve_idempotency_key(self, entry: _KeyReservation, fingerprint, run_id, status, request):
+    """Commit the ``(scope, key)`` reservation on the store's worker; the caller admits nothing
+    until this returns. A handler cancelled meanwhile admits nothing either, so a reservation the
+    worker still commits is released, as a refused admission's is (``_admit_run_to_authority``);
+    requests that joined *entry* resume only after that release, so none of them replays it."""
+    store = self._run_idempotency_store
+    loop = asyncio.get_running_loop()
+    future = store.submit(
+        store.reserve, *entry.identity, fingerprint, run_id, status,
+        owner_pid=self._run_owner_pid, owner_started=self._run_owner_started,
+        retention_until=_room_retention_until(request), provisional=True)
+    try:
+        return await asyncio.wrap_future(future)
+    except asyncio.CancelledError:
+        entry.releasing = True
+
+        def _decide(created: bool) -> None:  # on the loop
+            if created:
+                _release_key_reservation(self, entry, loop)
+            else:  # nothing was committed
+                entry.releasing = False
+                _settle_key_reservation(self, entry)
+
+        def _committed(done) -> None:
+            created = not done.cancelled() and done.exception() is None and done.result()[0] == "created"
+            with suppress(RuntimeError):  # the loop is closed: the row stays provisional, owner-bound
+                loop.call_soon_threadsafe(_decide, created)
+        future.add_done_callback(_committed)
+        raise
+
+
+async def _reserve_run(self, request, run_id, initial_status, identity, gateway_session_key, _openai_error):
+    """Reserve a keyed run's ``(scope, key)`` -> ``(None, reservation)`` once committed, else
+    ``(answer, None)`` (replay, conflict or retry). Every non-admission drops the run's live state."""
+    scope, key, fingerprint = identity
+    reserved = dict(initial_status)  # the snapshot committed, whatever the live dict does meanwhile
+    drop = (self._run_streams, self._run_streams_created, self._run_approval_sessions,
+            self._run_statuses, self._run_owners)
+    registry, loop = _key_reservations(self), asyncio.get_running_loop()
+    for _ in range(_KEY_SETTLE_ROUNDS):
+        if (scope, key) in registry:  # another request of this key is still being decided
+            try:
+                answer = await _keyed_answer(self, request, (scope, key), fingerprint, gateway_session_key, _openai_error)
+            except BaseException:
+                _forget_run(self, run_id, *drop)
+                raise
+            if answer is not None:
+                _forget_run(self, run_id, *drop)
+                return answer, None
+        entry = registry[(scope, key)] = _KeyReservation((scope, key), loop)
+        try:
+            outcome, record = await _reserve_idempotency_key(self, entry, fingerprint, run_id, reserved, request)
+        except BaseException:
+            _forget_run(self, run_id, *drop)
+            if not entry.releasing:  # the commit failed: nothing to release
+                _settle_key_reservation(self, entry)
+            raise
+        if outcome == "created":
+            break
+        _settle_key_reservation(self, entry)  # this request holds nothing
+        answer = await _keyed_answer(
+            self, request, (scope, key), fingerprint, gateway_session_key, _openai_error, found=(outcome, record))
+        if answer is not None:
+            _forget_run(self, run_id, *drop)
+            return answer, None
+    else:
+        _forget_run(self, run_id, *drop)
+        return _key_in_flight(_openai_error), None
+    self._run_idempotency_ids.add(run_id)
+    # A status published while the reservation committed (the drain marker) was not yet
+    # persistable; it is the run's newest status, so it follows the reserved row now.
+    with _RUN_STATUS_LOCK:
+        current = self._run_statuses.get(run_id)
+        if current is not None and current != reserved:
+            try:
+                self._run_idempotency_store.enqueue_status(run_id, current)
+            except Exception:
+                logger.exception("[api_server] failed to persist idempotent run status %s", run_id)
+    return None, entry
 
 
 async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Response:
@@ -815,11 +1174,11 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
     # A lost-acceptance replay must resolve even while the original run holds the last
     # concurrency slot; this read reserves nothing (the atomic reserve below closes the race).
     if idempotency_key:
-        outcome, record = self._run_idempotency_store.lookup(
-            idempotency_scope, idempotency_key, idempotency_fingerprint,
-            retention_until=_room_retention_until(request))
-        if outcome == "conflict" or (outcome == "reused" and record is not None):
-            return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
+        answer = await _keyed_answer(
+            self, request, (idempotency_scope, idempotency_key), idempotency_fingerprint,
+            gateway_session_key, _openai_error)
+        if answer is not None:
+            return answer
     # Enforce concurrency only for a genuinely new run.
     limited = self._concurrency_limited_response()
     if limited is not None:
@@ -855,50 +1214,51 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
     self._run_approval_sessions[run_id] = run_id  # approval session key (see _RunLaunch)
     initial_status = self._set_run_status(
         run_id, "queued", created_at=created_at, session_id=session_id, model=body.get("model", self._model_name))
+    reservation = None
     if idempotency_key:
-        outcome, record = self._run_idempotency_store.reserve(
-            idempotency_scope, idempotency_key, idempotency_fingerprint, run_id, initial_status,
-            owner_pid=self._run_owner_pid, owner_started=self._run_owner_started,
-            retention_until=_room_retention_until(request))
-        if outcome != "created":
-            _forget_run(
-                self, run_id, self._run_streams, self._run_streams_created, self._run_approval_sessions,
-                self._run_statuses, self._run_owners)
-            return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
-        self._run_idempotency_ids.add(run_id)
-    launch = _RunLaunch(
-        self, run_id, q, session_id, gateway_session_key, _declared_selected, user_message,
-        conversation_history, session_history_delivery,
-        agent_kwargs=dict(
-            ephemeral_system_prompt=instructions, session_id=session_id, gateway_session_key=gateway_session_key,
-            route=route, room_dispatch=room_dispatch, room_execution_policy=room_execution_policy,
-            **{k: agent_overrides.get(k) for k in ("requested_model", "requested_provider", "model_options")}),
-        request_profile=_api_server._api_request_profile.get(),
-        turn_author=turn_author, walked_from=walked_from if session_id == stored_session_id else None)
-    # A canonical Bot Chat that a Desktop holds live is that Desktop's to run: executing here would
-    # be a second writer beside its lease (#114959). The owner's mailbox takes the turn and its
-    # receipt drives this run's status, so `peer run` keeps its run_id and `peer status` still works.
-    # Under session authority the same call admits the turn to the Bot Chat's own FIFO, which is
-    # why it is decided BEFORE ``admit_api_turn`` would bind the chat as an API conversation.
-    admitted = await self._admit_to_live_bot_chat(session_id, user_message, turn_author) if selected_session_id else None
-    _retarget_to_delivered_chat(self, launch, admitted)
-    if admitted is None and getattr(self.gateway_runner, 'session_authority', None) is not None:
-        refused = await _admit_run_to_authority(
-            self, launch, run_id, session_history_delivery, _declared_selected,
-            idempotency_scope, idempotency_key, _openai_error)
-        if refused is not None:
-            return refused
-    self._activate_admitted_request()
-    if admitted is not None:
-        task = self._active_run_tasks[run_id] = asyncio.create_task(
-            _execute_run_via_live_owner(self, launch, *admitted, _api_server=_api_server))
-    else:
-        task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
-    with suppress(TypeError):
-        self._background_tasks.add(task)  # tracked for shutdown drain
-    if hasattr(task, "add_done_callback"):
-        task.add_done_callback(self._background_tasks.discard)
-    return _accepted_response(run_id, "started", gateway_session_key, replayed=False)
+        replayed, reservation = await _reserve_run(
+            self, request, run_id, initial_status, (idempotency_scope, idempotency_key, idempotency_fingerprint),
+            gateway_session_key, _openai_error)
+        if replayed is not None:
+            return replayed
+    # Joiners of this key's reservation resume once the request below is decided, whichever way.
+    with _key_reservation_held(self, reservation):
+        launch = _RunLaunch(
+            self, run_id, q, session_id, gateway_session_key, _declared_selected, user_message,
+            conversation_history, session_history_delivery,
+            agent_kwargs=dict(
+                ephemeral_system_prompt=instructions, session_id=session_id, gateway_session_key=gateway_session_key,
+                route=route, room_dispatch=room_dispatch, room_execution_policy=room_execution_policy,
+                **{k: agent_overrides.get(k) for k in ("requested_model", "requested_provider", "model_options")}),
+            request_profile=_api_server._api_request_profile.get(),
+            turn_author=turn_author, walked_from=walked_from if session_id == stored_session_id else None)
+        # A canonical Bot Chat that a Desktop holds live is that Desktop's to run: executing here would
+        # be a second writer beside its lease (#114959). The owner's mailbox takes the turn and its
+        # receipt drives this run's status, so `peer run` keeps its run_id and `peer status` still works.
+        # Under session authority the same call admits the turn to the Bot Chat's own FIFO, which is
+        # why it is decided BEFORE ``admit_api_turn`` would bind the chat as an API conversation.
+        admitted = (await self._admit_to_live_bot_chat(session_id, user_message, turn_author)
+                    if selected_session_id else None)
+        _retarget_to_delivered_chat(self, launch, admitted)
+        if admitted is None and getattr(self.gateway_runner, 'session_authority', None) is not None:
+            refused = await _admit_run_to_authority(
+                self, launch, run_id, session_history_delivery, _declared_selected,
+                idempotency_scope, idempotency_key, _openai_error, reservation=reservation)
+            if refused is not None:
+                return refused
+        self._activate_admitted_request()
+        if admitted is not None:
+            task = self._active_run_tasks[run_id] = asyncio.create_task(
+                _execute_run_via_live_owner(self, launch, *admitted, _api_server=_api_server))
+        else:
+            task = self._active_run_tasks[run_id] = asyncio.create_task(
+                _execute_run(self, launch, _api_server=_api_server))
+        with suppress(TypeError):
+            self._background_tasks.add(task)  # tracked for shutdown drain
+        if hasattr(task, "add_done_callback"):
+            task.add_done_callback(self._background_tasks.discard)
+        _confirm_key_admission(self, reservation, run_id)
+        return _accepted_response(run_id, "started", gateway_session_key, replayed=False)
 
 
 def _retarget_to_delivered_chat(self, launch: _RunLaunch, admitted) -> None:
@@ -1033,8 +1393,9 @@ async def _execute_run_via_live_owner(self, run: _RunLaunch, home, record: dict[
             # rewrite it as a plain "cancelled" (same guard as the native _execute_run).
             status, fields = "interrupted", {"error": "Gateway shutdown interrupted the run."}
         self._set_run_status(run_id, status, **fields, last_event=f"run.{status}")
+        event = _run_event(run_id, f"run.{status}", **fields)
         with suppress(Exception):
-            run.put_event(_run_event(run_id, f"run.{status}", **fields))
+            _publish_after_durable(self, run_id, asyncio.get_running_loop(), lambda: run.put_event(event))
 
     try:
         self._set_run_status(run_id, "running", delivery_id=delivery_id)
@@ -1059,8 +1420,8 @@ async def _execute_run_via_live_owner(self, run: _RunLaunch, home, record: dict[
         logger.exception("[api_server] run %s (live Bot Chat) failed", run_id)
         _finish("failed", completed=False, partial=False, interrupted=False, error=str(exc))
     finally:
-        with suppress(Exception):
-            run.put_event(None)  # sentinel: close the SSE stream
+        with suppress(Exception):  # sentinel: close the SSE stream, after the terminal event
+            _publish_after_durable(self, run_id, asyncio.get_running_loop(), lambda: run.put_event(None))
         _retire_live_run(self, run_id)
 
 
@@ -1094,10 +1455,12 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             fields = {"error": "Gateway shutdown interrupted the run."}
             extra = {}
         self._set_run_status(run_id, status, **fields, last_event=f"run.{status}", **extra)
+        event = _run_event(run_id, f"run.{status}", **fields, **extra)
         with suppress(Exception):
             # A worker can finish before its Future is wrapped, so awaiting it
-            # need not yield to already-scheduled commentary/tool callbacks.
-            loop.call_soon(run.put_event, _run_event(run_id, f"run.{status}", **fields, **extra))
+            # need not yield to already-scheduled commentary/tool callbacks; and the
+            # event follows the terminal status's commit (``_publish_after_durable``).
+            _publish_after_durable(self, run_id, loop, lambda: run.put_event(event))
 
     try:
         # Shutdown landed between admission and the task's first tick: nothing to
@@ -1187,8 +1550,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         # On cancellation (/stop) the executor thread may still block on an approval
         # Event; unregistering releases it. Idempotent on normal completion.
         _unregister_approval_notify(run.approval_session_key)
-        with suppress(Exception):
-            loop.call_soon(run.put_event, None)  # close after the queued events
+        with suppress(Exception):  # close after the queued events and the terminal commit
+            _publish_after_durable(self, run_id, loop, lambda: run.put_event(None))
         _retire_live_run(self, run_id)
 
 
@@ -1209,6 +1572,18 @@ def _release_run_owner_if_forgotten(self, run_id: str) -> None:
         self._run_owners.pop(run_id, None)
 
 
+async def _request_owns_run_async(self, request: web.Request, run_id: str) -> bool:
+    """``_request_owns_run`` with the durable-ownership read on the run store's worker."""
+    scope = self._run_idempotency_scope(request)
+    owner = self._run_owners.get(run_id)
+    if owner is not None:
+        return owner == scope
+    if await self._run_idempotency_store.owns_run_async(scope, run_id):
+        return True
+    from gateway.session_api_turn import owns_api_run
+    return owns_api_run(self, run_id, scope)
+
+
 def _request_owns_run(self, request: web.Request, run_id: str) -> bool:
     scope = self._run_idempotency_scope(request)
     owner = self._run_owners.get(run_id)
@@ -1225,7 +1600,7 @@ def _request_owns_run(self, request: web.Request, run_id: str) -> bool:
     return owns_api_run(self, run_id, scope)
 
 
-def _load_owned_run(self, request, *, _api_server, permission: Optional[str], active_fallback: bool):
+async def _load_owned_run(self, request, *, _api_server, permission: Optional[str], active_fallback: bool):
     """Authenticate (*permission* -> room-grant aware; ``None`` -> API key only) and resolve
     ``(run_id, status, agent, task, error)``; *active_fallback* reports a live in-process run
     without pollable status as ``running`` instead of 404."""
@@ -1234,11 +1609,12 @@ def _load_owned_run(self, request, *, _api_server, permission: Optional[str], ac
         return None, None, None, None, auth_err
     _openai_error = _api_server._openai_error
     run_id = request.match_info["run_id"]
-    if not self._request_owns_run(request, run_id):
+    if not await _request_owns_run_async(self, request, run_id):
         return run_id, None, None, None, _run_not_found(_openai_error, run_id)
+    status = await _durable_run_status_async(self, request, run_id)
+    # Read after the store awaits: the live refs are whatever the run holds at answer time.
     agent = self._active_run_agents.get(run_id)
     task = self._active_run_tasks.get(run_id)
-    status = self._durable_run_status(request, run_id)
     if status is None and active_fallback and (agent is not None or task is not None):
         status = self._set_run_status(run_id, "running")
     if status is None:
@@ -1248,7 +1624,7 @@ def _load_owned_run(self, request, *, _api_server, permission: Optional[str], ac
 
 async def _handle_get_run(self, request: web.Request, *, _api_server) -> web.Response:
     """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
-    _, status, _, _, err = _load_owned_run(
+    _, status, _, _, err = await _load_owned_run(
         self, request, _api_server=_api_server, permission="status", active_fallback=True)
     return err or web.json_response(status)
 
@@ -1260,7 +1636,7 @@ async def _handle_run_events(self, request: web.Request, *, _api_server) -> web.
     if auth_err:
         return auth_err
     run_id = request.match_info["run_id"]
-    if not self._request_owns_run(request, run_id):
+    if not await _request_owns_run_async(self, request, run_id):
         return _run_not_found(_api_server._openai_error, run_id)
     # Allow subscribing slightly before the run is registered (race window).
     # Confirm the force-kill actually reaped the process before we clear its PID file / scoped locks.
@@ -1358,7 +1734,7 @@ def _mark_run_event(self, run_id: str, name: str, **fields: Any) -> None:
 async def _handle_run_approval(self, request: web.Request, *, _api_server) -> web.Response:
     """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""
     _openai_error = _api_server._openai_error
-    run_id, _, _, _, err = _load_owned_run(
+    run_id, _, _, _, err = await _load_owned_run(
         self, request, _api_server=_api_server, permission="approve", active_fallback=False)
     if err is not None:
         return err
@@ -1423,7 +1799,7 @@ async def _respond_authority_run(self, run_id, body, *, kind, _api_server):
 
 
 async def _handle_run_clarify(self, request, *, _api_server):
-    run_id, _, _, _, err = _load_owned_run(
+    run_id, _, _, _, err = await _load_owned_run(
         self, request, _api_server=_api_server, permission="approve", active_fallback=False)
     if err is not None:
         return err
@@ -1441,7 +1817,7 @@ def _steer_refused(_openai_error, run_id):
 async def _handle_steer_run(self, request: web.Request, *, _api_server) -> web.Response:
     """POST /v1/runs/{run_id}/steer — inject guidance into a running agent."""
     _openai_error = _api_server._openai_error
-    run_id, status, agent, _, err = _load_owned_run(
+    run_id, status, agent, _, err = await _load_owned_run(
         self, request, _api_server=_api_server, permission=None, active_fallback=False)
     if err is not None:
         return err
@@ -1496,7 +1872,7 @@ async def _handle_steer_run(self, request: web.Request, *, _api_server) -> web.R
 async def _handle_stop_run(self, request: web.Request, *, _api_server) -> web.Response:
     """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
     _openai_error = _api_server._openai_error
-    run_id, status, agent, task, err = _load_owned_run(
+    run_id, status, agent, task, err = await _load_owned_run(
         self, request, _api_server=_api_server, permission="stop", active_fallback=True)
     if err is not None:
         return err
@@ -1531,7 +1907,7 @@ async def _handle_resolve_unknown_run(
     self, request: web.Request, *, _api_server
 ) -> web.Response:
     """POST /v1/runs/{run_id}/resolve-unknown — acknowledge one lost owner epoch."""
-    run_id, _, _, _, err = _load_owned_run(
+    run_id, _, _, _, err = await _load_owned_run(
         self, request, _api_server=_api_server, permission="stop", active_fallback=False)
     if err is not None:
         return err
@@ -1553,6 +1929,40 @@ async def _sweep_orphaned_runs(self) -> None:
     while True:
         await asyncio.sleep(60)
         self._sweep_orphaned_runs_once(time.time())
+
+
+def _durability_of(self, run_id: str):
+    """The run's outstanding status commits as a future (None: nothing outstanding / unkeyed)."""
+    store = getattr(self, "_run_idempotency_store", None)
+    durable_after = getattr(store, "durable_after", None)
+    if durable_after is None or run_id not in getattr(self, "_run_idempotency_ids", ()):
+        return None
+    return durable_after(run_id)
+
+
+async def _terminal_status_durable(self, run_id: str) -> None:
+    """Wait (off-loop) until the run's published statuses are committed; a failed write keeps its
+    established disposition (logged, the live status still answers), so its error is not raised."""
+    durable = _durability_of(self, run_id)
+    if durable is not None:
+        with suppress(Exception):
+            await asyncio.shield(asyncio.wrap_future(durable))
+
+
+def _publish_after_durable(self, run_id: str, loop, publish: Callable[[], None]) -> None:
+    """Run *publish* on the loop once every status enqueued for the run is committed, or failed
+    and was logged (the established disposition): a terminal event, or the stream close after it,
+    is never observable before the terminal status it reports is durable. The commit stays off the
+    loop, and the publication does not depend on the producing task surviving cancellation."""
+    durable = _durability_of(self, run_id)
+    if durable is None:  # queued behind any publication an earlier commit already released
+        loop.call_soon(publish)
+        return
+
+    def _published(_done) -> None:
+        with suppress(RuntimeError):  # the loop is closed: nobody is left to read the stream
+            loop.call_soon_threadsafe(publish)
+    durable.add_done_callback(_published)
 
 
 def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:

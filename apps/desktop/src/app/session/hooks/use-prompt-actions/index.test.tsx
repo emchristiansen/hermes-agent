@@ -2974,7 +2974,7 @@ describe('usePromptActions redirectPrompt', () => {
     expect(accepted).toBe(true)
     expect(requestGateway).toHaveBeenCalledWith('session.redirect', {
       session_id: RUNTIME_SESSION_ID,
-      text: 'nudge the run'
+      text: 'nudge the run', correction_id: expect.any(String)
     })
     expect(requestGateway).not.toHaveBeenCalledWith('prompt.submit', expect.anything())
     expect((capturedStates.at(-1)?.messages as unknown[]).at(-1)).toMatchObject({
@@ -3113,7 +3113,7 @@ describe('usePromptActions redirectPrompt', () => {
     expect(await handle!.redirectPrompt('build-window nudge')).toBe(true)
     expect(requestGateway).toHaveBeenCalledWith('session.redirect', {
       session_id: RUNTIME_SESSION_ID,
-      text: 'build-window nudge'
+      text: 'build-window nudge', correction_id: expect.any(String)
     })
     expect(requestGateway).not.toHaveBeenCalledWith('prompt.submit', expect.anything())
     expect((capturedStates.at(-1)?.messages as unknown[]).at(-1)).toMatchObject({
@@ -3161,9 +3161,9 @@ describe('usePromptActions redirectPrompt', () => {
 
     expect(await handle!.redirectPrompt('reconnect nudge')).toBe(true)
     expect(calls.map(c => c.method)).toEqual(['session.redirect', 'session.resume', 'session.redirect'])
-    expect(calls[0]?.params).toEqual({ session_id: RUNTIME_SESSION_ID, text: 'reconnect nudge' })
+    expect(calls[0]?.params).toEqual({ session_id: RUNTIME_SESSION_ID, text: 'reconnect nudge', correction_id: expect.any(String) })
     expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop', omit_messages: true })
-    expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID, text: 'reconnect nudge' })
+    expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID, text: 'reconnect nudge', correction_id: calls[0]?.params?.correction_id })
     expect(handle!.activeSessionIdRef.current).toBe(RECOVERED_SESSION_ID)
   })
 })
@@ -5283,7 +5283,7 @@ describe('usePromptActions stale-closure session routing', () => {
     // this is the observed "session suddenly working on another chat's task".
     expect(requestGateway).toHaveBeenCalledWith('session.redirect', {
       session_id: RUNTIME_SESSION_B,
-      text: 'actually use Postgres'
+      text: 'actually use Postgres', correction_id: expect.any(String)
     })
     expect(requestGateway).not.toHaveBeenCalledWith(
       'session.redirect',

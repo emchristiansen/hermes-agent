@@ -1,3 +1,4 @@
+import { jsonRpcErrorFromFrame } from '@hermes/shared/json-rpc-channel'
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -184,7 +185,7 @@ it('discards unknown execution with its generation, retaining the row on refusal
   } finally { h.cleanup() }
 })
 
-it('never replays an ambiguous non-idempotent busy correction or falls back to queue', async () => {
+it('sends an ambiguous busy correction again as the same correction, never as a queued prompt', async () => {
   const h = mount('steer')
 
   try {
@@ -196,8 +197,9 @@ it('never replays an ambiguous non-idempotent busy correction or falls back to q
     await expect.poll(() => h.queue.queueRef.current[0]?.failed).toBe(true)
     patchUiState({ busyInputMode: 'interrupt', info: { ...$uiState.get().info!, execution_generation: 2 } })
     h.submission.sendQueued(h.queue.dequeue(true)!)
-    await new Promise(resolve => setImmediate(resolve))
-    expect(h.calls).toEqual([{ method: 'session.steer', params: first }])
+    // At least once: the retry is the same correction for the same claim, never a prompt.submit.
+    await expect.poll(() => h.calls.length).toBe(2)
+    expect(h.calls).toEqual([{ method: 'session.steer', params: first }, { method: 'session.steer', params: first }])
     expect(first).not.toHaveProperty('submission_id')
     expect(loadPendingInputs(captureDestination())[0]).toMatchObject({ controlMethod: 'session.steer', executionGeneration: 1 })
   } finally { h.cleanup() }
@@ -286,5 +288,70 @@ it('re-admits an edited row to the session it was edited in, even when the user 
     release({ admission_id: 'adm-orig', status: 'terminal', outcome: 'cancelled' })
     await expect.poll(() => h.calls.filter(c => c.method === 'prompt.submit').length).toBe(1)
     expect(h.calls.find(c => c.method === 'prompt.submit')!.params).toMatchObject({ session_id: 'owner', text: 'EDITED_A' })
+  } finally { h.cleanup() }
+})
+
+// The owner's own refusal when it could not keep a correction (gateway/session_managed_worker), and a
+// transport lost before any reply: either way A is retried as the same correction, and B never waits on it.
+it.each(['correction_not_kept', 'transport_lost_before_delivery'])(
+  'an undelivered correction stays resendable as itself and never holds back the next one (%s)', async failure => {
+    const h = mount('steer')
+    let failA = true
+
+    try {
+      h.request.mockImplementation(async (method, params) => {
+        h.calls.push({ method, params })
+
+        if (params.text === 'UNCERTAIN_A' && failA) {
+          throw failure === 'correction_not_kept'
+            ? jsonRpcErrorFromFrame({ message: 'correction_not_kept', data: { reason: 'correction_not_kept' } })
+            : new Error(failure)
+        }
+
+        return { status: 'queued', execution_generation: params.execution_generation } as any
+      })
+      h.submission.dispatchSubmission('UNCERTAIN_A')
+      await expect.poll(() => h.queue.queueRef.current[0]?.failed).toBe(true)
+      failA = false
+      h.submission.dispatchSubmission('LATER_B')
+      await expect.poll(() => h.calls.filter(c => c.params.text === 'LATER_B').length).toBe(1)
+      await expect.poll(() => h.queue.queueRef.current.length).toBe(1)
+      h.submission.sendQueued(h.queue.dequeue(true)!)
+      await expect.poll(() => h.calls.filter(c => c.params.text === 'UNCERTAIN_A').length).toBe(2)
+      expect(h.calls.map(c => c.method)).toEqual(['session.steer', 'session.steer', 'session.steer'])
+      expect(h.calls.filter(c => c.params.text === 'UNCERTAIN_A').map(c => c.params.execution_generation)).toEqual([1, 1])
+      await expect.poll(() => h.queue.queueRef.current.length).toBe(0)
+    } finally { h.cleanup() }
+  }
+)
+
+// NC11-CLIENT-01: a card correction whose kept ACK was lost, retried after its claim ended. The owner
+// keeps it on the card's task again and answers the kept ACK (gateway/session_managed_worker
+// keep_closed_card_correction), so the retry settles kept: never a fresh, task-unbound prompt.submit.
+it('settles a retried card correction the owner kept on its task after the claim ended', async () => {
+  const h = mount('steer')
+
+  try {
+    let attempt = 0
+    h.request.mockImplementation(async (method, params) => {
+      h.calls.push({ method, params })
+
+      if (method === 'prompt.submit') {
+        return { status: 'queued', admission_id: 'unbound' } as any
+      }
+
+      if (attempt++ === 0) {
+        throw new Error('task comment kept but reply lost')
+      }
+
+      return { text: params.text, execution_generation: params.execution_generation, authority_epoch: 1,
+        status: 'rejected', delivered: false, kept: 'task_comment' } as any
+    })
+    h.submission.dispatchSubmission('TASK_BOUND_RETRY')
+    await expect.poll(() => h.queue.queueRef.current[0]?.failed).toBe(true)
+    h.submission.sendQueued(h.queue.dequeue(true)!)
+    await expect.poll(() => h.queue.queueRef.current.length).toBe(0)
+    expect(h.calls.map(c => [c.method, c.params.execution_generation])).toEqual([['session.steer', 1], ['session.steer', 1]])
+    expect(loadPendingInputs(captureDestination())).toEqual([])
   } finally { h.cleanup() }
 })

@@ -33,6 +33,9 @@ class RuntimeSessionCompressionMixin:
                 raise WorkerPersistenceError('permission_denied')
         return self._apply('compression.context', {'target': session_id})['session']
 
+    def end_conversation_in_place(self, session_id):
+        self._apply('conversation.end', {'target': session_id})
+
     def get_compression_lineage(self, session_id):
         return self._apply('compression.lineage', {'target': session_id})['lineage']
 
@@ -45,8 +48,11 @@ class RuntimeSessionCompressionMixin:
     def get_compression_tip(self, session_id):
         return self._apply('compression.lineage', {'target': session_id})['tip']
 
-    def resolve_resume_session_id(self, session_id):
-        return self._apply('compression.lineage', {'target': session_id})['resume']
+    def resolve_resume_session_id(self, session_id, *, strict=False):
+        # ``strict`` reaches the owner's selector: without it a failed selection read is swallowed there and
+        # comes back as the input id inside a successful receipt, which a reset must not accept.
+        payload = {'target': session_id, **({'strict': True} if strict else {})}
+        return self._apply('compression.lineage', payload)['resume']
 
     def declared_scope_identity(self, session_id):
         return tuple(self._apply('compression.lineage', {'target': session_id})['identity'])
@@ -90,6 +96,9 @@ class RuntimeSessionCompressionMixin:
             unresolved_held=unresolved, held_for_cas=cas))
         from agent.runtime_session_store import apply_row_annotations
         apply_row_annotations(compacted_messages, result['annotations'])
+        # The worker's local context version (the prompt-cache clock's compaction witness): every
+        # in-place rewrite archives through here, a prune or micro-compaction included.
+        self.context_rewrites = getattr(self, 'context_rewrites', 0) + 1
         return result['value']
 
     def publish_compression_child(self, *, parent_session_id, child_session_id, source, messages,

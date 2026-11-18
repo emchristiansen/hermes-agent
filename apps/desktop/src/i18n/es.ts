@@ -777,6 +777,8 @@ export const esOverrides = {
       mcp: 'MCP',
       archivedChats: 'Chats archivados',
       sessions: 'Sesiones',
+      backup: 'Copia de seguridad y transferencia',
+      backupOnly: 'Copia de seguridad',
       about: 'Acerca de',
       billing: 'Facturación',
       notifications: 'Notificaciones',
@@ -3945,6 +3947,13 @@ export const esOverrides = {
       'El gateway se reinició a mitad del turno y no puede terminarlo. Descártalo para que se ejecuten los turnos en cola que esperan detrás.',
     queueStuckTitle: 'Mensaje en cola no enviado',
     queueStuckBody: 'Un turno en cola no llegó a enviarse. Sigue en la cola; vuelve a intentarlo.',
+    correctionUnconfirmedTitle: 'Corrección no confirmada',
+    correctionUnconfirmedBody:
+      'Puede que ya haya llegado a la ejecución. Se vuelve a enviar automáticamente como la misma corrección hasta que la ejecución la confirme; «Enviar de nuevo» la envía ahora. Un duplicado no es problema.',
+    correctionSendAgain: 'Enviar de nuevo',
+    correctionNotSentTitle: 'Corrección no enviada',
+    correctionNotSentBody:
+      'No se envió y tu borrador actual quedó como estaba. Su texto está abajo; vuelve a enviarlo tú si aún aplica.',
     queueDroppedTitle: 'Entrada en cola descartada',
     queueDroppedBody:
       'Se descartó esta entrada en segundo plano porque su sesión no se pudo reanudar tras varios intentos. El resto de la cola no se ha visto afectado.',

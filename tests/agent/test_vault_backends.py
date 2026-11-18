@@ -109,11 +109,13 @@ def test_unlock_uses_vendor_passwordenv_contract_then_fill_routes_by_prefix(fake
     try:
         with patcher, patch("agent.vault_backends.enabled_backends", return_value=[backend]), \
              patch("tools.browser_vault_tool._current_page_origin", return_value="https://example.com"), \
-             patch("tools.browser_vault_tool._eval_js", return_value={"success": True, "result": json.dumps([
-                 {"tag": "input", "type": "password", "name": "password", "id": "pw", "autocomplete": "current-password",
-                  "visible": True}])}), \
+             patch("tools.browser_vault_tool._eval_js", side_effect=lambda task_id, expression, **_: (
+                 {"success": True, "result": json.dumps({"timeOrigin": 1.0, "now": 0.0})}
+                 if "performance.timeOrigin" in expression else {"success": True, "result": json.dumps([
+                     {"tag": "input", "type": "password", "name": "password", "id": "pw",
+                      "autocomplete": "current-password", "visible": True}])})), \
              patch("tools.browser_vault_tool._eval_js_secret", return_value={"success": True, "result": json.dumps(
-                 {"filled": 1})}) as secret_eval:
+                 {"filled": 1, "written": 1, "roles": ["current-password"]})}) as secret_eval:
             out = json.loads(browser_vault_fill("bw:abc", task_id="t"))
             out.pop("next")
             assert out == {"success": True, "filled_fields": 1, "backend": "bitwarden", "kind": "login",

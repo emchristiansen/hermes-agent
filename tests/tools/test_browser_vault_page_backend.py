@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from agent.browser_page_backend import BrowserPageBackend
+from agent.vault_login_classifier import PAGE_CLOCK_JS
 from agent.vault_store import VaultStore
 
 SECRET = "s3cret-pw"
@@ -32,8 +33,10 @@ class FakePage(BrowserPageBackend):
             raise RuntimeError(f"page.evaluate failed: {expression}")
         if "location.href" in expression:
             return self.url
+        if expression == PAGE_CLOCK_JS:
+            return json.dumps({"timeOrigin": 1.0, "now": 0.0})
         if SECRET in expression:
-            return json.dumps({"filled": 1})
+            return json.dumps({"filled": 1, "written": 1, "roles": ["current-password"]})
         return json.dumps(CONTROLS)
 
 
@@ -81,3 +84,16 @@ def test_secret_failure_never_echoes_the_script(page):
     raw = browser_vault_tool.browser_vault_fill(meta.id)
     out = json.loads(raw)
     assert out["success"] is False and SECRET not in raw
+
+
+def test_a_page_backend_failure_after_sending_keeps_the_truthful_wording(page):
+    """The plugin page-backend path has no isolated world (the CDP supervisor is never touched, see the fixture):
+    a failure of the secret script is reported as not established, never as nothing written."""
+    from tools import browser_vault_tool
+
+    fake, meta = page
+    fake.fail_secret = True
+    out = json.loads(browser_vault_tool.browser_vault_fill(meta.id))
+    assert out["success"] is False and out["error_type"] == "fill_unconfirmed" and out["may_complete_later"] is True
+    assert "not established" in out["error"] and "check the tab" in out["error"]
+    assert "nothing was written" not in out["error"].lower() and SECRET not in json.dumps(out)

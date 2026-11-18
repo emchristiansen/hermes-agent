@@ -441,7 +441,7 @@ class TestDeliverResultWrapping:
             patch("gateway.config.load_gateway_config", return_value=config),
             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro),
-            patch("tools.send_message_tool._send_to_platform", new=standalone_send),
+            patch("gateway.outbound.send._send_to_platform", new=standalone_send),
         ):
             result = _deliver_result(
                 job,
@@ -1793,13 +1793,12 @@ class TestParallelTick:
         assert start_s2 >= end_s1, "Jobs ran concurrently despite max_parallel=1"
 
 class TestDeliverResultTimeoutCancelsFuture:
-    """When the live adapter's confirmation outlasts the wait, the outcome depends on whether the
-    send had STARTED on the gateway loop. Started: it is in flight (a paced multi-chunk send can
-    legitimately outlast the wait) — leave it running and skip the standalone fallback, which would
-    duplicate it (#38922). Never started (wedged loop): nothing was sent, so fall through to
-    standalone or the message is silently dropped. ``future.cancel()`` cannot tell the two apart:
-    a run_coroutine_threadsafe future stays PENDING until done, so cancel() returns True mid-send
-    and kills it — these tests drive a real loop for that reason.
+    """A live confirmation that outlasts the wait is not a delivery (at least once: a duplicate is acceptable,
+    a loss is not; msg-retry-on-13f-9 MR-DELIVERY-15), so the standalone fallback sends either way. Whether
+    the send had STARTED decides only its own fate. Started: in flight (a paced multi-chunk send can outlast
+    the wait) — leave it running, never kill it mid-send. Never started (wedged loop): abandon it so it never
+    goes out late. ``future.cancel()`` cannot tell the two apart: a run_coroutine_threadsafe future stays
+    PENDING until done, so cancel() returns True mid-send and kills it — hence a real loop.
     """
 
     def _deliver(self, monkeypatch, adapter, loop):
@@ -1815,34 +1814,35 @@ class TestDeliverResultTimeoutCancelsFuture:
         standalone_send = AsyncMock(return_value={"success": True})
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+             patch("gateway.outbound.send._send_to_platform", new=standalone_send):
             result = _deliver_result(job, "Hello world", adapters={Platform.TELEGRAM: adapter}, loop=loop)
         return result, standalone_send
 
-    def test_in_flight_send_outlasting_the_wait_keeps_running_and_is_not_duplicated(self, monkeypatch):
+    def test_in_flight_send_outlasting_the_wait_keeps_running_and_is_sent_again(self, monkeypatch):
         import asyncio
         import threading
-        import time
 
         loop = asyncio.new_event_loop()
         threading.Thread(target=loop.run_forever, daemon=True).start()
-        events = []
+        events, release, finished = [], threading.Event(), threading.Event()
 
         async def slow_send(chat_id, content, **_kw):
             events.append("started")
-            await asyncio.sleep(0.6)  # outlasts the 0.3s confirmation wait
+            await asyncio.to_thread(release.wait, 5)  # outlasts the 0.3s confirmation wait
             events.append("finished")
+            finished.set()
             return MagicMock(success=True, message_id="m1", raw_response=None)
 
         adapter = MagicMock()
         adapter.send = slow_send
         try:
             result, standalone_send = self._deliver(monkeypatch, adapter, loop)
-            time.sleep(0.6)
+            release.set()
+            assert finished.wait(5)
         finally:
             loop.call_soon_threadsafe(loop.stop)
-        assert result is None, f"expected the in-flight send to count as delivered, got {result!r}"
-        standalone_send.assert_not_awaited()
+        assert result is None, f"standalone should have delivered, got {result!r}"
+        standalone_send.assert_awaited_once()  # the unconfirmed send goes again: a duplicate is acceptable
         assert events == ["started", "finished"], "the in-flight send must not be cancelled mid-way"
 
     def test_send_that_never_started_falls_back_to_standalone(self, monkeypatch):
@@ -1889,7 +1889,7 @@ class TestDeliverResultPartialSplitDelivery:
         try:
             with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
                  patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-                 patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+                 patch("gateway.outbound.send._send_to_platform", new=standalone_send):
                 result = _deliver_result(job, "Hello world", adapters={Platform.TELEGRAM: adapter}, loop=loop)
         finally:
             loop.call_soon_threadsafe(loop.stop)
@@ -1944,7 +1944,7 @@ class TestDeliverResultLiveAdapterUnconfirmed:
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
              patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
-             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+             patch("gateway.outbound.send._send_to_platform", new=standalone_send):
             result = _deliver_result(
                 job,
                 "Hello world",
@@ -2134,7 +2134,7 @@ class TestCronDeliveryMirror:
         mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
-             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
+             patch("gateway.outbound.send._send_to_platform", new=AsyncMock(return_value={"success": True})), \
              patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
             job = {
                 "id": "test-job",

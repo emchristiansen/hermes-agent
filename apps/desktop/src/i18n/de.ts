@@ -773,6 +773,8 @@ export const deOverrides = {
       mcp: 'MCP',
       archivedChats: 'Archivierte Chats',
       sessions: 'Sessions',
+      backup: 'Sicherung & Übertragung',
+      backupOnly: 'Sicherung',
       about: 'Über',
       billing: 'Abrechnung',
       notifications: 'Benachrichtigungen',
@@ -3957,6 +3959,13 @@ export const deOverrides = {
     queueStuckTitle: 'Eingereihte Nachricht nicht gesendet',
     queueStuckBody:
       'Ein eingereihter Turn konnte nicht gesendet werden. Er ist noch in der Warteschlange — versuchen Sie, ihn erneut zu senden.',
+    correctionUnconfirmedTitle: 'Korrektur nicht bestätigt',
+    correctionUnconfirmedBody:
+      'Sie hat den Lauf möglicherweise schon erreicht. Sie wird automatisch erneut als dieselbe Korrektur gesendet, bis der Lauf sie bestätigt; „Erneut senden“ sendet sie sofort. Ein Duplikat ist unproblematisch.',
+    correctionSendAgain: 'Erneut senden',
+    correctionNotSentTitle: 'Korrektur nicht gesendet',
+    correctionNotSentBody:
+      'Sie wurde nicht gesendet, und Ihr aktueller Entwurf blieb unverändert. Ihr Text steht unten; senden Sie ihn selbst erneut, falls er noch zutrifft.',
     queueDroppedTitle: 'Eingereihte Eingabe verworfen',
     queueDroppedBody:
       'Dieser Hintergrund-Eintrag wurde verworfen, da seine Sitzung nach wiederholten Versuchen nicht fortgesetzt werden konnte. Die übrige Warteschlange ist unverändert.',

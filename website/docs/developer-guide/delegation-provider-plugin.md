@@ -120,8 +120,13 @@ A route is a dict with any of:
   construction, its credential lease and every conversation turn, the same binding a multiplexed
   gateway applies to a routed turn, so a secret missing from the target profile is never read from
   the launching profile's environment. The child's transcript stays in the launching profile's
-  session database (it is the parent's work) and it keeps the parent's toolset. Other route keys are
-  ignored on a profile route.
+  session database (it is the parent's work) and it keeps the parent's toolset. A raw `model` on a
+  profile route pins only the child's model: the profile's provider, credentials, fallback chain and
+  reasoning still apply. The pin must be a plain model ID (no `provider:` or `vendor/` qualifier, no
+  alias), the profile must name an explicit provider (not `auto`), and any other route key that would
+  change the profile's routing (`provider`, `base_url`, `api_key`, `api_mode`, `request_overrides`,
+  `reasoning_effort`, `service_tier`, a different `fallback_providers`) refuses the task. Without a
+  `model`, other route keys are ignored on a profile route.
 - `label`: short text identifying the route (an option title, a profile name).
 
 Unknown keys are dropped. On a profile route, `service_tier` and `reasoning_effort` are ignored too.

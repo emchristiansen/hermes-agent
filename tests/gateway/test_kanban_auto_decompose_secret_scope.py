@@ -29,11 +29,16 @@ def test_auto_decompose_tick_reads_launch_profile_secrets_under_multiplex(monkey
 
     seen = {}
 
-    def fake_decompose(task_id, author=None):
+    def fake_decompose(task_id, author=None, *, automatic=False):
+        assert automatic
         seen["value"] = ss.get_secret("ANTHROPIC_API_KEY")
         return SimpleNamespace(ok=True, fanout=False, child_ids=None, reason=None)
 
-    fake = SimpleNamespace(list_triage_ids=lambda: ["t1"], decompose_task=fake_decompose)
+    def fake_list_triage_ids(*, automatic=False):
+        assert automatic is True
+        return ["t1"]
+
+    fake = SimpleNamespace(list_triage_ids=fake_list_triage_ids, decompose_task=fake_decompose)
     monkeypatch.setitem(sys.modules, "hermes_cli.kanban_decompose", fake)
     monkeypatch.setattr(hermes_cli, "kanban_decompose", fake, raising=False)
 
@@ -66,17 +71,27 @@ def test_auto_decompose_board_pin_stays_inside_the_tick(monkeypatch, tmp_path):
 
     seen = {}
 
-    def fake_decompose(task_id, author=None):
+    def fake_list_triage_ids(*, automatic=False):
+        # The dispatcher lists only what automatic decomposition may take (automatic=True).
+        assert automatic is True
+        seen["listed_on"] = kb.get_current_board()
+        return ["t1"]
+
+    def fake_decompose(task_id, author=None, *, automatic=False):
+        assert automatic is True
+        seen["decomposed"] = task_id
         seen["tick"] = kb.get_current_board()
         other = threading.Thread(target=lambda: seen.update(other=kb.get_current_board()))
         other.start()
         other.join()
         return SimpleNamespace(ok=True, fanout=False, child_ids=None, reason=None)
 
-    fake = SimpleNamespace(list_triage_ids=lambda: ["t1"], decompose_task=fake_decompose)
+    fake = SimpleNamespace(list_triage_ids=fake_list_triage_ids, decompose_task=fake_decompose)
     monkeypatch.setitem(sys.modules, "hermes_cli.kanban_decompose", fake)
     monkeypatch.setattr(hermes_cli, "kanban_decompose", fake, raising=False)
 
     assert asyncio.run(_to_thread_process_service(_dispatcher().auto_decompose_tick, 5)) == 1
+    assert seen["decomposed"] == "t1"  # the decomposition actually ran, not just the count
+    assert seen["listed_on"] == "clientb"
     assert seen["tick"] == "clientb"
     assert seen["other"] == "work"

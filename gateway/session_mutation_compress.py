@@ -42,7 +42,7 @@ async def prepare_compress(authority, live, payload, prepared):
     policy = restore_policy(snapshot['receipt']['policy'])
     config = policy.config(authority)
     options = config.get('compression') or {}
-    if options.get('checkpoint_required'):
+    if options.get('checkpoint_required') and not policy.skip_memory_requested:  # --skip-memory: no checkpoint
         raise RuntimeStoreError('compression_checkpoint_required')
     model, runtime = authority.runner._resolve_session_agent_runtime(source=live.source, session_key=live.route)
     if runtime.get('api_mode') == 'codex_app_server':
