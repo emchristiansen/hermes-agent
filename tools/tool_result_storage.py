@@ -28,6 +28,9 @@ SPILLOVER_SUBDIR = "cache/spillover"
 # retention window — see _spillover_retention_hours().
 SPILLOVER_MAX_AGE_HOURS = 24
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
+# Private tool-message flag set by the executor on a caller-controlled envelope
+# (tools.output_control.CONTROLLED_MESSAGE_FLAG): "destination" or "default" (archive allowed).
+_OUTPUT_CONTROLLED = "_output_controlled"
 # The exact key set tools/mcp_tool_handlers.py::_render_call_tool_result emits. A JSON object whose
 # keys stay inside this set is that handler's own envelope, never an arbitrary tool's JSON payload.
 _MCP_ENVELOPE_KEYS = frozenset({"result", "structuredContent", "_meta"})
@@ -442,26 +445,63 @@ def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, en
                     tool_name, tool_use_id, len(persisted_content), path, host_suffix)
         return _build_persisted_message(preview, has_more, len(persisted_content), path)
 
-    if (hosted_path := _persist_hosted(persisted_content, tool_use_id, env)) is not None:
-        return _persisted(hosted_path) if hosted_path else _inline_truncated(preview, tool_name, content)
+    stored = _store_text(persisted_content, filename, env, tool_use_id)
+    if stored is not None:
+        return _persisted(*stored)
+    return _inline_truncated(preview, tool_name, content)
+
+
+def _store_text(content: str, filename: str, env, tool_use_id: str) -> tuple[str, str] | None:
+    """Write *content* verbatim where the model can read it back: ``(path, log suffix)``, or
+    None when no location took it."""
+    # A hosted scope writes only into the bound agent's own sandbox, never on this host.
+    if (hosted_path := _persist_hosted(content, tool_use_id, env)) is not None:
+        return (hosted_path, "") if hosted_path else None
     # Always persist host-side first: cache/spillover is the single canonical home.
-    host_path = _write_to_spillover(persisted_content, filename)
+    host_path = _write_to_spillover(content, filename)
     host_side = _is_host_side_env(env)
     if host_side and host_path is not None:
-        return _persisted(host_path)
+        return host_path, ""
     if not host_side:
         # Remote backend: reference the mounted/synced path when the sandbox can actually read
         # it, else write into the sandbox temp dir (containers without the spillover mount).
         visible = _sandbox_visible_spillover_path(host_path, env) if host_path else None
         if visible is not None:
-            return _persisted(visible, f" [host: {host_path}]")
+            return visible, f" [host: {host_path}]"
         remote_path = f"{_resolve_storage_dir(env)}/{filename}"
         try:
-            if _write_to_sandbox(persisted_content, remote_path, env):
-                return _persisted(remote_path)
+            if _write_to_sandbox(content, remote_path, env):
+                return remote_path, ""
         except Exception as exc:
-            logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc)
-    return _inline_truncated(preview, tool_name, content)
+            logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc, exc_info=True)
+    return None
+
+
+def persist_exact_text(content: str, tool_use_id: str, env=None) -> str | None:
+    """Store *content* byte-for-byte in the ordinary archive and return its readable path, or
+    None. Unlike :func:`maybe_persist_tool_result` nothing is reinterpreted: caller-requested
+    content (tools/output_control.py) that merely looks like an MCP envelope stays as it was."""
+    stored = _store_text(content, _safe_result_filename(tool_use_id), env, tool_use_id)
+    if stored is None:
+        return None
+    logger.info("Archived requested tool content: %s (%d chars -> %s%s)", tool_use_id, len(content), *stored)
+    return stored[0]
+
+
+def archived_result_size_bound(tool_use_id: str, env=None, config: BudgetConfig = DEFAULT_BUDGET) -> int:
+    """An upper bound on the characters an ordinary result occupies once archived (the
+    ``<persisted-output>`` block :func:`maybe_persist_tool_result` and the turn budget leave),
+    whatever its original size and wherever the archive lands."""
+    filename = _safe_result_filename(tool_use_id)
+    paths = [str(get_spillover_dir() / filename)]
+    if not _is_host_side_env(env):
+        paths.append(f"{_resolve_storage_dir(env)}/{filename}")
+    from tools.environments.sandbox_scope import current_sandbox_key
+    if current_sandbox_key():
+        # _persist_hosted's name: the sandbox temp dir, a 16-hex sandbox stem, then the file name.
+        paths.append(f"{_resolve_storage_dir(env)}/{'0' * 16}-{filename}")
+    longest = max(paths, key=len) + "/" * 64  # slack: a mounted sandbox view of the same file
+    return len(_build_persisted_message("x" * config.preview_size, True, 10 ** 15, longest))
 
 
 def _inline_truncated(preview: str, tool_name: str, content: str) -> str:
@@ -527,9 +567,13 @@ def enforce_turn_budget(tool_messages: list[dict], env=None,
     text characters and spills its largest text part; its images stay inline."""
     sizes = [_content_text_size(msg.get("content", "")) for msg in tool_messages]
     total_size = sum(sizes)
+    # A caller-controlled envelope (tools/output_control.py) is never rewritten here: the executor
+    # bounded it once, before its row was flushed, to its share of this turn's budget
+    # (agent/tool_executor_output_control.py), so its live copy and transcript row agree.
     candidates = [(i, size) for i, size in enumerate(sizes)
-                  if isinstance(tool_messages[i].get("content"), list)
-                  or PERSISTED_OUTPUT_TAG not in tool_messages[i].get("content", "")]
+                  if not tool_messages[i].get(_OUTPUT_CONTROLLED)
+                  and (isinstance(tool_messages[i].get("content"), list)
+                       or PERSISTED_OUTPUT_TAG not in tool_messages[i].get("content", ""))]
     if total_size <= config.turn_budget:
         return tool_messages
     for idx, size in sorted(candidates, key=lambda x: x[1], reverse=True):

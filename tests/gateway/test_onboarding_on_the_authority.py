@@ -289,28 +289,117 @@ async def test_deleting_the_onboarding_chat_from_the_sidebar_ends_the_run(tmp_pa
         await desktop.connection.close()
 
 
-@pytest.mark.asyncio
-async def test_a_fresh_launch_deletes_the_chat_the_last_launch_left_with_no_viewer(tmp_path, monkeypatch):
-    """The previous launch's chat is still mounted (a backend that outlived the app, or local recovery),
-    but no window watches it and no turn runs in it: the new launch's start deletes it and drops it
-    from the authority."""
+async def _quit_mid_run(desktop, turns):
+    """A run the last launch left mid-dialogue: the opening turn ran, the user and the agent talked,
+    then the app quit. Returns the chat, its run id and its messages; the authority still mounts it."""
+    from agent import onboarding_record
     from gateway.session_controls import AuthorityConnection
-    turns = []
-    desktop = await _desktop(tmp_path, monkeypatch, turns)
     first = (await _request(desktop, 1, "onboarding.start", {"rerun": True}))["result"]["stored_session_id"]
     await async_wait_until(lambda: turns, timeout=10)
     await _settled(desktop, first)
+    for role, text in (("assistant", "Hi! What should I call you?"), ("user", "Call me Sid."),
+                       ("assistant", "Nice to meet you, Sid. Want to pick a theme next?")):
+        desktop.db.append_message(first, role, text)
+    messages = desktop.db.get_messages(first)
+    assert len(messages) >= 3
     await desktop.connection.close()  # the app quits
     assert first in desktop.authority.sessions
     identity = {"user_id": "uid:1", "provider": "local", "profile_id": desktop.authority.profile_id,
                 "instance_id": "owner"}
     desktop.connection = AuthorityConnection(desktop.authority, desktop.transport, identity)
+    return first, onboarding_record.load(desktop.db, first)["run_id"], messages
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_launch_keeps_the_chat_the_last_launch_left_and_ends_its_run_as_replaced(tmp_path, monkeypatch):
+    """The previous launch's chat is still mounted (a backend that outlived the app, or local recovery)
+    and no window watches it: the new launch's start keeps it with every message, ends its run as
+    replaced (every window is told), closes the card still waiting in it and starts over in a new chat.
+    The old run is never resumed."""
+    from agent import onboarding_record
+    from agent.onboarding_flow import is_active
+    from agent.onboarding_text import CHAT_TITLE
+    from gateway.session_server_requests import _lock, _open, _Pending, waiting
+    turns, ended = [], []
+    desktop = await _desktop(tmp_path, monkeypatch, turns)
+    onboarding_record.on_ended(ended.append)
+    try:
+        first, run_id, messages = await _quit_mid_run(desktop, turns)
+        stream = desktop.authority.sessions[first].event_stream
+        with _lock:
+            _open["srq-onboarding-keep"] = _Pending(first, events=stream, method="setup_beat")
+
+        second = (await _request(desktop, 2, "onboarding.start", {"fresh_launch": True}))["result"]
+
+        new = second["stored_session_id"]
+        assert new != first and second["resumed"] is False and second["run_id"] != run_id
+        assert desktop.db.get_session(first) is not None and desktop.db.get_messages(first) == messages
+        record = onboarding_record.load(desktop.db, first)
+        assert record["ended_by"] == "replaced" and not is_active(record)
+        assert [(e["run_id"], e["stored_session_id"], e["outcome"]) for e in ended] == [(run_id, first, "replaced")]
+        assert not waiting(stream, first, "setup_beat")
+        assert onboarding_record.open_session_ids(desktop.db) == [new]
+        assert desktop.db.get_session(first)["title"] == CHAT_TITLE
+        assert desktop.db.get_session(new)["title"] == f"{CHAT_TITLE} #2"
+        await async_wait_until(lambda: len(turns) >= 2, timeout=10)  # the new run's opening
+        again = (await _request(desktop, 3, "onboarding.start", {}))["result"]
+        assert again["stored_session_id"] == new and again["resumed"] is True
+    finally:
+        with _lock:
+            _open.pop("srq-onboarding-keep", None)
+        onboarding_record._ended_listeners.remove(ended.append)
+        await desktop.connection.close()
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_launch_keeps_a_chat_a_turn_still_writes_and_ends_its_run_as_replaced(tmp_path, monkeypatch):
+    import os
+    from agent import onboarding_record
+    turns = []
+    desktop = await _desktop(tmp_path, monkeypatch, turns)
+    first, _run_id, messages = await _quit_mid_run(desktop, turns)
+    holder = f"pid={os.getpid()}:turn=onboarding-test"
+    assert desktop.db.try_acquire_session_turn_lease(first, holder, ttl_seconds=300.0)
     try:
         second = (await _request(desktop, 2, "onboarding.start", {"fresh_launch": True}))["result"]
         assert second["stored_session_id"] != first
-        assert desktop.db.get_session(first) is None
-        assert first not in desktop.authority.sessions
+        assert desktop.db.get_messages(first) == messages
+        assert (onboarding_record.load(desktop.db, first) or {}).get("ended_by") == "replaced"
+        assert onboarding_record.open_session_ids(desktop.db) == [second["stored_session_id"]]
     finally:
+        desktop.db.release_session_turn_lease(first, holder)
+        await desktop.connection.close()
+
+
+@pytest.mark.asyncio
+async def test_the_chat_a_fresh_launch_kept_can_still_be_deleted_by_hand(tmp_path, monkeypatch):
+    from agent import onboarding_record
+    turns, ended = [], []
+    desktop = await _desktop(tmp_path, monkeypatch, turns)
+    onboarding_record.on_ended(ended.append)
+    try:
+        first, _run_id, _messages = await _quit_mid_run(desktop, turns)
+        assert "result" in await _request(desktop, 2, "onboarding.start", {"fresh_launch": True})
+        replies = []
+
+        async def delete_at_the_current_revision():
+            row = desktop.db.get_session(first)
+            replies.append(await _request(desktop, 10 + len(replies), "session.mutate", {
+                "session_id": first, "request_id": f"delete-kept-{len(replies)}",
+                "expected_revision": row["runtime_revision"], "expected_generation": row["runtime_generation"],
+                "operation": "delete", "payload": {}}))
+            return "result" in replies[-1] or replies[-1].get("error", {}).get("data", {}).get("reason") != "revision_conflict"
+
+        for _ in range(5):
+            if await delete_at_the_current_revision():
+                break
+        assert "result" in replies[-1], replies
+        assert desktop.db.get_session(first) is None and desktop.db.get_messages(first) == []
+        assert first not in desktop.authority.sessions
+        # Its run had already ended as replaced: the delete tells no window a second time.
+        assert [e["outcome"] for e in ended if e["stored_session_id"] == first] == ["replaced"]
+    finally:
+        onboarding_record._ended_listeners.remove(ended.append)
         await desktop.connection.close()
 
 
@@ -332,8 +421,8 @@ async def test_onboarding_start_from_a_client_that_is_not_the_local_desktop_chan
 
 @pytest.mark.asyncio
 async def test_a_window_that_reopens_the_old_chat_while_a_fresh_launch_starts_keeps_it(tmp_path, monkeypatch):
-    """The start decided the old chat had no viewer, then another window resumed it before the delete
-    ran: the chat stays with its messages, and its run ends as replaced."""
+    """Another window resumes the old chat while a fresh launch's start runs: the chat stays with its
+    messages and its viewer, and its run ends as replaced."""
     from agent import onboarding_record
     from gateway.session_controls import AuthorityConnection
     turns = []
@@ -371,8 +460,8 @@ async def test_a_window_that_reopens_the_old_chat_while_a_fresh_launch_starts_ke
 @pytest.mark.asyncio
 async def test_a_window_whose_resume_reads_history_while_a_fresh_launch_claims_the_chat_keeps_it(tmp_path, monkeypatch):
     """Another window's resume was reading the old chat's history when the fresh launch's start found
-    the chat unwatched and claimed it; the resume finished before the delete ran. The chat stays with its
-    messages, and its run ends as replaced."""
+    the chat unwatched; the resume finished while the start ran. The chat stays with its messages, and
+    its run ends as replaced."""
     import threading
     from agent import onboarding_record
     from gateway import session_local_recovery

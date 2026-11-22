@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import uuid
+import weakref
 from collections import deque
 from contextlib import contextmanager, suppress
 from pathlib import Path
@@ -94,6 +95,52 @@ except ImportError:  # pragma: no cover - stripped/scaffold installs only
 logger = logging.getLogger(__name__)
 
 _MAX_SAFE_MESSAGES = 20_000  # resume/export guard default
+
+# Handles whose latest close() did not finish: it raised, or a token writer still live past its join
+# left the connection open (SH-01 TOKEN-01). Keyed by id, holding only weak references. The gateway
+# stop's close verdict and the per-profile release read them. Nothing under the lock can finalize a
+# SessionDB (``__del__`` closes, and close takes this lock: SH-01 STORE-01): weak references are made,
+# and handles are resolved and dropped, outside it; it is re-entrant for a collection that still runs
+# a finalizer on this thread while it is held.
+_unsettled_closes: "dict[int, weakref.ref[SessionDB]]" = {}
+_unsettled_closes_lock = threading.RLock()
+
+
+def _mark_close_unsettled(db: "SessionDB") -> None:
+    key = id(db)
+
+    def _gone(ref: "weakref.ref[SessionDB]", key: int = key) -> None:
+        with _unsettled_closes_lock:
+            if _unsettled_closes.get(key) is ref:
+                del _unsettled_closes[key]
+    ref = weakref.ref(db, _gone)
+    with _unsettled_closes_lock:
+        _unsettled_closes[key] = ref
+
+
+def _mark_close_settled(db: "SessionDB") -> None:
+    with _unsettled_closes_lock:
+        _unsettled_closes.pop(id(db), None)
+
+
+def unsettled_closes(under: "str | Path | None" = None) -> list[str]:
+    """The paths of SessionDB handles whose latest close() did not finish (see ``SessionDB.close``); with
+    *under*, only those whose store lies in that directory. Only the weak references are copied under the
+    lock; each handle is resolved, read and released outside it."""
+    with _unsettled_closes_lock:
+        refs = list(_unsettled_closes.copy().values())
+    root = None if under is None else os.path.normcase(os.path.realpath(under))
+    paths = []
+    for ref in refs:
+        db = ref()
+        path = None if db is None else str(getattr(db, "db_path", "?"))
+        db = None  # this frame's reference goes here, outside the lock
+        if path is None:
+            continue
+        key = os.path.normcase(os.path.realpath(path))
+        if root is None or key == root or key.startswith(root.rstrip(os.sep) + os.sep):
+            paths.append(path)
+    return sorted(paths)
 
 
 def _configured_transcript_limit(key: str, fallback: int = _MAX_SAFE_MESSAGES) -> int:
@@ -1549,7 +1596,12 @@ class SessionDB(
             from hermes_state_registry import release
             release(self)
             return
-        self._stop_token_writer()
+        _mark_close_unsettled(self)  # until this close finishes: a raise below leaves it unsettled
+        if not self._stop_token_writer():
+            # A writer still live past its join can still write: closing under it only makes it reopen
+            # (#94736). Leave the connection open; the gateway stop then keeps the profile owned.
+            logger.warning("SessionDB close of %s left the connection open: a token writer is still live", self.db_path)
+            return
         hook, self._token_atexit_hook = self._token_atexit_hook, None
         if hook is not None:
             atexit.unregister(hook)
@@ -1596,6 +1648,7 @@ class SessionDB(
                     # identity when retiring an unsafe handle.
                     self._db_sidecar_identity = {}
         self._read_budget.unregister(self)  # idempotent: a never-registered (failed-init) handle is a no-op
+        _mark_close_settled(self)
 
     def __del__(self) -> None:
         """Safety net: close() if the caller forgot. Attribute access stays

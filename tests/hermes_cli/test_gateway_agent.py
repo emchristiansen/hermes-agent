@@ -749,11 +749,11 @@ def test_a_session_busy_refusal_at_submit_is_the_session_busy_verdict():
 
 @pytest.mark.parametrize("reason", ["permission_denied", "runtime_draining", "invalid_params"])
 def test_other_owner_refusals_at_submit_are_not_a_lost_connection(reason):
-    """A received refusal keeps main's unclassified failed result: no gateway_connection label and
-    no retryability verdict."""
+    """A received refusal is the gateway's refusal: no gateway_connection label, no retryability
+    verdict, and never left unclassified, where the chat copy would blame the model (t_b42e0875)."""
     result = submit_against(GatewayRPCError(reason))
-    assert result["failed"] is True and result["error"] == reason
-    assert result["failure_reason"] is None
+    assert result["failed"] is True and result["error"] == f"The gateway refused this turn: {reason}."
+    assert result["failure_reason"] == "gateway_refusal"
     assert "failure_retryable" not in result
 
 
@@ -1061,14 +1061,14 @@ def test_a_voice_stopped_correction_is_consumed_not_requeued(make_agent, mode):
     printed = []
     agent._print_fn = printed.append
     shell = object.__new__(HermesCLI)
-    shell.busy_input_mode = mode
+    shell.busy_input_mode = mode  # every message steers: a configured interrupt still reaches session.steer
     shell.agent = agent
     shell._pending_input, shell._interrupt_queue = queue.Queue(), queue.Queue()
     agent._turn_ask_index = 3  # the running turn's ask; a consumed stop must leave it alone
     shell._tui_enter_while_busy("stop", [], "stop")
     assert shell._pending_input.empty() and shell._interrupt_queue.empty(), "consumed stop was re-queued"
     sent = [m for m, _ in client.calls if m.startswith("session.")]
-    assert sent == [{"steer": "session.steer", "interrupt": "session.redirect"}[mode]]
+    assert sent == ["session.steer"]
     assert agent._turn_ask_index == 3, "the running turn's history changed for a consumed stop"
 
 

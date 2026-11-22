@@ -25,6 +25,9 @@ import uuid
 from hermes_cli.gateway_client import GatewayClientError
 from hermes_cli.gateway_connection import RESUME_REFUSALS, GatewayConnection
 
+# A refused resume of a stored session, reported as the usage error ``exit_on_resume_refusal`` prints.
+RESUME_REFUSED = "The gateway refused to resume session"
+
 logger = logging.getLogger(__name__)
 
 # Read-only SessionDB methods main's CLI calls (served by the WAL reader).
@@ -153,17 +156,23 @@ class GatewaySessionStore:
         return snapshot
 
     def open_session(self, cli, launch=None):
-        """Create (or resume) the gateway session for this CLI and adopt its id. A resume target the
-        gateway does not know is left as is: main's own "Session not found" path reports it."""
+        """Create (or resume) the gateway session for this CLI and adopt its id. A resume target that
+        neither the gateway nor this viewer's reader knows is left as is: main's own "Session not found"
+        path reports it. One the reader still holds but the gateway refuses raises
+        :data:`RESUME_REFUSED`: main would otherwise load its stored transcript and submit a turn the
+        gateway can only refuse."""
         key = self.connection.launch_api_key = (launch or {}).get("api_key") or None
         self.connection.launch_api_key_typed = key is not None and key == getattr(cli, "_typed_api_key", None)
         if getattr(cli, "_resumed", False):
             try:
                 snapshot = self.attach(cli.session_id, typed=self.connection.launch_api_key_typed)
             except GatewayClientError as exc:
-                if str(exc) in RESUME_REFUSALS:
+                if str(exc) not in RESUME_REFUSALS:
+                    raise
+                if self.get_session(cli.session_id) is None:
                     return None
-                raise
+                raise GatewayClientError(
+                    f"{RESUME_REFUSED} {cli.session_id} ({exc}); nothing was sent.") from None
             # The CLI sends a coding-posture toolset pick and an env-folded ignore_rules too; only a typed
             # -t / --ignore-rules is checked.
             _check_resume_launch({**(launch or {}), "toolsets": getattr(cli, "_typed_toolsets", None),

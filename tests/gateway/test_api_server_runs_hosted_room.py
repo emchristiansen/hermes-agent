@@ -8,11 +8,12 @@ Shared app/adapter helpers live in ``tests/gateway/test_api_server_runs.py``.
 import asyncio
 import hashlib
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
+from gateway.platforms import api_server_runs as _api_runs
 from gateway.platforms.api_server_runs import _RunStream
 from tests.gateway.test_api_server_runs import (
     _create_runs_app,
@@ -50,7 +51,7 @@ class TestHostedRoomRuns:
         try:
             with (
                 patch.object(auth_adapter, "_check_run_auth", return_value=None),
-                patch.object(auth_adapter, "_request_owns_run", return_value=True),
+                patch.object(_api_runs, "_request_owns_run_async", AsyncMock(return_value=True)),
                 patch.object(
                     auth_adapter, "_room_grant_token", return_value="scoped-grant"
                 ),
@@ -90,11 +91,11 @@ class TestHostedRoomRuns:
         app = _create_runs_app(auth_adapter)
         with (
             patch.object(auth_adapter, "_check_run_auth", return_value=None),
-            patch.object(auth_adapter, "_request_owns_run", return_value=True),
+            patch.object(_api_runs, "_request_owns_run_async", AsyncMock(return_value=True)),
             patch.object(
-                auth_adapter,
-                "_durable_run_status",
-                return_value={"status": "waiting_for_approval"},
+                _api_runs,
+                "_durable_run_status_async",
+                AsyncMock(return_value={"status": "waiting_for_approval"}),
             ),
             patch.object(
                 auth_adapter, "_room_grant_token", return_value="scoped-grant"

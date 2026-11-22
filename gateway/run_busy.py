@@ -947,6 +947,9 @@ class GatewayBusySessionMixin:
             if adapter and session_key in getattr(adapter, "_pending_messages", {}):
                 self._queue_or_replace_pending_event(session_key, event)
                 return True
+            if self._hm_steer_delivered(event, session_key):  # every message steers (Eric, 2026-11-04)
+                event._gateway_accepted = True
+                return True
             return False  # base adapter queues silently behind the active turn
 
         # Same authorization gate as the cold path, else unauthorized users in shared threads

@@ -3,6 +3,7 @@ import asyncio
 from contextlib import closing
 from http.server import ThreadingHTTPServer
 import json
+import re
 from pathlib import Path
 import sqlite3
 import threading
@@ -77,7 +78,7 @@ def test_worker_lineage_and_settlement(tmp_path, mode, invariant):
                                        timeout=30, interval=.02, what='failed worker admission unknown')
                 assert peer.requests == []
                 errors = (home / 'logs/errors.log').read_text()
-                assert 'Managed worker lost: managed_worker_failed' in errors
+                assert re.search(r'Managed worker lost: managed_worker_failed \(pid \d+, exit ', errors), errors
                 assert 'invalid_worker_frame' not in errors
                 return
             snap = await settled(ws, sid, 'before')

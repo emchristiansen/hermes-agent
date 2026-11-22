@@ -120,7 +120,7 @@ _WORKTREE_SUBCOMMANDS = {
 
 # Message fields copied verbatim onto a /branch row (plus role / tool_name / api_content).
 _BRANCH_COPY_KEYS = ("content", "tool_calls", "tool_call_id", "reasoning", "reasoning_content", "reasoning_details",
-                     "codex_reasoning_items", "codex_message_items", "timestamp", "data_use")
+                     "codex_reasoning_items", "codex_message_items", "timestamp", "data_use", "display_kind", "display_metadata")
 
 # /hatch progress event -> catalog key (``cli.commands.hatch.*``).
 _HATCH_PROGRESS = {"compose": "hatch.progress_compose", "save": "hatch.progress_save"}
@@ -2034,14 +2034,11 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
         """Handle /busy [status|queue|steer|interrupt] — what Enter does while Hermes is working."""
         arg = _command_arg(cmd, lower=True)
         usage = _dim_line(_t("busy.usage"))
-        if not arg or arg == "status":
-            mode = self.busy_input_mode if self.busy_input_mode in _BUSY_MODES else "interrupt"
-            return _cp(_accent_line(_t("busy.status", mode=self.busy_input_mode)),
-                       _dim_line(_t("busy.enter_while_busy", behavior=_t(f"busy.short_{mode}"))), usage)
-        if arg not in _BUSY_MODES:
+        if arg and arg != "status" and arg not in _BUSY_MODES:
             return _cp(_dim_line(_t("shared.unknown_argument", arg=arg)), usage)
-        self.busy_input_mode = arg
-        _persist_display_choice("display.busy_input_mode", arg, _t("busy.label"), _t(f"busy.long_{arg}"))
+        # Every message steers (``CLIInitMixin.busy_input_mode``): any mode asked for reports steer.
+        return _cp(_accent_line(_t("busy.status", mode=self.busy_input_mode)),
+                   _dim_line(_t("busy.enter_while_busy", behavior=_t(f"busy.short_{self.busy_input_mode}"))), usage)
 
     def _handle_indicator_command(self, cmd: str):
         """Handle /indicator [status|kaomoji|emoji|unicode|ascii] — pick the TUI busy-indicator style.

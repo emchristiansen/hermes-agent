@@ -18,6 +18,8 @@ from typing import Any, Callable, Optional
 from agent.delegation_context import owned_kanban_task
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
+from tools.output_control import open_destination as open_output_destination
+from tools.output_control import parse_args as parse_output_control, render_json_result
 from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
@@ -680,22 +682,36 @@ def inject_new_comments_from_env(agent: Any) -> bool:
 
 @_kanban_handler("kanban_show")
 def _handle_show(args: dict, **kw) -> str:
-    """Full task state: row, parents, children, comments, runs, last 50 events."""
+    """Full task state: row, parents, children, comments, runs, last 50 events.
+    ``output_control`` projects/routes it before the result exists anywhere else."""
+    # Malformed control or an unusable destination -> ValueError -> tool error before the board
+    # is read: the destination is created exclusively first, so no competing writer can take it
+    # between the read and the write. A failed read removes the still-empty file again.
+    output_control = parse_output_control(args)
+    sink = open_output_destination(output_control)
+    try:
+        return _show(args, output_control, sink)
+    finally:
+        if sink is not None:
+            sink.discard_unused()
+
+
+def _show(args: dict, output_control, sink) -> str:
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         # No dispatcher task in scope and no explicit id: the caller asked "what
         # should I be looking at". A chat profile cannot set HERMES_KANBAN_TASK,
         # so an error naming the env var is dead end (#91431) — answer instead.
-        return json.dumps({
+        return render_json_result({
             "current_task": None,
             "hint": (
                 "No dispatcher-assigned task in this session, so there is no "
                 "task to show by default. Call kanban_list to see task ids on "
                 "the board, then kanban_show(task_id=<id>) for full state."),
-        })
+        }, output_control, sink=sink)
     with _board(args.get("board")) as (kb, conn):
         task = _existing_task(kb, conn, tid)
-        return json.dumps({
+        return render_json_result({
             "task": _fields(task, _TASK_FIELDS),
             "parents": kb.parent_ids(conn, tid),
             # Non-terminal parents; on a running card this means the dependency
@@ -708,7 +724,7 @@ def _handle_show(args: dict, **kw) -> str:
             "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
             "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
             # Same string build_worker_context hands the dispatcher at spawn time.
-            "worker_context": kb.build_worker_context(conn, tid)})
+            "worker_context": kb.build_worker_context(conn, tid)}, output_control, sink=sink)
 
 
 @_kanban_handler("kanban_list")
@@ -741,6 +757,45 @@ def _handle_list(args: dict, **kw) -> str:
             "promoted": promoted})
 
 
+def _vet_external_artifacts(
+    tool_name: str, kb, conn, tid: str, metadata: Any, agent_task_id: Optional[str],
+) -> dict:
+    """Vet each declared artifact the handoff would otherwise keep only as a path outside the
+    task's managed scratch workspace (``kanban_db_artifacts.external_completion_artifacts``).
+
+    An outside file may become a task attachment, which the notifier then sends, only when the
+    file-sending rule already lets this worker send it off the machine
+    (``tools.connectors.gateway.files._readable_file``: the terminal backend's namespace, and
+    ``validate_media_delivery_path``'s denylist / strict policy) and the Hermes read guard allows
+    reading it. Returns ``{declared: VettedArtifact}``; the first refusal rejects the handoff
+    naming the path before anything changes, so no handoff reads as delivered without its files."""
+    from agent.file_safety import get_read_block_error
+    from hermes_cli.kanban_db_artifacts import VettedArtifact, external_completion_artifacts
+    from tools.connectors.gateway.files import FileInputError, _readable_file
+
+    def refuse(declared: str, reason: Any) -> _Reject:
+        return _Reject(
+            f"{tool_name} refused: declared artifact {declared} cannot be attached: {reason}. "
+            f"Your task is still in-flight (no state change) and nothing was attached. Declare "
+            f"only files this worker may send, or attach the content with kanban_attach, then "
+            f"retry {tool_name} with the same handoff.")
+
+    vetted: dict = {}
+    for declared in external_completion_artifacts(conn, tid, metadata):
+        try:
+            readable = _readable_file(declared, agent_task_id)
+        except FileInputError as exc:
+            raise refuse(declared, exc)
+        blocked = get_read_block_error(readable)
+        if blocked:
+            raise refuse(declared, blocked)
+        try:
+            vetted[declared] = VettedArtifact.bind(readable)
+        except kb.ArtifactPreservationError as exc:
+            raise refuse(declared, exc)
+    return vetted
+
+
 @_kanban_handler("kanban_complete")
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
@@ -764,10 +819,12 @@ def _handle_complete(args: dict, **kw) -> str:
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
         task = kb.get_task(conn, tid)
         _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
+        vetted = _vet_external_artifacts("kanban_complete", kb, conn, tid, metadata, kw.get("task_id"))
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
-                created_cards=created_cards, expected_run_id=_worker_run_id(tid))
+                created_cards=created_cards, expected_run_id=_worker_run_id(tid),
+                vetted_artifacts=vetted)
         except kb.ArtifactPreservationError as artifact_err:
             # Structured rejection — surface the phantom ids so the worker can retry with a corrected list
             # or drop the field. Audit event already landed in the DB. The task itself was NOT mutated (the
@@ -813,6 +870,13 @@ def _handle_complete(args: dict, **kw) -> str:
                 raise _Reject(
                     f"could not complete {tid}: unsatisfied parent dependencies: "
                     f"{detail}; complete the parents first (done or archived)")
+            # A state/run refusal is not the card's last_failure_error, which may be an earlier
+            # attempt's (t_234158d0 showed run 6474's quota wall for run 6493's refused completion).
+            own = _worker_run_id(tid)
+            if task and (task.status not in ("running", "ready", "blocked", "review")
+                         or (own is not None and task.current_run_id != own)):
+                raise _Reject(f"could not complete {tid}: status is {task.status}, current run "
+                              f"{task.current_run_id}, this worker's run {own}")
             _check(False, (task.last_failure_error if task else None) or
                    f"could not complete {tid} (unknown id, stale run, or already terminal)")
         run = kb.latest_run(conn, tid)
@@ -915,10 +979,11 @@ def _handle_request_review(args: dict, **kw) -> str:
                f"Installed profiles: {', '.join(list_profile_names())}")
     with _board(args.get("board")) as (kb, conn):
         _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
+        vetted = _vet_external_artifacts("kanban_request_review", kb, conn, tid, metadata, kw.get("task_id"))
         try:
             ok, fail_reason = kb.request_review(
                 conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
-                expected_run_id=_worker_run_id(tid), with_reason=True)
+                expected_run_id=_worker_run_id(tid), with_reason=True, vetted_artifacts=vetted)
         except kb.ArtifactPreservationError as artifact_err:
             # Same contract as kanban_complete (#22923): the transition rolled
             # back, the task is untouched and retryable — say so explicitly or
@@ -967,14 +1032,10 @@ def _handle_heartbeat(args: dict, **kw) -> str:
 def _handle_comment(args: dict, **kw) -> str:
     """Append a comment to a task's thread."""
     _reject_delegated_child_mutation("kanban_comment")
-    tid = args.get("task_id")
-    if not tid:
-        # A comment writes to the board, so a bare call must stay an error — but
-        # point at kanban_list, not an env var a chat caller cannot set (#91431).
-        raise _Reject(
-            "task_id is required: comments are per-task and this session has no "
-            "dispatcher-assigned task to default to. Discover task ids with "
-            "kanban_list, or pass the task id you mean.")
+    # A dispatcher-owned worker's bare comment goes to its own task, as its other board tools
+    # do; every other bare call stays an error that points at kanban_list (#91431), including a
+    # delegate child or cron run that only inherited HERMES_KANBAN_TASK (``_require_task_id``).
+    tid = _require_task_id(args)
     _reject_inherited_task_mutation(str(tid))
     body = _redact(_require_text(args, "body"))
     # Author comes from the worker's runtime identity (``_persisted_identity``), never

@@ -43,14 +43,23 @@ def test_idle_prompt_routed_to_pending_input():
     assert buf.reset_called
 
 
-def test_running_interrupt_mode_uses_interrupt_queue():
+def test_a_running_turn_takes_the_editor_draft_as_a_steer():
+    """Every message steers: a draft submitted while the agent runs goes into the running turn, whatever
+    busy mode was configured; only a draft nothing can take falls back to the queue."""
+    class Agent:
+        steered = []
+
+        def steer(self, text):
+            self.steered.append(text)
+            return True
     c = _make(agent_running=True, busy="interrupt")
-    buf = _FakeBuf("interrupt this")
+    c.agent = Agent()
+    buf = _FakeBuf("also check the logs")
 
     c._submit_editor_buffer(buf)
 
-    assert c._interrupt_queue.get_nowait() == "interrupt this"
-    assert c._pending_input.empty()
+    assert Agent.steered == ["also check the logs"]
+    assert c._interrupt_queue.empty() and c._pending_input.empty()
 
 
 def test_slash_command_dispatched_not_queued():

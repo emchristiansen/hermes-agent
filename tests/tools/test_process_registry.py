@@ -1230,14 +1230,14 @@ class TestKillProcess:
         finally:
             registry._running.pop(s.id, None)
 
-    def test_kill_receipt_rewritten_when_reader_finalises_first(self, registry):
+    def test_kill_owns_the_receipt_when_reader_finalises_during_the_signal(self, registry):
         """A kill racing the reader thread must not persist as a plain exit.
 
         The signal path blocks for the SIGKILL grace window, during which the
-        reader thread can observe the exit and finalise the session first. The
-        durable receipt from that first save says ``exited``; the kill result
-        returned to the caller says ``killed``. The second save must rewrite
-        the receipt so the persisted record matches what the caller was told.
+        reader thread can observe the exit and finalise the session. The kill
+        claimed the running session first, so the reader defers publication to
+        it: the receipt is written once, as the kill the caller was told about,
+        never first as a plain exit behind an already-queued notice (MEMCG-R4-06).
         """
         s = _make_session(sid="proc_kill_race", command="sleep 999")
         s.pid = 424243
@@ -1274,10 +1274,7 @@ class TestKillProcess:
             assert result["status"] == "killed"
             assert result["completion_reason"] == "killed"
             assert result["termination_source"] == "process.kill"
-            # First save: the reader won the race and persisted a plain exit.
-            assert saved[0] == ("exited", "", 0)
-            # Second save: the receipt rewritten with the kill outcome.
-            assert saved[-1] == ("killed", "process.kill", -15)
+            assert saved == [("killed", "process.kill", -15)]
         finally:
             registry._running.pop(s.id, None)
             registry._finished.pop(s.id, None)
@@ -2031,6 +2028,7 @@ class TestSystemdCgroupIsolation:
         )
         # _build_systemd_scope_argv calls shutil.which — point it at a stub.
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+        monkeypatch.setattr("tools.process_registry._worker_memory_max_bytes", lambda: None)
 
         with (
             patch("subprocess.Popen", side_effect=fake_popen),
@@ -2057,12 +2055,10 @@ class TestSystemdCgroupIsolation:
         assert "MemoryAccounting=yes" in properties
         # systemd rejects OOMPolicy= on transient --scope units across the versions
         # users run (239/245/249, #102486); emitting it fails the probe and every
-        # cron worker dispatch. MemoryMax + MemoryAccounting carry the isolation.
+        # cron worker dispatch. MemoryAccounting tracks the scope; a MemoryMax only carries a
+        # selected limit (test_worker_scope_memory), and none is selected here.
         assert not any(p.startswith("OOMPolicy=") for p in properties), properties
-        memory_max = next(
-            value for value in properties if value.startswith("MemoryMax=")
-        )
-        assert int(memory_max.split("=", 1)[1]) > 0
+        assert not any(p.startswith("MemoryMax=") for p in properties), properties
         # The original shell command must still be present at the tail,
         # after the ``--`` separator that prevents systemd-run from
         # interpreting command flags as its own.
@@ -2397,7 +2393,7 @@ class TestSystemdCgroupIsolation:
 
         assert f"MemoryMax={123 * 1024 * 1024}" in argv
 
-    def test_worker_memory_limit_caps_oversized_local_guard_override(
+    def test_worker_memory_limit_override_stands_without_a_readable_cgroup(
         self, monkeypatch
     ):
         import tools.process_registry as pr
@@ -2414,7 +2410,7 @@ class TestSystemdCgroupIsolation:
             lambda *_args: (_ for _ in ()).throw(OSError("no sysconf")),
         )
 
-        assert pr._worker_memory_max_bytes() == pr._DEFAULT_WORKER_MEMORY_MAX_BYTES
+        assert pr._worker_memory_max_bytes() == 999999 * 1024 * 1024
 
     def test_kill_recovered_detached_already_exited_stops_persisted_scope(
         self, registry, monkeypatch

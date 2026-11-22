@@ -157,8 +157,56 @@ def _export_timings(messages: list[dict[str, Any]], session_id: Optional[str] = 
     }
 
 
+# The key, inside ``origin_json`` ``imported_from``, of the last message row an import of a foreign transcript wrote:
+# rows after it were written here. Row ids only grow, and every rewrite inserts new rows, so a later row never reads
+# as imported (``agent/home_guidance.py::continues_without_prompt``). Imports from before it was recorded have none.
+FOREIGN_IMPORT_THROUGH = "through_message_id"
+
+
+def moved_foreign_origin(origin_json: Any, moved: dict[int, int]) -> Optional[str]:
+    """The ``origin_json`` of a session whose message rows moved to another store (*moved*: source row id -> target
+    row id, both ascending together): a foreign import's boundary (:data:`FOREIGN_IMPORT_THROUGH`) is a row id of the
+    store it was recorded in, so it moves to the target id of the last row at or before it (0 when none moved).
+    ``None`` when *origin_json* records no boundary, so there is nothing to change."""
+    origin = safe_json_loads(origin_json, default=None) if isinstance(origin_json, str) else None
+    imported = origin.get("imported_from") if isinstance(origin, dict) else None
+    through = imported.get(FOREIGN_IMPORT_THROUGH) if isinstance(imported, dict) else None
+    if type(through) is not int:
+        return None
+    imported[FOREIGN_IMPORT_THROUGH] = max((new for old, new in moved.items() if old <= through), default=0)
+    return json.dumps(origin)
+
+
 class SessionPortabilityMixin:
     """See module docstring — mixin for SessionDB (Port cluster)."""
+
+    @staticmethod
+    def _foreign_origin_on_conn(conn, session_id, origin, rows=None):
+        """The ``origin_json`` payload of a foreign import whose transcript *session_id* now holds: *origin* plus the
+        boundary (:data:`FOREIGN_IMPORT_THROUGH`) at the last row of that transcript. Without *rows* the import wrote
+        the session's whole transcript in this transaction: its last message row. *rows* are the ids of the rows an
+        import appended in transactions of their own, while another writer could already resume the session: the
+        boundary is the last row of the session's leading run of those ids, so a row any other writer added (even
+        between two imported rows) is never inside it; imported rows after such a row then read as written here."""
+        if rows is None:
+            through = conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ?",
+                                   (session_id,)).fetchone()[0]
+        else:
+            imported, through = set(rows), 0
+            for (row_id,) in conn.execute("SELECT id FROM messages WHERE session_id = ? ORDER BY id", (session_id,)):
+                if row_id not in imported:
+                    break
+                through = row_id
+        return {"imported_from": {**origin, FOREIGN_IMPORT_THROUGH: through}}
+
+    def record_foreign_import(self, session_id, origin, rows):
+        """Record that *session_id* holds the transcript imported from *origin* (the ``imported_from`` provenance),
+        written as the message rows *rows* (the ids ``append_message`` returned): call it once the import has written
+        them. The boundary binds to those rows, never to whatever the session holds by then
+        (:meth:`_foreign_origin_on_conn`)."""
+        self._execute_write(lambda conn: conn.execute(
+            "UPDATE sessions SET origin_json = ? WHERE id = ?",
+            (json.dumps(self._foreign_origin_on_conn(conn, session_id, origin, rows)), session_id)))
 
     @staticmethod
     def _find_foreign_import_on_conn(conn, origin):
@@ -203,7 +251,7 @@ class SessionPortabilityMixin:
                 item["session"]["title"] = f"{title} ({session_id[-12:]})"
             self._import_session_row(conn, item["session"], item["messages"], session_id)
             conn.execute("UPDATE sessions SET origin_json = ?, profile_name = ? WHERE id = ?",
-                         (json.dumps({"imported_from": origin}), profile, session_id))
+                         (json.dumps(self._foreign_origin_on_conn(conn, session_id, origin)), profile, session_id))
             return {"session_id": session_id, "already_imported": False}
 
         return self._execute_write(_do)

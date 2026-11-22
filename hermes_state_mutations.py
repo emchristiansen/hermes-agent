@@ -1,4 +1,5 @@
 """Closed action handlers inside the runtime mutation receipt transaction."""
+import json
 import time
 from hermes_state_runtime import RuntimeStoreError
 
@@ -39,7 +40,8 @@ def validate_action(operation, payload):
         return
     if operation in {'delete', 'reset'} and not payload:
         return
-    if operation == 'import' and set(payload) == {'sessions'} and isinstance(payload['sessions'], list):
+    if (operation == 'import' and {'sessions'} <= set(payload) <= {'sessions', 'imported_from'}
+            and isinstance(payload['sessions'], list) and _valid_import_origin(payload.get('imported_from'))):
         return
     if (operation == 'rewind' and 'target_message_id' in payload
             and not set(payload) - {'target_message_id', 'preserve_compaction_handoff'}
@@ -198,6 +200,15 @@ def _carrier_live_view(db, conn, session_id, message_id):
     return live if handoff is not None else None
 
 
+def _valid_import_origin(origin):
+    """An absent origin, or the foreign tool, path and session id a transcript was imported from."""
+    if origin is None:
+        return True
+    return (isinstance(origin, dict) and set(origin) == {'tool', 'path', 'foreign_session_id'}
+            and isinstance(origin['tool'], str) and isinstance(origin['path'], str)
+            and (origin['foreign_session_id'] is None or isinstance(origin['foreign_session_id'], str)))
+
+
 def _import(db, conn, session_id, payload):
     rows = payload['sessions']
     if len(rows) > db._IMPORT_MAX_SESSIONS:
@@ -218,6 +229,11 @@ def _import(db, conn, session_id, payload):
             skipped.append(sid)
             continue
         db._import_session_row(conn, raw, item['messages'], sid)
+        if sid == session_id and payload.get('imported_from') is not None:
+            # Where the foreign transcript ends, in the import's own transaction: a turn written later is
+            # never inside it (SessionPortabilityMixin._foreign_origin_on_conn).
+            conn.execute('UPDATE sessions SET origin_json = ? WHERE id = ?', (
+                json.dumps(db._foreign_origin_on_conn(conn, sid, payload['imported_from'])), sid))
         if raw.get('parent_session_id'):
             parents.append((sid, raw['parent_session_id']))
         imported.append(sid)

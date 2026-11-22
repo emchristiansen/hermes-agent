@@ -267,7 +267,7 @@ class _KanbanDispatcher:
                 # and spawned subprocess that names no board would resolve this one instead.
                 with scoped_current_board(slug):
                     try:
-                        triage_ids = _decomp.list_triage_ids()
+                        triage_ids = _decomp.list_triage_ids(automatic=True)
                     except Exception as exc:
                         logger.debug("kanban auto-decompose: list_triage_ids failed on board %s (%s)", slug, exc)
                         triage_ids = []
@@ -282,7 +282,7 @@ class _KanbanDispatcher:
     def _decompose_one(_decomp: Any, slug: str, tid: str) -> int:
         """Decompose one triage task; returns 1 on success, 0 otherwise."""
         try:
-            outcome = _decomp.decompose_task(tid, author="auto-decomposer")
+            outcome = _decomp.decompose_task(tid, author="auto-decomposer", automatic=True)
         except Exception:
             logger.exception("kanban auto-decompose: decompose_task crashed on %s", tid)
             return 0
@@ -329,9 +329,10 @@ def _log_spawn_results(results: Optional[list]) -> bool:
             # Quiet by default: an idle gateway stays silent.
             logger.info(
                 "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
-                "crashed=%d timed_out=%d promoted=%d auto_blocked=%d",
+                "crashed=%d owner_restarted=%d timed_out=%d promoted=%d auto_blocked=%d",
                 slug, len(res.spawned), res.reclaimed,
                 len(res.crashed) if hasattr(res.crashed, "__len__") else 0,
+                len(getattr(res, "owner_restarted", ())),
                 len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
                 res.promoted,
                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,

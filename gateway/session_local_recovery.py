@@ -10,7 +10,7 @@ from gateway.session import SessionEntry, SessionSource
 from gateway.session_contract import SessionRef
 from hermes_state_keys import local_identity
 from hermes_state_local import POLICY_PREFIX, local_receipt
-from hermes_state_runtime import RuntimeStoreError, list_session_admissions
+from hermes_state_runtime import OWNER_RESTART, RuntimeStoreError, list_session_admissions
 
 
 def local_adapter_map(authority):
@@ -479,7 +479,9 @@ def recover_local_sessions(authority, *, schedule=False):
         try:
             ref = restore_local_session(authority, sid)
             pending = list_session_admissions(authority.db, session_id=sid)
-            if any(row['status'] == 'unknown' for row in pending):
+            # An owed owner-restart result (boot could not publish it) is no person's to resolve:
+            # the drain settles it once published (``settle_unattended_unknown``).
+            if any(row['status'] == 'unknown' and row['outcome'] != OWNER_RESTART for row in pending):
                 continue  # the drain pauses on it until its user's Discard
             if schedule and pending:
                 authority._schedule(ref)

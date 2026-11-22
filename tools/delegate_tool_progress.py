@@ -187,7 +187,12 @@ def _build_child_system_prompt(
     # The goal and its context are the child's first user turn (``child_task_message``). Nothing
     # per-task belongs here: sibling children then send one identical system prompt, which is what
     # lets them read each other's prompt cache (tools included, on providers that order them after it).
-    parts = ["You are a focused subagent working on a specific delegated task."]
+    parts = [
+        "You are a focused subagent working on a specific delegated task.",
+        "A loaded profile supplies guidance and execution settings, not the canonical standing session's identity "
+        "or custody.\nApply its role guidance to your bounded parent assignment under your own session ID, return "
+        "your contribution to the parent, and leave whole-outcome responsibility with the parent.",
+    ]
     if workspace_path and str(workspace_path).strip():
         parts.append(
             "\nWORKSPACE PATH:\n"

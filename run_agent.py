@@ -287,6 +287,8 @@ class AIAgent(
                           "no longer sleep between executions.", DeprecationWarning, stacklevel=2)
         from agent.agent_init import init_agent
         init_agent(self, **init_kwargs)
+        from agent.home_guidance import adopt_stored_prompt
+        adopt_stored_prompt(self)  # an agent built for an existing session continues its recorded home guidance
 
     def _get_session_db_for_recall(self):
         """SessionDB for recall, opening the default state DB when no ``session_db`` was passed so the
@@ -408,6 +410,12 @@ class AIAgent(
         # The workspace snapshot is pinned per session (agent/system_prompt.py::_coding_parts); a
         # /new, /resume or /branch on the same agent must re-snapshot at its own session start.
         self._frozen_workspace_snapshot = None
+        # So are the system prompt and the home-guidance edition it renders, dropped together: the next turn restores
+        # the target session's stored prompt (/resume, /branch) or builds a new one (/new, ACP /reset).
+        from agent.home_guidance import end_conversation
+        from agent.system_prompt import invalidate_system_prompt
+        invalidate_system_prompt(self)
+        end_conversation(self)
 
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0

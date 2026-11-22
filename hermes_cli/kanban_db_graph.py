@@ -3,7 +3,120 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import os
 from typing import Any, Optional
+
+
+def automatic_triage_eligible(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Loop-breaker triage needs an explicit owner disposition, not another spec.
+
+    Call again inside the applying write transaction: a provider response may
+    arrive after a worker has tripped the breaker or an operator has parked it.
+    Completion resets the recurrence counter; explicit specify/decompose stays
+    separate and can resolve a loop without erasing its history.
+    """
+    from hermes_cli.kanban_db import BLOCK_RECURRENCE_LIMIT
+
+    return conn.execute(
+        "SELECT 1 FROM tasks WHERE id=? AND status='triage' "
+        "AND current_run_id IS NULL AND claim_lock IS NULL AND claim_expires IS NULL "
+        "AND worker_pid IS NULL AND COALESCE(block_recurrences, 0) < ?",
+        (task_id, BLOCK_RECURRENCE_LIMIT),
+    ).fetchone() is not None
+
+
+def _settlement_terminal_run(conn: sqlite3.Connection, task_id: str, expected: int):
+    """Positive managed-worker completion, not PID absence or lease expiry.
+
+    A terminal run retains the submitter PID. The interpreter may differ; its
+    immutable worker_bound/result pair identifies the completed attempt. This
+    attests the managed turn's completion, not settlement of external effects.
+    """
+    run = conn.execute(
+        "SELECT * FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if (run is None or run["id"] != expected or run["ended_at"] is None
+            or run["status"] != "blocked" or run["outcome"] != "blocked"
+            or not run["claim_lock"] or run["claim_expires"] is not None):
+        return None
+    if conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id=? AND ended_at IS NULL", (task_id,),
+    ).fetchone():
+        return None
+    return run if _settlement_worker_finished(conn, task_id, run) else None
+
+
+def _settlement_worker_finished(conn: sqlite3.Connection, task_id: str, run: sqlite3.Row) -> bool:
+    """The bound interpreter's result must follow this run's loop transition."""
+    from hermes_cli.kanban_db import _json_dict
+    from hermes_cli.kanban_db_dispatch import UNVERIFIED_WORKER_FINGERPRINT
+
+    events = {}
+    for kind in ("worker_bound", "block_loop_detected", "worker_result"):
+        row = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? AND run_id=? AND kind=? "
+            "ORDER BY id DESC LIMIT 1", (task_id, run["id"], kind),
+        ).fetchone()
+        if row is None:
+            return False
+        events[kind] = row
+    if not (events["worker_bound"]["id"] < events["block_loop_detected"]["id"]
+            < events["worker_result"]["id"]):
+        return False
+    bound = _json_dict(events["worker_bound"]["payload"])
+    result = _json_dict(events["worker_result"]["payload"])
+    if not isinstance(bound.get("started_at"), str) or bound["started_at"] == UNVERIFIED_WORKER_FINGERPRINT:
+        return False
+    if (type(bound.get("pid")) is not int or bound["pid"] <= 0 or not bound.get("started_at")
+            or bound.get("claim_lock") != run["claim_lock"]
+            or result.get("claim_lock") != run["claim_lock"]
+            or result.get("pid") != bound["pid"] or type(result.get("exit_code")) is not int):
+        return False
+    return True
+
+
+def settle_triage_task(
+    conn: sqlite3.Connection, task_id: str, *, expected_terminal_run_id: int,
+    kind: str, owner: str, required_input: str, event: str, author: str,
+) -> tuple[bool, str]:
+    """Orchestrator settlement of an exact finished loop into an external wait.
+
+    No run is closed or synthesized, no worker is signalled, and no workspace
+    is touched. The existing guarded unblock is used only when the named owner
+    supplies the substantive event; ordinary dispatch cannot release this wait.
+    """
+    from hermes_cli.kanban_db import _append_event, _json_dict, _latest_event, write_txn
+
+    from agent.swarm_capabilities import worker_board_management_enabled
+    if os.environ.get("HERMES_KANBAN_TASK") and not worker_board_management_enabled():
+        return False, "triage settlement is orchestrator-only"
+    if type(expected_terminal_run_id) is not int or expected_terminal_run_id <= 0:
+        raise ValueError("expected terminal run must be a positive run id")
+    if kind not in {"capability", "needs_input"}:
+        raise ValueError("external wait kind must be capability or needs_input")
+    if any(not isinstance(value, str) or not value.strip()
+           for value in (owner, required_input, event, author)):
+        raise ValueError("external owner, required input, event and author must be nonempty")
+    with write_txn(conn):
+        task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if task is None or task["status"] != "triage":
+            return False, "task is not in triage"
+        if any(task[field] is not None for field in
+               ("current_run_id", "claim_lock", "claim_expires", "worker_pid")):
+            return False, "task still has a run or claim; execution is not settled"
+        run = _settlement_terminal_run(conn, task_id, expected_terminal_run_id)
+        loop = _latest_event(conn, task_id, "block_loop_detected", expected_terminal_run_id)
+        if run is None or loop is None:
+            return False, "exact loop run lacks a matching terminal worker result"
+        source_status = _json_dict(loop["payload"]).get("source_status")
+        conn.execute("UPDATE tasks SET status='blocked', block_kind=? WHERE id=?", (kind, task_id))
+        _append_event(conn, task_id, "blocked", {
+            "kind": kind, "settled_from": "triage", "owner": owner,
+            "required_input": required_input, "event": event, "author": author,
+            "source_status": source_status, "expected_terminal_run_id": expected_terminal_run_id,
+        }, run_id=expected_terminal_run_id)
+    return True, "waiting for the named external owner event"
+
 
 def inherit_creator_origin(
     conn: sqlite3.Connection, task_id: str, creator_task_id: Optional[str], *,
@@ -89,7 +202,7 @@ def _validate_children_graph(children: list) -> None:
 
 def decompose_triage_task(
     conn: sqlite3.Connection, task_id: str, *, root_assignee: Optional[str], children: list[dict],
-    author: Optional[str] = None, auto_promote: bool = True,
+    author: Optional[str] = None, auto_promote: bool = True, automatic: bool = False,
 ) -> Optional[list[str]]:
     """Fan a triage task out into children and move the root to ``todo``; the root
     waits on every child and wakes (``ready``) when all are done.
@@ -119,6 +232,8 @@ def decompose_triage_task(
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
+            return None
+        if automatic and not automatic_triage_eligible(conn, task_id):
             return None
         # Dependency links alone do not imply lineage. The completion event is
         # committed with the graph, and survives re-triage or unlinking.

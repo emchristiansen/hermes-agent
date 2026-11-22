@@ -158,9 +158,16 @@ def _managed(tmp_path, monkeypatch, text):
         def close(self):
             pass
 
+    class _ExitedChild:
+        # What the loss path reads off the handle: the child's pid and exit status.
+        pid = 1
+
+        def poll(self):
+            return 0
+
     async def _acquire(*_args, **_kwargs):
         spawned.append(True)
-        return object()
+        return _ExitedChild()
 
     scope = {'profile_id': str(tmp_path), 'session_id': 'sid', 'execution_id': 'x', 'generation': 1,
              'pid': 1, 'birth': 0, 'secret': 's', 'epoch': 1}

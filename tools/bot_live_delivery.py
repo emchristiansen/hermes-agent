@@ -37,7 +37,18 @@ def _bot_chat_tip(home: Path) -> str | None:
     db = SessionDB(db_path=home / 'state.db', read_only=True)
     try:
         row = db.get_session_by_title('Bot Chat')
-        return db.get_compression_tip(row['id']) if row else None
+        if row is None:
+            return None
+        from hermes_state_local import local_conversation_ids
+
+        # A legacy title may remain on a compression ancestor outside the adopted
+        # owner's receipt. Reach that owner before following reset lineage, then
+        # account for compression of its latest segment. Discovery stays read-only;
+        # admission still validates/adopts the target and refuses a later reset.
+        tip = db.get_compression_tip(row['id'])
+        with db._read_ctx() as conn:
+            target = local_conversation_ids(conn, tip)[-1]
+        return db.get_compression_tip(target)
     finally:
         db.close()
 

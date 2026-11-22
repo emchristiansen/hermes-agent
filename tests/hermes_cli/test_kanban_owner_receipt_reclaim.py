@@ -185,16 +185,25 @@ def test_dead_attempt_behind_an_unresolved_receipt_is_named_and_reclaimed(board)
     dict(worker_pid=os.getpid(), worker_fingerprint=kbd._process_fingerprint(os.getpid())),  # live worker
     dict(worker_bound=True, worker_pid=os.getpid(),
          worker_fingerprint=kbd._process_fingerprint(os.getpid())),                          # live bound interpreter
-    # A settled admission is proof on its own (see the next test), so these model an attempt
-    # that may still be executing: its admission is still ``started``.
+    # These model an attempt that may still be executing: its admission is still ``started``.
+    # Settlement alone never outranks a live claim, a fresh heartbeat or a missing worker pid:
+    # the ``-settled`` cases below hold the same shapes with the default settled admission.
     dict(heartbeat_age=300, admission=("started", None)),                                    # fresh heartbeat
     dict(expires_age_seconds=-3600, admission=("started", None)),                            # live claim
     dict(lock_host="some-other-host"),                                                       # foreign host
     dict(owner_pid=os.getpid(), owner_birth=None, admission=("started", None)),               # live owner in flight
+    dict(owner_pid=os.getpid(), owner_birth=None, admission=("unknown", None)),              # live, uncomparable owner
+    dict(owner_pid=os.getpid(), owner_birth=worker_birth(psutil.Process()),
+         admission=("unknown", None)),                                                       # live owner, unsettled
+    dict(owner_pid=os.getpid(), owner_birth=worker_birth(psutil.Process()), admission=None),  # live owner, no row
     dict(record_worker_pid=False, admission=("started", None)),                              # no pid recorded
     dict(record_worker_pid=False, expires_age_seconds=-3600),                                # no pid yet, settled
-], ids=["live-worker", "live-bound", "fresh-heartbeat", "live-claim", "foreign-host", "live-owner", "no-pid",
-        "no-pid-live-claim"])
+    dict(record_worker_pid=False),                                                           # no pid, settled, lapsed
+    dict(heartbeat_age=300),                                                                 # fresh heartbeat, settled
+    dict(expires_age_seconds=-3600),                                                         # live claim, settled
+], ids=["live-worker", "live-bound", "fresh-heartbeat", "live-claim", "foreign-host", "live-owner",
+        "live-owner-uncomparable", "live-owner-unsettled", "live-owner-no-row", "no-pid", "no-pid-live-claim",
+        "no-pid-settled", "fresh-heartbeat-settled", "live-claim-settled"])
 def test_the_pause_still_holds_every_attempt_that_may_be_alive(board, shape):
     """Missing evidence is never proof: reclaiming beside a possibly-live attempt repeats its effects."""
     board.dead_attempt("t_ghost", **shape)
@@ -225,6 +234,51 @@ def test_a_settled_admission_is_proof_even_while_the_owner_gateway_is_alive(boar
     # Booked against the breaker like any other non-completing attempt (A3).
     assert board.state("t_gateway")["consecutive_failures"] == 1
     assert board.state("t_bound")["status"] == "running"
+
+
+# --- a live owner that settled the attempt no longer holds it -------------------------------
+
+_RELEASE_PATHS = {
+    "ttl": lambda conn: kb.release_stale_claims(conn),
+    "crash": lambda conn: kbd.detect_crashed_workers(conn),
+}
+
+
+@pytest.mark.parametrize("max_retries, landing", [(None, "ready"), (1, "blocked")])
+@pytest.mark.parametrize("path", sorted(_RELEASE_PATHS))
+def test_an_attempt_a_live_owner_settled_terminal_is_released(board, path, max_retries, landing):
+    """2026-11-04, runs 440-446: the owner's managed child died in ``worker.adopt`` before
+    ``worker_bound``, and the owner (still running, same birth) settled the admission
+    ``terminal``/``interrupted``. Its pid stayed alive, so the claim was held with every worker
+    pid dead and no heartbeat for as long as that owner lived. Release books the run as a failure
+    under the card's ordinary retry policy; the owner's interrupted row is left as it was."""
+    run = board.dead_attempt("t_fenced", owner_pid=os.getpid(), owner_birth=worker_birth(psutil.Process()),
+                             admission=("terminal", "interrupted"))
+    board.conn.execute("UPDATE tasks SET max_retries = ? WHERE id = 't_fenced'", (max_retries,))
+    board.conn.commit()
+    assert owner_reclaim_paused(board.conn, "t_fenced") is True
+    assert owner_attempt_provably_over(board.conn, "t_fenced") is True
+
+    assert _RELEASE_PATHS[path](board.conn)
+    row = board.state("t_fenced")
+    assert (row["status"], row["claim_lock"], row["worker_pid"], row["current_run_id"]) == (landing, None, None, None)
+    ended = board.conn.execute("SELECT status, outcome FROM task_runs WHERE id = ?", (run,)).fetchone()
+    assert ended["outcome"] in {"reclaimed", "crashed"}
+    with sqlite3.connect(board.ledger) as store:
+        assert store.execute("SELECT status, outcome FROM session_admissions").fetchall() == [("terminal", "interrupted")]
+
+
+def test_a_live_owners_settled_attempt_waits_for_its_claim_and_worker(board):
+    """Settlement proves the owner stopped, not that the dispatcher's own worker or the claim did."""
+    owner = dict(owner_pid=os.getpid(), owner_birth=worker_birth(psutil.Process()),
+                 admission=("terminal", "interrupted"))
+    board.dead_attempt("t_live_claim", expires_age_seconds=-3600, **owner)
+    board.dead_attempt("t_live_worker", worker_pid=os.getpid(),
+                       worker_fingerprint=kbd._process_fingerprint(os.getpid()), **owner)
+    for tid in ("t_live_claim", "t_live_worker"):
+        assert owner_attempt_provably_over(board.conn, tid) is False
+    assert kb.release_stale_claims(board.conn) == 0
+    assert kbd.detect_crashed_workers(board.conn) == []
 
 
 # --- the gate is decided under the same write lock as the release ---------------------------

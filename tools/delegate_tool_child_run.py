@@ -482,9 +482,20 @@ def _defer_close_after_timeout(child: Any, child_future: Any, *, cleanup: Any = 
     sweep + one delayed re-sweep for a connection opened in between; a worker that still won't settle keeps its
     resources until process exit.
     """
+    # The close (or cleanup tail) writes through the gateway's shared SessionDB too: a shutdown writer
+    # until it has run.
+    from tools import detached_writers
+    settle_close = detached_writers.track()
     context = contextvars.copy_context()
     finish = cleanup or (lambda: _close_child(child, "Failed to close timed-out child after worker exit"))
-    child_future.add_done_callback(lambda _done: context.run(finish))
+
+    def _close_after_exit(_done: Any) -> None:
+        try:
+            context.run(finish)
+        finally:
+            settle_close()
+
+    child_future.add_done_callback(_close_after_exit)
     # Bounded drain (#94248 native half): the deferred close above only fires once the abandoned worker
     # unwinds, but that worker is typically parked inside an in-flight OpenSSL read (Codex / httpx). Never
     # hard-close that transport from this thread — releasing FDs under a live SSL read is the #29507/#70773
@@ -1016,6 +1027,11 @@ class _ChildRun:
                 )
 
         future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
+        # The conversation shares the gateway's SessionDB and can outlive this wait (timeout, stale verdict):
+        # a shutdown writer until it has finished, whatever this wait returns.
+        from tools import detached_writers
+        settle_conversation = detached_writers.track()
+        future.add_done_callback(lambda _done: settle_conversation())
         # One wait covers both ways out: the worker finishing, or the heartbeat's stale verdict.
         # Without the second, a worker wedged after its final answer holds a finite (-Q / Bot Chat
         # one-shot) turn — and its session lease — forever, since that runtime has no gateway

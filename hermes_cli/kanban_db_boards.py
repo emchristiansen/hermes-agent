@@ -153,6 +153,21 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     d = _kb.board_dir(normed)
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
+    # Deleting or archiving (renaming) the board must not remove or move a retained workspace. The
+    # check and the removal share the workspace-removal fence, so no settlement commits in between.
+    from hermes_cli.kanban_db_retention import removal_fence
+    with removal_fence() as fenced:
+        if not fenced:
+            raise ValueError(f"board {normed!r}: a workspace removal or settlement holds the removal "
+                             "fence; retry")
+        return _remove_board_fenced(normed, d, archive)
+
+
+def _remove_board_fenced(normed: str, d: Path, archive: bool) -> dict:
+    from hermes_cli.kanban_db_retention import board_removal_refusal
+    refusal = board_removal_refusal(d)
+    if refusal:
+        raise ValueError(f"board {normed!r} cannot be deleted or archived: {refusal}")
 
     # If the user removed the currently-active board, revert to default.
     if _kb.get_current_board() == normed:

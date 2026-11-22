@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from hermes_cli.kanban_workflow import ARCHIVED, DEFAULT_WORKFLOW
+from tools.output_control import OUTPUT_CONTROL_PROPERTY
 
 _DESC_TASK_ID_DEFAULT = (
     "Task id. If omitted, defaults to HERMES_KANBAN_TASK from the env — the "
@@ -57,6 +58,7 @@ KANBAN_SHOW_SCHEMA = _schema(
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "output_control": OUTPUT_CONTROL_PROPERTY,
     },
     [],
 )
@@ -202,16 +204,18 @@ KANBAN_BLOCK_SCHEMA = _schema(
 KANBAN_SCHEDULE_SCHEMA = _schema(
     "kanban_schedule",
     (
-        "Park your task as 'scheduled' while it waits for a time or external event. This ends the current run and makes the "
-        "task non-dispatchable until an orchestrator unblocks it; it does not "
-        "create a timer. Put any wake-up marker such as "
-        "``SCHEDULED_UNTIL=<ISO8601>`` in ``reason``."
+        "Park your task as 'scheduled' while it waits for a time or external event. Scheduled parks the current "
+        "attempt; it does not set an alarm. This ends the current run, and the task stays non-dispatchable until a "
+        "supported release, such as an orchestrator's ``kanban_unblock``, moves it on. A timestamp or "
+        "``SCHEDULED_UNTIL=<ISO8601>`` marker in ``reason`` is descriptive text, not a timer or promised "
+        "resumption: name the real return event and the actor responsible for supported continuation."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
         "reason": _prop("string", (
-            "Optional reason or machine-readable wake-up marker recorded on "
-            "the completed run and scheduled event."
+            "Optional reason recorded on the completed run and scheduled "
+            "event. A timestamp or ``SCHEDULED_UNTIL`` marker here is "
+            "descriptive only; nothing reads it to resume the task."
         )),
     },
     [],
@@ -243,7 +247,11 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
             "type": "object",
             "description": (
                 "Optional structured handoff facts for the reviewer, such "
-                "as changed_files, tests_run, commit, or decisions."
+                "as changed_files, tests_run, commit, or decisions. "
+                "reviewer_context: \"continue\" gives the reviewer the "
+                "previous review conversation of this task (same reviewer "
+                "profile); add review_continues_task: <task id> to "
+                "continue another card's review when this card has none."
             ),
             "additionalProperties": True,
         },

@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 # build_worker_context() caps, sized for a ~100k-char prompt with headroom.
 _CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
+_CTX_FOLDED_TURN_REPORTS = 2      # earliest and latest N turn reports shown in one folded wall run
 _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # per task.body (opening post)
@@ -129,35 +130,109 @@ def _ctx_attachments(lines: list[str], attachments: list[Attachment]) -> None:
 
 def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
     """Closed runs on this task (the active run is this worker), newest
-    ``_CTX_MAX_PRIOR_ATTEMPTS`` in full, older ones as a one-line marker."""
+    ``_CTX_MAX_PRIOR_ATTEMPTS`` entries in full, older ones as a one-line marker.
+
+    A run of consecutive rate-limited attempts with no summary is ONE entry: a quota wall can requeue
+    a card for hours, and one row per walled attempt would push the last attempt that did work (its
+    summary names what it was waiting for) out of the window the retry reads."""
     all_prior = [r for r in _kb.list_runs(conn, task_id) if r.ended_at is not None]
-    shown, omitted_note = _ctx_tail(all_prior, _CTX_MAX_PRIOR_ATTEMPTS, "attempt")
+    entries = _ctx_attempt_entries(all_prior)
+    shown = entries[-_CTX_MAX_PRIOR_ATTEMPTS:]
     if not shown:
         return
-    first_shown_idx = len(all_prior) - len(shown) + 1
     lines.append("## Prior attempts on this task")
-    if omitted_note:
-        lines.append(omitted_note)
-    for offset, run in enumerate(shown):
-        profile = run.profile or "(unknown)"
-        outcome = run.outcome or run.status
-        lines.append(
-            f"### Attempt {first_shown_idx + offset} — {outcome} ({profile}, {_ctx_stamp(run.started_at, now)})"
-        )
-        if run.summary and run.summary.strip():
-            lines.append(_ctx_cap(run.summary))
-        if run.error and run.error.strip():
-            lines.append(f"_error_: {_ctx_cap(run.error)}")
-        meta_line = _ctx_metadata_line(run.metadata)
-        if meta_line:
-            lines.append(meta_line)
+    omitted = shown[0][0] - 1
+    if omitted:
+        lines.append(f"_({omitted} earlier attempt{'s' if omitted != 1 else ''} omitted; "
+                     f"showing the most recent {len(all_prior) - omitted})_")
+    for first, runs in shown:
+        if len(runs) == 1:
+            _ctx_attempt(lines, first, runs[0], now)
+        else:
+            _ctx_wall_run(lines, first, runs, now)
         lines.append("")
+
+
+def _ctx_attempt_entries(runs: list) -> list[tuple[int, list]]:
+    """``(first attempt number, runs)`` entries; consecutive summary-less walls share one."""
+    entries: list[tuple[int, list]] = []
+    for number, run in enumerate(runs, start=1):
+        if _ctx_is_wall(run) and entries and _ctx_is_wall(entries[-1][1][-1]):
+            entries[-1][1].append(run)
+        else:
+            entries.append((number, [run]))
+    return entries
+
+
+# What the crash sweep books on a rate-limited run; any other key is something the attempt or an
+# operator recorded, so that run keeps its own entry.
+_WALL_BOOKING_KEYS = frozenset({"pid", "claimer", "exit_code", "retry_status", "provider_wall"})
+
+
+def _ctx_is_wall(run) -> bool:
+    """A rate-limited attempt that left nothing but the sweep's own booking."""
+    metadata = run.metadata if isinstance(run.metadata, dict) else ({} if run.metadata is None else None)
+    return ((run.outcome or run.status) == "rate_limited" and not (run.summary or "").strip()
+            and metadata is not None and set(metadata) <= _WALL_BOOKING_KEYS)
+
+
+def _ctx_attempt(lines: list[str], number: int, run, now: int) -> None:
+    profile = run.profile or "(unknown)"
+    outcome = run.outcome or run.status
+    lines.append(f"### Attempt {number} — {outcome} ({profile}, {_ctx_stamp(run.started_at, now)})")
+    if run.summary and run.summary.strip():
+        lines.append(_ctx_cap(run.summary))
+    if run.error and run.error.strip():
+        lines.append(f"_error_: {_ctx_cap(run.error)}")
+    meta_line = _ctx_metadata_line(run.metadata)
+    if meta_line:
+        lines.append(meta_line)
+
+
+def _ctx_wall_run(lines: list[str], first: int, runs: list, now: int) -> None:
+    """Consecutive walled attempts: their span, then the newest one's own error and evidence."""
+    newest = runs[-1]
+    profiles = ", ".join(dict.fromkeys(r.profile or "(unknown)" for r in runs))
+    lines.append(
+        f"### Attempts {first}–{first + len(runs) - 1} — rate_limited ×{len(runs)} ({profiles}, "
+        f"{_ctx_stamp(runs[0].started_at, now)} to {_ctx_stamp(newest.ended_at, now)})"
+    )
+    lines.append("Each requeued on a provider wall without counting a failure.")
+    # An attempt whose turn ran before its wall may have acted: keep what it reported. The earliest
+    # and latest reports are shown; the rest stay in their runs, named here so they can be read.
+    turns = [(number, run, wall) for number, run in enumerate(runs[:-1], start=first)
+             if (wall := _ctx_turn_wall(run)) is not None]
+    edge = _CTX_FOLDED_TURN_REPORTS
+    hidden = turns[edge:-edge]
+    for number, _run, wall in turns[:edge]:
+        lines.append(f"- attempt {number} ran a turn: {_ctx_cap(str(wall.get('evidence') or ''), 300)}")
+    if hidden:
+        lines.append(f"- {len(hidden)} more attempt{'s' if len(hidden) != 1 else ''} ran a turn "
+                     f"(attempts {hidden[0][0]}–{hidden[-1][0]}, runs #{hidden[0][1].id}–#{hidden[-1][1].id}); "
+                     f"each report is its run's `metadata.provider_wall`: `hermes kanban runs {newest.task_id} --json`")
+    for number, _run, wall in turns[max(edge, len(turns) - edge):]:
+        lines.append(f"- attempt {number} ran a turn: {_ctx_cap(str(wall.get('evidence') or ''), 300)}")
+    lines.append("The newest:")
+    if newest.error and newest.error.strip():
+        lines.append(f"_error_: {_ctx_cap(newest.error)}")
+    meta_line = _ctx_metadata_line(newest.metadata)
+    if meta_line:
+        lines.append(meta_line)
+
+
+def _ctx_turn_wall(run) -> Optional[dict]:
+    """The provider wall a run's turn ended on, when its turn ran before the wall."""
+    wall = (run.metadata or {}).get("provider_wall") if isinstance(run.metadata, dict) else None
+    return wall if isinstance(wall, dict) and wall.get("phase") == "turn" else None
 
 
 def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
     """Done-parent handoffs: newest ``completed`` run's summary+metadata,
     falling back to ``task.result`` for pre-runs-table data. Stamped with a
-    relative age so the worker re-verifies stale upstream results."""
+    relative age so the worker re-verifies stale upstream results. A parent whose newest completion
+    is a delivered-assessment settlement hands off that settled result (or its corrected handoff
+    summary) and its provenance instead."""
+    from hermes_cli.kanban_db_settle import settled_handoff
     parent_rows = conn.execute(
         "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id", (task_id,),
     ).fetchall()
@@ -166,7 +241,8 @@ def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str
         pt = _kb.get_task(conn, pid)
         if not pt or pt.status != "done":
             continue
-        runs = [r for r in _kb.list_runs(conn, pid) if r.outcome == "completed"]
+        settled = settled_handoff(conn, pid)
+        runs = [] if settled else [r for r in _kb.list_runs(conn, pid) if r.outcome == "completed"]
         runs.sort(key=lambda r: r.started_at, reverse=True)
         run = runs[0] if runs else None
         if not wrote_header:
@@ -179,16 +255,22 @@ def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str
                 "source before acting on it as current._"
             )
             wrote_header = True
-        done_ts = run.ended_at if run is not None and run.ended_at else (pt.completed_at or None)
+        done_ts = run.ended_at if run is not None and run.ended_at else (
+            settled[2] if settled else pt.completed_at or None)
         age = _relative_age(done_ts, now)
         lines.append(f"### {pid}" + (f" (completed {age})" if age else ""))
-        if run is not None and run.summary and run.summary.strip():
-            lines.append(_ctx_cap(run.summary))
+        # A settlement correction's handoff summary stands where an ordinary edit's run summary does (SI-10).
+        handoff = run.summary if run is not None else settled[1].get("summary") if settled else None
+        if handoff and handoff.strip():
+            lines.append(_ctx_cap(handoff))
         elif pt.result:
             lines.append(_ctx_cap(pt.result))
         else:
             lines.append("(no result recorded)")
-        meta_line = _ctx_metadata_line(run.metadata) if run is not None else None
+        if settled:
+            lines.append(f"_settled by {settled[1].get('actor')} from run {settled[1].get('expected_terminal_run')} "
+                         f"as a delivered {settled[1].get('verdict')} assessment_")
+        meta_line = _ctx_metadata_line(run.metadata if run is not None else settled[1].get("metadata") if settled else None)
         if meta_line:
             lines.append(meta_line)
         lines.append("")

@@ -387,8 +387,9 @@ def _model_prompt_capability_surface(model_cfg: object) -> dict:
 def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
     """12-hex digest of the capability surface for ``home``'s profile: disabled skills +
     enabled toolsets + MCP config, model capability overrides that change the prompt
-    (``supports_vision``, ``context_length``), SOUL.md bytes, installed skill names, the
-    Bot-Mode roster (+ roles), peers and the relay roster. Deliberately NOT cached — the
+    (``supports_vision``, ``context_length``), the normalized context-file cap override,
+    SOUL.md bytes, installed skill names, the Bot-Mode roster (+ roles), peers and the
+    relay roster. Deliberately NOT cached — the
     point is detecting on-disk drift against a stored prompt's epoch. Never raises
     ("unavailable" on failure)."""
     import hashlib
@@ -400,6 +401,7 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
     try:
         # Canonical loader (managed overlay + env expansion + normalization),
         # scoped to the bot's home via the override the loaders already honor.
+        from agent.prompt_builder import _configured_context_file_max_chars
         from agent.skill_utils import parse_config_string_list
         from hermes_cli.config import load_config_readonly
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -412,6 +414,9 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
         skills_cfg = cfg.get("skills") if isinstance(cfg.get("skills"), dict) else {}
         model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
         surface["model_capabilities"] = _model_prompt_capability_surface(model_cfg)
+        # None means dynamic: the actual window belongs to the session's model,
+        # not this disk probe. Share explicit-cap coercion with the prompt loader.
+        surface["context_file_max_chars"] = _configured_context_file_max_chars(cfg)
         surface["disabled_skills"] = sorted(str(s).lower() for s in (skills_cfg.get("disabled") or []))
         # The live selection is platform_toolsets.<platform> minus agent.disabled_toolsets;
         # tools.enabled_toolsets is written by no surface, so watching it left Bot Chats
@@ -420,6 +425,8 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
         agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
         surface["platform_toolsets"] = json.dumps(cfg.get("platform_toolsets") or {}, sort_keys=True, default=str)
         surface["disabled_toolsets"] = sorted(parse_config_string_list(agent_cfg.get("disabled_toolsets")))
+        if disabled_tools := sorted(parse_config_string_list(agent_cfg.get("disabled_tools"))):
+            surface["disabled_tools"] = disabled_tools  # absent when unset: every other epoch is unchanged
         mcp = cfg.get("mcp_servers")
         surface["mcp"] = json.dumps(mcp, sort_keys=True, default=str) if isinstance(mcp, dict) else ""
     except Exception:
@@ -490,11 +497,36 @@ def stored_prompt_capability_stale(stored_prompt: str, home: str | os.PathLike |
     return current != "unavailable" and m.group(1) != current
 
 
+def session_is_canonical_bot_chat(db, session_id: str | None, title: str | None) -> bool:
+    """True when the session is a bot's canonical "Bot Chat": titled so, or the session the
+    gateway currently routes that chat to. A fresh reset of the canonical route moves its
+    ``gateway_routing`` entry (``agent:<profile>:local:dm:<chat id>``) to a successor session
+    whose title comes from its first message; the chat id still names the "Bot Chat" row, and
+    the successor is where every message to that chat lands. Fails closed: any lookup failure
+    is "not canonical", which is today's title-only answer."""
+    if str(title or "").strip() == BOT_CHAT_TITLE:
+        return True
+    if db is None or not session_id:
+        return False
+    try:
+        entry = db.gateway_routing_entry_for_session(session_id)
+        origin = entry.get("origin") if isinstance(entry, dict) else None
+        if not isinstance(origin, dict) or origin.get("platform") != "local" or origin.get("chat_type") != "dm":
+            return False
+        chat_id = origin.get("chat_id")
+        if not isinstance(chat_id, str) or not chat_id or chat_id == session_id:
+            return False
+        return str(db.get_session_title(chat_id) or "").strip() == BOT_CHAT_TITLE
+    except Exception:
+        return False
+
+
 def stored_bot_chat_prompt_needs_upgrade(stored_prompt: str, home: str | os.PathLike | None = None) -> bool:
     """True when a Bot Chat session's stored prompt PREDATES the epoch mechanism (no stamp —
     including SOUL-era prompts whose frozen roster rode in from SOUL.md). The caller must only
-    ask for sessions titled "Bot Chat"; we rebuild only when the probe would actually emit a
-    section, and every rebuilt prompt is stamped so this fires once. Fails closed."""
+    ask for canonical Bot Chat sessions (``session_is_canonical_bot_chat``); we rebuild only when
+    the probe would actually emit a section, and every rebuilt prompt is stamped so this fires once.
+    Fails closed."""
     if _EPOCH_PREFIX in (stored_prompt or ""):
         return False
     return _swallow(lambda: bool(get_bot_mode_protocol_section(home)), False)

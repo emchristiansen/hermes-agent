@@ -24,6 +24,7 @@ toward the slow path, which then does the authoritative parse).
 
 from __future__ import annotations
 
+import itertools
 import os
 import sys
 
@@ -33,12 +34,14 @@ __all__ = [
     "ensure_project_root_on_path",
     "is_container_startup_environment",
     "is_desktop_ssh_backend_argv",
+    "is_gateway_run_argv",
     "is_global_fast_version_argv",
     "normalize_hermes_home_env",
     "print_fast_version_info",
     "project_root_str",
     "read_install_method",
     "read_openai_version",
+    "try_auth_principals",
     "try_fast_version",
 ]
 
@@ -109,6 +112,10 @@ def ensure_project_root_on_path() -> None:
 
 def is_global_fast_version_argv(argv: list[str]) -> bool:
     return argv in (["--version"], ["-V"])
+
+
+def is_gateway_run_argv(argv: list[str]) -> bool:
+    return any(a == "gateway" and b == "run" for a, b in itertools.pairwise(argv))
 
 
 def is_desktop_ssh_backend_argv(argv: list[str]) -> bool:
@@ -266,3 +273,26 @@ def try_fast_version(argv: list[str] | None = None) -> bool:
 
     print_fast_version_info()
     return True
+
+
+def try_auth_principals(argv: list[str] | None = None) -> int | None:
+    """Run ``hermes auth principals`` before the scratch export and config/logging imports, which
+    create files in the home.
+
+    The command promises no home initialization or writes. Call after profile resolution (``-p``
+    picks the home it reads, and is gone from *argv*). Top-level options that leave the command
+    unchanged in the full parser (``--cli``, ``--yolo`` …) are accepted. Returns its exit status, or
+    None for the normal path: other commands; help, ``--version``, ``-z`` or an option the parser
+    rejects (answered there exactly as for any command); or container mode, which routes every
+    command into the container.
+    """
+    if argv is None:
+        argv = sys.argv[1:]
+    from hermes_cli._parser import no_init_command_args
+
+    args = no_init_command_args(argv, profile_flag_consumed=True)
+    if args is None or container_mode_may_be_active():
+        return None
+    from hermes_cli.auth_principals import main
+
+    return main(args)

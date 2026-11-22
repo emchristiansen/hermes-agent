@@ -174,10 +174,11 @@ def authorize_local_source(runner, source):
 
 def _bypass_policy(params, *, private_secrets, client_local=False):
     """Frozen snapshot for --safe-mode / --ignore-user-config: code defaults plus the explicit
-    launch options. The profile's config.yaml/.env are never read, so a malformed profile cannot
+    launch options, and the administrator's managed home-guidance setting (``build_bypass_policy``).
+    The profile's config.yaml/.env are never read, so a malformed profile cannot
     block or shape the session; there is no default model to inherit, so one must be explicit."""
     import copy
-    from gateway.session_policy import build_policy
+    from agent.home_guidance import build_bypass_policy as build_policy
     from hermes_cli.config_defaults import DEFAULT_CONFIG
     if not params.get('model'):
         raise RuntimeStoreError('invalid_params', field='model',

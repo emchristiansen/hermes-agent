@@ -33,6 +33,78 @@ LOSS_RECORD_WAIT_S = 10
 WORKER_POPEN = {'start_new_session': True, 'close_fds': True}
 
 
+def _describe_exit(returncode):
+    """``returncode`` for the loss log: the signal's name when one ended the child, ``running`` when
+    it has not exited yet."""
+    if returncode is None:
+        return 'running'
+    if returncode < 0:
+        import signal
+        try:
+            return f'{returncode} ({signal.Signals(-returncode).name})'
+        except ValueError:
+            return str(returncode)
+    return str(returncode)
+
+
+def _kanban_attempt(request_id):
+    """The dispatcher attempt a Kanban admission carries in its request identity
+    (``session_kanban``: ``kanban:[board, task_id, run_id]``), else None. Read, never reconstructed."""
+    if not isinstance(request_id, str) or not request_id.startswith('kanban:'):
+        return None
+    try:
+        attempt = json.loads(request_id[len('kanban:'):])
+    except ValueError:
+        return None
+    if not isinstance(attempt, list) or len(attempt) != 3:
+        return None
+    board, task_id, run_id = attempt
+    return {'board': board, 'task_id': task_id, 'run_id': run_id}
+
+
+def _managed_exit_record(row, scope, process, lifecycle, returncode, exit_observed_at):
+    """The worker's lifecycle as the owner observed it on the ordinary finish path, stored with the
+    admission's settled result (``managed_exit``) so the finish, the ACK and the actual OS exit are
+    correlated durably by card/run (the Kanban request identity), admission, generation and execution.
+
+    ``exit`` is only what ``process.wait`` returned for the reserved interpreter itself. A wait that
+    timed out, or a handle that is not the reserved interpreter (a launcher), leaves the status
+    ``unknown`` with its reason: an exit is never inferred from the turn's or the board's result.
+    Times are owner wall-clock seconds: ``result_received_at`` (the worker's result frame accepted),
+    ``ack_sent_at`` (the owner's ``finish`` ACK written to the worker), ``finish_observed_at`` (the
+    worker's ``finished``, which it sends only after its durable execution.finish receipt)."""
+    handle_is_worker = process.pid == scope['pid']
+    if returncode is None:
+        exit_ = {'status': 'unknown', 'returncode': None, 'observed_at': None, 'reason': 'wait_timeout'}
+    elif not handle_is_worker:
+        exit_ = {'status': 'unknown', 'returncode': None, 'observed_at': None, 'reason': 'handle_is_not_the_worker',
+                 'handle_returncode': returncode, 'handle_observed_at': exit_observed_at}
+    elif returncode < 0:
+        import signal
+        try:
+            name = signal.Signals(-returncode).name
+        except ValueError:
+            name = None
+        exit_ = {'status': 'signalled', 'returncode': returncode, 'signal': name, 'observed_at': exit_observed_at}
+    else:
+        exit_ = {'status': 'exited', 'returncode': returncode, 'observed_at': exit_observed_at}
+    return {'v': 1, 'request_id': row.get('request_id'), 'kanban': _kanban_attempt(row.get('request_id')),
+            'admission_id': row['admission_id'], 'generation': row['generation'], 'owner_epoch': scope.get('epoch'),
+            'execution_id': scope['execution_id'], 'worker_pid': scope['pid'], 'worker_birth': scope['birth'],
+            'handle_pid': process.pid, **lifecycle, 'exit': exit_}
+
+
+async def _fence_lost_worker(authority, row, scope, owner_restart):
+    """Fence a lost worker's admission ``unknown``. The loss's cause (``owner_restart``) is bound by the
+    caller where the loss is found (``_settle_lost``): an owner already stopping lost it to its own end,
+    and that cause commits with the fence itself, so the settlement that follows (this drain's, or a later
+    owner's boot) owes the card its restart result. A kill under a live owner stays a crash even if a stop
+    begins afterwards."""
+    from gateway.session_runtime_workers import tracked_write
+    from gateway.session_worker_reservation import lose_admission_worker
+    await tracked_write(authority, partial(lose_admission_worker, authority, row, scope, owner_restart))
+
+
 class ManagedExecutionUnknown(RuntimeError):
     """The committed unknown verdict stops the FIFO without forging failed settlement."""
 
@@ -297,8 +369,21 @@ class ManagedWorker:
             stopper.cancel()
             arrived.cancel()
 
-    def interrupt(self):
-        self.control({'type': 'stop'})
+    def interrupt(self, message=None, **kwargs):
+        """The Stop control, under the explicit-stop ABI (``agent.interrupt_compat``): the profile
+        stop and ``adopt_agent`` reach an adopted worker through ``request_hard_interrupt``, which
+        passes a message and may pass ``tool_reason``. The stop frame carries neither; a gateway
+        stop's cause is recorded by ``stop_authority_turns``. The execution's ``finally`` drops the
+        worker from ``_managed_workers`` and closes it while ``adopted`` still names it, so a closed
+        worker has nothing left to stop. A full control queue is not an error either: ``control``
+        latched ``stop`` first and the owner's read loop escalates on that latch."""
+        try:
+            self.control({'type': 'stop'})
+        except RuntimeStoreError as exc:
+            if exc.reason not in {'managed_worker_lost', 'worker_control_backpressure'}:
+                raise
+            import logging
+            logging.getLogger(__name__).debug('Managed Stop not queued (%s)', exc.reason)
 
     def respond(self, kind, prompt_id, value):
         self.control({'type': kind, 'prompt_id': prompt_id, 'value': value})
@@ -591,14 +676,15 @@ async def _settle_lost(authority, row, scope, recording):
     books the bound interpreter, so a later write is dropped and an exit-0 worker_result reads
     as a protocol violation. A busy board holds this up ``LOSS_RECORD_WAIT_S`` at most (the
     write carries on, tracked), and a cancellation during the wait still settles.
+    Whether the owner was already ending is read now, before that wait (``_fence_lost_worker``).
     """
-    from gateway.session_worker_reservation import lose_admission_worker
-    from gateway.session_runtime_workers import tracked_write
+    from gateway.session_unattended_unknown import owner_ending
+    owner_restart = owner_ending(authority)
     try:
         if recording is not None:
             await asyncio.wait({recording}, timeout=LOSS_RECORD_WAIT_S)
     finally:
-        await tracked_write(authority, partial(lose_admission_worker, authority, row, scope))
+        await _fence_lost_worker(authority, row, scope, owner_restart)
 
 
 async def _spawn_registered_worker(authority, ref, row):
@@ -716,6 +802,7 @@ async def execute_managed(authority, ref, row, policy):
     authority.adopt_agent(ref.session_id, row['generation'], worker)
     accepted = usage = None
     scope = None
+    lifecycle = {}
     try:
         # The interpreter behind the handle introduces itself first; the owner verifies that
         # identity (alive, same birth, descends from the handle) before reserving for it.
@@ -757,27 +844,39 @@ async def execute_managed(authority, ref, row, policy):
                     accepted, usage = accept_result(frame['result'])
                 except ValueError as exc:
                     raise RuntimeStoreError('invalid_worker_result') from exc
+                lifecycle['result_received_at'] = time.time()
                 authority.sessions[ref.session_id].controls.snapshot(ref.session_id, None)
                 await asyncio.to_thread(worker.send, {'type': 'finish'})
+                lifecycle['ack_sent_at'] = time.time()
                 continue
             if frame == {'type': 'finished'} and accepted is not None:
                 # 'finished' follows the worker's durable execution.finish: the turn is complete.
                 # A slow or non-zero interpreter exit after it is close()'s cleanup, not a loss.
+                lifecycle['finish_observed_at'] = time.time()
+                returncode = exit_observed_at = None
                 with suppress(subprocess.TimeoutExpired):
-                    await asyncio.to_thread(process.wait, 10)
+                    returncode = await asyncio.to_thread(process.wait, 10)
+                    exit_observed_at = time.time()
+                managed_exit = _managed_exit_record(row, scope, process, lifecycle, returncode, exit_observed_at)
+                import logging
+                logging.getLogger(__name__).info(
+                    'Managed worker finished: admission %s generation %s request %s execution %s pid %s exit %s (%s)',
+                    row['admission_id'], row['generation'], row.get('request_id'), scope['execution_id'], scope['pid'],
+                    managed_exit['exit']['status'], managed_exit['exit']['returncode']
+                    if managed_exit['exit']['returncode'] is not None else managed_exit['exit']['reason'])
                 accepted = _with_stop_cause(accepted, worker)
                 await _finalize_managed_refusal(authority, scope['session_id'], accepted)
                 # Like in-process execution, settlement belongs to the drain's stream lock.
                 authority.pending_results[row['admission_id']] = {
-                    'result': {**accepted, 'local_viewer': True}, 'usage': usage,
+                    'result': {**accepted, 'local_viewer': True}, 'usage': usage, 'managed_exit': managed_exit,
                     **await asyncio.to_thread(_settled_session_usage, authority, scope['session_id'], accepted, scope['execution_id'])}
                 return accepted['final_response']
             raise RuntimeStoreError('invalid_worker_frame')
     except (Exception, asyncio.CancelledError) as exc:
         import logging
         reason = exc.reason if isinstance(exc, RuntimeStoreError) else type(exc).__name__
-        logging.getLogger(__name__).warning('Managed worker lost: %s', reason)
         if scope is None:
+            logging.getLogger(__name__).warning('Managed worker lost: %s', reason)
             if isinstance(exc, asyncio.CancelledError) or (
                     isinstance(exc, RuntimeStoreError) and exc.reason == 'managed_worker_stopped'):
                 # Stopped before the child ever received its bootstrap: nothing executed, so
@@ -785,6 +884,10 @@ async def execute_managed(authority, ref, row, policy):
                 return _interrupted_before_bootstrap(authority, row, worker.stop_cause)
             _record_lost_attempt(authority, policy, exc, reason, scope)  # nothing bound: a late note is dropped, never misbooked
             raise
+        # The reserved child's exit status tells its own exit from a kill (a negative code names
+        # the signal). Read without waiting: nothing may delay or cancel the loss write below.
+        logging.getLogger(__name__).warning('Managed worker lost: %s (pid %s, exit %s)', reason,
+            process.pid, _describe_exit(process.poll()))
         await _settle_lost(authority, row, scope, _record_lost_attempt(authority, policy, exc, reason, scope))
         live = authority.sessions[ref.session_id]
         with live.event_stream.lock:

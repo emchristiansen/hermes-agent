@@ -624,6 +624,15 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         row = self._read_one("SELECT role FROM messages WHERE id = ? AND session_id = ? AND active = 1", (int(row_id), session_id))
         return row[0] if row else None
 
+    def get_message_identity(self, session_id: str, row_id: int) -> Optional[tuple[str, Optional[str]]]:
+        """``(role, message_uid)`` of the active message at *row_id* in *session_id*, or ``None``."""
+        if not session_id:
+            return None
+        row = self._read_one(
+            "SELECT role, message_uid FROM messages WHERE id = ? AND session_id = ? AND active = 1",
+            (int(row_id), session_id))
+        return (row[0], row[1]) if row else None
+
     def _carry_parent_timestamps(self, conn, parent_session_id: str, messages: list[dict[str, Any]]) -> None:
         """Adopt the durable parent row's timestamp onto carried handoff rows so the re-inserted child row keeps
         the original's display identity (see _display_dedupe_key). Idempotent; never overwrites a timestamp the
@@ -1465,7 +1474,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         # before_rows includes the anchor itself.
         return {"window": window_msgs, "messages_before": max(0, len(before_rows) - 1), "messages_after": len(after_rows)}
 
-    def resolve_resume_session_id(self, session_id: str) -> str:
+    def resolve_resume_session_id(self, session_id: str, *, strict: bool = False) -> str:
         """Redirect a resume target to the descendant holding the messages: follow the compression chain to
         the live tip (lineage-aware, so delegate/branch children never hijack it), then walk
         ``parent_session_id`` forward to the DEEPEST node with messages (a continuation may hold newer
@@ -1475,13 +1484,17 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         ``parent_session_id``). The flush cursor is reset, so the child is where new messages actually land
         — the parent ends up with ``message_count = 0`` rows unless messages had already been flushed to it
         before compression. See #15000.
+
+        A read failure leaves the input id (best effort for readers); *strict* raises it instead, for a caller
+        that must know the selection is complete (a reset ending what resumes read).
         """
         if not session_id:
             return session_id
         try:
             session_id = self.get_compression_tip(session_id) or session_id
         except Exception:
-            pass
+            if strict:
+                raise
         with self._read_ctx() as conn:
             current = session_id
             seen = {current}
@@ -1499,6 +1512,8 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
                         "  AND COALESCE(child.source, '') != 'tool' "
                         "ORDER BY child.started_at DESC, child.id DESC LIMIT 1", (current,)).fetchone()
                 except Exception:
+                    if strict:
+                        raise
                     return session_id
                 if child_row is None or not child_row["id"] or child_row["id"] in seen:
                     break
@@ -1954,6 +1969,22 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         """Delete all messages for a session and reset its counters."""
         def _do(conn):
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.execute(_RESET_COUNTERS_SQL, (session_id,))
+        self._execute_write(_do)
+
+    def end_conversation_in_place(self, session_id: str) -> None:
+        """A reset in place (ACP ``/reset``): the session keeps its row, usage counters and messages on disk, but its
+        conversation ends. In one transaction, drop the stored prompt that recorded the ended conversation and take
+        its rows out of the session's conversation — the live ones and those compaction summarized away
+        (``active = 1 OR compacted = 1``) get the marking rewind gives rows the user took back (``active = 0,
+        compacted = 0``): kept on disk for audit (``include_inactive=True`` reads and searches find them; default
+        search does not), never replayed or shown as the conversation's history again."""
+        def _do(conn):
+            conn.execute("UPDATE sessions SET system_prompt_hash = NULL, system_prompt = NULL WHERE id = ?",
+                         (session_id,))
+            self._delete_unreferenced_system_prompts(conn)
+            conn.execute(f"UPDATE messages SET active = 0, compacted = 0 WHERE session_id = ?{_DISPLAY_ACTIVE_CLAUSE}",
+                         (session_id,))
             conn.execute(_RESET_COUNTERS_SQL, (session_id,))
         self._execute_write(_do)
 

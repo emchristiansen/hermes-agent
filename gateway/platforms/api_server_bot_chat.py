@@ -175,18 +175,24 @@ async def await_peer_receipt(authority, record, timeout, *, should_stop=None):
 
     Each pass re-reads which admission is live (``peer_wait_admission``): after a transient failure
     the owner admits ONE retry, whose id is the only future that fires again; the original's interim
-    ``failed`` (retry still eligible) reads as pending, never as the answer."""
+    ``failed`` (retry still eligible) reads as pending, never as the answer.
+
+    Both state.db reads run off the loop and stay owned by the authority's gateway runner until
+    their thread has finished (``owned_offload``): a waiter cancelled mid-read leaves the read
+    counted by the shutdown close gate, so SessionDB is never closed under it."""
+    from gateway.run_notifications_offload import owned_offload
     from gateway.session_bot import peer_wait_admission
     if record['status'] not in _PENDING:
         return record
     loop = asyncio.get_running_loop()
+    runner = getattr(authority, 'runner', None)
     deadline = None if timeout is None else loop.time() + timeout
     while True:
-        live, interim = await asyncio.to_thread(peer_wait_admission, authority, record)
+        live, interim = await owned_offload(runner, peer_wait_admission, authority, record)
         # Register the waiter BEFORE re-reading: a settle between the two either shows in the read
         # or resolves this future; a settle before both would otherwise leave a future nobody pops.
         waiter = None if live is None or interim else authority.waiters.setdefault(live, loop.create_future())
-        current = _receipt(authority, record)
+        current = await owned_offload(runner, _receipt, authority, record)  # state DB reads, off the loop
         if live is None and current['status'] in _PENDING:
             continue  # The derived retry committed while the receipt was being read.
         if live == record['admission_id'] and not interim and current['status'] == 'failed' \
