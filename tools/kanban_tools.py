@@ -957,14 +957,10 @@ def _handle_heartbeat(args: dict, **kw) -> str:
 def _handle_comment(args: dict, **kw) -> str:
     """Append a comment to a task's thread."""
     _reject_delegated_child_mutation("kanban_comment")
-    tid = args.get("task_id")
-    if not tid:
-        # A comment writes to the board, so a bare call must stay an error — but
-        # point at kanban_list, not an env var a chat caller cannot set (#91431).
-        raise _Reject(
-            "task_id is required: comments are per-task and this session has no "
-            "dispatcher-assigned task to default to. Discover task ids with "
-            "kanban_list, or pass the task id you mean.")
+    # A dispatcher-owned worker's bare comment goes to its own task, as its other board tools
+    # do; every other bare call stays an error that points at kanban_list (#91431), including a
+    # delegate child or cron run that only inherited HERMES_KANBAN_TASK (``_require_task_id``).
+    tid = _require_task_id(args)
     body = _redact(_require_text(args, "body"))
     # Author comes from the worker's runtime identity (``_persisted_identity``), never
     # caller args: comments are injected into future workers' system prompts, so an
