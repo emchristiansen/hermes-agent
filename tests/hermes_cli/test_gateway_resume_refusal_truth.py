@@ -77,3 +77,41 @@ def test_a_refused_turn_is_shown_as_the_gateways_refusal_not_the_models():
     shown = chat_error_response(text, provider="openai-codex", model="gpt-6.1-sol", failure_reason="gateway_refusal")
     assert shown == text
     assert "/model" not in shown
+
+
+class _HistoryReader(_Reader):
+    def get_messages_as_conversation(self, session_id, repair_alternation=False):
+        return [{"role": "user", "content": "earlier"}, {"role": "assistant", "content": "reply"}]
+
+
+def _late_loader(open_):
+    from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+
+    class _Viewer(CLIAgentSetupMixin):
+        tool_progress_mode = "off"  # plain status lines on stderr
+        session_id = _Cli.session_id
+        conversation_history = []
+
+        def _follow_compression_chain(self, meta, announce):
+            self._resume_read_id = self.session_id
+            return meta
+
+        def _resume_history_limit_error(self, tip_only=False):
+            return None
+
+        def _restore_session_state(self, meta, *, quiet=False):
+            pass
+
+    viewer = _Viewer()
+    viewer._session_db = GatewaySessionStore(_Connection("not_found"))
+    viewer._session_db._reader = _HistoryReader({_Cli.session_id: {"id": _Cli.session_id, "title": "t"}})
+    viewer._gateway_session_open = open_
+    return viewer
+
+
+@pytest.mark.parametrize("attached", [True, False])
+def test_resumed_is_announced_only_after_the_gateway_attached(capsys, attached):
+    viewer = _late_loader(attached)
+    assert viewer._load_resumed_history_late() is True
+    assert len(viewer.conversation_history) == 2  # the reader's history still loads
+    assert ("Resumed" in capsys.readouterr().err) is attached

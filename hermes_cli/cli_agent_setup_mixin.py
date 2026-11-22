@@ -570,6 +570,15 @@ class CLIAgentSetupMixin:
                 self.session_id = resolved_id
         return session_meta
 
+    def _gateway_attached(self) -> bool:
+        """Whether "Resumed session" is true here: off the gateway the local store is the session;
+        on it, only once ``_ensure_gateway_session`` attached it. Until then the history is only the
+        read-only reader's copy, and a refused attach must never be preceded by a resume claim."""
+        from hermes_cli.gateway_session_store import GatewaySessionStore
+        if not isinstance(getattr(self, "_session_db", None), GatewaySessionStore):
+            return True
+        return bool(getattr(self, "_gateway_session_open", False))
+
     def _restore_session_state(self, session_meta, *, quiet: bool = False) -> None:
         """Restore cwd / yolo / model from the resumed session's metadata."""
         self._restore_session_cwd(session_meta, quiet=quiet)
@@ -631,10 +640,11 @@ class CLIAgentSetupMixin:
             msg_count = len([m for m in restored if m.get("role") == "user"])
             title_part = f" \"{session_meta['title']}\"" if session_meta.get("title") else ""
             counts = _resume_counts(msg_count, len(restored))
-            _say(
-                f"{t('cli.resume.resumed_session')} {self.session_id}{title_part} {counts}",
-                f"[bold {_accent_hex()}]{_escape(t('cli.resume.resumed_session'))}[/] [bold]{_escape(self.session_id)}[/]"
-                f"[bold {_accent_hex()}]{_escape(title_part)}[/] {counts}")
+            if self._gateway_attached():
+                _say(
+                    f"{t('cli.resume.resumed_session')} {self.session_id}{title_part} {counts}",
+                    f"[bold {_accent_hex()}]{_escape(t('cli.resume.resumed_session'))}[/] [bold]{_escape(self.session_id)}[/]"
+                    f"[bold {_accent_hex()}]{_escape(title_part)}[/] {counts}")
             self._restore_session_state(session_meta, quiet=_quiet_mode)
         else:
             no_messages = t("cli.resume.session_no_messages", session_id=self.session_id)
@@ -864,9 +874,10 @@ class CLIAgentSetupMixin:
         # role=user rows without display_kind.
         msg_count = len([m for m in self._resume_display_history if is_user_originated_turn(m)])
         title_part = f' "{session_meta["title"]}"' if session_meta.get("title") else ""
-        self._console_print(
-            f"[{accent_color}]{_escape(t('cli.resume.resumed_session'))} [bold]{self.session_id}[/bold]"
-            f"{title_part} {_resume_counts(msg_count, len(restored))}[/]")
+        if self._gateway_attached():
+            self._console_print(
+                f"[{accent_color}]{_escape(t('cli.resume.resumed_session'))} [bold]{self.session_id}[/bold]"
+                f"{title_part} {_resume_counts(msg_count, len(restored))}[/]")
         self._restore_session_state(session_meta)
         self._reopen_session()
         return True
