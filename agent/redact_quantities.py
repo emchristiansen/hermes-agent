@@ -1,11 +1,13 @@
-"""Tell signed quantities from E.164 phone numbers for the redactor's phone pass.
+"""Tell signed quantities and joined identifiers from E.164 phone numbers for the redactor's phone pass.
 
-``+1109262336`` (bytes freed) has the shape of an E.164 number. ``signed_quantity_offsets`` names
-the occurrences that carry their own evidence of being a signed quantity, so
-``agent.redact.redact_sensitive_text`` leaves them intact and masks every other phone-shaped match.
+``+1109262336`` (bytes freed) and the ``+5323013`` of ``new09f71717+5323013`` (two identifiers
+joined by ``+``) have the shape of an E.164 number. ``non_phone_offsets`` names the occurrences that
+carry their own evidence of being something else, so ``agent.redact.redact_sensitive_text`` leaves
+them intact and masks every other phone-shaped match.
 """
 
 import bisect
+import collections
 import re
 
 # E.164 phone numbers, 7-15 digits; the lookahead rejects hex strings / identifiers.
@@ -32,6 +34,11 @@ _OPERATIONAL_FIELD_RE = re.compile(
 _CONTACT_NAME = (r"(?:[a-z]*(?:phone|mobile|msisdn|whatsapp|contact)[a-z]*"
                  r"|(?<![a-z])(?:tel|telephone|cell|fax|sms|signal|call)(?:s|ed|er|ing)?(?![a-z]))")
 _CONTACT_NAME_RE = re.compile(rf"(?i){_CONTACT_NAME}")
+# Where some _CONTACT_NAME_RE match occurs: its stem alone, without the optional surrounding letters
+# whose ``[a-z]*`` makes a search over a long letter run quadratic. One pass finds them all (_Segments).
+_CONTACT_STEM_RE = re.compile(
+    r"(?i)phone|mobile|msisdn|whatsapp|contact"
+    r"|(?<![a-z])(?:tel|telephone|cell|fax|sms|signal|call)(?:s|ed|er|ing)?(?![a-z])")
 # Syntax between a contact label and its value: whitespace, Markdown emphasis, quotes and their
 # JSON escapes, parentheses, array/object openers, XML tags, YAML list dashes and read_file's ``N|`` gutter.
 _LABEL_GAP = r"(?:[\s*_\"'`\\(\[{<>-]|(?<=\n)\d+\|)*"
@@ -50,6 +57,31 @@ _LIST_PREDECESSOR_RE = re.compile(
     r"[ \t*_\"'`\\(\[]*\Z")
 _QUANTITY_CONTEXT = 200  # chars searched around a match for its token
 _LABEL_CONTEXT = 60  # chars searched before a match for a contact label
+# A blank line, behind read_file's optional ``N|`` gutter: it separates blocks of text (_Segments).
+_BLANK_LINE_RE = re.compile(r"(?m)^(?:[ \t]*\d+\|)?[ \t\r]*$\n?")
+# An XML name: it starts with a letter (any script), ``_`` or ``:`` (XML NameStartChar), never a
+# digit, so ``<_phone>`` is an element while ``a <1`` is not.
+_XML_NAME = r"(?:[^\W\d]|:)[^\s<>/]*"
+# A quoted string to its closing quote or the end of its line, or a closer: a bracket (group 1)
+# or an XML end tag (group 2, its name) (_closers). Triple quotes come first so ``"""`` is not
+# read as an empty string.
+_QUOTED_OR_CLOSER_RE = re.compile(
+    r"\"\"\"|'''|\"(?:[^\"\\\n]|\\.)*\"?|'(?:[^'\\\n]|\\.)*'?"
+    rf"|([\]}})])|</({_XML_NAME})[^<>\n]*>")
+# An opener: a bracket (group 1) or the start of an XML start tag (group 2, its name) unless it
+# visibly closes itself (``<br/>``). A tag whose end is not seen still counts.
+_OPENER_RE = re.compile(rf"([\[{{(])|<({_XML_NAME})(?![^<>\n]*/>)")
+# Delimiters of text that may run across blank lines, each opener with its closer: TOML/Python
+# triple-quoted strings, XML comments and CDATA sections, and Markdown code fences at a line
+# start (behind the gutter). Only a fence holds code whose brackets count (_Segments).
+_DATA_BRACKETS = frozenset("[{")
+_TEXT_SECTIONS = ("<!--", "<![CDATA[")  # XML comments and CDATA: text even inside a string
+_LONG_CLOSER = {'"""': '"""', "'''": "'''", "<!--": "-->", "<![CDATA[": "]]>", "```": "```", "~~~": "~~~"}
+_LONG_STRING_RE = re.compile(
+    r"\"\"\"|'''|<!--|-->|<!\[CDATA\[|\]\]>|(?m:^(?:[ \t]*\d+\|)?[ \t]*(?:```|~~~))")
+# A block's first line indented, or a YAML/Markdown list item (behind the gutter): it may continue
+# an enclosing structure (``phone:\n- a\n\n- x1+P``).
+_CONTINUATION_LINE_RE = re.compile(r"(?:[ \t]*\d+\|)?(?:[ \t]|-(?:[ \t]|$))", re.MULTILINE)
 
 # GFM pipe tables, optionally behind read_file's ``N|`` gutter (see _table_cells).
 _MD_GUTTER_RE = re.compile(r"[ \t]*\d+\|")
@@ -180,6 +212,150 @@ def _in_operational_run(text: str, m: re.Match, window: int) -> bool:
     return operational(i) and (operational(i - 1) or operational(i + 1))
 
 
+# The kind of each bracket: a closer only ever closes an opener of its own kind. An XML element's
+# kind is its tag name, so ``</other>`` never closes ``<phone>``.
+_KIND = {"[": "[", "]": "[", "{": "{", "}": "{", "(": "(", ")": "("}
+
+
+def _kind(m: re.Match) -> str:
+    return _KIND[m.group(1)] if m.group(1) else "<" + m.group(2)
+
+
+def _openers(block: str) -> collections.Counter:
+    """The openers of ``block`` by kind, counted everywhere, quoted or not."""
+    return collections.Counter(_kind(m) for m in _OPENER_RE.finditer(block))
+
+
+def _closers(block: str) -> collections.Counter:
+    """The closers of ``block`` that are certainly outside a quoted string, by kind.
+
+    A quoted string runs to its closing quote, honouring backslash escapes, or else to the end of
+    its line (a JSON string cannot span lines); a closer inside ``"..."`` or ``'...'``, or after an
+    unmatched quote on its line, is not counted. An apostrophe in prose therefore only hides
+    closers, which keeps the open count high.
+    """
+    return collections.Counter(_kind(m) for m in _QUOTED_OR_CLOSER_RE.finditer(block)
+                               if m.group(1) or m.group(2))
+
+
+class _Segments:
+    """The segments of one text: blocks of non-blank lines, joined where structure continues.
+
+    A blank line ends a segment only when the text before it has closed every bracket and XML
+    element it may have opened and the next line is neither indented nor a list item. Otherwise
+    the next block may still belong to the same structured value: a pretty-printed JSON array
+    (``"phone": [\n\n  "x1+P"``), an indented YAML block scalar (``phone: |\n\n  x1+P``), a YAML
+    list (``phone:\n- a\n\n- x1+P``) or a ``<phone>`` element. The open count only errs high, so
+    an unknown structure joins blocks (leaving more values masked) and never ends one early:
+    every opener counts, while a closer counts only outside quotes (``"note ]}"`` closes nothing;
+    _closers) and only against openers of its own kind (``<phone>\n])}`` leaves the element open).
+
+    A triple-quoted string, XML comment, CDATA section or code fence is text, segmented like any
+    other, but it belongs to the place that opened it: a value inside one is also near whatever
+    is near its opening delimiter (``phone = \"\"\"\n\nnote\n\nx1+P``). Inside a fence brackets
+    are code and count as usual. Inside a string, comment or CDATA section they count separately
+    and only until it ends: a string's brackets and XML elements (serialized JSON or XML), a
+    comment's or CDATA section's ``[`` and ``{`` only (``<!-- </phone> -->`` is text), and never
+    a prose parenthesis.
+
+    Built in one pass over the text when a digit-joined value first needs it; contact stems are
+    found in one more pass.
+    """
+
+    def __init__(self, text: str):
+        self.text, self.starts = text, None
+
+    def _build(self) -> None:
+        text, pos, blocks = self.text, 0, []
+        for m in _BLANK_LINE_RE.finditer(text):
+            if m.start() > pos:
+                blocks.append((pos, m.start()))
+            pos = max(pos, m.end())
+        if pos < len(text):
+            blocks.append((pos, len(text)))
+        starts, block_starts, owners = [], [], []
+        depth = collections.Counter()
+        # Structure of data embedded in an open text region (a JSON or XML value inside a TOML
+        # string), kept apart from ``depth`` so nothing inside the region can close or extend
+        # structure outside it, and discarded when the region ends.
+        inner = collections.Counter()
+        long = None  # (closer, position, holds code) of the open long string or fence, if any
+        section = None  # closer of an XML comment or CDATA section open inside a long string
+
+        def count(piece: str) -> None:
+            nonlocal depth, inner
+            if long and not long[2]:
+                # Text, not code: prose parentheses never merge. A string may hold serialized
+                # data, so its brackets and elements nest; in a comment or CDATA section only
+                # data brackets do, and tags there are text (``<!-- </phone> -->``).
+                comment = section or long[0] in ("-->", "]]>")
+                nests = (lambda k: k in _DATA_BRACKETS) if comment else (lambda k: k != "(")
+                inner.update({k: n for k, n in _openers(piece).items() if nests(k)})
+                inner.subtract({k: n for k, n in _closers(piece).items() if nests(k)})
+                inner = +inner
+                return
+            depth.update(_openers(piece))
+            depth.subtract(_closers(piece))
+            depth = +depth  # an unmatched closer never goes below zero
+
+        for a, b in blocks:
+            if not starts or (not depth and not inner and not _CONTINUATION_LINE_RE.match(text, a)):
+                starts.append(a)
+                depth = collections.Counter()
+            block_starts.append(a)
+            owners.append(long[1] if long else None)
+            cursor = a
+            for m in _LONG_STRING_RE.finditer(text, a, b):
+                count(text[cursor:m.start()])
+                cursor = m.end()
+                delimiter = m.group().lstrip(" \t0123456789|")
+                if long is None:
+                    if delimiter in _LONG_CLOSER:  # a stray closer (``-->``) opens nothing
+                        long = (_LONG_CLOSER[delimiter], m.end(), delimiter in ("```", "~~~"))
+                elif delimiter == long[0]:
+                    long, section = None, None
+                    inner = collections.Counter()
+                elif long[0] in ('"""', "'''"):
+                    if section is None and delimiter in _TEXT_SECTIONS:
+                        section = _LONG_CLOSER[delimiter]
+                    elif delimiter == section:
+                        section = None
+            count(text[cursor:b])
+        self.starts, self.block_starts, self.owners = starts, block_starts, owners
+        self.stems = [m.start() for m in _CONTACT_STEM_RE.finditer(text)]
+
+    def _stem_near(self, pos: int) -> bool:
+        """Whether a contact stem is in the segment holding ``pos`` or in the segment before it."""
+        k = bisect.bisect_right(self.starts, pos) - 1
+        lo = self.starts[max(0, k - 1)] if k >= 0 else 0
+        hi = self.starts[k + 1] if k + 1 < len(self.starts) else len(self.text)
+        n = bisect.bisect_left(self.stems, lo)
+        return n < len(self.stems) and self.stems[n] < hi
+
+    def contact_near(self, pos: int) -> bool:
+        """Whether a contact name is near ``pos``, or near the opening of the long string or fence
+        that ``pos`` lies in."""
+        if self.starts is None:
+            self._build()
+        if self._stem_near(pos):
+            return True
+        owner = self.owners[bisect.bisect_right(self.block_starts, pos) - 1]
+        return owner is not None and self._stem_near(owner)
+
+
+def _digit_joined(text: str, start: int, segments: "_Segments") -> bool:
+    """Whether the ``+`` at ``start`` joins two numbers rather than starting a phone number.
+
+    E.164 writes ``+`` at the start of the number, never directly after a digit, so a ``+`` glued
+    to a preceding digit joins two values: ``new09f71717+5323013``, ``1.2.3+7654321``, ``r7+P``.
+    Contact context still wins, and is never cropped to a lookup window: any contact name in the
+    value's segment or the segment before it (``phone1: x1+P``, ``{"phone": "<any text> x1+P"}``,
+    ``Phone:\n\n1+P``, ``"phone": [\n\n  "x1+P"``) leaves the value to the ordinary
+    classification below, as before.
+    """
+    return start > 0 and text[start - 1] in "0123456789" and not segments.contact_near(start)
+
+
 def _contact_labelled(text: str, start: int, floor: int, memo: dict) -> bool:
     """Whether a contact label introduces the value at ``start`` or the list it continues.
 
@@ -224,8 +400,8 @@ def _unit_follows(text: str, end: int, memo: dict) -> bool:
     return memo[pos]
 
 
-def signed_quantity_offsets(text: str) -> frozenset:
-    """Offsets of each phone-shaped ``+digits`` that is evidently a signed quantity.
+def non_phone_offsets(text: str) -> frozenset:
+    """Offsets of each phone-shaped ``+digits`` that is evidently a signed quantity or joins two numbers.
 
     Contact context always masks it: a contact label directly before it or before the list it
     continues (``Phone: ``, ``tel:``, ``Call``, ``**Phone:**``, ``"phone": "``, ``Phone: +P / ``),
@@ -237,14 +413,15 @@ def signed_quantity_offsets(text: str) -> frozenset:
     column or a data-size unit follows it or the ``/`` list of signed integers it starts
     (``+820772864 / +1340882944 bytes``). Each occurrence needs its own evidence: equal digits
     elsewhere say nothing about what this one means. A lone ``+digits`` (``delta +P``) stays
-    masked.
+    masked. A ``+`` glued directly after a digit joins two values and is no phone number unless a
+    contact name is near it (``_digit_joined``).
     """
     table, masked, cells = (_table_cells(text) if "|" in text and "-" in text
                             else (frozenset(), [], []))
     masked.sort()
     masked_starts = [a for a, _ in masked]
     cell_starts = [a for a, _ in cells]  # table rows are in text order, so already sorted
-    signed, labelled, units = set(), {}, {}
+    kept, labelled, units, segments = set(), {}, {}, _Segments(text)
     for m in SIGNAL_PHONE_RE.finditer(text):
         start = m.start()
         window = max(0, start - _QUANTITY_CONTEXT)
@@ -255,12 +432,15 @@ def signed_quantity_offsets(text: str) -> frozenset:
         floor = cells[cell][0] if cell >= 0 and start < cells[cell][1] else 0
         if _contact_labelled(text, start, floor, labelled):
             continue
+        if _digit_joined(text, start, segments):
+            kept.add(start)
+            continue
         unit_follows = _unit_follows(text, m.end(), units)
         label = _glued_label(text, start, window)
         if label:
             if _OPERATIONAL_LABEL_RE.fullmatch(label) and (
                     unit_follows or _in_operational_run(text, m, window)):
-                signed.add(start)
+                kept.add(start)
         elif start in table or unit_follows:
-            signed.add(start)
-    return frozenset(signed)
+            kept.add(start)
+    return frozenset(kept)

@@ -16,8 +16,8 @@ from urllib.parse import unquote_plus
 # Shared with agent/file_safety's read-block list so the two defenses can't
 # drift: a blocked file_tools read that falls back to ``cat`` is still caught.
 from agent.file_safety import _BLOCKED_PROJECT_ENV_BASENAMES as _ENV_FILE_BASENAMES
-# E.164 phone numbers; signed quantities of the same shape are told apart there.
-from agent.redact_quantities import SIGNAL_PHONE_RE as _SIGNAL_PHONE_RE, signed_quantity_offsets
+# E.164 phone numbers; signed quantities and joined identifiers of the same shape are told apart there.
+from agent.redact_quantities import SIGNAL_PHONE_RE as _SIGNAL_PHONE_RE, non_phone_offsets
 
 logger = logging.getLogger(__name__)
 
@@ -1520,8 +1520,8 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         text = _redact_form_body(text)
 
     if "+" in text:
-        signed = signed_quantity_offsets(text)
-        text = _SIGNAL_PHONE_RE.sub(lambda m: m.group(0) if m.start() in signed else _redact_phone(m), text)
+        kept = non_phone_offsets(text)
+        text = _SIGNAL_PHONE_RE.sub(lambda m: m.group(0) if m.start() in kept else _redact_phone(m), text)
 
     return text
 
