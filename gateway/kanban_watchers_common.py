@@ -75,9 +75,16 @@ def _resolve_auto_decompose_settings(load_config: Callable[[], Any]) -> tuple[bo
     reaches for this flag to halt it, and a stale boot-captured value silently ignoring that change is the
     bug reported in #49638.
     """
+    from hermes_cli.config_read_errors import FailedConfigRead
+
     try:
         cfg = load_config()
     except Exception:
+        return False, 3
+    # ``load_config`` does not raise on a broken config.yaml: it serves defaults or the last good
+    # config as a ``FailedConfigRead``. That fallback is a read error here too, so a malformed edit
+    # meant to stop fan-out never leaves auto-decompose running on the default/previous ``true``.
+    if isinstance(cfg, FailedConfigRead):
         return False, 3
     kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     try:

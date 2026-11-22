@@ -782,14 +782,16 @@ class GatewayAgent:
                 self._give_back_turn_route()  # nothing was sent: the pick is still owed
                 return self._failed(history, user_message, "Stopped before the prompt was sent; nothing was sent.")
             except GatewayRPCError as exc:
-                # The owner answered and refused: not a lost connection. Only its own site code
-                # (session_busy: send again) is a verdict; any other refusal stays unclassified.
-                busy = str(exc) == "session_busy"
-                if busy:
+                # The owner answered and refused: not a lost connection, and not the model's verdict
+                # either, so never main's "Run /model to switch" copy. ``session_busy`` means send again.
+                # The reason alone does not prove the input was never admitted, so the copy names the
+                # refusal and claims nothing about what the owner kept.
+                if str(exc) == "session_busy":
                     # Nothing was admitted: the resend carries the pick (the CLI keeps its restore).
                     self._give_back_turn_route()
-                return self._failed(history, user_message, str(exc),
-                                    failure_reason="session_busy" if busy else None, retryable=busy)
+                    return self._failed(history, user_message, str(exc), failure_reason="session_busy", retryable=True)
+                return self._failed(history, user_message, f"The gateway refused this turn: {exc}.",
+                                    failure_reason="gateway_refusal", retryable=None)
             except GatewayClientError as exc:
                 if str(exc) == NOT_SENT:
                     return self._unadmitted(history, user_message, str(exc))
@@ -1282,11 +1284,14 @@ class GatewayAgent:
 
     def _failed(self, history, user_message, error, *, failure_reason=None, retryable=False):
         """``failure_reason="gateway_connection"``: the CLI shows ``error`` as written instead of
-        classifying a lost gateway as a model failure ("Run /model to switch...")."""
+        classifying a lost gateway as a model failure ("Run /model to switch..."). ``retryable=None``
+        records no retryability verdict: the reason alone does not say whether sending again helps."""
         out = {**_RESULT_DEFAULTS, "final_response": "", "messages": history + [self._user_row(user_message)],
                "failed": True, "completed": False, "error": error, "session_id": self.session_id}
         if failure_reason:
-            out.update(failure_reason=failure_reason, failure_retryable=retryable)
+            out["failure_reason"] = failure_reason
+            if retryable is not None:
+                out["failure_retryable"] = retryable
         return out
 
     def _result(self, history, user_message, complete, turn):

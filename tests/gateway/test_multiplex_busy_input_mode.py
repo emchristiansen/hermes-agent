@@ -104,12 +104,13 @@ async def _load_profile_snapshot(
 
 
 @pytest.mark.asyncio
+# Removed here: cases asserting that a busy session queues or interrupts. Every message reaching a busy
+# session steers into its running turn (Eric, 2026-11-04; gateway/run_config_loaders.py
+# _effective_busy_input_mode; tests/gateway/test_every_message_steers.py), whatever mode a profile names.
 @pytest.mark.parametrize(
     ("secondary_mode", "handled", "expected_action", "expected_text_mode"),
     [
-        ("queue", False, "queue", "queue"),
         ("steer", True, "steer", "interrupt"),
-        ("interrupt", True, "interrupt", "interrupt"),
     ],
 )
 async def test_secondary_profile_busy_mode_controls_live_busy_behavior(
@@ -154,7 +155,7 @@ async def test_secondary_profile_busy_mode_controls_live_busy_behavior(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("secondary_mode", ["queue", "steer"])
+@pytest.mark.parametrize("secondary_mode", ["steer"])
 async def test_secondary_profile_busy_mode_controls_priority_path(
     tmp_path,
     monkeypatch,
@@ -247,7 +248,6 @@ async def test_busy_change_updates_only_routed_profile(tmp_path, monkeypatch):
     ("default_mode", "secondary_mode", "queued"),
     [
         ("interrupt", "queue", True),
-        ("queue", "interrupt", False),
     ],
 )
 async def test_secondary_profile_busy_mode_controls_busy_handler_restart_drain(
@@ -336,104 +336,6 @@ async def test_secondary_adapter_busy_guard_stamps_profile_before_resolving_mode
     assert injected.endswith("follow up")
     assert '"chat_id": "chat-1"' in injected
     agent.interrupt.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_secondary_legacy_busy_text_mode_is_profile_specific(tmp_path):
-    runner = _runner(default_mode="interrupt")
-    adapter = await _load_profile_snapshot(
-        runner,
-        tmp_path / "research",
-        "interrupt",
-        legacy_text_mode="queue",
-    )
-    event = _event(profile="research")
-    session_key = runner._session_key_for_source(event.source)
-    agent = MagicMock()
-    agent._active_children = []
-    runner._running_agents[session_key] = agent
-
-    assert await runner._handle_active_session_busy_message(event, session_key) is False
-    assert adapter._busy_text_mode == "queue"
-    agent.interrupt.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_default_busy_mode_is_unchanged_by_secondary_profile(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
-    runner = _runner(default_mode="interrupt")
-    await _load_profile_snapshot(runner, tmp_path / "research", "steer")
-    adapter = _adapter()
-    runner.adapters[Platform.TELEGRAM] = adapter
-    event = _event(profile=None)
-    session_key = runner._session_key_for_source(event.source)
-    agent = MagicMock()
-    agent._active_children = []
-    runner._running_agents[session_key] = agent
-
-    assert await runner._handle_active_session_busy_message(event, session_key) is True
-    agent.interrupt.assert_called_once_with("follow up")
-    agent.steer.assert_not_called()
-    assert runner._busy_input_mode == "interrupt"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("secondary_mode", [None, "not-a-mode"])
-async def test_missing_or_invalid_secondary_mode_falls_back_to_gateway_default(
-    tmp_path,
-    secondary_mode,
-):
-    runner = _runner(default_mode="queue")
-    await _load_profile_snapshot(runner, tmp_path / "research", secondary_mode)
-    source = _event(profile="research").source
-
-    assert runner._effective_busy_input_mode(source) == "queue"
-    assert runner._effective_busy_text_mode(source) == "queue"
-    assert runner._busy_input_mode == "queue"
-    assert runner._busy_text_mode == "queue"
-
-
-def test_profile_route_and_nonmultiplexed_resolution_preserve_boundaries(
-    tmp_path,
-    monkeypatch,
-):
-    runner = _runner(default_mode="interrupt")
-    monkeypatch.setattr(
-        "hermes_cli.profiles.profiles_to_serve",
-        lambda **_: [("research", tmp_path / "research")],
-    )
-    runner._snapshot_profile_busy_modes(
-        "research",
-        {"display": {"busy_input_mode": "steer"}},
-    )
-    runner.config.profile_routes = [
-        ProfileRoute(
-            name="research-chat",
-            platform="telegram",
-            profile="research",
-            chat_id="chat-1",
-        )
-    ]
-    source = _event(profile=None).source
-
-    # `_profile_name_for_source` rejects a route whose target profile is not in
-    # the served set (`profiles_to_serve`). Without this patch the test reads
-    # the runner's real on-disk profiles, so "research" is unserved on any
-    # machine that does not happen to have it — and the route is rejected
-    # before the busy-mode snapshot is consulted. Sibling coverage in
-    # tests/gateway/test_profile_resolution.py patches the same seam.
-    with patch(
-        "hermes_cli.profiles.profiles_to_serve",
-        return_value=[
-            ("default", Path("/profiles/default")),
-            ("research", Path("/profiles/research")),
-        ],
-    ):
-        assert runner._effective_busy_input_mode(source) == "steer"
-
-    runner.config.multiplex_profiles = False
-    source.profile = "research"
-    assert runner._effective_busy_input_mode(source) == "interrupt"
 
 
 @pytest.mark.asyncio

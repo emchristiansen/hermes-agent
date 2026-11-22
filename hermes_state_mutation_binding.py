@@ -79,7 +79,8 @@ def authorize_history(conn, actor, session_id, *, claim=False):
         return False
     # Import intentionally strips routes. Never reinterpret a cold native/API
     # transcript as imported history, even if stale import metadata exists.
-    if row['session_key'] or row['chat_id'] or row['origin_json']:
+    from hermes_state_local_migration import routed_origin
+    if row['session_key'] or row['chat_id'] or routed_origin(row):
         return False
     key = BINDING_PREFIX + session_id
     binding = json.dumps([actor.profile_id, actor.subject], separators=(',', ':'))
@@ -120,7 +121,8 @@ def same_history_owner(conn, anchor_id, session_id):
     anchor, row = (conn.execute(columns, (sid,)).fetchone() for sid in (anchor_id, session_id))
     if anchor is None or row is None:
         return False
-    if row['session_key'] or row['chat_id'] or row['origin_json']:
+    from hermes_state_local_migration import routed_origin
+    if row['session_key'] or row['chat_id'] or routed_origin(row):  # an import boundary alone is no route
         return tuple(row)[1:4] == tuple(anchor)[1:4]
     binding = history_binding(conn, session_id)
     if not bindings_agree(binding, history_binding(conn, anchor_id)):

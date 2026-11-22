@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+import functools
 import logging
 from pathlib import Path
 import threading
+import time
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -274,14 +276,33 @@ async def reserve_profile_home_in_worker(runner, name, home):
 
 
 def release_profile_home(runner, home):
-    """Shrink the reservation by one profile (deleted, or parked because it cannot be served)."""
+    """Shrink the reservation by one profile (deleted, or parked because it cannot be served). True once
+    its ``gateway.lock`` is released. False while a SessionDB close under *home* has not finished (its
+    token writer outlived the close's join, or the close raised): that writer can still write the store,
+    so the profile leaves the served set but keeps its lock until process exit (SH-01 TOKEN-RELEASE-02,
+    the per-profile form of the whole stop's close verdict)."""
     from gateway.runtime_ownership import process_ownership
+    from hermes_state import unsettled_closes
     home = Path(home).resolve()
     registry = getattr(runner, 'session_authorities', None)
     if registry is not None and registry.for_home(home) is not None:
         raise RuntimeError('Profile authority must retire before ownership is released')
     _withdraw_profile_home(runner, home)
+    unfinished = unsettled_closes(home)
+    if unfinished:
+        logger.error("[MULTIPLEX] Profile store close did not finish (%s): ownership of %s retained until "
+                     "process exit", ", ".join(unfinished), home)
+        return False
+    from gateway.run_shutdown_budget import title_upgrades_live_under
+    # Second check (A3-SH-TITLE-02): retirement waited for them first. The read fences the home when it finds none
+    # (A3-SH-TITLE-03): a failed serve lifted the fence and never retired an authority, so without it an old deferred
+    # upgrade handed over after this release would reopen the store under the next owner's lock. From the zero read on,
+    # registration under the home is refused, through the release and until a later serve lifts it again.
+    if title_upgrades_live_under(home, 0.0, fence=True):
+        logger.error("[MULTIPLEX] A title writer of %s is still live: ownership retained until process exit", home)
+        return False
     process_ownership.release(home)
+    return True
 
 
 def _withdraw_profile_home(runner, home):
@@ -305,6 +326,11 @@ def _authority_tasks(authority):
 # How long a Stopped turn gets to settle durably before shutdown refuses to release ownership: a managed worker
 # acknowledges Stop within STOP_ACK_SECONDS (30) or is terminated, then closed (<=10).
 TURN_SETTLE_SECONDS = 45.0
+# How long a profile's retirement waits for a title upgrade still writing its store (A3-SH-TITLE-02), within the
+# retirement deadline. A title thread cannot be interrupted, and its model call has no bound of its own. One that
+# outlives this wait keeps the profile's reservation and store handles (the False verdict). The wait does not hold
+# the reconcile for the whole turn deadline, and it leaves the control verb's 5 s answer window an explicit answer.
+TITLE_SETTLE_SECONDS = 3.0
 # What a stop keeps of its watchdog leash for the phases after the settle (adapter teardown, executor
 # quiesce, SessionDB close, exit-state writes): the settle never spends it.
 STOP_TAIL_RESERVE_SECONDS = 10.0
@@ -314,6 +340,17 @@ def managed_turn_count(runner):
     """Unmapped claims, managed workers and owner mutations across the served authorities."""
     from gateway.session_runtime_workers import uncounted_runtime_work
     return uncounted_runtime_work(runner)
+
+
+def hosted_room_writers(runner):
+    """For the stop's DB-close gate only (never the drain waits, where a running room supervisor is
+    no work to wait for): hosted-room threads alive now, or 1 when a room Stop was not confirmed
+    (it raised or timed out) even if none is visible any more. Errs toward a live writer."""
+    if getattr(runner, 'session_authorities', None) is None:
+        return int(bool(getattr(runner, '_hosted_rooms_unconfirmed', False)))
+    from gateway.session_hosted_service import live_hosted_room_threads
+    live = len(live_hosted_room_threads(runner))
+    return max(live, int(bool(getattr(runner, '_hosted_rooms_unconfirmed', False))))
 
 
 def stop_authority_turns(authority, *, in_process=False, reason=None):
@@ -397,12 +434,15 @@ async def _retire_profile_authority(authority, timeout=None):
     task is joined (an in-process turn's task ends only after its executor thread returned and the
     admission settled). The hosted-room stop runs alongside that join under the same deadline: it
     never interrupts accepted turns and its room threads wait for the member turns they observe, so
-    those turns must be signalled first or the room stop cannot finish. False when a turn or room
-    thread misses *timeout* (default TURN_SETTLE_SECONDS): it may still call tools and write
-    history, so the caller must keep the profile's reservation and store handles."""
+    those turns must be signalled first or the room stop cannot finish. Last, still within the same
+    deadline (at most TITLE_SETTLE_SECONDS), it waits for the auto-title upgrades writing this home's
+    stores (A3-SH-TITLE-02). False when a turn, room thread or title upgrade misses *timeout* (default
+    TURN_SETTLE_SECONDS): it may still write this home's store, so the caller must keep the profile's
+    reservation and store handles."""
     from gateway.session_cron import unbind_owner
     from gateway.session_runtime_workers import join_authority_work, stop_authority_work
     timeout = TURN_SETTLE_SECONDS if timeout is None else timeout
+    deadline = time.monotonic() + max(0.0, timeout)
     authority.retiring = True
     if getattr(authority.runner, 'session_ticket_store', None) is not None:
         _publish_served_set(authority.runner)  # discovery and tickets stop naming it now
@@ -428,6 +468,24 @@ async def _retire_profile_authority(authority, timeout=None):
         task.cancel()
     if rest:
         await asyncio.gather(*rest, return_exceptions=True)
+    # A completed turn hands its model-title upgrade to a thread that keeps this profile's SessionDB and writes
+    # the title when its model call returns, after the turn retired (A3-SH-TITLE-02). Closing the home's stores
+    # and releasing its reservation under that thread lets the late write reopen a store another process owns.
+    # Every turn here has retired (joined above) and registered its upgrade before retiring, so this read sees
+    # them all. Only upgrades writing a store under this home count, so another profile still releases on its own.
+    # A zero read also fences the home: an upgrade handed over later (by a turn not joined here) is refused.
+    from gateway.run_shutdown_budget import title_fence_generation, title_upgrades_live_under
+    db_path = getattr(getattr(authority, 'db', None), 'db_path', None)
+    home = Path(db_path).parent if db_path is not None else Path(str(authority.profile_id))
+    budget = min(TITLE_SETTLE_SECONDS, max(0.0, deadline - time.monotonic()))
+    # Bind the fence to this generation before the handoff (TITLE-CANCEL-01): cancelling this coroutine does not stop
+    # the read's thread, and a re-serve meanwhile starts a generation that thread must never fence, however late it runs.
+    generation = title_fence_generation(home)
+    titles = await asyncio.to_thread(functools.partial(title_upgrades_live_under, home, budget, fence=True,
+                                                       generation=generation))
+    if titles:
+        logger.error('Profile %s title writer (%d) still live; ownership retained', authority.profile_id, titles)
+        return False
     unbind_owner(authority)
     # Ownership is released next; until a successor bumps the epoch, A's epoch still fences its
     # writes as current, so a stale connection to A must find it retired instead.
@@ -468,7 +526,16 @@ async def serve_profile_runtime(runner, name, home):
         registry.remove(home)
     elif existing is not None:
         return existing
-    authority = await _build_profile_authority(runner, name, home, register=False)
+    from gateway.run_shutdown_budget import title_upgrades_live_under, unfence_title_home
+    unfence_title_home(home)  # served again: its new turns' title upgrades start (A3-SH-TITLE-02 fence)
+    try:
+        authority = await _build_profile_authority(runner, name, home, register=False)
+    except BaseException:
+        # A failed initialization must not leave the home unfenced (A3-SH-TITLE-03): restore the fence unless an upgrade
+        # started meanwhile, which is a live writer that keeps the reservation (``release_profile_home`` reads it). The
+        # read does not wait (timeout 0), so it runs inline even when the serve was cancelled.
+        title_upgrades_live_under(home, 0.0, fence=True)
+        raise
     try:
         with owner_scope(authority):
             _drop_retired_local_adapter(authority)
@@ -528,8 +595,8 @@ async def recover_served_native_rows(runner):
 
 async def unserve_profile_runtime(runner, home):
     """Retire one profile's authority (deleted while running) and shrink the published set.
-    False when one of its turns outlived the Stop deadline (keep the reservation); True otherwise,
-    including for a profile this process never served."""
+    False when one of its turns, or a title upgrade writing its store, outlived the Stop deadline
+    (keep the reservation); True otherwise, including for a profile this process never served."""
     home = await asyncio.to_thread(Path(home).resolve)
     registry = runner.session_authorities
     authority = registry.for_home(home)
@@ -564,12 +631,24 @@ async def recover_bot_mailbox(authority):
         logger.warning('Bot Chat recovery skipped for %s: %s', authority.db.db_path, exc)
 
 
+def _startup_profile_detail(runner, authority) -> str:
+    """``profile=<name|launch> db=<path>`` for startup-phase attribution; never raises."""
+    try:
+        registry = getattr(runner, 'session_authorities', None)
+        name = None if registry is None else registry.profile_name(authority)
+        db = getattr(getattr(authority, 'db', None), 'db_path', None)
+        return f"profile={name or 'launch'} db={db}"
+    except Exception:  # health: allow BLE001 -- a label lookup failure must never abort startup; attribution only
+        return f"profile_id={getattr(authority, 'profile_id', '?')}"
+
+
 async def start_gateway_runtime_api(runner):
     from gateway import run_api
     from gateway.webapp_listener import (
         STARTING, BrowserCredentialError, browser_session_token, dial_origin, listener_plan, register_control_verbs,
     )
     from hermes_constants import get_hermes_home
+    from hermes_startup_watchdog import startup_phase
     home = get_hermes_home()
     # The bootstrap registered these before its control socket answered; a runner started without it
     # (an embedded gateway) gets them here, before the listener's slow start.
@@ -579,42 +658,46 @@ async def start_gateway_runtime_api(runner):
     runner.webapp_status = ({"state": "unavailable", "url": None, "reason": unusable} if unusable
                             else {"state": "off", "url": None, "reason": None} if webapp is None
                             else dict(STARTING))
-    try:
-        # Without the Webapp the listener is main's: the same call, a private ephemeral port.
-        runner.session_api = await (run_api.start_gateway_api(runner, host=host, port=port, webapp=webapp)
-                                    if webapp is not None else run_api.start_gateway_api(runner))
-    except (Exception, SystemExit) as exc:
-        if webapp is None:
-            raise
-        # The Webapp's listener could not start (port taken, address unavailable, its browser credential
-        # not storable in the home, or the dashboard's auth gate exiting on a wildcard bind with no
-        # sign-in provider): native clients still need this gateway, so it keeps main's private
-        # listener and reports why the Webapp is not served.
-        if isinstance(exc, SystemExit):
-            reason = str(exc.code).strip()  # the gate's own message names the fix
-        elif isinstance(exc, BrowserCredentialError):
-            reason = str(exc)  # names the file and why it cannot be stored
-        elif isinstance(exc, OSError) and exc.filename:  # the browser credential's file, not the port
-            reason = f"could not use {exc.filename} ({exc.strerror or exc})"
-        else:
-            cause = (exc.strerror or exc) if isinstance(exc, OSError) else exc
-            reason = f"could not listen on {host}:{port} ({cause})"
-        logger.error("Webapp unavailable: %s", reason)
-        runner.webapp_status = {"state": "unavailable", "url": None, "reason": reason}
-        # Open tabs keep sending their credential to whatever answers on the Webapp's port, and that
-        # is not this gateway now. Replace it, so one captured there never opens this gateway; the
-        # tabs sign in again once the Webapp is back.
+    # Attribution only (expected_s=0, no lease): each step logs begin/end while the startup watchdog is
+    # armed, and an over-deadline warning names the steps still open.
+    with startup_phase("gateway_runtime_api_start"):
         try:
-            browser_session_token(home, rotate=True)
-        except OSError as write_error:
-            logger.warning("Could not replace the Webapp's browser credential: %s", write_error)
-        runner.session_api = await run_api.start_gateway_api(runner)
-    else:
-        if webapp is not None:
-            runner.webapp_status = {"state": "serving", "url": dial_origin(host, port), "reason": None}
+            # Without the Webapp the listener is main's: the same call, a private ephemeral port.
+            runner.session_api = await (run_api.start_gateway_api(runner, host=host, port=port, webapp=webapp)
+                                        if webapp is not None else run_api.start_gateway_api(runner))
+        except (Exception, SystemExit) as exc:
+            if webapp is None:
+                raise
+            # The Webapp's listener could not start (port taken, address unavailable, its browser credential
+            # not storable in the home, or the dashboard's auth gate exiting on a wildcard bind with no
+            # sign-in provider): native clients still need this gateway, so it keeps main's private
+            # listener and reports why the Webapp is not served.
+            if isinstance(exc, SystemExit):
+                reason = str(exc.code).strip()  # the gate's own message names the fix
+            elif isinstance(exc, BrowserCredentialError):
+                reason = str(exc)  # names the file and why it cannot be stored
+            elif isinstance(exc, OSError) and exc.filename:  # the browser credential's file, not the port
+                reason = f"could not use {exc.filename} ({exc.strerror or exc})"
+            else:
+                cause = (exc.strerror or exc) if isinstance(exc, OSError) else exc
+                reason = f"could not listen on {host}:{port} ({cause})"
+            logger.error("Webapp unavailable: %s", reason)
+            runner.webapp_status = {"state": "unavailable", "url": None, "reason": reason}
+            # Open tabs keep sending their credential to whatever answers on the Webapp's port, and that
+            # is not this gateway now. Replace it, so one captured there never opens this gateway; the
+            # tabs sign in again once the Webapp is back.
+            try:
+                browser_session_token(home, rotate=True)
+            except OSError as write_error:
+                logger.warning("Could not replace the Webapp's browser credential: %s", write_error)
+            runner.session_api = await run_api.start_gateway_api(runner)
+        else:
+            if webapp is not None:
+                runner.webapp_status = {"state": "serving", "url": dial_origin(host, port), "reason": None}
     runner.session_runtime_descriptor['api_origin'] = runner.session_api.api_origin
     for authority in _authorities(runner):
-        await _recover_profile_bot_mailbox(runner, authority)
+        with startup_phase("bot_mailbox_recovery", detail=_startup_profile_detail(runner, authority)):
+            await _recover_profile_bot_mailbox(runner, authority)
 
 
 async def _recover_profile_bot_mailbox(runner, authority):
@@ -762,7 +845,12 @@ async def drain_gateway_runtime(runner):
     if descriptor.get('drain_reason') == RESTART_WAIT_REASON:
         del descriptor['drain_reason']  # stopping now: no client attaches to answer anymore
     from gateway.session_hosted_service import stop_hosted_service
-    await stop_hosted_service(runner)
+    if not await stop_hosted_service(runner):
+        # A room thread outlived its Stop, or a Stop raised: its store may still be written. Sticky
+        # (a later drain finds the rooms stopped): the stop's DB gate keeps the stores open and
+        # owned (``hosted_rooms_unconfirmed``).
+        runner._hosted_rooms_unconfirmed = True
+        logger.warning('Hosted room services did not confirm their stop; stores stay open and owned')
     # Stop fetching (long-poll / socket) BEFORE withdrawing the handlers: an update a fetcher acks
     # after the withdrawal is dropped and never redelivered (#143122); one never fetched stays on
     # the platform for the next boot. Egress stays up for admitted work; the disconnect retries a

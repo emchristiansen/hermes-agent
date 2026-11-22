@@ -130,7 +130,8 @@ async def test_send_during_a_running_turn_is_admitted_once(monkeypatch, tmp_path
     event, marker, interrupt_text = make(tmp_path)
     followups, interrupt, _ = await _followup_while_running(monkeypatch, event, marker)
     assert len(followups) == 1 and marker in followups[0], followups
-    assert interrupt == interrupt_text
+    # Every message steers (Eric, 2026-11-04): a send to a busy session never interrupts its turn.
+    assert interrupt is None
 
 
 @pytest.mark.asyncio

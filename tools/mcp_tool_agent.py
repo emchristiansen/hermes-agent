@@ -214,13 +214,15 @@ def tool_pin_version() -> str:
     return identity.get("sha") or identity.get("version") or __version__
 
 
-def persist_agent_tool_names(agent) -> None:
+def persist_agent_tool_names(agent) -> bool:
     """Best-effort: write ``agent.tools`` to the session row (freeze pin). The full definitions,
-    keyed by the code that built them: another process or surface derives different bytes."""
+    keyed by the code that built them: another process or surface derives different bytes.
+    True only when the pin was written; False when there is no session row to write to or the
+    write failed (callers that must not run ahead of the pin check it)."""
     db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
     if not db or not session_id:
-        return
+        return False
     try:
         pin = {"version": tool_pin_version(), "tools": _agent_tool_defs(agent)}
         if isinstance(backend := getattr(agent, "_delegation_backend", None), str) and backend:
@@ -228,8 +230,9 @@ def persist_agent_tool_names(agent) -> None:
         db.update_session_tool_names(session_id, pin)
     except Exception:
         logger.debug("tool_names persist skipped", exc_info=True)
-        return
+        return False
     _record_pinned_snapshot(agent, session_id)
+    return True
 
 
 def _pinned_snapshot_key(session_id) -> tuple:

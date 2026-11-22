@@ -43,8 +43,9 @@ def mirror_to_session(
     cron in_channel seed) to skip the origin scan, which drops the mirror when a bare
     target's room can't be told apart (no General/thread-1 and no flat session).
     Text that is NOT the agent speaking (e.g. a cron brief) must pass
-    ``role="user"``: ``mirror`` metadata is dropped at the SQLite boundary, so an
-    assistant-role mirror replays as a real turn and yields assistant→assistant
+    ``role="user"``: only the mirror's provenance survives the SQLite boundary, as
+    display metadata a model never sees, so an assistant-role mirror replays as a
+    real turn and yields assistant→assistant
     pairs that break strict-alternation providers, while a user-role mirror
     collapses safely via the consecutive-user merge.
     Returns True if mirrored, False if no matching session or error. Never raises.
@@ -147,10 +148,14 @@ def _append_to_sqlite(session_id: str, message: dict) -> None:
     Raises on failure: ``mirror_to_session`` reports ``False`` (and warns) only when the
     exception reaches it — swallowing it here made every failed write look mirrored (#10130).
     """
+    from agent.message_metadata import DELIVERY_MIRROR
     from hermes_state_registry import acquire, release_or_close
 
     db = acquire()
     try:
-        db.append_message(session_id=session_id, role=message.get("role", "assistant"), content=message.get("content"))
+        # The provenance survives as display metadata (never sent to a model): the destination's conversation did
+        # not write this row, so it is no evidence that a turn there built a prompt (agent/home_guidance.py).
+        db.append_message(session_id=session_id, role=message.get("role", "assistant"), content=message.get("content"),
+                          display_metadata={DELIVERY_MIRROR: message.get("mirror_source") or "unknown"})
     finally:
         release_or_close(db)

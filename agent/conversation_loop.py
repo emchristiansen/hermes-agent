@@ -693,11 +693,12 @@ def _print_billing_or_entitlement_guidance(
 
 
 def _bot_chat_prompt_stale(agent, stored_prompt: str | None) -> bool:
-    """Bot Chat capability epoch check for a stored prompt.
+    """Bot Chat capability/Home-edition check for a stored prompt.
 
     The stored prompt embeds a capability fingerprint; a mismatch is a deliberate
-    once-per-change rebuild. Unstamped prompts never match; probe failures fail closed
-    to "reuse" so the cache is kept. Legacy upgrade: a Bot Chat prompt predating the
+    once-per-change rebuild. Canonical sessions also repair a stale SOUL-origin
+    Home edition, including one joined to an already-current epoch. Probe failures
+    keep the cache. Legacy upgrade: a Bot Chat prompt predating the
     epoch mechanism gets ONE title-gated migration rebuild; the stamped result cannot
     re-fire. A NULL or empty stored prompt already rebuilds every turn, so this probe
     is not a gate there and must not run.
@@ -706,7 +707,7 @@ def _bot_chat_prompt_stale(agent, stored_prompt: str | None) -> bool:
         return False
     try:
         from tools.bot_mode_probe import (
-            BOT_CHAT_TITLE,
+            session_is_canonical_bot_chat,
             stored_bot_chat_prompt_needs_upgrade,
             stored_prompt_capability_stale,
         )
@@ -726,7 +727,10 @@ def _bot_chat_prompt_stale(agent, stored_prompt: str | None) -> bool:
                 title = str(agent._session_db.get_session_title(agent.session_id) or "").strip()
             except Exception:
                 title = ""
-        return title == BOT_CHAT_TITLE and bool(stored_bot_chat_prompt_needs_upgrade(stored_prompt, home))
+        from agent.home_guidance import soul_edition_stale
+        return (session_is_canonical_bot_chat(agent._session_db, agent.session_id, title)
+                and (bool(stored_bot_chat_prompt_needs_upgrade(stored_prompt, home))
+                     or soul_edition_stale(agent, stored_prompt)))
     except Exception:
         return False
 
@@ -734,14 +738,26 @@ def _bot_chat_prompt_stale(agent, stored_prompt: str | None) -> bool:
 def _persist_system_prompt(agent, failure_message: str, *, persist_tools: bool = False) -> None:
     """Persist ``agent._cached_system_prompt`` to the session row; failures log at WARNING
     (with ``failure_message``) because the gateway path (fresh AIAgent per turn) reads
-    this row every turn, so a silent failure breaks prefix-cache reuse."""
+    this row every turn, so a silent failure breaks prefix-cache reuse.
+
+    With ``persist_tools`` the tools[] pin is written FIRST and the prompt only after it:
+    a prompt stamped with the current capability epoch over a pre-refresh pin reads as
+    fresh and never refreshes again, while an unwritten prompt is rebuilt by the next
+    fresh agent. So a failed pin write leaves the stored prompt as it was."""
     if not agent._session_db:
         return
+    if persist_tools:
+        from tools.mcp_tool_agent import persist_agent_tool_names
+        if not persist_agent_tool_names(agent):
+            logger.warning(
+                "Session %s: the tools[] pin could not be persisted, so the system prompt was "
+                "not persisted either; the next fresh agent rebuilds both (this agent already "
+                "runs the rebuilt prompt and tools).",
+                agent.session_id,
+            )
+            return
     try:
         agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
-        if persist_tools:
-            from tools.mcp_tool_agent import persist_agent_tool_names
-            persist_agent_tool_names(agent)
     except Exception as exc:
         logger.warning(failure_message, agent.session_id, exc)
 
@@ -781,6 +797,10 @@ def _refresh_bot_chat_tools(agent) -> None:
     policy = active_policy()
     platform = getattr(agent, "platform", None)
     if policy is None and platform not in ("desktop", "tui"):
+        # These agents already have current config-built tools, but the routed
+        # canonical identity also owns this dynamic schema. Include it before pinning.
+        from tools.bot_mode_dm import ensure_message_agent_tool
+        ensure_message_agent_tool(agent)
         return
     try:
         from tools.mcp_tool_agent import refresh_agent_mcp_tools
@@ -795,8 +815,13 @@ def _refresh_bot_chat_tools(agent) -> None:
             agent, enabled_override=_load_enabled_toolsets(platform),
             disabled_override=_load_disabled_toolsets(), quiet_mode=True, content_aware=True)
     except Exception as exc:
-        logger.warning("Bot Chat capability refresh kept the previous tools for session %s: %s",
-                       agent.session_id, exc)
+        logger.warning(
+            "Bot Chat capability refresh failed for session %s; no refreshed prompt will be "
+            "committed and the next turn can retry: %s", agent.session_id, exc,
+        )
+        # A current epoch is a completion record for both the prompt and its tools.
+        # Do not let the caller stamp it over a snapshot that failed to rebuild.
+        raise
 
 
 def _restore_or_build_system_prompt(agent, system_message, conversation_history):
@@ -805,9 +830,12 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     Mutates ``agent._cached_system_prompt`` and persists a freshly-built prompt on first
     build. Row states ``missing``/``null``/``empty``/``present`` are logged and DB
     failures log at WARNING so silent prefix-cache misses show in ``agent.log``."""
+    from agent.home_guidance import continues_without_prompt, restore_home_guidance, stored_messages
     stored_prompt = None
     stored_state = "missing"
     session_row = None
+    read_failure = None
+    continuing = False
     if conversation_history and agent._session_db:
         try:
             session_row = agent._session_db.get_session(agent.session_id)
@@ -815,18 +843,27 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 raw_prompt = session_row.get("system_prompt")
                 stored_state = "null" if raw_prompt is None else ("empty" if raw_prompt == "" else "present")
                 stored_prompt = raw_prompt or None
+            # A row that lost its prompt but shows a decided conversation, in the history this turn continues or in
+            # its stored transcript (whose row ids place an import's boundary), is a continuing conversation.
+            continuing = stored_state in ("null", "empty") and (
+                continues_without_prompt(session_row, conversation_history)
+                or continues_without_prompt(session_row, stored_messages(agent._session_db, agent.session_id)))
         except Exception as exc:
+            read_failure = type(exc).__name__
             logger.warning(
                 "Session DB get_session failed for system-prompt restore (session=%s): %s. "
                 "Falling back to fresh build — prefix cache will miss for this turn.",
                 agent.session_id, exc,
             )
 
+    # A resumed session keeps its edition through every rebuild; a row that lost its prompt but shows a decided
+    # conversation, or a failed read with history to continue, is a continuing conversation, never a new one.
+    restore_home_guidance(agent, stored_prompt, unreadable=read_failure, continuing=continuing)
     if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
         # NULL/empty rows never reach this probe: they already rebuild below.
         if _bot_chat_prompt_stale(agent, stored_prompt):
             logger.info(
-                "Bot Chat capability epoch changed for session %s; rebuilding system prompt to "
+                "Bot Chat capability or SOUL Home edition changed for session %s; rebuilding system prompt to "
                 "adopt the new capability surface (one-time prefix-cache break).",
                 agent.session_id,
             )
@@ -841,7 +878,8 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             except Exception:
                 pass
             _refresh_bot_chat_tools(agent)
-            agent._cached_system_prompt = agent._build_system_prompt(system_message)
+            from agent.home_guidance import build_with_soul_edition_refresh
+            agent._cached_system_prompt = build_with_soul_edition_refresh(agent, system_message)
             record_cache_break(agent, "toolset_change")
             stage_surface_switch_note(agent, agent._cached_system_prompt, conversation_history)
             # Persist so the NEXT turn restores the new bytes verbatim (cache break is

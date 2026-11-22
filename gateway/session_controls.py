@@ -340,7 +340,11 @@ class AuthorityConnection:
         original_params = dict(params)
         contract = contract or METHODS.get(method)
         authority = self.authority
-        if (isinstance(ref.session_id, str) and ref.session_id and not getattr(authority, 'retiring', False)
+        # Adopt/persist authenticate a durable execution, not a restored viewer session.
+        # A reserved child has no live session or local receipt. Probing for one here
+        # takes a synchronous DB lock before the handler's off-loop verification.
+        if (method not in {'worker.adopt', 'worker.persist'}
+                and isinstance(ref.session_id, str) and ref.session_id and not getattr(authority, 'retiring', False)
                 and ref.profile_id == getattr(authority, 'profile_id', None)
                 and ref.session_id not in getattr(authority, 'sessions', {ref.session_id: None})):
             # A first read of a session recovery never restored: its compression catch-up (#140060)
@@ -912,7 +916,8 @@ class AuthorityConnection:
             # a finite viewer reads its ledger (tokens, cost, model, exit reason) from here, the same
             # dict the in-process one-shot wrote from `run_conversation`.
             from gateway.session_results import admission_result
-            saved = admission_result(self.authority.db, receipt.admission_id)
+            saved = await asyncio.to_thread(admission_result, self.authority.db, receipt.admission_id)
+            self.authority.authorize(self.actor, ref, 'session:submit')
             if saved is not None:
                 out['result'] = saved['result']
                 out['usage'] = saved.get('usage') or {}

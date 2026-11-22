@@ -116,7 +116,7 @@ def test_busy_policy_is_authorized_session_scoped_and_not_inference(tmp_path):
                 result = await rpc(ws, 'config.set', session_id=ids[0], key='busy', value='queue')
                 assert result.get('result', {}).get('scope') == 'session', result
                 async with websocket(home, desc) as viewer:
-                    assert (await rpc(viewer, 'config.get', session_id=ids[0], key='busy'))['result']['value'] == 'queue'
+                    assert (await rpc(viewer, 'config.get', session_id=ids[0], key='busy'))['result']['value'] == 'steer'
                 assert (await rpc(ws, 'config.get', session_id=ids[1], key='busy'))['result']['value'] == 'steer'
                 for method, params, reason in [
                     ('config.get', {'session_id': ids[0], 'key': 'busy', 'profile': 'foreign'}, 'profile_mismatch'),
@@ -135,8 +135,8 @@ def test_busy_policy_is_authorized_session_scoped_and_not_inference(tmp_path):
                         result = await rpc(other, method, session_id=ids[0], key='busy', **params)
                         # This configured dashboard token is another verified operator.
                         assert result.get('result') == {
-                            'key': 'busy', 'value': 'queue', 'scope': 'session'}, result
-                assert (await rpc(ws, 'config.get', session_id=ids[0], key='busy'))['result']['value'] == 'queue'
+                            'key': 'busy', 'value': 'steer', 'scope': 'session'}, result
+                assert (await rpc(ws, 'config.get', session_id=ids[0], key='busy'))['result']['value'] == 'steer'
                 assert (await rpc(ws, 'config.get', session_id=ids[1], key='busy'))['result']['value'] == 'steer'
                 # /verbose is the same kind of session-scoped display negotiation.
                 result = await rpc(ws, 'config.set', session_id=ids[0], key='verbose', value='cycle')

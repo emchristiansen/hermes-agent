@@ -39,7 +39,8 @@ def require_history_claim(authority, conn, actor, sid):
     from gateway.owner_identity import same_owner
     from hermes_state_mutation_binding import BINDING_PREFIX, _owner_user
     row = conn.execute('SELECT * FROM sessions WHERE id=?', (sid,)).fetchone()
-    if row is None or row['session_key'] or row['chat_id'] or row['origin_json']:
+    from hermes_state_local_migration import routed_origin
+    if row is None or row['session_key'] or row['chat_id'] or routed_origin(row):
         return
     if conn.execute('SELECT 1 FROM state_meta WHERE key=?', (BINDING_PREFIX + sid,)).fetchone():
         return  # authorize_history checks the already committed importer identity.

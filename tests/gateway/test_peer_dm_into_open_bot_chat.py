@@ -145,8 +145,10 @@ async def test_a_peer_run_into_a_bot_chat_without_an_authority_runs_here(tmp_pat
 
 @pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
 def test_peer_dm_reports_a_turn_queued_in_the_open_bot_chat_as_delivered(monkeypatch, capsys, as_json):
-    """The queued answer means the message IS in the peer's open Bot Chat: say so, succeed, and tell
-    the sender not to resend, instead of printing ``(no reply)`` as if the turn were empty."""
+    """The queued answer means the message IS in the peer's open Bot Chat: say so, succeed and keep the
+    delivery handle, instead of printing ``(no reply)`` as if the turn were empty. The guidance is the
+    current retry distinction (retry only on failure/uncertainty; a duplicate never authorizes repeated
+    effects), not the obsolete blanket "Do NOT resend"."""
     monkeypatch.setattr(peer_mod, "_ensure_bot_chat", lambda base, key: "bot-chat")
     monkeypatch.setattr(peer_mod, "_request", lambda url, key, **kw: {
         "object": "hermes.session.chat.queued", "session_id": "bot-chat", "status": "claimed", "delivery_id": "d" * 32})
@@ -159,8 +161,13 @@ def test_peer_dm_reports_a_turn_queued_in_the_open_bot_chat_as_delivered(monkeyp
     if as_json:
         assert json.loads(out) == {"peer": "mini", "profile": None, "session_id": "bot-chat",
                                    "status": "claimed", "delivery_id": "d" * 32}
+        assert "Retry" not in out  # the JSON payload carries the handles, not prose
     else:
-        assert "went into that chat (session bot-chat)" in out and "Do NOT resend" in out
+        assert "went into that chat (session bot-chat)" in out
+        assert "The reply cannot come back on this call." in out
+        assert "Retry promptly if delivery fails, times out or remains uncertain" in out
+        assert "duplicate messages do not authorize repeated effects" in out
+        assert "Do NOT resend" not in out
 
 
 @pytest.mark.asyncio

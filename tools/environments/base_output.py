@@ -34,8 +34,11 @@ class _BoundedOutputCollector:
     # Hard ceiling on spill file size; protects disk from runaway output.
     _SPILL_CAP_CHARS = 5_000_000
 
-    def __init__(self, max_chars: int, spill_path: Path | None = None):
+    def __init__(self, max_chars: int, spill_path: Path | None = None, sink=None):
         self.max_chars = max(1, int(max_chars))
+        # Caller destination (``tools.output_control.Destination``): receives EVERY chunk from
+        # byte 0, uncapped, instead of the default overflow-only spill file.
+        self._sink = sink
         self._head_limit = int(self.max_chars * 0.4)
         self._tail_limit = self.max_chars - self._head_limit
         self._head: list[str] = []
@@ -103,6 +106,8 @@ class _BoundedOutputCollector:
             return
         with self._lock:
             text_len = len(text)
+            if self._sink is not None:
+                self._sink.write(text)
             # Spill tee activates at the first overflow, then mirrors every chunk.
             if self._spill_path is not None and (
                 self._spill_fh is not None or self._total_chars + text_len > self.max_chars):
@@ -166,19 +171,28 @@ class _BoundedOutputCollector:
             return head[:head_chars] + notice[:available] + rendered_tail + suffix
 
 
-def _new_output_collector(proc, bounded_capture: bool) -> _BoundedOutputCollector:
+def _new_output_collector(proc, bounded_capture: bool, capture=None) -> _BoundedOutputCollector:
     """Build the collector for one ``_wait_for_process`` call. ``bounded_capture`` (foreground
     terminal path only) caps retention at ``tool_output.max_bytes`` and tees overflow to a
     spill file under ``$HERMES_HOME/cache/terminal-output`` (created only on actual overflow;
     spills older than 7 days are pruned opportunistically). Otherwise the collector is
-    effectively unbounded so internal consumers keep full-fidelity output."""
-    if not bounded_capture:
+    effectively unbounded so internal consumers keep full-fidelity output.
+
+    ``capture`` (a ``tools.output_control.StreamCapture``, foreground terminal only) is the
+    caller's prospective control and replaces both: its window, its destination sink, and the
+    default spill tee only when it asks for it."""
+    if capture is not None:
+        if not capture.default_spill:
+            return _BoundedOutputCollector(capture.window_chars, sink=capture.sink)
+        capture_limit = capture.window_chars
+    elif not bounded_capture:
         return _BoundedOutputCollector(_UNBOUNDED_CAPTURE_CHARS)
-    try:
-        from tools.tool_output_limits import get_max_bytes
-        capture_limit = get_max_bytes()
-    except Exception:
-        capture_limit = 50_000
+    else:
+        try:
+            from tools.tool_output_limits import get_max_bytes
+            capture_limit = get_max_bytes()
+        except Exception:
+            capture_limit = 50_000
     spill_path = None
     from tools.hosted_tool_policy import host_feature_enabled
     if not host_feature_enabled("tool_host_artifacts"):  # a hosted agent's output is never teed here
@@ -202,6 +216,9 @@ def _new_output_collector(proc, bounded_capture: bool) -> _BoundedOutputCollecto
 def _finalize_wait_result(collector: _BoundedOutputCollector, rendered: str, returncode: int | None) -> dict:
     """Assemble a wait result, attaching spill metadata when overflow occurred."""
     result = {"output": rendered, "returncode": returncode}
+    if collector.total_chars > collector.max_chars:
+        # Size of the whole stream when the window had to cut it (with or without a spill).
+        result["stream_total_chars"] = collector.total_chars
     spill = collector.close_spill()
     if spill:
         result["output_total_chars"] = collector.total_chars

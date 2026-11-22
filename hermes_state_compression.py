@@ -371,6 +371,15 @@ class SessionCompressionMixin:
                 (parent["archived"] or 0) if continuation else 0,
                 (parent["auto_archived"] or 0) if continuation else 0),
         )
+        # A continuation is its parent's history: it carries the parent's import binding as it carries the
+        # route columns, or a bound import's compressed tip reads as another owner's (unbound) row and a
+        # chain-aware delete or archive splits the conversation (same_history_owner).
+        # A branch or reset child is its own conversation (routed by its policy receipt), so only a
+        # continuation carries it, as pin and archive state are carried.
+        if continuation:
+            from hermes_state_mutation_binding import BINDING_PREFIX
+            conn.execute('INSERT OR IGNORE INTO state_meta(key,value) SELECT ?, value FROM state_meta WHERE key=?',
+                         (BINDING_PREFIX + child_session_id, BINDING_PREFIX + parent_session_id))
 
     def publish_compression_child(
         self, *, parent_session_id: str, child_session_id: str, source: str,

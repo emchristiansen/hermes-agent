@@ -47,6 +47,29 @@ def worker_output_log(session_id: str) -> Optional[Path]:
     return directory / f"{session_id}.log"
 
 
+def worker_spawn_outlives_unit() -> bool:
+    """A registered worker inside a systemd *service* cgroup (Linux): its spawns need their own scope.
+
+    What a worker starts is meant to outlive it (see the module docstring), but a supervised
+    gateway's managed workers share the gateway unit's cgroup, so stopping or restarting that unit
+    kills them with it, and the ``-lic`` wrapper ignores SIGTERM, holding the stop until systemd's
+    SIGKILL. Read from the kernel, not the inherited ``INVOCATION_ID``: a worker already running in
+    a scope of its own (a kanban worker) keeps today's placement."""
+    from agent.runtime_session_store import is_worker_process
+    if not is_worker_process():
+        return False
+    try:
+        lines = Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines()
+    except OSError:  # not Linux, or no procfs
+        return False
+    for line in lines:  # v2: "0::/path"; v1 hybrid: the "name=systemd" hierarchy carries the unit
+        _, _, rest = line.partition(":")
+        controllers, _, path = rest.partition(":")
+        if controllers in ("", "name=systemd"):
+            return path.rstrip("/").rpartition("/")[2].endswith(".service")
+    return False
+
+
 def adoptable_log(path) -> str:
     """A checkpointed log path, only when it names this profile's output directory."""
     log = Path(str(path or ""))

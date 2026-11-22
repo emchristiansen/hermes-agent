@@ -57,6 +57,12 @@ def save_completed_result(session) -> None:
     with session._lock:
         record = {key: getattr(session, key) for key in _RESULT_FIELDS}
         record["output"] = session.output_buffer[-MAX_OUTPUT_CHARS:]
+        # Durable scope custody (process_registry_scope_custody): the unit stays on the receipt
+        # until its scope is verified empty or stopped, so a later interpreter can still stop it.
+        record["systemd_unit"] = session.systemd_unit if session._scope_stop_pending else ""
+        # Provenance, never released with custody: the scope the command ran in and what its cgroup did.
+        record["scope_unit"] = session.scope_unit
+        record["scope_oom_killed"] = session.scope_oom_killed
     # Live-output opt-out must not persist raw credentials in durable receipts.
     record["output"] = redact_terminal_output(record["output"], record["command"], force=True)
     record["command"] = redact_sensitive_text(record["command"], code_file=True, force=True)
@@ -70,6 +76,31 @@ def save_completed_result(session) -> None:
     except OSError:
         # Preserve live delivery on disk failure, but never silently claim durability.
         logger.warning("Could not retain completed process result %s", session.id, exc_info=True)
+
+
+def _result_path(session_id: str):
+    return get_hermes_home() / "logs" / "process-results" / f"{session_id}.json"
+
+
+def load_result_record(session_id: str) -> dict | None:
+    """The raw retained receipt of *session_id* (no ownership filter: registry-internal use)."""
+    try:
+        record = json.loads(_result_path(session_id).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) and record.get("id") == session_id else None
+
+
+def forget_result_scope(session_id: str) -> None:
+    """The receipt's scope was stopped or found empty: drop the unit, keep everything else."""
+    record = load_result_record(session_id)
+    if not record or not record.get("systemd_unit"):
+        return
+    record["systemd_unit"] = ""
+    try:
+        atomic_json_write(_result_path(session_id), record, mode=0o600)
+    except OSError:
+        logger.warning("Could not release the scope on process result %s", session_id, exc_info=True)
 
 
 def _owns_result(owner: str, parent: str | None) -> bool:
@@ -114,10 +145,14 @@ def load_completed_results(prefix: str = "") -> dict:
                 continue
             if not _owns_result(owner, record.get("parent_session_id")):
                 continue
+            unit = record.get("systemd_unit") or ""  # absent on receipts written before scope custody
             session = ProcessSession(
                 **{key: record[key] for key in _RESULT_FIELDS},
                 # Receipts written before processes carried a sandbox are a local activity's.
                 sandbox_key=record.get("sandbox_key", ""), exited=True, output_buffer=record["output"],
+                systemd_unit=unit, _scope_stop_pending=bool(unit),
+                # Absent on receipts written before scope provenance: unknown, not inferred from custody.
+                scope_unit=record.get("scope_unit", ""), scope_oom_killed=record.get("scope_oom_killed"),
             )
             session._completion_event.set()
             results[session.id] = session

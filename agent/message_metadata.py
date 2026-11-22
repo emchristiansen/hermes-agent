@@ -149,6 +149,60 @@ def without_withheld_prompts(messages: Any) -> Any:
     ]
 
 
+# A row ``gateway/mirror.py`` delivered into a destination session (a cron or webhook brief, an outgoing
+# ``send_message``): text written into that transcript by a delivery, not by a turn of its conversation. Persisted
+# inside ``display_metadata`` as the mirror's source label, never sent to a model.
+DELIVERY_MIRROR = "delivery_mirror"
+
+
+def is_delivery_mirror(message: Any) -> bool:
+    """Whether *message* is a delivery mirror (:data:`DELIVERY_MIRROR`)."""
+    metadata = message.get("display_metadata") if isinstance(message, Mapping) else None
+    return isinstance(metadata, Mapping) and DELIVERY_MIRROR in metadata
+
+
+# A failed-turn notice that now also stands for a row a turn of its conversation wrote (a real, partial, empty or
+# tool-call reply folded into it, or retired behind it): it keeps its notice text and ``display_kind`` for display,
+# but it is no longer only a notice. Persisted inside ``display_metadata``, never sent to a model.
+STANDS_FOR_TURN_ROW = "stands_for_turn_row"
+
+
+def written_without_a_turn(message: Any) -> bool:
+    """Whether *message* is a row Hermes writes into a transcript without a turn of that conversation producing it: a
+    delivery mirror (:data:`DELIVERY_MIRROR`), or the failed-turn notice (``agent/turn_failure_copy.py``: typed by its
+    ``display_kind``, or a legacy row by its exact text) a closer writes even when no agent was built — unless it
+    has since absorbed a row a turn wrote (:data:`STANDS_FOR_TURN_ROW`, :func:`absorb_turn_provenance`)."""
+    from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, untyped_failed_turn_display_kind
+
+    if not isinstance(message, Mapping):
+        return False
+    metadata = message.get("display_metadata")
+    if isinstance(metadata, Mapping) and metadata.get(STANDS_FOR_TURN_ROW):
+        return False
+    return (is_delivery_mirror(message) or message.get("display_kind") == FAILED_TURN_DISPLAY_KIND
+            or untyped_failed_turn_display_kind(message.get("role"), message.get("content")) is not None)
+
+
+def absorb_turn_provenance(survivor: MutableMapping[str, Any], dropped: Mapping[str, Any]) -> None:
+    """*survivor* now stands for *dropped*'s row too (a host fold, or a dropped row retired behind it). Its
+    written-without-a-turn provenance (:func:`written_without_a_turn`) holds only while every row it stands for was
+    written without one (another mirror, a failed-turn notice); once it absorbs any other row (a real reply, its tool
+    calls, an empty reply, user text) the survivor is such a row too. A mirror loses its :data:`DELIVERY_MIRROR`
+    mark; a failed-turn notice, whose text and type still say what to display, records :data:`STANDS_FOR_TURN_ROW`.
+    The survivor gets a new ``display_metadata`` dict; a copy sharing the old one keeps its own."""
+    if not written_without_a_turn(survivor) or written_without_a_turn(dropped):
+        return
+    old = survivor.get("display_metadata")
+    metadata = {key: value for key, value in (old.items() if isinstance(old, Mapping) else ())
+                if key != DELIVERY_MIRROR}
+    if written_without_a_turn({**survivor, "display_metadata": metadata}):
+        metadata[STANDS_FOR_TURN_ROW] = True
+    if metadata:
+        survivor["display_metadata"] = metadata
+    else:
+        survivor.pop("display_metadata", None)
+
+
 def lift_data_use(message: MutableMapping[str, Any]) -> None:
     """Restore a replayed row's ``data_use`` key from its durable ``display_metadata`` copy."""
     metadata = message.get("display_metadata")
@@ -323,9 +377,14 @@ def _is_empty_content(content: Any) -> bool:
 
 def record_absorbed_message(
     survivor: MutableMapping[str, Any], dropped: Mapping[str, Any], *, dropped_leads: bool = False,
+    text_kept: bool = True,
 ) -> None:
-    """Merge-witness bookkeeping for every host fold of *dropped* into *survivor*.
+    """Merge-witness bookkeeping for every host fold of *dropped* into *survivor*, and for a dropped row retired
+    behind it.
 
+    Either way the survivor now stands for *dropped*'s row, so its provenance follows its constituents
+    (:func:`absorb_turn_provenance`). The uid witness claims *dropped*'s text lives on in the survivor, so it is
+    recorded only when the fold kept that text (*text_kept*; a retired row's content is discarded).
     The composite keeps the uid of the constituent whose text comes first and records every other
     constituent's uid in ``_absorbed_message_uids`` (text order, no repeats). By default the survivor's
     text leads; with *dropped_leads* the dropped dict's text was put first (the real user anchor folded
@@ -335,6 +394,9 @@ def record_absorbed_message(
     now holds more than that one ask, so ``previous_message`` reads it as before stamps existed); an empty
     turn leaves the content, and so the stamp, as they were.
     """
+    absorb_turn_provenance(survivor, dropped)
+    if not text_kept:
+        return
     if not _is_empty_content(dropped.get("content")):
         drop_typed_ask(survivor)
     survivor_uid = message_uid_or_none(survivor)

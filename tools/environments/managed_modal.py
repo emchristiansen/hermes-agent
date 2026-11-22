@@ -49,6 +49,7 @@ class ManagedModalEnvironment(BaseEnvironment):
     # The askpass prologue checks sudo ``-A`` support inside each command, so no capability probe
     # runs here (a timed-out probe could only be cancelled by stopping the sandbox).
     _sudo_askpass_runtime_checked = True
+    supports_stream_capture = False  # one gateway payload, no streaming collector
     _CONNECT_TIMEOUT_SECONDS = _request_timeout_env("TERMINAL_MANAGED_MODAL_CONNECT_TIMEOUT_SECONDS", 1.0)
     _POLL_READ_TIMEOUT_SECONDS = _request_timeout_env("TERMINAL_MANAGED_MODAL_POLL_READ_TIMEOUT_SECONDS", 5.0)
     _CANCEL_READ_TIMEOUT_SECONDS = _request_timeout_env("TERMINAL_MANAGED_MODAL_CANCEL_READ_TIMEOUT_SECONDS", 5.0)

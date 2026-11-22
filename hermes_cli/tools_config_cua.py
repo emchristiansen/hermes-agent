@@ -198,10 +198,15 @@ def _cua_autostart_opt_in() -> bool:
     session exactly as macOS and Linux do, install/enable flows register no scheduled task, and
     a missing task is not a repair condition. True registers (or repairs) the logon task at
     install/enable time — needed when driving Windows over SSH (Session 0 has no interactive
-    desktop). Unreadable config fails closed to the on-demand default."""
+    desktop). Unreadable config fails closed to the on-demand default, including the defaults /
+    last-good fallback ``load_config`` serves for a broken config.yaml (``FailedConfigRead``)."""
     with contextlib.suppress(Exception):
         from hermes_cli.config import load_config
-        return bool(((load_config() or {}).get("computer_use") or {}).get("autostart", False))
+        from hermes_cli.config_read_errors import FailedConfigRead
+        cfg = load_config()
+        if isinstance(cfg, FailedConfigRead):
+            return False
+        return bool(((cfg or {}).get("computer_use") or {}).get("autostart", False))
     return False
 
 

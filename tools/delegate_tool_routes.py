@@ -196,9 +196,41 @@ def _refuse_under_worker_snapshot(home: Path) -> None:
             f"cannot run as the profile at {home}. Delegate without a profile.")
 
 
-def _profile_route(home: Path) -> TaskRoute:
-    """The profile's own primary route, resolved inside its scope (its config.yaml + secrets). The
-    child never borrows the launching profile's key, pool, fallback chain or reasoning level."""
+def _profile_pinned_request(cfg: Mapping[str, Any], route: Mapping[str, Any]) -> dict[str, Any]:
+    """A raw child model may change only the model, never the profile's route or policy.
+
+    Do not resolve aliases here: an alias can select another endpoint and read its credentials.
+    Qualified/aggregator model IDs and other route overrides require a separate routing contract.
+    """
+    pin = route.get("model")
+    if not isinstance(pin, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", pin) is None:
+        raise DelegationRouteError("A profile model pin must be a nonempty raw model ID, not a qualified route.")
+    from hermes_cli.model_switch import MODEL_ALIASES
+    model_cfg = cfg.get("model")
+    aliases = [cfg.get("model_aliases"), model_cfg.get("aliases") if isinstance(model_cfg, dict) else None,
+               MODEL_ALIASES]
+    if any(isinstance(names, Mapping) and pin.lower() in {str(k).strip().lower() for k in names}
+           for names in aliases):
+        raise DelegationRouteError("A profile model pin must name the raw model, not an alias.")
+    conflicts = [name for name in ("provider", "base_url", "api_key", "api_mode", "request_overrides",
+                                  "reasoning_effort", "service_tier") if route.get(name) not in (None, "", {})]
+    fallback = cfg.get("fallback_providers")
+    fallback = fallback if isinstance(fallback, list) else []
+    if route.get("fallback_providers") is not None and route["fallback_providers"] != fallback:
+        conflicts.append("fallback_providers")
+    if conflicts:
+        raise DelegationRouteError("A profile model pin keeps profile-owned routing; remove overrides: "
+                                   + ", ".join(conflicts) + ".")
+    request = _profile_model_request(cfg)
+    provider = request.get("requested") or (model_cfg.get("provider") if isinstance(model_cfg, dict) else None)
+    if not isinstance(provider, str) or provider.strip().lower() in ("", "auto"):
+        raise DelegationRouteError("A profile model pin requires an explicit profile-owned provider.")
+    return {**request, "target_model": pin}
+
+
+def _profile_route(home: Path, route: Optional[Mapping[str, Any]] = None) -> TaskRoute:
+    """The profile's route, resolved inside its scope (its config.yaml + secrets). A raw
+    model pin changes only the child model; credentials, fallback and reasoning remain profile-owned."""
     from hermes_cli.config import load_config_readonly
     from hermes_cli.runtime_provider import resolve_runtime_provider
     from hermes_constants import resolve_reasoning_config
@@ -206,7 +238,8 @@ def _profile_route(home: Path) -> TaskRoute:
     _refuse_under_worker_snapshot(home)
     with delegated_profile_scope(home):
         cfg = load_config_readonly() or {}
-        request = _profile_model_request(cfg)
+        request = (_profile_pinned_request(cfg, route) if route is not None and route.get("model") not in (None, "")
+                   else _profile_model_request(cfg))
         try:
             rt = resolve_runtime_provider(**request)
         except Exception as exc:
@@ -241,7 +274,7 @@ def _with_inherited_fallback(route: dict[str, Any], config: Mapping[str, Any]) -
 
 def _resolve_route(route: dict[str, Any], parent_agent: Any, backend: str) -> TaskRoute:
     if route.get("profile"):
-        return replace(_profile_route(_profile_home(route["profile"])), backend=backend)
+        return replace(_profile_route(_profile_home(route["profile"]), route), backend=backend)
     from tools.delegate_tool import _resolve_delegation_credentials  # the facade is the patch seam
     creds = _resolve_delegation_credentials(route, parent_agent)
     if route.get("service_tier") not in (None, ""):

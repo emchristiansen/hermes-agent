@@ -48,6 +48,7 @@ from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get, config_exists
 from gateway.run_common import _csv_or_list_to_set
 from hermes_cli.fallback_config import pre_agent_fallback_notice
 from gateway.turn_executor import _UnboundedThreadExecutor
+from gateway.run_shutdown_budget import counted_maintenance_pass
 
 # Per-session AIAgent cache bounds (agents are heavy); see _enforce_agent_cache_cap/_session_housekeeping_watcher.
 _AGENT_CACHE_MAX_SIZE = 128
@@ -1119,7 +1120,7 @@ def _build_replay_entry(
 ) -> dict[str, Any]:
     """Build a replay entry for a non-tool-calling message, preserving ``_ASSISTANT_REPLAY_FIELDS``.
 
-    ``preserve_timestamp``: only user rows need it (stale-dangerous-confirmation stripper). Falsy fields are
+    ``preserve_timestamp``: keep the durable row's ``timestamp`` (persistence-only, never sent). Falsy fields are
     dropped EXCEPT ``reasoning_content``: DeepSeek/Kimi treat "" as a sentinel; dropping it can 400.
 
     Empty values: most fields are dropped when falsy (matching the original PR #2974 behaviour) since an
@@ -1270,9 +1271,9 @@ def _build_gateway_agent_history(
             observed_group_context.append(str(content).strip())
             continue
 
-        # Rich tool_calls/tool-result rows pass through intact so the API sees valid assistant→tool sequences.
+        # Rich tool_calls/tool-result rows pass through intact (valid assistant→tool sequences; timestamp never sent).
         if "tool_calls" in msg or "tool_call_id" in msg or role == "tool":
-            clean_msg = {k: v for k, v in msg.items() if k not in {"timestamp", "observed"}}
+            clean_msg = {k: v for k, v in msg.items() if k != "observed"}
             agent_history.append(clean_msg)
         elif content or _has_replayable_sidecar(role, content, msg):
             replay_timestamp = msg.get("timestamp")
@@ -1288,8 +1289,8 @@ def _build_gateway_agent_history(
                             replay_timestamp = embedded_timestamp
                 if not content:
                     continue
-            # Keep user timestamps for the stale-dangerous-confirmation stripper in agent/replay_cleanup.py.
-            entry = _build_replay_entry(role, content, msg, preserve_timestamp=(role == "user"))
+            # Every role keeps its durable stamp, as live rows do (replay_cleanup; context engines match on it).
+            entry = _build_replay_entry(role, content, msg, preserve_timestamp=True)
             if inject_timestamps and role == "user" and isinstance(content, str) and not is_compaction_scaffolding(msg):
                 rendered = _render_msg_ts(content, replay_timestamp, tz=_msg_tz)
                 # Preserve only a sidecar matching the complete rendered message,
@@ -4066,7 +4067,7 @@ class GatewayRunner(
         ("compression", "proactive_prune_tokens"),
         ("compression", "proactive_prune_min_result_chars"),
         ("compression", "proactive_prune_min_reclaim_tokens"),
-        ("compression", "min_tail_user_messages"), ("agent", "disabled_toolsets"),
+        ("compression", "min_tail_user_messages"), ("agent", "disabled_toolsets"), ("agent", "disabled_tools"),
         ("memory", "provider"), ("checkpoints", "enabled"), ("checkpoints", "max_snapshots"),
         ("checkpoints", "max_total_size_mb"), ("checkpoints", "max_file_size_mb"))
 
@@ -4310,17 +4311,16 @@ def _profile_sessions_dir(launch: Optional[tuple[Path, Path]]) -> Path:
     return home / "sessions"
 
 
+@counted_maintenance_pass  # a writer the shutdown close waits for (and fences); see run_shutdown_budget
 def _housekeeping_state_db_maintenance(launch: Optional[tuple[Path, Path]] = None) -> None:
-    """Stale-session auto-archive plus auto-prune/VACUUM for ONE profile's state.db; both are gated
-    by sessions.min_interval_hours (VACUUM additionally by its own throttles). Opens its own
-    SessionDB — SQLite connections are thread-bound.
-
-    Profile-scoped by its caller: ``acquire()``, ``get_hermes_home()`` and ``load_config()`` all
-    resolve through the active scope, so an unscoped run swept only the LAUNCH profile's store with
-    the LAUNCH profile's retention settings and a multiplexed secondary was never archived, pruned
-    or vacuumed by anyone — the dashboard/serve trigger defers to the gateway for every profile a
-    gateway owns (``web_server_sessions``). *launch* carries the launch home's configured transcript
-    dir (:func:`_launch_sessions_dir`) so its override still governs its own profile."""
+    """Stale-session auto-archive plus auto-prune/VACUUM for ONE profile's state.db; both are gated by
+    sessions.min_interval_hours (VACUUM additionally by its own throttles). Opens its own SessionDB.
+    Profile-scoped by its caller: ``acquire()``, ``get_hermes_home()`` and ``load_config()`` all resolve
+    through the active scope, so an unscoped run swept only the LAUNCH profile's store with the LAUNCH
+    profile's retention settings and a multiplexed secondary was never archived, pruned or vacuumed by
+    anyone — the dashboard/serve trigger defers to the gateway for every profile a gateway owns
+    (``web_server_sessions``). *launch* carries the launch home's configured transcript dir
+    (:func:`_launch_sessions_dir`) so its override still governs its own profile."""
     from hermes_cli.config import load_config as _load_full_config
     from hermes_state_registry import acquire, release_or_close
     _sess_cfg = (_load_full_config().get("sessions") or {})
@@ -5074,8 +5074,7 @@ def main():
         from hermes_cli.gateway_multiplex_mode import log_multiplex_decision, resolve_multiplex_mode
         log_multiplex_decision(resolve_multiplex_mode(config))
 
-    # start_gateway() completes teardown before returning/raising SystemExit; force-exit after so a
-    # wedged non-daemon worker can't block Py_FinalizeEx's join. SystemExit caught so EVERY path exits.
+    # start_gateway() completes teardown before returning/raising SystemExit; force-exit after (see below).
     try:
         # start_gateway() performs the full graceful teardown (adapters disconnected, sessions saved +
         # flushed, SQLite closed, cron/MCP stopped, PID file + runtime lock released) before it returns OR
@@ -5086,8 +5085,9 @@ def main():
         # SystemExit is caught explicitly: start_gateway raises it on the clean-fatal-config (#51228),
         # planned-restart, and service-restart paths, all of which complete teardown first. Routing those
         # codes through the same os._exit backstop means EVERY exit path is wedge-proof, not just the
-        # boolean-return ones.
-        success = asyncio.run(start_gateway(config))
+        # boolean-return ones. asyncio.run's own teardown runs after the stop disarmed its watchdog: backstopped.
+        from gateway.shutdown_watchdog import run_with_exit_backstop
+        success = asyncio.run(run_with_exit_backstop(lambda: start_gateway(config)))
         exit_code = 0 if success else 1
     except SystemExit as e:
         # e.code may be None (→ 0), an int, or a str (→ 1, like CPython).

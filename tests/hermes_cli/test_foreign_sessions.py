@@ -255,7 +255,10 @@ def test_import_claude_session(tmp_path, gateway):
     row = gateway.db.get_session(session_id)
     assert row is not None
     assert row["source"] == "cli"
-    assert row["origin_json"] is None
+    imported = json.loads(row["origin_json"])["imported_from"]  # the composition's import boundary
+    assert imported == {"tool": "claude-code", "path": str(f), "foreign_session_id": "abc-123",
+                        "through_message_id": imported["through_message_id"]}
+    assert imported["through_message_id"] > 0
     assert row["cwd"] is None  # /home/user/proj is not a folder here, and resume would refuse it
     assert row["message_count"] == 4
     title = gateway.db.get_session_title(session_id)
@@ -383,3 +386,72 @@ def test_whitespace_only_user_turn_does_not_break_discovery(tmp_path):
     listed = _list_sessions("claude", project.parent)
     assert [s.title_guess for s in listed] == ["real question"]
     assert listed[0].turn_count == 3  # leading assistant reply gets the user stub
+
+
+def test_an_import_boundary_alone_is_not_a_route_for_chain_ownership(tmp_path):
+    """Fable 181 R1: a local row whose origin_json holds only a foreign import's boundary is routeless
+    history, so chain ownership (``same_history_owner``) checks its import binding. Read as a route,
+    two boundary-only rows compared equal on three empty route columns whoever imported them."""
+    import sqlite3
+    from hermes_state import SessionDB
+    from hermes_state_mutation_binding import BINDING_PREFIX, same_history_owner
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        origin = json.dumps({"imported_from": {"tool": "claude-code", "path": "/x.jsonl",
+                                               "foreign_session_id": "f", "through_message_id": 2}})
+        for sid in ("root", "continuation", "other"):
+            db.create_session(sid, source="cli")
+    finally:
+        db.close()
+    conn = sqlite3.connect(tmp_path / "state.db")
+    conn.row_factory = sqlite3.Row
+    try:
+        with conn:
+            for sid, owner in (("root", "alice"), ("continuation", "alice"), ("other", "bob")):
+                conn.execute("UPDATE sessions SET origin_json=? WHERE id=?", (origin, sid))
+                conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)",
+                             (BINDING_PREFIX + sid, json.dumps(["p", owner], separators=(",", ":"))))
+        assert same_history_owner(conn, "root", "continuation")
+        assert not same_history_owner(conn, "root", "other")
+    finally:
+        conn.close()
+
+
+def test_a_compressed_continuation_of_an_import_stays_in_its_chain(tmp_path, monkeypatch):
+    """Fable 181 ADDENDUM-1: a CLI import continued locally and compressed before any adoption. The
+    continuation copies the root's source and boundary-only origin; a chain-aware delete from either end
+    must take both rows, or the survivor re-projects as the deleted conversation."""
+    import sqlite3
+    from types import SimpleNamespace
+    from hermes_state import SessionDB
+    import hermes_state_runtime
+    from hermes_state_mutation_binding import same_history_owner
+    from hermes_state_mutation_guards import delete_targets
+    db = SessionDB(tmp_path / "state.db")
+    epoch = hermes_state_runtime.begin_runtime_epoch(db, instance_id="import-chain")
+
+    def call(method, **params):
+        return hermes_state_runtime.mutate_runtime_session(
+            db, epoch=epoch, principal_id="owner", session_id=params["session_id"], request_id=params["request_id"],
+            expected_revision=params["expected_revision"], operation=params["operation"], payload=params["payload"])
+    monkeypatch.setattr("hermes_cli.gateway_session_store.session_store", lambda: SimpleNamespace(call=call))
+    try:
+        root = import_foreign_session("claude", _write_claude_fixture(tmp_path))
+        # The gateway's session.mutate import binds the imported row to its importer
+        # (gateway/session_mutations.py: import_history_control); this direct runtime call does not.
+        from hermes_state_mutation_binding import BINDING_PREFIX
+        db._execute_write(lambda c: c.execute("INSERT INTO state_meta(key,value) VALUES(?,?)",
+                                              (BINDING_PREFIX + root, json.dumps(["p", "owner"], separators=(",", ":")))))
+        db.publish_compression_child(parent_session_id=root, child_session_id="continuation", source="cli",
+                                     messages=[{"role": "user", "content": "compacted"}],
+                                     require_compression_lease=False)
+    finally:
+        db.close()
+    conn = sqlite3.connect(tmp_path / "state.db")
+    conn.row_factory = sqlite3.Row
+    try:
+        assert same_history_owner(conn, root, "continuation") and same_history_owner(conn, "continuation", root)
+        assert {root, "continuation"} <= set(delete_targets(conn, root))
+        assert {root, "continuation"} <= set(delete_targets(conn, "continuation"))
+    finally:
+        conn.close()

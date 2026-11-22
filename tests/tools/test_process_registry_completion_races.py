@@ -94,7 +94,7 @@ def _finalizing_session(registry: ProcessRegistry) -> ProcessSession:
     session._reader_selectable = True
     session._reader_thread = cast(Any, SimpleNamespace(is_alive=lambda: True))
     session._reader_finish_requested.set()
-    session.mark_exited(0)
+    session.mark_exited(0, provisional=True)  # as _reconcile_local_exit marks it
     session.append_output("partial")
     registry._running[session.id] = session
     return session
@@ -104,7 +104,8 @@ def test_status_reads_do_not_consume_a_completion_still_being_finalized():
     registry = ProcessRegistry()
     session = _finalizing_session(registry)
 
-    assert registry.poll(session.id)["status"] == "exited"
+    poll = registry.poll(session.id)
+    assert poll["status"] == "settling" and "exit_code" not in poll  # pending, never shown as final (MEMCG-R7-12)
     registry.read_log(session.id)
 
     assert session.id not in registry._poll_observed
@@ -211,6 +212,7 @@ def test_kill_of_an_exited_session_reports_a_failed_scope_stop(monkeypatch):
     registry = ProcessRegistry()
     session = _session("proc_exited_scope_stuck", systemd_unit="hermes-worker-proc_exited_scope_stuck.scope")
     session.mark_exited(0)
+    session._finish_claimed = True  # finished as _move_to_finished leaves it: claimed once its receipt is written
     registry._finished[session.id] = session
     monkeypatch.setattr(module, "_stop_systemd_unit", lambda _unit: False)
 

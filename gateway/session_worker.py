@@ -62,6 +62,27 @@ def _verify(connection, ref, params, claim):
             raise RuntimeStoreError('permission_denied')
 
 
+async def verified_worker_claim(connection, ref, params):
+    """Verify on a worker: even a read can wait for SessionDB's writer lock.
+
+    Recheck retirement after yielding; the owner may have released its epoch
+    while verification waited. The receipt transaction still fences the epoch.
+    """
+    from gateway.session_authorities import require_serving
+    require_serving(connection.authority)
+
+    def verify():
+        claim = _claim(connection, ref, params)
+        if 'worker:adopt' not in connection.actor.capabilities:
+            raise RuntimeStoreError('permission_denied')
+        _verify(connection, ref, params, claim)
+        return claim
+
+    claim = await asyncio.to_thread(verify)
+    require_serving(connection.authority)
+    return claim
+
+
 async def worker_request(connection, ref, params, *, operation):
     from gateway.session_authorities import require_serving
     require_serving(connection.authority)  # adopt/persist would write with the released epoch
@@ -74,7 +95,6 @@ async def worker_request(connection, ref, params, *, operation):
     extra = {'register': {'kind'}, 'adopt': set(), 'persist': {'epoch', 'sequence', 'operation', 'payload'}}[operation]
     if set(params) != _SCOPE | extra:
         raise RuntimeStoreError('invalid_params')
-    claim = _claim(connection, ref, params)
     authority = connection.authority
     if operation == 'register':
         authority._require_admission_open()
@@ -85,11 +105,12 @@ async def worker_request(connection, ref, params, *, operation):
         authority.authorize(connection.actor, ref, 'worker:adopt')
         if params['kind'] != 'compute':
             raise RuntimeStoreError('unsupported_producer')
+        claim = await asyncio.to_thread(_claim, connection, ref, params)
+        require_serving(authority)
+        authority._require_admission_open()
         return await asyncio.to_thread(register_worker_execution, authority.db, epoch=authority.epoch,
             **scope, kind='compute', adoption_secret=claim, require_idle=True)
-    if 'worker:adopt' not in connection.actor.capabilities:
-        raise RuntimeStoreError('permission_denied')
-    _verify(connection, ref, params, claim)
+    claim = await verified_worker_claim(connection, ref, params)
     if operation == 'adopt':
         return await asyncio.to_thread(adopt_worker_execution, authority.db, epoch=authority.epoch,
                                        **scope, adoption_secret=claim)
@@ -97,5 +118,5 @@ async def worker_request(connection, ref, params, *, operation):
         **scope, sequence=params['sequence'], operation=params['operation'], payload=params['payload'])
     if params['operation'] == 'execution.finish':
         # Queued input parked behind this worker; nothing else would restart its FIFO.
-        authority.wake_after_worker(params['session_id'])
+        await authority.wake_after_worker(params['session_id'])
     return result

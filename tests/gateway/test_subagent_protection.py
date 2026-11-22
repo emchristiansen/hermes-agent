@@ -169,10 +169,9 @@ class TestBusyHandlerDemotesInterruptForSubagents:
 
 
     @pytest.mark.asyncio
-    async def test_interrupt_still_fires_when_no_subagents(self) -> None:
-        """Regression-guard the other direction: with no subagents the
-        demotion must NOT trigger and behaviour must be byte-identical
-        to the pre-#30170 interrupt path."""
+    async def test_a_busy_message_steers_when_no_subagents(self) -> None:
+        """With no subagents the demotion does not trigger: the message steers into the running turn
+        (Eric, 2026-11-04: every message steers; a configured ``interrupt`` mode no longer interrupts)."""
         runner = _make_runner()
         runner._busy_input_mode = "interrupt"
         adapter = _make_adapter()
@@ -185,7 +184,8 @@ class TestBusyHandlerDemotesInterruptForSubagents:
         with patch("gateway.platforms.base.merge_pending_message_event"):
             await runner._handle_active_session_busy_message(event, sk)
 
-        parent.interrupt.assert_called_once_with("please stop")
+        parent.interrupt.assert_not_called()
+        parent.steer.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_queue_mode_unchanged_with_subagents(self) -> None:

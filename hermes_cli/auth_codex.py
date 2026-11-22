@@ -450,14 +450,15 @@ def _codex_http_client(**kwargs: Any) -> httpx.Client:
     return client
 
 
-def _codex_quota_exhausted_error(retry_after: Optional[int]) -> AuthError:
+def _codex_quota_exhausted_error(retry_after: Optional[int], *, exhausted: Optional[str] = None) -> AuthError:
     message = (
         f"Codex provider quota exhausted (429); retry after {retry_after}s. "
         "Credentials are still valid."
         if retry_after is not None else
         "Codex provider quota exhausted (429). Credentials are still valid; "
         "retry after the usage limit resets.")
-    return _codex_err(message, CODEX_RATE_LIMITED_CODE, relogin=False)
+    return AuthError(message, provider="openai-codex", code=CODEX_RATE_LIMITED_CODE,
+                     retry_after=retry_after, exhausted=exhausted)
 
 
 def _codex_refresh_failure_error(response: httpx.Response) -> AuthError:
@@ -683,7 +684,8 @@ def resolve_codex_runtime_credentials(
                         base_url=_codex_pool_route_base_url(pool_base))
             reset_at = pool_rate_limit.get("reset_at")
             in_future = isinstance(reset_at, (int, float)) and reset_at > time.time()
-            raise _codex_quota_exhausted_error(int(reset_at - time.time()) if in_future else None)
+            raise _codex_quota_exhausted_error(int(reset_at - time.time()) if in_future else None,
+                                               exhausted="credential_pool")
         if read_error is not None:
             raise read_error
         raise _codex_err(_NO_CREDENTIALS_MSG.format(relogin=_codex_relogin_command()),

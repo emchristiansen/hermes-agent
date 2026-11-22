@@ -27,6 +27,7 @@ from gateway.run_profile_home import completion_event_scope_or_refuse
 from gateway.run_shutdown import _delivery_target_key, _log_suppressed, _notice_target_key, _send_error, _send_failed
 from gateway.run_notifications_update import GatewayUpdateNotificationsMixin
 from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin, _local_completion_card
+from gateway.run_notifications_offload import owned_offload
 from gateway.run_notifications_restart import GatewayRestartNoticeMixin
 
 # Log-record parity with the origin module.
@@ -784,7 +785,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             fail = "Watch notification self-post wake failed for session %s: %s"
             from agent.notification_presentation import diagnostic_process_event
             try:
-                served = await asyncio.to_thread(self._served_api_server_wake_profile, evt, raw_sid)
+                served = await owned_offload(self, self._served_api_server_wake_profile, evt, raw_sid)
             except LookupError as e:
                 logger.warning(fail, raw_sid, e)
                 return False
@@ -902,7 +903,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         from gateway.wake import WakeNotAccepted, adapter_supports_push, admit_internal_event
         restore_completion_route(self, str(evt.get("session_key") or ""))  # watch notices and heartbeats too
         queued, evt = evt, await follow_detached_pin(self, evt)  # the drain reads its verdict off *queued*
-        source = await asyncio.to_thread(self._build_process_event_source, evt)
+        source = await owned_offload(self, self._build_process_event_source, evt)
         if not source:
             # API-server sessions bind the RAW X-Hermes-Session-Id key, not a structured ``agent:...`` key.
             raw_sid = _raw_process_event_session_id(evt)
@@ -1066,7 +1067,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         if session_key:
             try:
                 session_store: SessionStore = cast(Any, self).session_store
-                await asyncio.to_thread(session_store._ensure_loaded)
+                await owned_offload(self, session_store._ensure_loaded)
                 entry = session_store._entries.get(session_key)
             except Exception:
                 logger.debug("Completion route lookup failed for %s", session_key, exc_info=True)
@@ -1113,7 +1114,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             if verdict != "deliver":
                 # Definitively closed targets still need the normal terminal disposition.
                 return verdict == "terminal"
-        source = await asyncio.to_thread(self._build_process_event_source, evt)
+        source = await owned_offload(self, self._build_process_event_source, evt)
         if source is not None:
             platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
             adapter = self._resolve_injection_adapter(platform, source)
@@ -1137,7 +1138,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         if not adapter_supports_push(adapter):
             ensure = getattr(adapter, "_ensure_session_db", None)
             try:
-                if not callable(ensure) or await asyncio.to_thread(ensure) is None:
+                if not callable(ensure) or await owned_offload(self, ensure) is None:
                     return False
             except Exception:
                 logger.debug("Async-completion delivery DB unavailable", exc_info=True)
@@ -1238,7 +1239,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         profile), else the launch profile's, as for any unrouted event."""
         from gateway.run import _async_profile_runtime_scope
         from tui_gateway.launch_profile_policy import async_launch_profile_scope_if_multiplexed
-        served = await asyncio.to_thread(self._served_api_server_wake_profile, evt, raw_sid)
+        served = await owned_offload(self, self._served_api_server_wake_profile, evt, raw_sid)
         if served:
             source = SessionSource(platform=Platform.API_SERVER, chat_id=raw_sid, profile=served)
             scope = _async_profile_runtime_scope(self._resolve_profile_home_for_source(source))
@@ -1282,7 +1283,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 return claim.early_result
             if getattr(self, 'session_authority', None) is not None:
                 from gateway.session_automation import completion_admission
-                if completion_admission(self, evt) is not None:
+                if await owned_offload(self, completion_admission, self, evt) is not None:
                     accepted = True  # Lost ACK: finish durable claims, never infer again.
                     return True
             if identity is not None:
@@ -1332,6 +1333,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
     def _format_coalesced_process_completions(entries: list[tuple[str, dict, asyncio.Future]]) -> str:
         """Build one bounded synthetic event from several redacted completions."""
         from gateway.run import _redact_gateway_user_facing_secrets
+        from tools.process_registry_notifications import scope_oom_note
         lines = [
             f"[IMPORTANT: {len(entries)} background processes completed for this session.",
             "Treat these results as one completion batch and send at most one "
@@ -1347,10 +1349,17 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             output = _redact_gateway_user_facing_secrets(str(evt.get("output") or "")).strip()
             if len(output) > 800:
                 output = f"[… truncated …]\n{output[-800:]}"
-            lines.append(f"\n- {session_id}: exit_code={exit_code}, reason={reason}")
+            note = scope_oom_note(evt)
+            lines.append(f"\n- {session_id}: exit_code={exit_code}, reason={reason}" + (f" ({note})" if note else ""))
             if output:
                 lines.append(output)
-        omitted = len(entries) - len(shown)
+        # Every accepted completion's scope OOM kill stays in the delivery: its cause is the result, beyond the cap too.
+        explained = [(str(evt.get("session_id") or "unknown"), evt, scope_oom_note(evt)) for _t, evt, _f in entries[10:]]
+        explained = [entry for entry in explained if entry[2]]
+        for session_id, evt, note in explained:
+            lines.append(f"\n- {session_id}: exit_code={evt.get('exit_code')}, "
+                         f"reason={evt.get('completion_reason') or 'exited'} ({note}; output not shown)")
+        omitted = len(entries) - len(shown) - len(explained)
         if omitted:
             lines.append(
                 f"\n- … and {omitted} more completion(s); inspect them with "
@@ -1380,7 +1389,10 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 return
             if getattr(self, 'session_authority', None) is not None:
                 from gateway.session_automation import completion_admission, producer_identity
-                entries_to_deliver = [item for item in entries if completion_admission(self, item[1]) is None]
+                # One off-loop pass for the whole batch (state DB reads, never on the event loop).
+                admitted = await owned_offload(self,
+                    lambda: [completion_admission(self, evt) for _text, evt, _future in entries])
+                entries_to_deliver = [item for item, row in zip(entries, admitted) if row is None]
                 if not entries_to_deliver:
                     delivered = True
                     return
@@ -1435,8 +1447,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         }
         for task in tasks:
             task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        if tasks:  # during a stop, waited only within the leash the adapter teardown after it leaves
+            from gateway.run_shutdown_budget import agent_wait_reserve, stop_wait_timeout
+            timeout = stop_wait_timeout(self, reserve=agent_wait_reserve(self))
+            settled = asyncio.gather(*tasks, return_exceptions=True)
+            if not (await asyncio.wait({settled}, timeout=timeout))[0]:
+                logger.warning("Shutdown: %d completion-batch flush task(s) still running %.1fs after their "
+                               "cancel; settling their batches as undelivered", len(tasks), timeout)
         # Defensive cleanup for an orphaned queue with no live flush task.
         batches = getattr(self, "_completion_notification_batches", {})
         for entries in batches.values():
@@ -1456,6 +1473,10 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             from tools.process_registry_notifications import should_surface_notification
             if not should_surface_notification(evt):
                 return None
+            # Pin the owner here: the flush (its off-loop admission reads, batch recognition and delivery)
+            # runs in this scope, never in the context that happens to create it (INT-R2-PROFILE-01).
+            from hermes_constants import get_hermes_home_override
+            owner, owner_context = get_hermes_home_override(), contextvars.copy_context()
         # Lazy defaults: lifecycle tests build GatewayRunner via object.__new__.
         for attr, default in (
             ("_completion_notification_batches", dict), ("_completion_notification_batch_tasks", dict),
@@ -1471,11 +1492,11 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         # in the same queue. Never settle one pin on another pin's acceptance.
         key = self._event_route_key(
             evt, (*self._COMPLETION_BATCH_KEY_FIELDS, "parent_session_id", "origin_session_id"),
-        )
+        ) + (owner or "",)  # distinct owners never share a batch, whatever their route fields
         future = asyncio.get_running_loop().create_future()
         self._completion_notification_batches.setdefault(key, []).append((synth_text, evt, future))
         if key not in self._completion_notification_batch_tasks:
-            task = asyncio.create_task(self._flush_process_completion_batch(key))
+            task = asyncio.create_task(self._flush_process_completion_batch(key), context=owner_context)
             self._completion_notification_batch_tasks[key] = task
             # Keep the flush alive under the gateway's normal lifecycle accounting.
             self._retain_background_task(task)
@@ -1534,7 +1555,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 continue
             if getattr(self, 'session_authority', None) is not None:
                 from gateway.session_automation import completion_admission
-                if completion_admission(self, evt) is not None:
+                if await owned_offload(self, completion_admission, self, evt) is not None:
                     acknowledged = await self._deliver_completion_notification(synth_text, evt) is True or acknowledged
                     continue
             parent = str(evt.get("parent_session_id") or "")
@@ -1646,7 +1667,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 # Completions whose owner process died while this gateway runs (#97202).
                 if last_orphan_sweep is None or time.monotonic() - last_orphan_sweep >= ORPHAN_SWEEP_INTERVAL_S:
                     last_orphan_sweep = time.monotonic()
-                    await asyncio.to_thread(self._sweep_orphaned_completion_ledgers)
+                    await owned_offload(self, self._sweep_orphaned_completion_ledgers)
                 # Pattern events also need an idle consumer; foreground turns are optional.
                 await self._drain_watch_notifications(_pr.completion_queue)
                 # Process completions remain owned by their per-process watchers.
@@ -1729,13 +1750,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         session_key = str(watcher.get("session_key") or "").strip()
         if not session_key:
             return False
-        source = await asyncio.to_thread(self._build_process_event_source, watcher)
+        source = await owned_offload(self, self._build_process_event_source, watcher)
         adapter = self._resolve_injection_adapter(platform_name, source)
         return session_key in (getattr(adapter, "_active_sessions", None) or {})
 
     async def _send_watcher_message(self, platform_name: str, chat_id, thread_id, message_text: str, watcher: dict) -> None:
         from gateway.run import _non_conversational_metadata
-        source = await asyncio.to_thread(self._build_process_event_source, watcher)
+        source = await owned_offload(self, self._build_process_event_source, watcher)
         adapter = self._resolve_injection_adapter(platform_name, source)
         if adapter and chat_id:
             with _log_suppressed(logging.ERROR, "Watcher delivery error: %s"):
@@ -1780,6 +1801,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             "exit_code": session.exit_code,
             "completion_reason": getattr(session, "completion_reason", "exited"),
             "termination_source": getattr(session, "termination_source", ""),
+            "scope_unit": getattr(session, "scope_unit", ""),
+            "scope_oom_killed": getattr(session, "scope_oom_killed", None),
             "output": _redact_gateway_user_facing_secrets(_out),
             # Spawning session-db id: lets pre-flight drop this completion if the user /new'd first.
             "parent_session_id": (
@@ -1853,6 +1876,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         the output tail) / all (running updates + final raw) / result (final raw) / error (final raw
         if exit != 0) / off."""
         from tools.process_registry import process_registry
+        from tools.process_registry_awaiting import completion_settled
         from tools.process_registry_notifications import format_process_notification, should_surface_notification
         session_id = watcher["session_id"]
         interval = watcher["check_interval"]
@@ -1886,10 +1910,15 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 if session.exited:
                     break
                 continue
+            # One observation decides this tick: a reconcile may flag the exit at any moment, so the completion
+            # branch below consumes this settled outcome, never a later raw ``exited`` read.
+            settled = completion_settled(session)
+            if session.exited and not settled:
+                continue  # a reconcile flagged the exit; the reader still settles output, exit and OOM cause
             current_output_len = len(session.output_buffer)
             has_new_output = current_output_len > last_output_len
             last_output_len = current_output_len
-            if session.exited:
+            if settled:
                 # Agent-notify: inject a synthetic message unless the agent already consumed the result via
                 # wait/log (poll() is read-only and deliberately does NOT mark consumed).
                 if agent_notify and not process_registry.is_completion_consumed(session_id):
@@ -1926,7 +1955,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                         try:
                             # The owning profile's authority, as on the delivery path.
                             async with self._completion_event_scope(completion_evt):
-                                committed = completion_admission(self, completion_evt) is not None
+                                committed = await owned_offload(self,
+                                    completion_admission, self, completion_evt) is not None
                         except Exception:
                             # Failing open sends the notice; a dead watcher would send nothing.
                             logger.debug("Process watcher: admission recheck failed for %s", session_id,

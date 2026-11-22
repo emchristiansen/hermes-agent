@@ -581,7 +581,7 @@ class RelaunchExit(SystemExit):
 from pm.environments import activate_dependencies, install_state_permission_message
 from hermes_cli._early_recovery import recover_if_needed
 
-from hermes_cli._parser import command_argv
+from hermes_cli._parser import command_argv, is_no_init_command
 
 # Repair needs only stdlib. Do not activate the damaged tree to reach it.
 _pm_repair = command_argv(sys.argv[1:])[:2] == ["pm", "repair"]
@@ -623,4 +623,5 @@ if not _pm_repair:
             print(f"hermes: {exc}; run `hermes pm repair`", file=sys.stderr)
             raise SystemExit(1) from None
 install_happy_eyeballs_socket_connect()
-export_scratch_tmp_env()
+if not is_no_init_command(sys.argv[1:]):  # creates <home>/cache/scratch, a prune stamp and logs/
+    export_scratch_tmp_env()

@@ -188,7 +188,7 @@ async def test_prompt_parked_behind_a_busy_head_while_the_close_runs_is_never_st
         # ``closed_stamp`` is set by the retirement check, in the loop step that would drop it.
         await async_wait_until(lambda: live.closed_stamp is not None, timeout=10, what="the close to settle")
         assert ref.session_id in authority.sessions  # its queued prompt pins it
-        authority.wake_after_worker(ref.session_id)  # the worker ended
+        await authority.wake_after_worker(ref.session_id)  # the worker ended (async in the composition)
         await async_wait_until(lambda: replies == ["parked"], timeout=10, what="the parked turn")
     finally:
         db.close()

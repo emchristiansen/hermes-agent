@@ -19,6 +19,10 @@ def compress_in_transaction(db, conn, session_id, payload, prepared):
         publish_on_connection(db, conn, parent_session_id=target, child_session_id=child,
             source=policy['source'], model=policy['model'], messages=prepared['messages'],
             model_config={'_compressed_from': target}, cwd=policy['cwd'], require_compression_lease=False)
+        # The child continues the parent's conversation: it keeps the parent's stored prompt, which records the
+        # conversation's decisions (``agent/home_guidance.py``), as a /branch child does (``hermes_state_mutation_branch``).
+        conn.execute('UPDATE sessions SET (system_prompt, system_prompt_hash) = '
+                     '(SELECT system_prompt, system_prompt_hash FROM sessions WHERE id=?) WHERE id=?', (target, child))
         affected = set()  # Rotation publication already advances the logical revision.
     conn.execute('UPDATE sessions SET runtime_generation=runtime_generation+1 WHERE id=?', (session_id,))
     generation = conn.execute('SELECT runtime_generation FROM sessions WHERE id=?', (session_id,)).fetchone()[0]

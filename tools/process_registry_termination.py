@@ -17,8 +17,54 @@ logger = logging.getLogger("tools.process_registry")
 
 
 class ProcessTerminationMixin:
-    """The subclass supplies ``_host_pid_is_ours``, ``_is_host_pid_alive``,
-    ``_detached_host_fate`` and ``_daemon_term_grace_seconds``. See ProcessRegistry."""
+    """The subclass supplies ``_host_pid_is_ours``, ``_is_host_pid_alive``, ``_move_to_finished``, ``_exit_snapshot``,
+    ``_reader_finalizing``, ``_detached_host_fate`` and ``_daemon_term_grace_seconds``. See ProcessRegistry."""
+
+    @staticmethod
+    def _claim_kill(session: "ProcessSession") -> bool:
+        """A kill of a still-running session owns its outcome. A finisher that records the exit while the kill's
+        signal is in flight (often the signal's own effect) leaves its publication to the kill, so the queued
+        notice, receipt and queries carry one outcome (``_finish_with_scope``). Each claim is counted and released
+        only by the kill that made it (``_release_kill``), so an overlapping kill that fails cannot release another's
+        claim and let a finish publish under it. False: the session had exited, and nothing was claimed."""
+        if session.exited:  # settled or flagged already: nothing to claim (rechecked under the lock otherwise)
+            return False
+        with session._lock:
+            claimed = not session.exited
+            session._kills_in_flight += claimed
+        return claimed
+
+    @staticmethod
+    def _commit_kill(session: "ProcessSession", source: str) -> None:
+        """Under the session lock: the kill's outcome, over an exit a finisher recorded during the signal (never
+        published; it deferred), keeping that finisher's scope OOM observation. A concurrent kill's commit stands."""
+        session.exited, session._outcome_final = True, True  # its claim is released by its own _release_kill
+        if session.completion_reason != "killed":
+            session.exit_code, session.completion_reason, session.termination_source = -15, "killed", source  # SIGTERM
+
+    def _settled_exit_result(self, session: "ProcessSession") -> tuple[dict, bool]:
+        """A kill's result for a session that had already exited, and whether its outcome is still settling. An
+        exit another owner still settles (a kill's claim, the reader's final drain) gets a moment to publish;
+        until it does, the result is the nonterminal ``settling`` status, never the provisional exit as final."""
+        from tools.process_registry import _READER_FINAL_DRAIN_WAIT_SECONDS
+        if self._reader_finalizing(session):
+            session._completion_event.wait(_READER_FINAL_DRAIN_WAIT_SECONDS)
+        with session._lock:
+            if self._reader_finalizing(session):
+                return {"status": "settling", "session_id": session.id, "command": session.command,
+                        "error": "The process exited; its final outcome is still being recorded. "
+                                 "Poll or wait for it."}, True
+            return self._exit_snapshot(session, "already_exited"), False
+
+    def _release_kill(self, session: "ProcessSession") -> None:
+        """Release this kill's own claim, however it ended (committed, incomplete, refused or failed). Once no kill
+        holds a claim, an exit a finisher recorded meanwhile and deferred to an uncommitted kill is published as
+        the finisher's own outcome; while another kill still holds one, that kill settles it."""
+        with session._lock:
+            session._kills_in_flight -= 1
+            deferred = not session._kills_in_flight and session._outcome_final and not session._finish_claimed
+        if deferred:
+            self._move_to_finished(session)
 
     @staticmethod
     def _proc_alive(proc) -> bool:

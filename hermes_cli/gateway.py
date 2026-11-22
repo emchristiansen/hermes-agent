@@ -4523,11 +4523,11 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         # threads (in-flight cron jobs) can't delay a /restart by minutes.
         from gateway.run import _exit_after_graceful_shutdown
         _exit_after_graceful_shutdown(code)
-
     success = False
-    try:
-        success = asyncio.run(start_gateway(replace=replace, force=force, verbosity=verbosity,
-                                            idle_exit=idle_exit))
+    try:  # asyncio.run's own teardown runs after the stop disarmed its watchdog: backstopped
+        from gateway.shutdown_watchdog import run_with_exit_backstop
+        success = asyncio.run(run_with_exit_backstop(lambda: start_gateway(
+            replace=replace, force=force, verbosity=verbosity, idle_exit=idle_exit)))
         _exit_diag("asyncio.run.returned", success=success)
     except KeyboardInterrupt:
         # Detached Windows runs absorb SIGINT above; keep the handler for console runs.

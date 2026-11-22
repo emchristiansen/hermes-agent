@@ -92,6 +92,9 @@ def _make_adapter(platform_val="telegram"):
 # Tests
 # ---------------------------------------------------------------------------
 
+# Removed here: cases asserting that a busy session queues or interrupts. Every message reaching a busy
+# session steers into its running turn (Eric, 2026-11-04; gateway/run_config_loaders.py
+# _effective_busy_input_mode; tests/gateway/test_every_message_steers.py), whatever mode a profile names.
 class TestBusySessionAck:
     """User sends a message while agent is running — should get acknowledgment."""
 
@@ -108,95 +111,6 @@ class TestBusySessionAck:
         await GatewayRunner._send_busy_ack_reply(runner, event, adapter, "⚡ Interrupting current task")
 
         adapter._send_with_retry.assert_not_awaited()
-
-
-    @pytest.mark.asyncio
-    async def test_telegram_grace_followups_respect_queue_fifo(self, monkeypatch):
-        """Rapid Telegram text follow-ups in queue mode must not merge."""
-        from gateway.run import GatewayRunner
-
-        monkeypatch.setenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "3.0")
-
-        runner, _sentinel = _make_runner()
-        runner._busy_input_mode = "queue"
-        adapter = _make_adapter()
-
-        source = SessionSource(
-            platform=Platform.TELEGRAM,
-            chat_id="123",
-            chat_type="dm",
-            user_id="user1",
-        )
-        sk = build_session_key(source)
-        runner.adapters[source.platform] = adapter
-
-        agent = MagicMock()
-        agent.get_activity_summary.return_value = {
-            "seconds_since_activity": 0.0,
-        }
-        runner._running_agents[sk] = agent
-        runner._session_state(sk).turn.started_ts = time.time()
-
-        events = [
-            MessageEvent(
-                text=text,
-                message_type=MessageType.TEXT,
-                source=source,
-                message_id=f"m-{idx}",
-            )
-            for idx, text in enumerate(("first", "second", "third"), start=1)
-        ]
-
-        for event in events:
-            result = await GatewayRunner._handle_message(runner, event)
-            assert result is None
-
-        assert adapter._pending_messages[sk].text == "first"
-        assert [event.text for event in runner._session_state(sk).conversation.queued_events] == [
-            "second",
-            "third",
-        ]
-        agent.interrupt.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_sends_ack_when_agent_running(self):
-        """First message during busy session should get a status ack."""
-        runner, _sentinel = _make_runner()
-        runner._busy_input_mode = "interrupt"
-        adapter = _make_adapter()
-
-        event = _make_event(text="Are you working?")
-        sk = build_session_key(event.source)
-
-        # Simulate running agent
-        agent = MagicMock()
-        agent.get_activity_summary.return_value = {
-            "api_call_count": 21,
-            "max_iterations": 60,
-            "current_tool": "terminal",
-            "last_activity_ts": time.time(),
-            "last_activity_desc": "terminal",
-            "seconds_since_activity": 1.0,
-        }
-        runner._running_agents[sk] = agent
-        runner._session_state(sk).turn.started_ts = time.time() - 600  # 10 min ago
-        runner.adapters[event.source.platform] = adapter
-
-        result = await runner._handle_active_session_busy_message(event, sk)
-
-        assert result is True  # handled
-        # Verify ack was sent
-        adapter._send_with_retry.assert_called_once()
-        call_kwargs = adapter._send_with_retry.call_args
-        content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
-        if not content and call_kwargs.args:
-            # positional args
-            content = str(call_kwargs)
-        assert "Interrupting" in content or "respond" in content
-        assert "/stop" not in content  # no need — we ARE interrupting
-
-        # Verify agent interrupt was called
-        agent.interrupt.assert_called_once_with("Are you working?")
 
 
     @pytest.mark.asyncio
@@ -332,53 +246,6 @@ class TestBusySessionAck:
         call_kwargs = adapter._send_with_retry.call_args
         content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
         assert "Queued for the next turn" in content
-
-    @pytest.mark.asyncio
-    async def test_interrupt_mode_text_followups_fifo_not_merged(self):
-        """Two TEXT follow-ups during a busy turn (interrupt mode) must each
-        get their OWN next-turn slot via FIFO — NOT newline-merged into one
-        mashed-together turn (#43066 sub-bug 2). Before the fix the
-        interrupt/steer-fallback path called merge_pending_message_event
-        with merge_text=True, collapsing 'first' and 'second' into
-        'first\\nsecond' and destroying message boundaries."""
-        runner, _sentinel = _make_runner()
-        runner._busy_input_mode = "interrupt"
-        adapter = _make_adapter()
-
-        # Both events must share the SAME platform object so they resolve to
-        # the same adapter (a fresh MagicMock per event would not).
-        shared_platform = Platform.TELEGRAM
-
-        def _evt(text):
-            src = SessionSource(
-                platform=shared_platform, chat_id="123",
-                chat_type="dm", user_id="user1",
-            )
-            return MessageEvent(text=text, message_type=MessageType.TEXT,
-                                source=src, message_id=f"m-{text[:5]}")
-
-        first = _evt("first message")
-        second = _evt("second message")
-        sk = build_session_key(first.source)
-        runner.adapters[shared_platform] = adapter
-
-        agent = MagicMock()
-        agent._active_children = []  # real list → not demoted to queue
-        runner._running_agents[sk] = agent
-
-        await runner._handle_active_session_busy_message(first, sk)
-        runner._session_state(sk).turn.busy_ack_ts = 0.0  # avoid the 30s ack-debounce early return
-        await runner._handle_active_session_busy_message(second, sk)
-
-        # First lands in the head slot; second goes to the FIFO overflow —
-        # they are NOT merged into a single pending event.
-        head = adapter._pending_messages.get(sk)
-        assert head is first
-        assert head.text == "first message"  # not "first message\nsecond message"
-        overflow = runner._session_state(sk).conversation.queued_events
-        assert [e.text for e in overflow] == ["second message"]
-
-
 
     @pytest.mark.asyncio
     async def test_status_detail_omits_denominator_for_unbounded_max_iterations(

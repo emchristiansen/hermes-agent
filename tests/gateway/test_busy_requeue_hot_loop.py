@@ -133,6 +133,7 @@ async def test_requeued_event_runs_once_the_agent_finishes():
     so chained genuine follow-ups after it must each dispatch immediately."""
     adapter = RestartTestAdapter()
     runner, agent, sk = _runner_with_running_agent(adapter, compression_in_flight=True)
+    agent.steer.return_value = False  # every message steers; a refused steer falls back to the queue
     handled, starts, ends = [], [], []
     real_handle = runner._handle_message
 

@@ -77,9 +77,9 @@ def test_managed_start_failure_books_the_one_shot_credential_exit(tmp_path, monk
     assert session_kanban.worker_exit_code(path, context) == expected
 
 
-def test_managed_result_redacts_the_reply_the_worker_log_quotes(tmp_path, monkeypatch):
-    """The submitter prints ``last_output`` into the durable worker log (#63594): a secret the
-    final reply quotes must be masked before it is booked, like comments and summaries."""
+def test_managed_result_books_the_reply_the_worker_log_quotes_verbatim(tmp_path, monkeypatch):
+    """The submitter prints ``last_output`` into the durable worker log (#63594). Worker output is
+    recorded with full fidelity (owner policy: never redact): a secret the reply quotes stays as sent."""
     path, context = _bound_claim(tmp_path, monkeypatch)
     secret = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
     monkeypatch.setattr(session_kanban, "_run_task_turns",
@@ -89,8 +89,7 @@ def test_managed_result_redacts_the_reply_the_worker_log_quotes(tmp_path, monkey
     session_kanban.run_worker_turns(SimpleNamespace(), frame, [])
 
     output = session_kanban.worker_result(path, context)["last_output"]
-    assert output.startswith("token is ")
-    assert secret not in output
+    assert output == f"token is {secret}"
 
 
 
@@ -105,9 +104,9 @@ _TOKEN_TAIL = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
     # 500-char tail starts inside the token: the ghp_ prefix is cut off.
     ("intro " * 100 + "token ghp_" + _TOKEN_TAIL + " " + "z" * (500 - len(_TOKEN_TAIL) + 4), _TOKEN_TAIL[6:]),
 ], ids=["pem-header-cut", "token-prefix-cut"])
-def test_managed_result_redacts_secrets_straddling_the_tail_cut(tmp_path, monkeypatch, reply, leaked):
-    """The booked reply keeps only its last 500 chars; a secret cut by that tail must be masked
-    in full first, else its remainder no longer looks like a secret to the redactor (#63594)."""
+def test_managed_result_keeps_the_exact_tail_across_a_secret(tmp_path, monkeypatch, reply, leaked):
+    """The booked reply keeps exactly its last 500 chars, unaltered, even where the cut falls inside
+    a secret (owner policy: never redact)."""
     path, context = _bound_claim(tmp_path, monkeypatch)
     assert leaked in reply[-500:]
     monkeypatch.setattr(session_kanban, "_run_task_turns",
@@ -117,5 +116,4 @@ def test_managed_result_redacts_secrets_straddling_the_tail_cut(tmp_path, monkey
     session_kanban.run_worker_turns(SimpleNamespace(), frame, [])
 
     output = session_kanban.worker_result(path, context)["last_output"]
-    assert len(output) <= 500
-    assert leaked not in output
+    assert output == reply[-500:] and leaked in output

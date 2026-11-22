@@ -105,6 +105,7 @@ def _make_runner(*, compression_in_flight: bool):
     runner._emit_gateway_run_progress = AsyncMock()
     runner._draining = False
     runner._busy_input_mode = "interrupt"
+    runner._effective_busy_input_mode = lambda _source: "interrupt"  # every message steers; only a clarify takeover still interrupts
 
     # No subagents active — isolates the compression-demotion behavior from
     # the (already-correct) subagent-demotion branch.

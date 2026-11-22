@@ -573,6 +573,127 @@ def test_active_pr_guard_holds_through_same_profile_reassign_and_unassign(
         assert kbd.check_respawn_guard(conn, tid) is None
 
 
+def test_active_pr_guard_lifts_after_explicit_unblock_but_not_after_reclaim(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator's ``unblock`` after the PR comment resumes the card's own assignee.
+
+    A worker that opened a PR and then failed into ``blocked`` can only come back
+    through an explicit release; holding that release for the whole PR window left
+    the card ``ready`` with zero workers (2026-11-04, t_674db54b). An automatic
+    return to ``ready`` (operator reclaim of a running claim) is still not a
+    release of a block, and a newer PR comment after the unblock guards again.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    pr_comment = "Landed https://github.com/example/repo/pull/44 (merged)."
+    with kbc.connect() as conn:
+        reclaimed = kb.create_task(conn, title="reclaimed after pr", assignee="dev")
+        kb.claim_task(conn, reclaimed)
+        kb.add_comment(conn, reclaimed, author="dev", body=pr_comment)
+        _backdate_comments(conn, reclaimed)
+        assert kb.reclaim_task(conn, reclaimed, reason="operator reclaim") is True
+        assert kb.get_task(conn, reclaimed).status == "ready"
+        assert kbd.check_respawn_guard(conn, reclaimed) == "active_pr"
+
+        tid = kb.create_task(conn, title="blocked after pr", assignee="dev")
+        claimed = kb.claim_task(conn, tid)
+        kb.add_comment(conn, tid, author="dev", body=pr_comment)
+        assert kb.block_task(conn, tid, reason="crash hold", expected_run_id=claimed.current_run_id)
+        _backdate_comments(conn, tid)
+        assert kb.unblock_task(conn, tid) is True
+        assert kb.get_task(conn, tid).status == "ready"
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert tid in [s[0] for s in res.spawned]
+        assert dict(res.respawn_guarded).get(reclaimed) == "active_pr"
+
+        kb.add_comment(conn, tid, author="dev", body="Opened https://github.com/example/repo/pull/45")
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_active_pr_guard_lifts_after_dependency_release_but_not_reprioritize(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker that opened a PR and parked its card on a dependency resumes
+    when that dependency is released (2026-11-05, t_ea2f65e1).
+
+    The worker's ``block --kind dependency`` puts the card in ``todo``; the
+    parent finishing or being unlinked (``promoted``) or an operator's
+    ``kanban promote`` (``promoted_manual``) re-readies it for the same
+    assignee. That card can never be ``unblock``-ed (it was never ``blocked``),
+    so holding it under ``active_pr`` left it ``ready`` with zero workers for
+    the whole PR window. A reprioritize is not a re-ready, nor is
+    ``recompute_ready`` auto-recovering the PR worker's breaker park, and a
+    newer PR comment after the release guards again.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    pr_comment = "Opened https://github.com/example/repo/pull/44 for review."
+
+    def parked_on(parent_title):
+        tid = kb.create_task(conn, title=f"pr then wait on {parent_title}", assignee="dev")
+        parent = kb.create_task(conn, title=parent_title, assignee="reviewer")
+        claimed = kb.claim_task(conn, tid)
+        kb.link_tasks(conn, parent, tid, expected_child_run_id=claimed.current_run_id)
+        kb.add_comment(conn, tid, author="dev", body=pr_comment)
+        assert kb.block_task(conn, tid, reason="await review", kind="dependency",
+                             expected_run_id=claimed.current_run_id)
+        assert kb.get_task(conn, tid).status == "todo"
+        _backdate_comments(conn, tid)
+        return tid, parent
+
+    with kbc.connect() as conn:
+        unlinked, parent = parked_on("unrelated review")
+        assert kb.unlink_tasks(conn, parent, unlinked) is True
+        assert kb.get_task(conn, unlinked).status == "ready"
+
+        finished, parent = parked_on("finished review")
+        assert kb.complete_task(conn, parent, result="ok", force=True) is True
+        assert kb.get_task(conn, finished).status == "ready"
+
+        manual, parent = parked_on("archived review")
+        with kb.write_txn(conn):  # parent satisfied without auto-promotion
+            conn.execute("DELETE FROM task_links WHERE child_id = ?", (manual,))
+        ok, err = kb.promote_task(conn, manual, actor="operator")
+        assert ok, err
+
+        reprioritized = kb.create_task(conn, title="pr then reprioritized", assignee="dev")
+        kb.add_comment(conn, reprioritized, author="dev", body=pr_comment)
+        _backdate_comments(conn, reprioritized)
+        kb.edit_task(conn, reprioritized, priority=100)
+
+        # The PR's own worker crash-looping into a breaker park is not released
+        # by recompute_ready auto-recovering it (a lower dispatcher limit here).
+        crashed = kb.create_task(conn, title="pr then crash loop", assignee="dev")
+        kb.claim_task(conn, crashed)
+        kb.add_comment(conn, crashed, author="dev", body=pr_comment)
+        assert kbd._record_task_failure(conn, crashed, "worker crashed", outcome="crashed",
+                                        failure_limit=1, release_claim=True, end_run=True)
+        assert kb.get_task(conn, crashed).status == "blocked"
+        _backdate_comments(conn, crashed)
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, crashed).status == "ready"
+
+        res = kbd.dispatch_once(conn, dry_run=True)
+        spawned = [s[0] for s in res.spawned]
+        for tid in (unlinked, finished, manual):
+            assert tid in spawned
+        guarded = dict(res.respawn_guarded)
+        assert guarded.get(reprioritized) == "active_pr"
+        assert guarded.get(crashed) == "active_pr"
+
+        kb.add_comment(conn, unlinked, author="dev", body="Opened https://github.com/example/repo/pull/45")
+        assert kbd.check_respawn_guard(conn, unlinked) == "active_pr"
+
+
 def test_active_pr_guard_lifts_for_implementer_after_changes_requested(
     kanban_home: Path,
 ) -> None:

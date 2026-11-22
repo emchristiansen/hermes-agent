@@ -257,7 +257,9 @@ def import_foreign_session(source: str, path) -> str:
     # Resume refuses a folder missing here (another machine's, or deleted), as the Desktop import does.
     row = {"id": session_id, "source": "cli", "cwd": cwd if cwd and Path(cwd).is_dir() else None, "messages": turns}
     receipt = store.call("session.mutate", session_id=session_id, request_id=uuid.uuid4().hex, expected_revision=0,
-                         operation="import", payload={"sessions": [row]})
+                         operation="import", payload={"sessions": [row], "imported_from": {
+                             "tool": _SOURCE_DB_NAMES[source], "path": str(path),
+                             "foreign_session_id": parsed.get("session_id")}})
     # Titles are UNIQUE (a re-import's is taken), so the title is a separate, cosmetic rename.
     with contextlib.suppress(GatewayClientError):
         store.call("session.mutate", session_id=session_id, request_id=uuid.uuid4().hex,

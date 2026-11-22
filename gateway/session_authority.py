@@ -24,7 +24,7 @@ from gateway.session_pending_controls import PendingControls
 from gateway.session_producer_lifecycle import drop_producer_turn, mark_producer_admission
 from hermes_cli.observability.shared_metrics_busy import busy_row_settled
 from hermes_state_runtime import (
-    STEERING, RuntimeStoreError, admit_session_input, begin_runtime_epoch,
+    OWNER_RESTART, STEERING, RuntimeStoreError, admit_session_input, begin_runtime_epoch,
     cancel_session_input, claim_session_input, get_session_admission,
     list_session_admissions, recover_session_inputs, resolve_unknown_session_input,
 )
@@ -64,6 +64,13 @@ class LiveSession:
     # Set by ``_schedule`` while a drain is alive. The claim commits off-loop, so input admitted
     # after its transaction read the FIFO would otherwise be stranded by a drain that exits idle.
     rescan: bool = False
+    # The busy steering pass (``session_busy_ingress``): one at a time; a request during it rereads.
+    steering: asyncio.Task | None = None
+    steer_again: bool = False
+    # Admission ids of a messaging user's plain text admitted while the running turn had no agent yet
+    # (``_hm_steer_at_adoption``): the adoption pass steers them. In memory only: lost with this owner,
+    # such a row runs as its own next turn, as before.
+    adoption_steers: set = field(default_factory=set)
     # admission id -> its started claim, from the moment the settlement worker starts the terminal
     # write until the completion frame is published. The write runs outside ``event_stream.lock``
     # (a contended SQLite writer must not stall loop-side lock takers); readers holding that lock
@@ -368,11 +375,7 @@ class SessionAuthority:
         from gateway.session_local_recovery import local_history, prepare_history, transcript_target
         # The lineage read stays off the loop and the lock; without history the target is resolved under it.
         prepared = await prepare_history(self, ref) if history else None
-        from gateway.session_onboarding import keep_from_discard
-        # The last await before the viewer joins: a fresh launch's claim is taken back with no yield
-        # before the join, and a delete already past it answers not_found below.
-        await keep_from_discard(self, ref.session_id)
-        # A delete or eviction can land during those awaits: re-check, so it answers not_found, never a KeyError.
+        # A delete or eviction can land during that await: re-check, so it answers not_found, never a KeyError.
         self.authorize(actor, ref, 'session:read')
         live = self.sessions[ref.session_id]
         from gateway.session_queued_controls import pending_rows
@@ -449,7 +452,10 @@ class SessionAuthority:
 
     def _receipt(self, row):
         status, outcome = row['status'], row['outcome']
-        if outcome == STEERING:  # handed to the running claim: it reads as that execution until settled
+        # Handed to the running claim, or a card attempt lost to its owner's end that still owes its
+        # board the restart result: it reads as that execution until settled (a submitter that read
+        # ``unknown`` would exit before the cause it waits for is published).
+        if outcome == STEERING or (status, outcome) == ('unknown', OWNER_RESTART):
             status, outcome = 'started', None
         return AdmissionReceipt(row['admission_id'], SessionRef(self.profile_id, row['target_session_id']),
                                 row['seq'], status, outcome, row['owner_epoch'] or self.epoch, row['generation'])
@@ -500,10 +506,16 @@ class SessionAuthority:
             from gateway.session_runtime_workers import persist_work_count
             live.task.add_done_callback(lambda task: persist_work_count(self, task))
 
-    def wake_after_worker(self, session_id):
+    async def wake_after_worker(self, session_id):
         """A worker execution on ``session_id`` (a logical owner or its compression continuation)
         ended: a drain that parked behind it re-runs. A no-op while a drain is running."""
-        for sid in dict.fromkeys((session_id, self.logical_owner(session_id))):
+        from gateway.session_authorities import require_serving
+        require_serving(self)
+        # The finish receipt is already committed. Lineage reads can still wait for
+        # the writer lock; only their result, not live scheduling, belongs off-loop.
+        owner = await asyncio.to_thread(self.logical_owner, session_id)
+        require_serving(self)
+        for sid in dict.fromkeys((session_id, owner)):
             if sid in self.sessions:
                 self._schedule(SessionRef(self.profile_id, sid))
 
@@ -524,7 +536,7 @@ class SessionAuthority:
             if waiter is not None and not waiter.done():
                 waiter.set_exception(RuntimeStoreError(reason))
 
-    async def admit_automation(self, adapter, event, identity, replaces=None, fold=None):
+    async def admit_automation(self, adapter, event, identity, replaces=(), fold=None):
         from gateway.session_automation import admit_automation
         return await admit_automation(self, adapter, event, identity, replaces, fold)
 
@@ -654,12 +666,18 @@ class SessionAuthority:
             if row['status'] == 'queued' and (committed := getattr(event, '_on_commit', None)) is not None:
                 committed()  # a queued slash command's ack follows its commit (``_queue_command_turn``)
             mark_producer_admission(self, event, row)
+            if row['status'] == 'queued' and getattr(event, '_steer_at_adoption', False) and ref.session_id in self.sessions:
+                # Recorded in this write's ``then``, before its ``after`` (``_schedule_admitted``) reruns the
+                # steering pass: a pass that read the row before this mark is followed by one that sees it.
+                self.sessions[ref.session_id].adoption_steers.add(row['admission_id'])
         self._publish_pending(ref)
         return self._receipt(row)
 
     def _schedule_admitted(self, ref, _receipt=None):
         # tracked_write's ``after``: in the admitting caller's own step (see tracked_write).
         self._schedule(ref)
+        from gateway.session_busy_ingress import admitted
+        admitted(self, ref)  # a message admitted while a claim runs steers into it
 
     async def recover_native_sessions(self, bindings):
         """Bind only server-observed native routes; unknown work stays paused."""
@@ -791,7 +809,8 @@ class SessionAuthority:
 
     async def receipt(self, actor, ref, admission_id):
         self.authorize(actor, ref, 'session:submit')
-        row = get_session_admission(self.db, admission_id=admission_id)
+        row = await asyncio.to_thread(get_session_admission, self.db, admission_id=admission_id)
+        self.authorize(actor, ref, 'session:submit')
         if row is None or row['target_session_id'] != ref.session_id:
             raise RuntimeStoreError('not_found')
         from gateway.owner_identity import same_owner
@@ -1039,6 +1058,8 @@ class SessionAuthority:
             latched, steers = self.pending_steers.pop(session_id, (None, ()))
             for text in steers if latched == generation else ():
                 agent.steer(text)
+        from gateway.session_busy_ingress import adopted
+        adopted(self, session_id)  # messages admitted before the agent existed steer into it now
 
     def check_approval_generation(self, session_id, generation):
         handle = self._handle(SessionRef(self.profile_id, session_id))

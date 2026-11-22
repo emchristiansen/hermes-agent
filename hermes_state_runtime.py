@@ -210,14 +210,17 @@ def admit_session_input(db, *, epoch: int, principal_id: str, session_id: str,
             if _replay_guard is not None:
                 _replay_guard(conn)
             return _row(old)
+        # The guard runs before the cap is counted: a replacement cancels the queued rows it
+        # supersedes inside this transaction, so it needs only the room they leave (a fold of a
+        # full FIFO's waiting wakes). Any refusal below rolls those cancellations back.
+        if _authorize_write is not None:
+            _authorize_write(conn)
         queued = conn.execute('''SELECT COUNT(*) FROM session_admissions WHERE target_session_id=?
             AND status='queued' ''', (session_id,)).fetchone()[0]
         # Main's cap holds in both states: a FIFO paused behind an unknown turn runs every accepted
         # input after Discard, so it must not grow without bound while nobody resolves it.
         if queued >= ADMISSION_QUEUE_MAX:
             raise RuntimeStoreError('queue_full')
-        if _authorize_write is not None:
-            _authorize_write(conn)
         admission_id = uuid.uuid4().hex
         conn.execute('''INSERT INTO session_admissions(admission_id,request_id,principal_id,
             target_session_id,lineage_json,payload_json,payload_digest,intent,status,owner_epoch)
@@ -266,6 +269,20 @@ def latest_session_admission(db, *, session_id: str, accept) -> dict | None:
         finally:
             for cursor in cursors:  # before the connection goes back to the pool
                 cursor.close()
+
+
+def list_session_admissions_containing(db, *, session_id: str, needle: str) -> list[dict]:
+    """The session's admissions, any status, whose stored payload JSON contains *needle*, in
+    ``seq`` order. A prefilter, never an identity: callers verify the parsed payload exactly.
+
+    The (target, status, seq) index bounds the scan to the session and ``instr`` runs inside
+    SQLite, so only matching rows are returned and decoded; they are ordered here, so no temp
+    B-tree sorts (and on a large session spills) the session's whole history."""
+    with db._read_ctx() as conn:
+        rows = [_row(row) for row in conn.execute(
+            'SELECT * FROM session_admissions WHERE target_session_id=? AND instr(payload_json, ?) > 0',
+            (session_id, needle))]
+    return sorted(rows, key=lambda row: row['seq'])
 
 
 _ANY_HEAD = object()
@@ -365,6 +382,14 @@ def cancel_session_input(db, *, epoch: int, admission_id: str) -> dict:
 # with it: ``steered`` once the claim completes with the text delivered, ``interrupted`` otherwise, or
 # back to ``queued`` (its own FIFO place) when the text never reached the claim's agent.
 STEERING = 'steering'
+
+# An ``unknown`` Kanban card attempt lost because its owner itself ended (stopping, or a predecessor
+# that left it running): the cause it still owes its board (``session_unattended_unknown``), committed
+# in the same transaction as its loss fence so no cancellation or later owner loss can drop it. It
+# reads as in flight until it settles ``interrupted``, which replaces it.
+OWNER_RESTART = 'owner_restart'
+OWE_OWNER_RESTART = ("UPDATE session_admissions SET outcome='" + OWNER_RESTART + "' WHERE outcome IS NULL "
+                     "AND json_type(payload_json, '$.kanban_card_v1') IS NOT NULL")
 
 
 def steer_replayed(row) -> bool:
@@ -528,6 +553,9 @@ def recover_session_inputs(db, *, epoch: int) -> int:
         # A steer handed to a lost claim may or may not have reached its agent: never replayed.
         conn.execute("UPDATE session_admissions SET outcome='interrupted' WHERE status='terminal' AND outcome=? "
                      "AND owner_epoch!=?", (STEERING, epoch))
+        # A card attempt a previous owner left running was lost to that owner's end: its cause
+        # commits with this fence (``OWNER_RESTART``).
+        conn.execute(OWE_OWNER_RESTART + " AND status='started' AND owner_epoch!=?", (epoch,))
         return conn.execute("UPDATE session_admissions SET status='unknown' WHERE status='started' AND owner_epoch!=?", (epoch,)).rowcount
     return db._execute_write(write)
 

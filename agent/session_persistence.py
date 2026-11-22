@@ -20,6 +20,7 @@ from agent.context_compressor import (
 )
 from agent.lazy_forward import forward as _forward, forward_static as _forward_static
 from agent.memory_context import sanitize_context
+from agent.prompt_builder import STEER_DISPLAY_KIND
 
 from agent.tool_dispatch_helpers import _is_multimodal_tool_result, _multimodal_text_summary
 from agent.trajectory import save_trajectory as _save_trajectory_to_file
@@ -68,6 +69,12 @@ def _safe_session_filename_component(session_id: str) -> str:
     if raw and sanitized == raw:
         return sanitized
     return f"{sanitized}_{hashlib.sha256(raw.encode('utf-8', errors='surrogatepass')).hexdigest()[:12]}"
+
+
+def _is_steer_row(msg: dict) -> bool:
+    """A /steer row carries its own text and time: the current-turn persist override (the inbound
+    message's clean text, platform timestamp and id) never applies to it, whatever index addresses it."""
+    return msg.get("display_kind") == STEER_DISPLAY_KIND
 
 
 def _override_replaces_content(msg: dict, content: Any, override: Any) -> bool:
@@ -226,7 +233,7 @@ def _db_flush_row(agent, msg: dict, is_current_turn_user: bool) -> dict[str, Any
     # api_content sidecar: exact bytes sent to the API when they differ from clean content (replay parity).
     api_content = msg.get("api_content") if isinstance(msg.get("api_content"), str) else None
     timestamp = msg.get("timestamp")
-    if is_current_turn_user and role == "user":
+    if is_current_turn_user and role == "user" and not _is_steer_row(msg):
         content, api_content = durable_user_row_content(agent, msg, content, api_content)
         ov_timestamp = getattr(agent, "_persist_user_message_timestamp", None)
         timestamp = timestamp if ov_timestamp is None else ov_timestamp
@@ -497,7 +504,7 @@ class SessionPersistenceMixin:
         if idx is None or (override is None and timestamp is None and platform_id is None):
             return
         msg = messages[idx] if 0 <= idx < len(messages) else None
-        if not (isinstance(msg, dict) and msg.get("role") == "user"):
+        if not (isinstance(msg, dict) and msg.get("role") == "user") or _is_steer_row(msg):
             return
         if _override_replaces_content(msg, msg.get("content"), override):
             msg["content"] = _content_with_turn_override(msg, msg.get("content"), override)

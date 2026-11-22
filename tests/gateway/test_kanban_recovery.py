@@ -13,7 +13,7 @@ import pytest
 # flags); without it the probe cannot prove the client never opens state.db writable.
 @pytest.mark.platforms('linux')
 @pytest.mark.skipif(shutil.which('strace') is None, reason='requires strace on PATH')
-@pytest.mark.parametrize('mode', ['custom', 'cross_profile', 'restart'])
+@pytest.mark.parametrize('mode', ['custom', 'cross_profile', 'restart', 'kill_then_restart', 'interrupt_then_restart'])
 def test_owner_board_recovery(tmp_path, mode):
     repo = Path(__file__).resolve().parents[2]
     env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'TIRITH_ENABLED') if k in os.environ}

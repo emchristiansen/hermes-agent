@@ -96,6 +96,32 @@ def retained_for_delivery(s) -> bool:
     return bool(getattr(s, "_finish_claimed", False)) and not s._completion_event.is_set()
 
 
+def completion_settled(s) -> bool:
+    """Exited with a final outcome, so a completion may be built from it: not a reconcile's provisional mark while
+    the reader that owns the output, the exit and the scope's OOM cause still finalizes. Read under the session lock,
+    so ``exited`` comes with the outcome recorded in the same step (``mark_exited``)."""
+    from tools.process_registry import ProcessRegistry
+    with s._lock:
+        return s.exited and not ProcessRegistry._reader_finalizing(s)
+
+
+def take_settled_exit(registry, s, timeout: float):
+    """``wait``'s terminal decision, its exit snapshot and its consumption of the completion, as one observation under
+    the session lock every exit writer holds (``mark_exited`` sets ``exited`` before the outcome it records, so an
+    unlocked read can see an exit without one). None: not settled, or a writer still held the lock after ``timeout``
+    seconds; the caller keeps waiting, still seeing interrupts and yields."""
+    from tools.process_registry import ProcessRegistry
+    if not s._lock.acquire(timeout=max(timeout, 0.0)):
+        return None
+    try:
+        if not s.exited or ProcessRegistry._reader_finalizing(s):
+            return None
+        registry._completion_consumed.add(s.id)
+        return ProcessRegistry._exit_snapshot(s, "exited")
+    finally:
+        s._lock.release()
+
+
 def _notifies(s) -> bool:
     return bool(s.notify_on_complete or (s.watch_patterns and not s._watch_disabled))
 
