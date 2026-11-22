@@ -27,7 +27,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
-from hermes_cli.kanban_db_active_pr import dispatch_guard, released_after
+from hermes_cli.kanban_db_active_pr import dispatch_guard, implementation_prs, linked_prs, released_after
 from hermes_cli.kanban_db_failure_stamp import LATEST_RUN_FIRST, RESPAWN_BLOCKER_RE as _RESPAWN_BLOCKER_RE, stamp_superseded
 from hermes_cli.kanban_db_retry_policy import CrashSweep as _CrashSweep, DeadWorker as _DeadWorker, KANBAN_OWNER_RESTART_EXIT_CODE
 from hermes_cli.kanban_db_retry_policy import first_failure_landing
@@ -1629,9 +1629,11 @@ def check_respawn_guard(
     #    an operator ``unblock``/``promote`` (incl. a ready-card continuation), or a dependency
     #    release (``promoted`` from ``todo``). Crash/reclaim, reprioritize and breaker auto-recovery
     #    are none (``kanban_db_active_pr``: provenance; ``dispatch_guard``: proven interruption).
+    #    Only a PR this card's own work linked counts (``implementation_prs``), not a dependency's.
+    own = implementation_prs(conn, task_id)
     pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
                                           cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
-                if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
+                if own & linked_prs(_kb._lossy_text(c["body"]) or "")]
     if pr_times and not released_after(conn, task_id, max(pr_times)):
         return "active_pr"
     return None

@@ -28,6 +28,31 @@ _LANDINGS = ('dependency_wait', 'blocked', 'gave_up', 'block_loop_detected', 'st
              'stale', 'spawn_failed', 'rate_limited', 'promoted', 'promoted_manual', 'continued')
 
 
+def linked_prs(text) -> set:
+    """The GitHub PR URLs in TEXT, normalized to one key per PR."""
+    from hermes_cli.kanban_db_dispatch import _RESPAWN_GUARD_PR_URL_RE
+    return {m.group(0).lower() for m in _RESPAWN_GUARD_PR_URL_RE.finditer(text)}
+
+
+def implementation_prs(conn, task_id) -> frozenset:
+    """The PRs this card's own work linked: those in its completion contract, or in a comment by its
+    assignee or by a profile that ran it. A PR only someone else linked, such as a landed dependency
+    (Cryo t_7752959d comment 179846), is not this card's, so it never holds the ready lane; a later
+    comment by anyone that names one of these PRs still does."""
+    from hermes_cli import kanban_db as kb
+    row = conn.execute("SELECT assignee, completion_contract FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        return frozenset()
+    workers = {profile for (profile,) in conn.execute(
+        "SELECT DISTINCT profile FROM task_runs WHERE task_id = ? AND profile IS NOT NULL", (task_id,))}
+    workers.add(row[0])
+    own = linked_prs(kb._lossy_text(row[1]) or "")
+    for author, body in conn.execute("SELECT author, body FROM task_comments WHERE task_id = ?", (task_id,)):
+        if (author or "").split("/", 1)[0] in workers:
+            own |= linked_prs(kb._lossy_text(body) or "")
+    return frozenset(own)
+
+
 def released_after(conn, task_id, since) -> bool:
     """True when a release event was recorded strictly after ``since`` (a same-second tie
     stays guarded: fail closed)."""
