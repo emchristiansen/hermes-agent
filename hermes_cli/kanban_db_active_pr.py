@@ -35,10 +35,12 @@ def linked_prs(text) -> set:
 
 
 def implementation_prs(conn, task_id) -> frozenset:
-    """The PRs this card's own work linked: those in its completion contract, or in a comment by its
-    assignee or by a profile that ran it. A PR only someone else linked, such as a landed dependency
-    (Cryo t_7752959d comment 179846), is not this card's, so it never holds the ready lane; a later
-    comment by anyone that names one of these PRs still does."""
+    """The PRs this card's own work linked: those in its completion contract, or in a comment by a
+    profile the card was ever assigned to (its creation, every ``assigned`` event's old and new owner,
+    the current assignee) or that ran it. Owners are taken from the whole history, so an unassign or a
+    same-profile reassign after the PR comment keeps holding it. A PR only someone else linked, such as
+    a landed dependency (Cryo t_7752959d comment 179846), is not this card's, so it never holds the
+    ready lane; a later comment by anyone that names one of these PRs still does."""
     from hermes_cli import kanban_db as kb
     row = conn.execute("SELECT assignee, completion_contract FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if row is None:
@@ -46,6 +48,12 @@ def implementation_prs(conn, task_id) -> frozenset:
     workers = {profile for (profile,) in conn.execute(
         "SELECT DISTINCT profile FROM task_runs WHERE task_id = ? AND profile IS NOT NULL", (task_id,))}
     workers.add(row[0])
+    for (payload,) in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind IN ('created', 'assigned')", (task_id,)):
+        data = kb._json_dict(payload)
+        workers.update(data.get(key) for key in ("assignee", "from"))
+    workers.discard(None)
+    workers.discard("")
     own = linked_prs(kb._lossy_text(row[1]) or "")
     for author, body in conn.execute("SELECT author, body FROM task_comments WHERE task_id = ?", (task_id,)):
         if (author or "").split("/", 1)[0] in workers:

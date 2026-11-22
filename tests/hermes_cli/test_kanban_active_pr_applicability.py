@@ -77,3 +77,27 @@ def test_a_profile_that_ran_the_card_links_its_own_pr(conn) -> None:
         conn.execute("UPDATE tasks SET assignee = 'next-owner' WHERE id = ?", (tid,))
     kb.add_comment(conn, tid, author=profile, body=f"Opened {OWN_PR}.")
     assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_an_owner_unassigned_after_its_pr_comment_still_holds(conn) -> None:
+    tid = _card(conn)
+    kb.add_comment(conn, tid, author="dev", body=f"Opened {OWN_PR}.")
+    assert kb.assign_task(conn, tid, None) is True
+    assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+# Known limits: the board records no structured "my implementation PR" provenance while a run is
+# in flight, and no PR state, so the card's own workers' links cannot be told apart. Each flips to a
+# pass (strict xfail fails) once that provenance exists.
+@pytest.mark.xfail(strict=True, reason="no structured implementation-PR provenance: an owner's dependency link holds")
+def test_the_owner_linking_a_landed_dependency_holds_nothing(conn) -> None:
+    tid = _card(conn)
+    kb.add_comment(conn, tid, author="dev", body=f"Consumed the landed dependency {DEPENDENCY_PR}.")
+    assert kbd.check_respawn_guard(conn, tid) is None
+
+
+@pytest.mark.xfail(strict=True, reason="no PR state on the board: the owner's own merged PR holds until a release")
+def test_the_owners_merged_pr_holds_nothing(conn) -> None:
+    tid = _card(conn)
+    kb.add_comment(conn, tid, author="dev", body=f"{OWN_PR} is merged.")
+    assert kbd.check_respawn_guard(conn, tid) is None
