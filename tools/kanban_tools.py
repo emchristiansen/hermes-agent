@@ -738,6 +738,45 @@ def _handle_list(args: dict, **kw) -> str:
             "promoted": promoted})
 
 
+def _vet_external_artifacts(
+    tool_name: str, kb, conn, tid: str, metadata: Any, agent_task_id: Optional[str],
+) -> dict:
+    """Vet each declared artifact the handoff would otherwise keep only as a path outside the
+    task's managed scratch workspace (``kanban_db_artifacts.external_completion_artifacts``).
+
+    An outside file may become a task attachment, which the notifier then sends, only when the
+    file-sending rule already lets this worker send it off the machine
+    (``tools.connectors.gateway.files._readable_file``: the terminal backend's namespace, and
+    ``validate_media_delivery_path``'s denylist / strict policy) and the Hermes read guard allows
+    reading it. Returns ``{declared: VettedArtifact}``; the first refusal rejects the handoff
+    naming the path before anything changes, so no handoff reads as delivered without its files."""
+    from agent.file_safety import get_read_block_error
+    from hermes_cli.kanban_db_artifacts import VettedArtifact, external_completion_artifacts
+    from tools.connectors.gateway.files import FileInputError, _readable_file
+
+    def refuse(declared: str, reason: Any) -> _Reject:
+        return _Reject(
+            f"{tool_name} refused: declared artifact {declared} cannot be attached: {reason}. "
+            f"Your task is still in-flight (no state change) and nothing was attached. Declare "
+            f"only files this worker may send, or attach the content with kanban_attach, then "
+            f"retry {tool_name} with the same handoff.")
+
+    vetted: dict = {}
+    for declared in external_completion_artifacts(conn, tid, metadata):
+        try:
+            readable = _readable_file(declared, agent_task_id)
+        except FileInputError as exc:
+            raise refuse(declared, exc)
+        blocked = get_read_block_error(readable)
+        if blocked:
+            raise refuse(declared, blocked)
+        try:
+            vetted[declared] = VettedArtifact.bind(readable)
+        except kb.ArtifactPreservationError as exc:
+            raise refuse(declared, exc)
+    return vetted
+
+
 @_kanban_handler("kanban_complete")
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
@@ -762,10 +801,12 @@ def _handle_complete(args: dict, **kw) -> str:
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
         task = kb.get_task(conn, tid)
         _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
+        vetted = _vet_external_artifacts("kanban_complete", kb, conn, tid, metadata, kw.get("task_id"))
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
-                created_cards=created_cards, expected_run_id=_worker_run_id(tid))
+                created_cards=created_cards, expected_run_id=_worker_run_id(tid),
+                vetted_artifacts=vetted)
         except kb.ArtifactPreservationError as artifact_err:
             # Structured rejection — surface the phantom ids so the worker can retry with a corrected list
             # or drop the field. Audit event already landed in the DB. The task itself was NOT mutated (the
@@ -921,10 +962,11 @@ def _handle_request_review(args: dict, **kw) -> str:
                f"Installed profiles: {', '.join(list_profile_names())}")
     with _board(args.get("board")) as (kb, conn):
         _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
+        vetted = _vet_external_artifacts("kanban_request_review", kb, conn, tid, metadata, kw.get("task_id"))
         try:
             ok, fail_reason = kb.request_review(
                 conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
-                expected_run_id=_worker_run_id(tid), with_reason=True)
+                expected_run_id=_worker_run_id(tid), with_reason=True, vetted_artifacts=vetted)
         except kb.ArtifactPreservationError as artifact_err:
             # Same contract as kanban_complete (#22923): the transition rolled
             # back, the task is untouched and retryable — say so explicitly or

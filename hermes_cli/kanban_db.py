@@ -27,7 +27,8 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from types import MappingProxyType
+from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from hermes_cli import kanban_db_retry_policy as _retry_policy
@@ -2528,17 +2529,23 @@ def _verify_created_cards(
 ) -> tuple[list[str], list[str]]:
     """Partition ``claimed_ids`` into (verified, phantom). Verified = the row
     exists AND ``created_by`` is the completing task's assignee or id, OR the
-    card is linked as its child (created elsewhere, attached by the worker).
-    Never mutates."""
+    card is linked as its child (created elsewhere, attached by the worker),
+    OR the session the owner admitted for the current run created it
+    (:func:`hermes_cli.kanban_db_card_provenance.created_by_completing_session`). Never mutates."""
     ordered = list(dict.fromkeys(str(x).strip() for x in (claimed_ids or []) if str(x).strip()))
     if not ordered:
         return [], []
 
-    row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (completing_task_id,)).fetchone()
+    row = conn.execute(
+        "SELECT assignee, current_run_id FROM tasks WHERE id = ?", (completing_task_id,),
+    ).fetchone()
     if row is None:
         # Completing task not found — nothing resolves.
         return [], ordered
     completing_assignee = row["assignee"]
+    session_created = created_by_completing_session(
+        conn, completing_task_id, completing_assignee, row["current_run_id"], ordered,
+    )
 
     # Batch-fetch existence + created_by in one query.
     placeholders = ",".join(["?"] * len(ordered))
@@ -2559,6 +2566,7 @@ def _verify_created_cards(
             (completing_assignee and created_by == completing_assignee)
             or created_by == completing_task_id
             or cid in linked_children
+            or cid in session_created
         )
         (verified if trusted else phantom).append(cid)
     return verified, phantom
@@ -2639,6 +2647,7 @@ def complete_task(
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
+    vetted_artifacts: Mapping[str, VettedArtifact] = MappingProxyType({}),
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2708,7 +2717,7 @@ def complete_task(
         if conn.execute(sql, params).rowcount != 1:
             return False
         if isinstance(metadata, dict):
-            _stage_completion_artifacts(conn, task_id, metadata, now)
+            _stage_completion_artifacts(conn, task_id, metadata, now, vetted=vetted_artifacts)
         run_id = _end_run(
             conn, task_id, outcome="completed", status="done", summary=handoff_summary,
             metadata=metadata,
@@ -2808,11 +2817,12 @@ def _gate_empty_completion(
 def _stage_completion_artifacts(
     conn: sqlite3.Connection, task_id: str, metadata: dict, now: int, *,
     uploaded_by: str = "kanban_complete",
+    vetted: Mapping[str, VettedArtifact] = MappingProxyType({}),
 ) -> list[Path]:
     """Copy scratch artifacts to the attachments dir and record each as an
     attachment row; returns the copies so the caller can discard them if its
     transaction rolls back."""
-    _persist_scratch_completion_artifacts(conn, task_id, metadata)
+    _persist_scratch_completion_artifacts(conn, task_id, metadata, vetted=vetted)
     staged = [Path(stored_path) for stored_path in metadata.pop("_staged_artifacts", [])]
     for path in staged:
         _insert_completion_attachment(
@@ -2820,16 +2830,6 @@ def _stage_completion_artifacts(
             size=path.stat().st_size, created_at=now, uploaded_by=uploaded_by,
         )
     return staged
-
-
-def _cleaned_artifact_paths(metadata: Any) -> list[str]:
-    """Non-blank string paths declared in ``metadata["artifacts"]``."""
-    if not isinstance(metadata, dict):
-        return []
-    raw = metadata.get("artifacts")
-    if not isinstance(raw, (list, tuple)):
-        return []
-    return [str(p).strip() for p in raw if isinstance(p, str) and str(p).strip()]
 
 
 def _completed_event_payload(
@@ -2854,6 +2854,8 @@ def _completed_event_payload(
         cleaned = _cleaned_artifact_paths(metadata)
         if cleaned:
             payload["artifacts"] = cleaned
+        if metadata.get("unattached_artifacts"):
+            payload["unattached_artifacts"] = metadata["unattached_artifacts"]
     return payload
 
 
@@ -2876,146 +2878,6 @@ def _flag_phantom_prose_refs(
             )
 
 
-def _merge_completion_prose_artifacts(
-    conn: sqlite3.Connection, task_id: str, metadata: Optional[dict], *, summary: Optional[str],
-    result: Optional[str],
-) -> Optional[dict]:
-    """Legacy workers named deliverables only by absolute path in prose; add
-    those that exist under the scratch workspace to ``metadata["artifacts"]``
-    before cleanup can erase them."""
-    workspace = _scratch_workspace(conn, task_id)
-    if workspace is None:
-        return metadata
-    if not _is_managed_scratch_path(workspace):
-        return metadata
-    text = "\n".join(part for part in (summary, result) if part)
-    if not text:
-        return metadata
-    prefix = re.escape(str(workspace))
-    discovered: list[str] = []
-    for match in re.finditer(prefix + r"(?:[/\\][^\s`\"'<>]+)", text):
-        raw = match.group(0).rstrip(".,;:!?)]}")
-        candidate = Path(raw)
-        if candidate.is_file():
-            discovered.append(str(candidate))
-    if not discovered:
-        return metadata
-    updated = dict(metadata) if isinstance(metadata, dict) else {}
-    existing = updated.get("artifacts")
-    merged = list(existing) if isinstance(existing, (list, tuple)) else []
-    seen = {str(path) for path in merged}
-    for path in discovered:
-        if path not in seen:
-            merged.append(path)
-            seen.add(path)
-    updated["artifacts"] = merged
-    return updated
-
-
-def _persist_scratch_completion_artifacts(
-    conn: sqlite3.Connection, task_id: str, metadata: dict,
-) -> None:
-    """Copy scratch-workspace completion artifacts before cleanup removes them."""
-    raw_artifacts = metadata.get("artifacts")
-    if not isinstance(raw_artifacts, (list, tuple)):
-        return
-
-    workspace = _scratch_workspace(conn, task_id)
-    if workspace is None:
-        return
-    is_managed, board = _managed_scratch_path_info(workspace)
-    if not is_managed:
-        return
-
-    try:
-        workspace_root = workspace.resolve()
-    except OSError:
-        return
-
-    attachment_dir = task_attachments_dir(task_id, board=board)
-    persisted: list[str] = []
-    used_destinations: set[Path] = set()
-    changed = False
-
-    def _discard_copies() -> None:
-        _discard_staged_copies(used_destinations, attachment_dir)
-
-    for item in raw_artifacts:
-        artifact = str(item).strip() if isinstance(item, str) else ""
-        if not artifact:
-            continue
-        src = Path(artifact).expanduser()
-        try:
-            resolved_src = src.resolve()
-        except OSError:
-            persisted.append(artifact)
-            continue
-
-        if not resolved_src.is_relative_to(workspace_root):
-            persisted.append(artifact)
-            continue
-
-        problem = None
-        if not src.is_file():
-            problem = f"declared scratch artifact is unavailable or not a regular file: {artifact}"
-        elif resolved_src.stat().st_size > KANBAN_ATTACHMENT_MAX_BYTES:
-            problem = (
-                f"declared scratch artifact exceeds the "
-                f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
-            )
-        if problem:
-            _discard_copies()
-            raise ArtifactPreservationError(problem)
-
-        dest: Optional[Path] = None
-        try:
-            attachment_dir.mkdir(parents=True, exist_ok=True)
-            dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
-            _copy_capped(resolved_src, dest, artifact)
-        except Exception as exc:
-            if dest is not None:
-                with contextlib.suppress(OSError):
-                    dest.unlink(missing_ok=True)
-            _discard_copies()
-            if isinstance(exc, ArtifactPreservationError):
-                raise
-            raise ArtifactPreservationError(
-                f"could not preserve declared scratch artifact {artifact}: {exc}"
-            ) from exc
-        used_destinations.add(dest)
-        persisted.append(str(dest.resolve()))
-        changed = True
-
-    if changed:
-        metadata["artifacts"] = persisted
-        # Only this call's own new copies: a registered attachment passed through is not ours to discard.
-        copied = {str(dest.resolve()) for dest in used_destinations}
-        metadata["_staged_artifacts"] = [path for path in persisted if path in copied]
-
-
-def _discard_staged_copies(copies: Iterable[Path], attachment_dir: Path) -> None:
-    """Remove staged attachment copies whose DB rows never committed; a leaked
-    copy would make the retry stage ``name_1.ext`` next to an orphan."""
-    for copied in copies:
-        with contextlib.suppress(OSError):
-            Path(copied).unlink(missing_ok=True)
-    with contextlib.suppress(OSError):
-        attachment_dir.rmdir()
-
-
-def _copy_capped(src: Path, dest: Path, artifact: str) -> None:
-    """Chunked copy that aborts if the file grows past the attachment cap mid-copy."""
-    with src.open("rb") as source_file, dest.open("xb") as destination_file:
-        copied = 0
-        while chunk := source_file.read(1024 * 1024):
-            copied += len(chunk)
-            if copied > KANBAN_ATTACHMENT_MAX_BYTES:
-                raise ArtifactPreservationError(
-                    f"declared scratch artifact grew beyond the size limit: {artifact}"
-                )
-            destination_file.write(chunk)
-
-
 def _insert_completion_attachment(
     conn: sqlite3.Connection, task_id: str, *, filename: str, stored_path: str, size: int,
     created_at: int, uploaded_by: str = "kanban_complete",
@@ -3028,18 +2890,6 @@ def _insert_completion_attachment(
         (task_id, filename, stored_path, size, uploaded_by, created_at),
     )
     _append_event(conn, task_id, "attached", {"filename": filename, "size": size, "by": uploaded_by})
-
-
-def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> Path:
-    """Return a non-conflicting path under ``directory`` for ``filename``."""
-    safe_name = Path(filename).name or "artifact"
-    stem, suffix = Path(safe_name).stem or "artifact", Path(safe_name).suffix
-    candidate = directory / safe_name
-    idx = 1
-    while candidate in used or candidate.exists():
-        candidate = directory / f"{stem}_{idx}{suffix}"
-        idx += 1
-    return candidate
 
 
 @_retry_policy.guarded_edit(lambda: (write_txn, _append_event, notify_task_updated))
@@ -3263,6 +3113,7 @@ def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
     expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
+    vetted_artifacts: Mapping[str, VettedArtifact] = MappingProxyType({}),
 ):
     """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
 
@@ -3369,6 +3220,7 @@ def request_review(
             if isinstance(metadata, dict):
                 staged_copies = _stage_completion_artifacts(
                     conn, task_id, metadata, now, uploaded_by="kanban_request_review",
+                    vetted=vetted_artifacts,
                 )
             run_id = _end_or_synthesize_run(
                 conn, task_id, outcome="review_requested", status="review",
@@ -3383,6 +3235,8 @@ def request_review(
             staged = _cleaned_artifact_paths(metadata)
             if staged:
                 payload["artifacts"] = staged
+            if isinstance(metadata, dict) and metadata.get("unattached_artifacts"):
+                payload["unattached_artifacts"] = metadata["unattached_artifacts"]
             _append_event(conn, task_id, "review_requested", payload, run_id=run_id)
     except Exception:
         if staged_copies:
@@ -4162,6 +4016,16 @@ from hermes_cli.kanban_db_connect import (
     init_db,
     write_txn,
 )
+from hermes_cli.kanban_db_artifacts import (
+    VettedArtifact,
+    _cleaned_artifact_paths,
+    _copy_capped,
+    _discard_staged_copies,
+    _merge_completion_prose_artifacts,
+    _persist_scratch_completion_artifacts,
+    _unique_attachment_path,
+)
+from hermes_cli.kanban_db_card_provenance import created_by_completing_session
 from hermes_cli.kanban_db_workspace import (
     _cleanup_workspace,
     _is_managed_scratch_path,
