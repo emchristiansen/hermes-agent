@@ -311,7 +311,14 @@ async def connect_gateway(endpoint=None, subject=None, ready_timeout=None):
             raise GatewayUnavailableError(f"Gateway {result.state}: {result.reason_code or 'not_ready'}{detail}",
                                           result.state)
         endpoint = result.endpoint
-        ticket = await asyncio.to_thread(_session_ticket, home, endpoint)
+        try:
+            ticket = await asyncio.to_thread(_session_ticket, home, endpoint)
+        except TimeoutError as exc:
+            # The owner's control socket took the request but answered nothing within the mint's bound:
+            # the verdict the ensure gives a control timeout (``starting``/deadline), not a refusal.
+            # Nothing was submitted, so a caller may wait for the owner (``kanban_worker_client``).
+            raise GatewayUnavailableError("Gateway starting: control_timeout (session ticket unanswered)",
+                                          "starting") from exc
         url, protocols = gateway_ws_target(endpoint, ticket)
     try:
         # The gateway is a loopback (or explicitly named) peer, never something to route through the
