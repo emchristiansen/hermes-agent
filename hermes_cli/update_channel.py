@@ -155,6 +155,10 @@ def default_channel(project_root: Optional[Path] = None) -> str:
     root = Path(project_root) if project_root is not None else install_root()
     stamp = _read_stamp(root)
     if not _package_channel(stamp):
+        # This deployment pins Nix to official stable releases. Its checkout-less
+        # store tree has no origin; main is not its update notification source.
+        if stamp.get("distribution") == "nix" and stamp.get("updateMechanism") == "external":
+            return CHANNEL_STABLE
         return CHANNEL_STABLE if _tracks_official_origin(root) else CHANNEL_MAIN
     if stamp.get("source") == "channel-build":
         request = stamp.get("channelBuild")

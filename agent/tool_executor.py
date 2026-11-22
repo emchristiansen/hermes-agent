@@ -62,6 +62,7 @@ from tools.tool_result_storage import (
     extract_persisted_path,
 )
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
+from agent.tool_executor_output_control import finish_controlled_message, persist_controlled_result, with_controlled_batch
 from hermes_cli.observability.shared_metrics_efficiency import note_tool_result, record_tool_batch
 
 # A tool result this large (raw stdout, file dumps) is the biggest allocation a turn ever drops.
@@ -1126,7 +1127,15 @@ def _commit_tool_result(
     agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s){_status_suffix}")
 
     persisted_result = function_result
-    if _is_multimodal_tool_result(persisted_result):
+    # The caller's prospective control (tools/output_control.py) bounds its envelope in place.
+    def bound_controlled(overhead: int = 0):
+        return persist_controlled_result(
+            function_name, function_args, function_result, tool_call_id=tool_call_id, messages=messages,
+            budget=budget, env=lambda: get_active_env(effective_task_id), agent=agent, overhead=overhead)
+    controlled = bound_controlled()
+    if controlled is not None:
+        persisted_result = controlled[0]
+    elif _is_multimodal_tool_result(persisted_result):
         persisted_result = _persist_multimodal_text_parts(
             persisted_result, function_name, tool_call_id, get_active_env(effective_task_id), budget,
         )
@@ -1157,6 +1166,8 @@ def _commit_tool_result(
     # are told on this new row (outside any untrusted-data wrapper).
     lsp_deferred.forward_to_agent(agent)
     plugin_live_notes.attach_to_tool_message(agent, tool_message)
+    if controlled is not None:  # what was added around the bounded result counts against its room
+        persisted_result = finish_controlled_message(tool_message, persisted_result, controlled, bound_controlled)
     # Prepare presentation data before the append. The emitting completion callback
     # stays below the durability fence; raw tool/model content remains unchanged.
     prepare_metadata = getattr(agent, "tool_result_metadata_callback", None)
@@ -1582,6 +1593,7 @@ def _append_batch_results(agent, messages: list, effective_task_id: str, batch: 
     return True
 
 
+@with_controlled_batch
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute tool calls concurrently; results are appended in original call order.
     ``finalize=False`` skips end-of-batch budget enforcement and /steer injection (the
@@ -1862,6 +1874,7 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
     return True
 
 
+@with_controlled_batch
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     from types import SimpleNamespace
     from agent.terminal_approval_batch import terminal_approval_batch, terminal_approval_runs
@@ -1932,6 +1945,7 @@ def _execute_tool_calls_sequential(agent, assistant_message, messages: list, eff
         _finalize_tool_batch(agent, messages, effective_task_id, len(tool_calls), _tool_budget)
 
 
+@with_controlled_batch
 def execute_tool_calls_segmented(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, segments=None) -> None:
     """Execute a mixed batch as ordered parallel/sequential segments (the ``(kind, calls)``
     plan from ``_plan_tool_batch_segments``), preserving per-call result order and barrier

@@ -562,7 +562,12 @@ def check_for_updates(*, install_root: Path | None = None, home: Path | None = N
     from hermes_cli.release_channels import validate_name
 
     embedded = (os.environ.get("HERMES_REVISION") or None) if install_root is None else None
-    root = Path(install_root if install_root is not None else get_project_root()).resolve()
+    # Nix separates the Python package from the stamped installation tree.
+    # Only the running install inherits its wrapper's root; explicit targets
+    # retain their own revision, stamp, channel record and cache identity.
+    root = Path(install_root if install_root is not None else (
+        os.environ.get("HERMES_INSTALL_ROOT") or get_project_root()
+    )).resolve()
     home = Path(home if home is not None else get_hermes_home()).resolve()
     result = {"supported": False, "hermesRoot": str(root), "behind": None, "commits": []}
     unsupported = _unsupported_reason(read_install_stamp(root), root,

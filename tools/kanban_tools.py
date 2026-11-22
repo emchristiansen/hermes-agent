@@ -17,6 +17,8 @@ from typing import Any, Callable, Optional
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
+from tools.output_control import open_destination as open_output_destination
+from tools.output_control import parse_args as parse_output_control, render_json_result
 from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
@@ -661,22 +663,36 @@ def inject_new_comments_from_env(agent: Any) -> bool:
 
 @_kanban_handler("kanban_show")
 def _handle_show(args: dict, **kw) -> str:
-    """Full task state: row, parents, children, comments, runs, last 50 events."""
+    """Full task state: row, parents, children, comments, runs, last 50 events.
+    ``output_control`` projects/routes it before the result exists anywhere else."""
+    # Malformed control or an unusable destination -> ValueError -> tool error before the board
+    # is read: the destination is created exclusively first, so no competing writer can take it
+    # between the read and the write. A failed read removes the still-empty file again.
+    output_control = parse_output_control(args)
+    sink = open_output_destination(output_control)
+    try:
+        return _show(args, output_control, sink)
+    finally:
+        if sink is not None:
+            sink.discard_unused()
+
+
+def _show(args: dict, output_control, sink) -> str:
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         # No dispatcher task in scope and no explicit id: the caller asked "what
         # should I be looking at". A chat profile cannot set HERMES_KANBAN_TASK,
         # so an error naming the env var is dead end (#91431) — answer instead.
-        return json.dumps({
+        return render_json_result({
             "current_task": None,
             "hint": (
                 "No dispatcher-assigned task in this session, so there is no "
                 "task to show by default. Call kanban_list to see task ids on "
                 "the board, then kanban_show(task_id=<id>) for full state."),
-        })
+        }, output_control, sink=sink)
     with _board(args.get("board")) as (kb, conn):
         task = _existing_task(kb, conn, tid)
-        return json.dumps({
+        return render_json_result({
             "task": _fields(task, _TASK_FIELDS),
             "parents": kb.parent_ids(conn, tid),
             # Non-terminal parents; on a running card this means the dependency
@@ -689,7 +705,7 @@ def _handle_show(args: dict, **kw) -> str:
             "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
             "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
             # Same string build_worker_context hands the dispatcher at spawn time.
-            "worker_context": kb.build_worker_context(conn, tid)})
+            "worker_context": kb.build_worker_context(conn, tid)}, output_control, sink=sink)
 
 
 @_kanban_handler("kanban_list")
