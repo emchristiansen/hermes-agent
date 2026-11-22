@@ -343,18 +343,20 @@ def _auto_load_parts(agent: Any) -> list[str]:
 
 
 def _bot_mode_parts(agent: Any) -> list[str]:
-    """Bot Mode teammate protocol — only in a bot's canonical "Bot Chat" session.
+    """Bot Mode teammate protocol — only in a bot's canonical "Bot Chat" session
+    (``session_is_canonical_bot_chat``: titled so, or the gateway's routed successor).
     Marks the prompt timeless (the volatile date line is dropped) since a birth
     date pinned in a months-long session is misinformation."""
     parts: list[str] = []
     try:
-        from tools.bot_mode_probe import BOT_CHAT_TITLE, epoch_line, get_bot_mode_protocol_section
+        from tools.bot_mode_probe import epoch_line, get_bot_mode_protocol_section, session_is_canonical_bot_chat
+        _sdb = getattr(agent, "_session_db", None)
+        _sid = getattr(agent, "session_id", None)
         _title = str(getattr(agent, "_session_title_hint", "") or "").strip()
         if not _title:
-            _sdb = getattr(agent, "_session_db", None)
-            _sid = getattr(agent, "session_id", None)
             _title = str((_sdb.get_session_title(_sid) if (_sdb and _sid) else None) or "").strip()
-        _bot_section = get_bot_mode_protocol_section(_agent_home(agent)) if _title == BOT_CHAT_TITLE else None
+        _bot_section = (get_bot_mode_protocol_section(_agent_home(agent))
+                        if session_is_canonical_bot_chat(_sdb, _sid, _title) else None)
         if _bot_section:
             parts.append(_bot_section)
             # Capability epoch lets the restore path rebuild ONCE per

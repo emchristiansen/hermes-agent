@@ -127,11 +127,14 @@ def message_agent_authorized(agent: Any) -> bool:
     try:
         if not getattr(agent, "_bot_mode_protocol", True):
             return False
-        from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
+        from tools.bot_mode_probe import session_is_canonical_bot_chat, is_bot_mode_managed
 
         # Managed-install check, NOT section non-emptiness: a SOUL.md carrying the
         # legacy protocol text gets an empty section but must still get the tool.
-        return _session_title(agent) == BOT_CHAT_TITLE and is_bot_mode_managed(_agent_home(agent))
+        return session_is_canonical_bot_chat(
+            getattr(agent, "_session_db", None), getattr(agent, "session_id", None),
+            _session_title(agent),
+        ) and is_bot_mode_managed(_agent_home(agent))
     except Exception:  # pragma: no cover — must never break a turn
         logger.debug("message_agent_authorized failed", exc_info=True)
         return False
@@ -204,12 +207,15 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
     home = _agent_home(agent)
     try:
         from tools.bot_mode_probe import (
-            BOT_CHAT_TITLE, _display_name, _handle, _hermes_root, _peers, _profile_name as _self_profile_name,
+            session_is_canonical_bot_chat, _display_name, _handle, _hermes_root, _peers, _profile_name as _self_profile_name,
             _roster, is_bot_mode_managed,
         )
         from tools.bot_relay import _hermes_cli
 
-        if _session_title(agent) != BOT_CHAT_TITLE:
+        if not session_is_canonical_bot_chat(
+            getattr(agent, "_session_db", None), getattr(agent, "session_id", None),
+            _session_title(agent),
+        ):
             return _err("message_agent is only available in a Bot Mode 'Bot Chat' session. "
                         "This session is not one; do not retry.")
         if not is_bot_mode_managed(home):
