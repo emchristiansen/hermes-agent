@@ -364,6 +364,7 @@ def execute(frame, channel, *, control_stream=None):
     register_worker_hooks(policy)
     discover_profile_mcp(policy)
     from run_agent import AIAgent
+    from agent.skill_utils import parse_config_string_list
     from tools.approval import register_gateway_notify, unregister_gateway_notify
     from tools.approval_context import set_current_session_key
     set_current_session_key(frame['route'])
@@ -380,6 +381,8 @@ def execute(frame, channel, *, control_stream=None):
                 # delegate_task stays offered: each child is reserved by the owner under this
                 # execution (agent/runtime_session_child.py) and retires with it.
                 enabled_toolsets=list(policy.toolsets), max_iterations=policy.max_turns,
+                disabled_toolsets=parse_config_string_list(
+                    (policy.config().get('agent') or {}).get('disabled_toolsets')) or None,
                 reasoning_config=policy.reasoning_config,
                 # ``tool`` / ``oneshot`` are storage labels for a CLI-surface agent (session_policy.SURFACES).
                 platform=policy.platform if policy.source in ('tool', 'oneshot') else policy.source,

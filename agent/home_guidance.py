@@ -25,10 +25,11 @@ Every built prompt records the decision in one renderer-owned line at the end of
 ``agent/surface_switch.py::identity_line_value`` reads; no identity, project, memory or guidance text comes after it). A
 resumed session recovers the decision from that line alone: a carried block is located by offset and verified by length,
 SHA-256 and block form, so text quoted inside guidance, SOUL.md or project files never reads as state. A rebuild of a
-continuing conversation (compaction, a capability refresh, a model switch) therefore never re-reads the file or adopts a block
-SOUL.md gains mid-session. A continuing conversation whose stored prompt is missing or unreadable cannot show its decision
-and carries an explicit :class:`Unavailable` (none where nothing is configured); only a new conversation, or one reset in
-place, decides afresh.
+continuing conversation (compaction, a model switch) therefore never re-reads the configured file or adopts a block
+SOUL.md gains mid-session. The explicit canonical Bot Chat between-turn refresh may replace a known SOUL-origin edition
+with the current SOUL's one complete, byte-verified block; other origins and ordinary rebuilds remain frozen. A continuing
+conversation whose stored prompt is missing or unreadable cannot show its decision and carries an explicit
+:class:`Unavailable` (none where nothing is configured); only a new conversation, or one reset in place, decides afresh.
 """
 
 from __future__ import annotations
@@ -580,6 +581,79 @@ def frozen(agent: Any) -> Any:
     return None if persisted is _UNSET else persisted
 
 
+def _soul_refresh_allowed(agent: Any, snapshot: Any) -> bool:
+    """Only a canonical Bot Chat continuing a known SOUL edition may replace it.
+
+    File/parent/none/unavailable decisions and SOUL-suppressed surfaces keep their
+    ordinary freeze. Resolve the physical session's route, not just its title hint.
+    """
+    if not isinstance(snapshot, Carried) or snapshot.origin != "soul":
+        return False
+    if not getattr(agent, "_bot_mode_protocol", True):
+        return False
+    if not (agent.load_soul_identity or not agent.skip_context_files):
+        return False
+    from tools.bot_mode_probe import session_is_canonical_bot_chat
+
+    db, sid = agent._session_db, agent.session_id
+    # The refresh caller may synthesize a Bot Chat title hint for the new build.
+    # Qualification must use the stored physical identity/route, not that hint.
+    title = (str(db.get_session_title(sid) or "").strip() if db and sid
+             else str(getattr(agent, "_session_title_hint", "") or "").strip())
+    return session_is_canonical_bot_chat(db, sid, title)
+
+
+def soul_edition_stale(agent: Any, stored_prompt: str) -> bool:
+    """Pure refresh probe: a known SOUL edition differs from today's valid block.
+
+    This also repairs a prefix whose epoch already matches but whose previous
+    builder joined the new outer SOUL to the old Home edition. Use the identity
+    producer's normal gates, cap and transformations; raw file text is not proof
+    that the builder can deliver it. Failure keeps the existing prefix.
+    """
+    try:
+        snapshot = persisted_state(stored_prompt)
+        if snapshot is LEGACY:
+            snapshot = legacy_decision(stored_prompt)
+        if not _soul_refresh_allowed(agent, snapshot):
+            return False
+        from agent.system_prompt import _agent_home, _identity_parts
+
+        length = getattr(getattr(agent, "context_compressor", None), "context_length", None)
+        length = length if isinstance(length, int) and length > 0 else None
+        parts, loaded = _identity_parts(agent, length)
+        soul = read_soul(parts[0] if loaded else None, _pb.soul_md_path(_agent_home(agent)))
+        return soul.block is not None and soul.block != snapshot.block
+    except Exception:
+        logger.debug("SOUL Home-edition refresh probe failed; keeping the frozen edition", exc_info=True)
+        return False
+
+
+def build_with_soul_edition_refresh(agent: Any, system_message: Optional[str] = None) -> str:
+    """Build at the between-turn capability refresh, allowing only a valid SOUL replacement.
+
+    The actual build's reader validates the replacement in apply_home_guidance;
+    a probe's earlier read never becomes the decision. The allowance cannot leak
+    to compression or static reconstruction, and a failed build restores the old
+    decision. Prompt/tools persistence and retry remain the caller's normal path.
+    """
+    snapshot = frozen(agent)
+    try:
+        allowed = _soul_refresh_allowed(agent, snapshot)
+    except Exception:
+        allowed = False
+    if not allowed:
+        return agent._build_system_prompt(system_message)
+    agent._home_guidance_refreshing = True
+    try:
+        return agent._build_system_prompt(system_message)
+    except BaseException:
+        agent._home_guidance = snapshot
+        raise
+    finally:
+        agent.__dict__.pop("_home_guidance_refreshing", None)
+
+
 def _render(snapshot: Any, soul: SoulReading) -> tuple[Optional[str], str]:
     """``(identity text, part)`` for one build. The frozen decision wins over a SOUL.md re-read for a rebuild: a complete
     block the SOUL now carries is replaced in place by the frozen content — or removed when the decision is "none" — so
@@ -616,6 +690,9 @@ def apply_home_guidance(agent: Any, soul_text: Optional[str], soul_path: Path,
     if snapshot is _UNSET:
         _recover(agent)
         snapshot = agent._home_guidance = _resolve(agent, soul, context_length)
+    if (_own(agent, "_home_guidance_refreshing") is True
+            and isinstance(snapshot, Carried) and snapshot.origin == "soul" and soul.block is not None):
+        snapshot = agent._home_guidance = Carried(soul.block, "soul")
     return _render(_checked(snapshot), soul)
 
 

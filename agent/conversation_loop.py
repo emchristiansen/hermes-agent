@@ -708,11 +708,12 @@ def _print_billing_or_entitlement_guidance(
 
 
 def _bot_chat_prompt_stale(agent, stored_prompt: str | None) -> bool:
-    """Bot Chat capability epoch check for a stored prompt.
+    """Bot Chat capability/Home-edition check for a stored prompt.
 
     The stored prompt embeds a capability fingerprint; a mismatch is a deliberate
-    once-per-change rebuild. Unstamped prompts never match; probe failures fail closed
-    to "reuse" so the cache is kept. Legacy upgrade: a Bot Chat prompt predating the
+    once-per-change rebuild. Canonical sessions also repair a stale SOUL-origin
+    Home edition, including one joined to an already-current epoch. Probe failures
+    keep the cache. Legacy upgrade: a Bot Chat prompt predating the
     epoch mechanism gets ONE title-gated migration rebuild; the stamped result cannot
     re-fire. A NULL or empty stored prompt already rebuilds every turn, so this probe
     is not a gate there and must not run.
@@ -741,8 +742,10 @@ def _bot_chat_prompt_stale(agent, stored_prompt: str | None) -> bool:
                 title = str(agent._session_db.get_session_title(agent.session_id) or "").strip()
             except Exception:
                 title = ""
+        from agent.home_guidance import soul_edition_stale
         return (session_is_canonical_bot_chat(agent._session_db, agent.session_id, title)
-                and bool(stored_bot_chat_prompt_needs_upgrade(stored_prompt, home)))
+                and (bool(stored_bot_chat_prompt_needs_upgrade(stored_prompt, home))
+                     or soul_edition_stale(agent, stored_prompt)))
     except Exception:
         return False
 
@@ -875,7 +878,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         # NULL/empty rows never reach this probe: they already rebuild below.
         if _bot_chat_prompt_stale(agent, stored_prompt):
             logger.info(
-                "Bot Chat capability epoch changed for session %s; rebuilding system prompt to "
+                "Bot Chat capability or SOUL Home edition changed for session %s; rebuilding system prompt to "
                 "adopt the new capability surface (one-time prefix-cache break).",
                 agent.session_id,
             )
@@ -888,7 +891,8 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             except Exception:
                 pass
             _refresh_bot_chat_tools(agent)
-            agent._cached_system_prompt = agent._build_system_prompt(system_message)
+            from agent.home_guidance import build_with_soul_edition_refresh
+            agent._cached_system_prompt = build_with_soul_edition_refresh(agent, system_message)
             record_cache_break(agent, "toolset_change")
             stage_surface_switch_note(agent, agent._cached_system_prompt, conversation_history)
             # Persist so the NEXT turn restores the new bytes verbatim (cache break is
