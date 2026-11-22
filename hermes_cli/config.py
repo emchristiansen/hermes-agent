@@ -2269,7 +2269,8 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
         return None
     # save_config() stores the pre-expansion dict, the load path the expanded user layer: expand
     # (idempotent), then apply the CURRENT managed overlay — the one cache_sig's managed half names.
-    lkg_copy = FailedConfigRead(_merge_managed_overlay(_expand_env_vars(copy.deepcopy(lkg)))[0], error=exc)
+    lkg_copy = FailedConfigRead(_merge_managed_overlay(_expand_env_vars(copy.deepcopy(lkg)))[0], error=exc,
+                                last_known_good=True)
     if cache_sig is not None:
         # Cache under the failed file's signature (empty env snapshot: always valid) so repeated
         # loads don't re-parse the fallback; fixing the file changes the signature and reloads

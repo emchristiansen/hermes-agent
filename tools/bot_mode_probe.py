@@ -396,6 +396,8 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
         agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
         surface["platform_toolsets"] = json.dumps(cfg.get("platform_toolsets") or {}, sort_keys=True, default=str)
         surface["disabled_toolsets"] = sorted(parse_config_string_list(agent_cfg.get("disabled_toolsets")))
+        if disabled_tools := sorted(parse_config_string_list(agent_cfg.get("disabled_tools"))):
+            surface["disabled_tools"] = disabled_tools  # absent when unset: every other epoch is unchanged
         mcp = cfg.get("mcp_servers")
         surface["mcp"] = json.dumps(mcp, sort_keys=True, default=str) if isinstance(mcp, dict) else ""
     except Exception:
