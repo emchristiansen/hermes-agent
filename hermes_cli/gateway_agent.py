@@ -780,7 +780,7 @@ class GatewayAgent:
                     self._give_back_turn_route()
                     return self._failed(history, user_message, str(exc), failure_reason="session_busy", retryable=True)
                 return self._failed(history, user_message, f"The gateway refused this turn: {exc}.",
-                                    failure_reason="gateway_refusal")
+                                    failure_reason="gateway_refusal", retryable=None)
             except GatewayClientError as exc:
                 return self._failed(history, user_message, str(exc), failure_reason="gateway_connection")
             if (receipt or {}).get("voice_stopped") is True:
@@ -1216,11 +1216,14 @@ class GatewayAgent:
 
     def _failed(self, history, user_message, error, *, failure_reason=None, retryable=False):
         """``failure_reason="gateway_connection"``: the CLI shows ``error`` as written instead of
-        classifying a lost gateway as a model failure ("Run /model to switch...")."""
+        classifying a lost gateway as a model failure ("Run /model to switch..."). ``retryable=None``
+        records no retryability verdict: the reason alone does not say whether sending again helps."""
         out = {**_RESULT_DEFAULTS, "final_response": "", "messages": history + [self._user_row(user_message)],
                "failed": True, "completed": False, "error": error, "session_id": self.session_id}
         if failure_reason:
-            out.update(failure_reason=failure_reason, failure_retryable=retryable)
+            out["failure_reason"] = failure_reason
+            if retryable is not None:
+                out["failure_retryable"] = retryable
         return out
 
     def _result(self, history, user_message, complete, turn):
