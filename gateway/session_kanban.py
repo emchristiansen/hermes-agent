@@ -45,10 +45,13 @@ def build_kanban_policy(connection, params, config, *, route_inputs=None):
             if bound and json.loads(bound[0])['request_id'] != 'kanban:' + json.dumps([board, task.id, task.current_run_id], separators=(',', ':')):
                 raise RuntimeStoreError('stale_kanban_claim')
             context = kb.build_worker_context(conn, task.id)
-            skills = list(task.skills or ())
+            skills, continues = list(task.skills or ()), None
             if kb._retry_status_for_run(conn, task.id, task.current_run_id) == 'review':
                 # Same rule as the dispatcher's review lane: the reviewer always loads sdlc-review.
                 skills = list(dict.fromkeys([*skills, 'sdlc-review']))
+                # Frozen with the policy, so a retry seeds from the same source, never a newer one.
+                from hermes_cli.kanban_db_review_handoff import review_continuity_source
+                continues = review_continuity_source(conn, task.id, task.current_run_id)
     except (ValueError, OSError, sqlite3.Error) as exc:
         raise RuntimeStoreError('invalid_kanban_claim') from exc
     cwd = task.workspace_path
@@ -70,6 +73,8 @@ def build_kanban_policy(connection, params, config, *, route_inputs=None):
     context['route_inputs'] = (route_inputs if route_inputs is not None
                                and route_inputs == current_route_inputs(authority.profile_id) else None)
     context['db'] = str(path)
+    if continues is not None:
+        context['continues'] = continues
     request = json.loads(policy.request_json)
     request.update(source='kanban', board=board, task_id=task.id, run_id=task.current_run_id)
     return replace(policy, source='kanban', platform='cli', toolsets=tuple(sorted(set(policy.toolsets) | {'kanban'})),
@@ -137,6 +142,14 @@ async def run_task(connection, params):
                      'request_id': request_id, 'pid': os.getpid(), 'birth': process_birth(psutil.Process())},
                     run_id=task.current_run_id)
     from gateway.session_runtime_workers import tracked_write
+    note = None
+    if 'continues' in context:
+        # Before admission: every admitted attempt that asked to continue has its record, and the
+        # record (not a re-resolution) words the note, so a retry reproduces the admitted payload.
+        from hermes_state_review_seed import first_turn_note, seed_review_continuity
+        seed = await tracked_write(authority, lambda: seed_review_continuity(
+            authority.db, epoch=authority.epoch, session_id=ref.session_id, intent=context['continues'], owner_db=owner_db))
+        note = first_turn_note(seed, context)
     await tracked_write(authority, admit_claim)
     await connection.resume(ref, {})
     # Finite like the `chat -q` worker it replaced: nobody can answer an approval or clarify in a
@@ -146,7 +159,7 @@ async def run_task(connection, params):
     from hermes_state_runtime import find_session_admission
     committed = None if not saved else await asyncio.to_thread(find_session_admission, authority.db,
         principal_id=connection.actor.subject, session_id=ref.session_id, request_id=request_id)
-    payload: dict = {'text': f'work kanban task {params["task_id"]}'}
+    payload: dict = {'text': '\n\n'.join(filter(None, (f'work kanban task {params["task_id"]}', note)))}
     if committed is None or 'finite' in committed['payload']:
         payload['finite'] = True
     # The dispatcher's trusted producer marker (#134889 KB-8): nobody waits on a card attempt, so one
