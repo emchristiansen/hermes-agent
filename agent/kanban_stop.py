@@ -80,19 +80,27 @@ def build_kanban_stop_nudge(
     tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
     # The transcript is the status source: this text is only reached when the session made no
     # handoff call, so it never tells a worker to close a card it already sent to review.
+    # Ending a turn is not an obstacle. Listing ``kanban_block`` as an equal exit made workers that
+    # stopped early block their own unfinished, unblocked work (Cryo t_7752959d runs 25385, 25387
+    # and 25388), so the nudge sends unfinished work back to work and keeps block for a real obstacle.
     return (
         "[System: You are a Hermes kanban worker. A plain-text reply is NOT a "
         "terminal state for the board.\n\n"
         f"Task `{tid}` has not been handed off: this session made no terminal board "
         "call (`kanban_complete` / `kanban_request_review` / `kanban_block`). Ending now "
         "causes a protocol violation (clean exit with the card still `running`).\n\n"
+        "Ending your turn is not a reason to stop, and this message is not one either. "
         "Do this immediately in your next response — do not narrate intent:\n"
-        "1. Finish any remaining deliverable (write the required file(s) now).\n"
-        "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work is done "
-        "and needs no review, `kanban_request_review(summary=...)` if it is a code "
-        "change that needs same-card review, OR `kanban_block(reason=...)` if you are "
-        "blocked. Reviewers approve with `kanban_complete` or send the card back with "
-        "`kanban_request_changes(reason=...)`.\n\n"
+        "1. If authorized work remains that you can do now, keep doing it: make the next "
+        "edit, run the next check, and continue until the result is done.\n"
+        "2. When the work is done, call `kanban_complete(summary=..., artifacts=[...])` if it "
+        "needs no review, or `kanban_request_review(summary=...)` if it is a code change that "
+        "needs same-card review. Reviewers approve with `kanban_complete` or send the card "
+        "back with `kanban_request_changes(reason=...)`.\n"
+        "3. Call `kanban_block(reason=...)` only for a concrete obstacle outside your "
+        "control that stops all remaining work: name the missing input, who provides it and "
+        "when work can resume. Unfinished work, a long task or the end of a turn is not such "
+        "an obstacle.\n\n"
         "Never end a turn with only a promise of future action. Repeated "
         "protocol violations will block this task and require manual intervention.]"
     )
