@@ -358,6 +358,18 @@ _SPECS = [
                                 "handed to dependents; scratch artifacts it or --result names are preserved"),
     ], help="Orchestrator-only: settle a local-only Scheduled card whose ended run's worker already "
             "delivered a negative assessment; never readies or dispatches it"),
+    _cmd("settle-record-only", [
+        _TASK_ID,
+        _arg("--expected-terminal-run", type=int, required=True,
+             help="Exact latest ended run of the card; it keeps its own profile and history"),
+        _arg("--result", required=True, help="The accepted outcome being recorded"),
+        _arg("--accepted-by", required=True,
+             help="Where the outcome was accepted (comment, review or decision locator)"),
+        _arg("--custody", required=True,
+             help="What stays in unknown or separate custody (sessions, admissions, the workspace)"),
+        _arg("--metadata", help="JSON object of structured facts stored on the bookkeeping run"),
+    ], help="Orchestrator-only: record an already-accepted, stopped blocked/ready card Done with no "
+            "cleanup, durably retaining its workspace; writes a bookkeeping run that performed no work"),
     _cmd("schedule", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),

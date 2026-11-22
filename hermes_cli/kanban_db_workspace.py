@@ -254,34 +254,15 @@ def _prune_terminal_events(conn: sqlite3.Connection, cutoff: int) -> int:
 def _sibling_board_db_files(conn: sqlite3.Connection) -> list[Path]:
     """Every other board's ``kanban.db``. Raises ``OSError`` when the set is unknown.
 
-    ``kanban_db_path`` follows ``HERMES_KANBAN_DB`` and would collapse every
-    slug onto the pinned file, so the scan uses the on-disk layout: the
-    default board at ``<home>/kanban.db`` and named boards at
-    ``<home>/kanban/boards/<slug>/kanban.db``.
+    The set is :func:`kanban_db_retention.cleanup_board_db_files` without *conn*'s own file. A
+    record-only settlement refuses on any database outside that set, so every retention lies on a
+    board this scan reads.
     """
     from hermes_cli.kanban_db_connect import _main_db_file  # late: import cycle
 
     current_file = _main_db_file(conn)
     current = Path(current_file).resolve() if current_file else None
-    candidates = [_kb.kanban_home() / "kanban.db"]
-    root = _kb.boards_root()
-    if root.is_dir():
-        for child in root.iterdir():
-            if child.is_dir():
-                candidates.append(child / "kanban.db")
-    found: list[Path] = []
-    seen: set[Path] = set()
-    for path in candidates:
-        if not path.is_file():
-            continue
-        resolved = path.resolve()
-        if current is not None and resolved == current:
-            continue
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        found.append(resolved)
-    return found
+    return [path for path in cleanup_board_db_files() if current is None or path != current]
 
 
 def _other_board_in_use(db_file: Path, task_id: str, key: str) -> Optional[str]:
@@ -289,6 +270,8 @@ def _other_board_in_use(db_file: Path, task_id: str, key: str) -> Optional[str]:
     other = sqlite3.connect(uri, uri=True, timeout=1.0)
     try:
         other.row_factory = sqlite3.Row
+        if retention_covering(other, key):
+            return RETAINED
         if _conn_live_worker_inside(other, key):
             return "live_worker"
         return "shared" if _conn_uses_path(other, task_id, key, exclude_task_id=False) else None
@@ -299,7 +282,12 @@ def _other_board_in_use(db_file: Path, task_id: str, key: str) -> Optional[str]:
 def _workspace_in_use_by_other(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> Optional[str]:
-    """Why *path* must be kept: ``"live_worker"``, ``"shared"``, ``"unknown"``, or None when free.
+    """Why *path* must be kept: ``"retained"``, ``"live_worker"``, ``"shared"``, ``"unknown"``, or None
+    when free.
+
+    ``"retained"``: a record-only settlement (``kanban_db_retention``) retains a workspace at, inside
+    or containing *path*, on this board or a sibling one, whatever that card's status. A retention
+    has no expiry, so this holds until the row is gone.
 
     ``"live_worker"``: a bound worker that has not ended works at or under *path*, whatever its
     card's status and whether or not that card is *task_id* itself. Every removal route (the
@@ -327,6 +315,11 @@ def _workspace_in_use_by_other(
     if not key:
         return None
     try:
+        retained_task = retention_covering(conn, key)
+        if retained_task:
+            _kb._log.debug("Workspace %s of task %s overlaps the workspace retained for task %s",
+                           path, task_id, retained_task)
+            return RETAINED
         worker_task = _conn_live_worker_inside(conn, key)
         if worker_task:
             _kb._log.debug("Workspace %s of task %s is still in use by the live worker of task %s",
@@ -362,6 +355,11 @@ def _defer_shared_workspace_cleanup(
     reason = _workspace_in_use_by_other(conn, task_id, path)
     if reason is None:
         return False
+    if reason == RETAINED:
+        # Durable and expected: the retention row is the record, so no event per sweep.
+        _kb._log.info("Keeping workspace %s of task %s: a record-only settlement retains it",
+                      path, task_id)
+        return True
     if reason == "live_worker":
         # Ordinary: a worker that completed its own card is still in its turn. Its end retries.
         _kb._log.info("Deferring workspace cleanup for task %s: a live worker still uses %s",
@@ -402,6 +400,38 @@ def _defer_shared_worktree_cleanup(
         and _is_linked_worktree_checkout(wt)
         and _defer_shared_workspace_cleanup(conn, task_id, path)
     )
+
+
+def _remove_scratch_dir(
+    conn: sqlite3.Connection, task_id: str, path: Path | str, *, release_lsp: bool = True
+) -> bool:
+    """Remove managed scratch *path* unless it is in use or retained; True when removal ran.
+
+    The in-use check and the removal run inside :func:`removal_fence`, so a record-only settlement
+    cannot commit a retention between them. No fence in time: keep the directory."""
+    with removal_fence() as fenced:
+        if not fenced:
+            _kb._log.warning("Keeping workspace %s of task %s: removal fence unavailable", path, task_id)
+            return False
+        if _defer_shared_workspace_cleanup(conn, task_id, path):
+            return False
+        if release_lsp:
+            release_lsp_clients(str(path))
+        shutil.rmtree(path, ignore_errors=True)
+        return True
+
+
+def _remove_worktree_dir(
+    conn: sqlite3.Connection, task_id: str, path: str, branch_name: Optional[str]
+) -> None:
+    """:func:`_cleanup_worktree_workspace` unless shared, in use or retained, inside the removal fence."""
+    with removal_fence() as fenced:
+        if not fenced:
+            _kb._log.warning("Keeping worktree %s of task %s: removal fence unavailable", path, task_id)
+            return
+        if _defer_shared_worktree_cleanup(conn, task_id, path):
+            return
+        _cleanup_worktree_workspace(task_id, path, branch_name)
 
 
 def _lexical_path(path: Path | str) -> Path:
@@ -535,6 +565,12 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # See #33774.
             _try_cleanup_parent_workspaces(conn, task_id)
             return
+        # A retained workspace keeps its directory, LSP clients and the assignee's
+        # tmux session. A read error raises into the handler below, which removes nothing.
+        if task_is_retained(conn, task_id):
+            _kb._log.info("Keeping retained workspace of task %s at %s", task_id, path)
+            _try_cleanup_parent_workspaces(conn, task_id)
+            return
         # Defer while any child is not yet terminal so it can still read
         # handoff artifacts from this workspace.
         if _has_active_children(conn, task_id):
@@ -548,8 +584,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         # lingering worker never has its cwd deleted from under it.
         if kind == "worktree":
             _cleanup_worker_tmux(conn, task_id)
-            if not _defer_shared_worktree_cleanup(conn, task_id, path):
-                _cleanup_worktree_workspace(task_id, path, row["branch_name"])
+            _remove_worktree_dir(conn, task_id, path, row["branch_name"])
             _try_cleanup_parent_workspaces(conn, task_id)
             return
         wp = Path(path)
@@ -560,9 +595,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # See #28818. Containment runs first so an unmanaged dir that is
             # never removed does not pay for (or log) the shared-use scan.
             if _is_managed_scratch_path(wp):
-                if not _defer_shared_workspace_cleanup(conn, task_id, path):
-                    release_lsp_clients(str(wp))
-                    shutil.rmtree(wp, ignore_errors=True)
+                if _remove_scratch_dir(conn, task_id, wp):
                     _kb._log.debug("Removed scratch workspace: %s", wp)
             else:
                 _kb._log.warning(
@@ -678,19 +711,14 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 continue
             ws_path = row["workspace_path"]
             if row["workspace_kind"] == "worktree":
-                if _defer_shared_worktree_cleanup(conn, parent_id, ws_path):
-                    continue
-                _cleanup_worktree_workspace(parent_id, ws_path, row["branch_name"])
+                _remove_worktree_dir(conn, parent_id, ws_path, row["branch_name"])
                 continue
             wp = Path(ws_path)
             if not wp.is_dir():
                 continue
             if _is_managed_scratch_path(wp):
-                if _defer_shared_workspace_cleanup(conn, parent_id, ws_path):
-                    continue
-                release_lsp_clients(str(wp))
-                shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+                if _remove_scratch_dir(conn, parent_id, wp):
+                    _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:
         pass  # best-effort
 
@@ -1033,3 +1061,7 @@ def publish_claimed_workspace(
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb
+# Retention imports ``kanban_db`` too, so it also loads only once this module is complete.
+from hermes_cli.kanban_db_retention import (
+    RETAINED, cleanup_board_db_files, removal_fence, retention_covering, task_is_retained,
+)
