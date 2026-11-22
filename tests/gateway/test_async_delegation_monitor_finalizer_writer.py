@@ -29,11 +29,11 @@ def test_monitor_finalization_is_a_physical_writer(monkeypatch, tmp_path, worker
     writes, closes = [], []
     original_persist, original_close = ad._persist_completion, db.close
 
-    def held_persist(event, result):
+    def held_persist(event, result, **kw):  # main also passes delivery=
         persist_entered.set()
         assert release_persist.wait(30)
         writes.append({'after_close': bool(closes), 'thread': threading.current_thread().name})
-        return original_persist(event, result)
+        return original_persist(event, result, **kw)
 
     def close(*a, **kw):
         closes.append({'physical_worker_count': ad.join_workers(0), 'logical_live': ad.active_count(),
@@ -68,9 +68,10 @@ def test_monitor_finalization_is_a_physical_writer(monkeypatch, tmp_path, worker
         ctx.api_live = 0
         if full_stop:
             runner._restart_drain_timeout = 0.0
+            runner._cron_drain_timeout = 0.0  # main's drain also waits on background delegations; this schedule interrupts at once
             with ExitStack() as patches:
                 for target in ('tools.terminal_tool_lifecycle.cleanup_all_environments',
-                               'tools.browser_tool_lifecycle.cleanup_all_browsers',
+                               'tools.browser_session_lifecycle.cleanup_all_browsers',
                                'gateway.status.remove_pid_file', 'gateway.status.publish_runtime_status'):
                     patches.enter_context(patch(target))
                 patches.enter_context(patch('tools.process_registry.process_registry.kill_all', return_value=0))

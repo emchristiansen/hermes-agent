@@ -19,7 +19,7 @@ async def test_kanban_wake_is_admitted_into_a_local_session(tmp_path, monkeypatc
     from gateway.run import GatewayRunner
     from gateway.session import SessionSource
     from gateway.session_authority import initialize_session_authority
-    from gateway.session_contract import Principal
+    from gateway.session_contract import SessionActor
     from gateway.session_local import LocalSessionAdapter, create_local_session
     from gateway.wake import deliver_wake
     from hermes_state import SessionDB
@@ -37,7 +37,7 @@ async def test_kanban_wake_is_admitted_into_a_local_session(tmp_path, monkeypatc
 
     monkeypatch.setattr(runner, "_handle_message", answer)
     try:
-        viewer = Principal("test-owner", "default", frozenset(
+        viewer = SessionActor("test-owner", "default", frozenset(
             {"session:create", "session:submit", "session:read"}), "viewer")
         ref = create_local_session(authority, viewer, dict(request_id="cli", source="cli", model="fixture",
                                                           toolsets=[]))

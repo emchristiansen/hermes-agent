@@ -17,9 +17,10 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.config import GatewayConfig, Platform
+from gateway.session_unattended_unknown import owner_ending
 from gateway.session import SessionSource, SessionStore
 from gateway.session_authority import LiveSession, initialize_session_authority
-from gateway.session_contract import Principal, SessionRef
+from gateway.session_contract import SessionActor, SessionRef
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
@@ -159,7 +160,7 @@ async def test_drain_cancelled_after_the_loss_fence_still_records_the_restart(ca
         loop.call_soon_threadsafe(fenced.set)
         assert release.wait(30)
     monkeypatch.setattr(reservation, 'lose_admission_worker', fence_then_wait)
-    lost = asyncio.create_task(managed._fence_lost_worker(owner, row, scope))
+    lost = asyncio.create_task(managed._fence_lost_worker(owner, row, scope, owner_ending(owner)))
     await asyncio.wait_for(fenced.wait(), 30)
     lost.cancel()  # the drain is cancelled as its fence returns: nothing after it runs
     with pytest.raises(asyncio.CancelledError):
@@ -187,7 +188,7 @@ async def test_board_locked_at_boot_holds_the_receipt_until_the_drain_records_th
         held = get_session_admission(store._db, admission_id=row['admission_id'])
         assert (held['status'], held['outcome']) == ('unknown', OWNER_RESTART)
         assert not _results(conn, params)
-        actor = Principal('kanban', 'p', frozenset({'session:submit', 'session:control'}), 'cli')
+        actor = SessionActor('kanban', 'p', frozenset({'session:submit', 'session:control'}), 'cli')
         assert (await owner.receipt(actor, SessionRef('p', SID), row['admission_id'])).status == 'started'
 
         from gateway import session_unattended_unknown as unattended
@@ -226,7 +227,7 @@ async def test_board_locked_on_the_stopping_drain_leaves_the_cause_for_the_next_
     from gateway.session_unattended_unknown import settle_unattended_unknown
     lock = _BoardLock(board_db, monkeypatch)
     try:
-        await _fence_lost_worker(owner, row, scope)
+        await _fence_lost_worker(owner, row, scope, owner_ending(owner))
         assert not await settle_unattended_unknown(owner, SessionRef('p', SID))
     finally:
         lock.release()
@@ -284,6 +285,8 @@ def test_boot_schedules_a_session_whose_only_unknown_row_owes_a_restart(monkeypa
     monkeypatch.setattr(recovery, 'restore_local_session', lambda authority, sid: SessionRef('p', sid))
     monkeypatch.setattr(recovery, 'list_session_admissions', lambda db, session_id: rows[session_id])
     monkeypatch.setattr('gateway.session_viewer_close.rearm_persisted_closes', lambda authority: [])
+    # main's boot also arms startup orphan closes (a store read); this fake authority has no store.
+    monkeypatch.setattr('gateway.session_viewer_close.arm_startup_orphan_closes', lambda authority, orphans: None)
 
     recovery.recover_local_sessions(authority, schedule=True)
 

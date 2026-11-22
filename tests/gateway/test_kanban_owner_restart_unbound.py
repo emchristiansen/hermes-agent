@@ -22,12 +22,13 @@ import psutil
 import pytest
 
 from gateway.session_contract import SessionRef
+from gateway.session_unattended_unknown import owner_ending
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli.kanban_db_retry_policy import KANBAN_OWNER_RESTART_EXIT_CODE
 from hermes_cli.kanban_owner_recovery import owner_attempt_provably_over, owner_reclaim_blocked
-from hermes_cli.process_identity import process_birth
+from hermes_cli.process_identity import worker_birth
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 from hermes_state_runtime import get_session_admission
 from tests.gateway.test_kanban_owner_restart_durable import SID, _bind_worker, _owner, _start_turn
@@ -96,7 +97,7 @@ def _dead_owner(conn, store, params):
 
 
 def _live_owner(conn, store, params):
-    _admitted(conn, store, params, owner_pid=os.getpid(), owner_birth=process_birth(psutil.Process()))
+    _admitted(conn, store, params, owner_pid=os.getpid(), owner_birth=worker_birth(psutil.Process()))
 
 
 def _bound(conn, params):
@@ -126,7 +127,7 @@ async def _lost_on_the_stopping_drain(store, runner, params):
     row = _start_turn(owner, params)
     scope = _bind_worker(owner, row)  # the owner's worker registration; the board has no worker_bound
     runner._draining = True
-    await _fence_lost_worker(owner, row, scope)
+    await _fence_lost_worker(owner, row, scope, owner_ending(owner))
     assert await settle_unattended_unknown(owner, SessionRef('p', SID))
     return row
 
@@ -259,7 +260,7 @@ async def _interrupted_without_result(runner, params):
     from gateway.session_unattended_unknown import settle_unattended_unknown
     owner = await _owner(runner, 'old')
     row = _start_turn(owner, params)
-    await _fence_lost_worker(owner, row, _bind_worker(owner, row))
+    await _fence_lost_worker(owner, row, _bind_worker(owner, row), owner_ending(owner))
     assert await settle_unattended_unknown(owner, SessionRef('p', SID))
 
 
@@ -327,7 +328,7 @@ async def test_control_a_worker_lost_under_a_live_owner_still_counts(board, boun
         _bound(conn, params)
     owner = await _owner(runner, 'live')
     row = _start_turn(owner, params)
-    await _fence_lost_worker(owner, row, _bind_worker(owner, row))
+    await _fence_lost_worker(owner, row, _bind_worker(owner, row), owner_ending(owner))
     assert await settle_unattended_unknown(owner, SessionRef('p', SID))
     settled = get_session_admission(store._db, admission_id=row['admission_id'])
     assert (settled['status'], settled['outcome']) == ('terminal', 'interrupted')
@@ -494,7 +495,7 @@ async def test_a_restart_committed_during_a_reclaim_kill_is_left_to_the_crash_sw
             assert record_owner_restart_result({key: params[key] for key in ('board', 'task_id', 'run_id')}, board_db, SID)
             return
         runner._draining = True
-        await _fence_lost_worker(owner, row, scope)
+        await _fence_lost_worker(owner, row, scope, owner_ending(owner))
         assert await settle_unattended_unknown(owner, SessionRef('p', SID))
 
     booked, signals = await _reclaim_with_owner_step_in_kill(entry, restart)
@@ -525,7 +526,7 @@ async def test_control_a_reclaim_kill_with_no_restart_cause_still_counts(unregis
     owner, row, scope = await _serving_owner_past_its_limits(store, runner, conn, params, bound)
 
     async def lost_under_a_serving_owner():
-        await _fence_lost_worker(owner, row, scope)
+        await _fence_lost_worker(owner, row, scope, owner_ending(owner))
         assert await settle_unattended_unknown(owner, SessionRef('p', SID))
 
     booked, signals = await _reclaim_with_owner_step_in_kill(entry, lost_under_a_serving_owner)

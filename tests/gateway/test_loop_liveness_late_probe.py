@@ -57,7 +57,7 @@ class Run:
     def _issued(self) -> int:
         return len(self.loop.callbacks)
 
-    def _dump(self, _path, *, delay_s, snapshot, event) -> None:
+    def _dump(self, _path, *, delay_s, snapshot, event, **_diagnostics) -> None:  # main adds loop_thread_id
         self.dumps.append({"delay_s": delay_s, "event": event, "probes": self._issued(), **snapshot})
         if self.on_dump is not None:
             self.on_dump()

@@ -47,8 +47,7 @@ def test_enter_while_busy_interrupt_does_not_persist_the_message(tmp_path):
     import cli as cli_mod
 
     shell = object.__new__(cli_mod.HermesCLI)
-    shell.busy_input_mode = "interrupt"
-    shell.agent = None  # no redirect support -> legacy interrupt queue
+    shell.agent = None  # every message steers; with no running agent to take it, it waits for the next turn
     shell._agent_running = True
     shell._pending_input, shell._interrupt_queue = queue.Queue(), queue.Queue()
     config = {"onboarding": {"seen": {BUSY_INPUT_FLAG: True}}}
@@ -56,7 +55,7 @@ def test_enter_while_busy_interrupt_does_not_persist_the_message(tmp_path):
     with patch.object(cli_mod, "_hermes_home", tmp_path), patch.dict(cli_mod.__dict__, {"CLI_CONFIG": config}):
         shell._tui_enter_while_busy(SECRET, [], SECRET)
 
-    assert shell._interrupt_queue.get_nowait() == SECRET
+    assert shell._pending_input.get_nowait() == SECRET
     assert _files_containing(tmp_path, SECRET) == []
 
 

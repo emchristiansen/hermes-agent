@@ -211,7 +211,7 @@ def test_cleared_binding_reaches_the_next_attempts_owner_and_dispatcher(tmp_path
     next attempt's frozen context carries no skill and its turn passes the skills gate that
     raised ``kanban_skills_unavailable`` before."""
     from gateway import session_kanban
-    from gateway.session_contract import Principal
+    from gateway.session_contract import SessionActor
     from hermes_cli import kanban_db_dispatch as kbd
 
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
@@ -225,7 +225,7 @@ def test_cleared_binding_reaches_the_next_attempts_owner_and_dispatcher(tmp_path
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     kb.create_board("owned")
-    actor = Principal("owner", str(tmp_path), frozenset({"session:create"}), "transport")
+    actor = SessionActor("owner", str(tmp_path), frozenset({"session:create"}), "transport")
     connection = SimpleNamespace(authority=SimpleNamespace(profile_id=str(tmp_path)), actor=actor, native_owner=True)
     config = {"model": {"default": "m", "provider": "custom"}, "platform_toolsets": {"cli": ["file"]}}
 

@@ -109,6 +109,7 @@ def _install_fake_tools_package():
     )
     sys.modules["agent.credential_persistence"] = types.SimpleNamespace(
         sanitize_borrowed_credential_payload=lambda entry, provider_id=None: entry,
+        fingerprint_secret_value=lambda value: None,  # main's model_metadata memo keys import it
     )
 
     # Stubs for the browser-provider plugin layer introduced in PR #25214.

@@ -427,6 +427,7 @@ async def test_real_owner_admission_reopens_the_grace_after_a_counted_failure(ho
     from gateway.session_controls import AuthorityConnection
     from gateway.session_kanban import run_task
     from gateway.session_managed_worker import _fence_lost_worker
+    from gateway.session_unattended_unknown import owner_ending
     from gateway.session_unattended_unknown import settle_unattended_unknown
     from hermes_cli.kanban_presubmit_grace import accepted
     from hermes_state_runtime import claim_session_input, find_session_admission
@@ -473,7 +474,8 @@ async def test_real_owner_admission_reopens_the_grace_after_a_counted_failure(ho
             "INSERT INTO worker_executions(execution_id,session_id,kind,owner_epoch,generation,status,adoption_digest) "
             "VALUES('execution',?,'compute',?,?,'registered','test')", (sid, authority.epoch, row['generation'])))
         await _fence_lost_worker(authority, row, {'epoch': authority.epoch, 'generation': row['generation'],
-                                                  'execution_id': 'execution'})
+                                                  'execution_id': 'execution'},
+                                 owner_ending(authority))  # main binds the loss's cause where it is found
         assert await settle_unattended_unknown(authority, SessionRef(authority.profile_id, sid))
         with kb.write_txn(host.conn):  # the claim lapses with nothing heartbeating it
             host.conn.execute('UPDATE tasks SET claim_expires=? WHERE id=?', (int(time.time()) - 1, host.tid))

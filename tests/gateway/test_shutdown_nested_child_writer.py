@@ -73,9 +73,9 @@ async def _stop_after_nested_timeout(monkeypatch, tmp_path, *, release_at_quiesc
         finally:
             child_closed.set()
 
-    def observed_defer(ch, future):
+    def observed_defer(ch, future, **kw):  # main hands the cleanup tail along (cleanup=)
         nested.append(future)
-        return real_defer(ch, future)
+        return real_defer(ch, future, **kw)
 
     def model(_kwargs):
         entered.set()
@@ -106,7 +106,7 @@ async def _stop_after_nested_timeout(monkeypatch, tmp_path, *, release_at_quiesc
         stack.enter_context(patch.object(child, "_cleanup_task_resources"))
         stack.enter_context(_probe_tools_only())
         for target in ("tools.terminal_tool_lifecycle.cleanup_all_environments",
-                       "tools.browser_tool_lifecycle.cleanup_all_browsers",
+                       "tools.browser_session_lifecycle.cleanup_all_browsers",
                        "gateway.status.remove_pid_file", "gateway.status.publish_runtime_status"):
             stack.enter_context(patch(target))
         stack.enter_context(patch("tools.process_registry.process_registry.kill_all", return_value=0))

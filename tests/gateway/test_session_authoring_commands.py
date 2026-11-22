@@ -41,6 +41,10 @@ def test_local_session_authoring_commands_run_the_gateway_handler(tmp_path):
     env = child_env()
     env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=str(root),
                OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url, PYTHONUNBUFFERED='1')
+    # The daemon is not under pytest: keep it off this host's /etc/hermes managed scope (its guidance
+    # file would reach the system prompt the fake judge reads).
+    (tmp_path / 'managed').mkdir(exist_ok=True)
+    env['HERMES_MANAGED_DIR'] = str(tmp_path / 'managed')
     out, sid = {}, {}
 
     def admissions():
@@ -186,6 +190,10 @@ def test_local_goal_kickoff_is_judged_and_continued_by_the_gateway(tmp_path):
     env = child_env()
     env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=str(root),
                OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url, PYTHONUNBUFFERED='1')
+    # The daemon is not under pytest: keep it off this host's /etc/hermes managed scope (its guidance
+    # file would reach the system prompt the fake judge reads).
+    (tmp_path / 'managed').mkdir(exist_ok=True)
+    env['HERMES_MANAGED_DIR'] = str(tmp_path / 'managed')
     out = {}
 
     async def probe(desc):

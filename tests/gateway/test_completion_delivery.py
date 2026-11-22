@@ -436,7 +436,9 @@ def _at_watcher_line(text: str, action) -> list:
             action()
         return local
 
-    sys.settrace(lambda frame, _event, _arg: local if frame.f_code.co_name == "_run_process_watcher" else None)
+    # main runs the watcher's loop in ``_watch_process``, inside ``_run_process_watcher``'s profile scope.
+    sys.settrace(lambda frame, _event, _arg: local if frame.f_code.co_name in (
+        "_run_process_watcher", "_watch_process") else None)
     return fired
 
 

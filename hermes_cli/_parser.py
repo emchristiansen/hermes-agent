@@ -109,10 +109,13 @@ def no_init_command_args(argv: list[str], *, profile_flag_consumed: bool = False
     values and invalid names, so for ``hermes_bootstrap`` this is an approximation. The decisive call
     (``_startup_fast``) runs on the override's actual result with *profile_flag_consumed* (a remaining
     ``-p`` is then the parser's error). Multi-word session names are then joined exactly as main
-    does before its parse."""
+    does before its parse, except that the active memory provider's command name is not looked up (that
+    reads config): only when that name stands between a session flag and ``auth principals`` does the
+    classifier differ from main."""
     if not profile_flag_consumed:
         argv = _without_profile_flag(argv)
-    argv = _coalesce_session_name_args(argv)  # as main's parse does: ``-c my session auth principals``
+    # As main's parse does (``-c my session auth principals``), without the config-reading provider lookup.
+    argv = _coalesce_session_name_args(argv, memory_provider_commands=False)
     parser = argparse.ArgumentParser(prog="hermes")
     _add_top_level_flags(parser)
     parser.add_argument("command", nargs=argparse.PARSER)
@@ -132,20 +135,23 @@ def no_init_command_args(argv: list[str], *, profile_flag_consumed: bool = False
     return args.command[2:]
 
 
-def _coalesce_session_name_args(argv: list) -> list:
-    """Join unquoted multi-word session names after -c/--continue and -r/--resume.
+def _coalesce_session_name_args(argv: list, *, memory_provider_commands: bool = True) -> list:
+    """Join unquoted multi-word session names after -c/--continue and -r/--resume: ``hermes -c Pokemon
+    Agent Dev`` → ``['-c', 'Pokemon Agent Dev']``, up to the next flag or known top-level subcommand.
 
-    ``hermes -c Pokemon Agent Dev`` → ``['-c', 'Pokemon Agent Dev']``; tokens
-    are collected until the next flag (``-*``) or known top-level subcommand.
-    """
+    *memory_provider_commands* also counts the active memory provider's ``hermes <name>`` command as a
+    subcommand; that loads config, so the no-init classifier (``is_no_init_command``) turns it off."""
     _SUBCOMMANDS = {
         "chat", "model", "gateway", "setup", "whatsapp", "whatsapp-cloud", "login", "logout",
         "auth", "status", "cron", "doctor", "config", "pairing", "skills", "tools", "mcp",
-        "sessions", "insights", "update", "uninstall", "profile", "dashboard", "serve",
-        "desktop", "gui", "honcho", "claw", "plugins", "security", "acp", "webhook", "peer",
+        "sessions", "insights", "update", "uninstall", "profile", "dashboard", "serve", "webapp",
+        "desktop", "gui", "claw", "plugins", "security", "acp", "webhook", "peer",
         "memory", "dump", "debug", "backup", "import", "completion", "logs", "usage",
     }
     _SESSION_FLAGS = {"-c", "--continue", "-r", "--resume"}
+    if memory_provider_commands and _SESSION_FLAGS.intersection(argv):  # the provider's ``hermes <name>``
+        from plugins.memory import active_memory_provider_commands
+        _SUBCOMMANDS |= active_memory_provider_commands()
 
     result = []
     i = 0
@@ -154,7 +160,6 @@ def _coalesce_session_name_args(argv: list) -> list:
         if token in _SESSION_FLAGS:
             result.append(token)
             i += 1
-            # Collect subsequent non-flag, non-subcommand tokens as one name
             parts: list = []
             while (
                 i < len(argv)

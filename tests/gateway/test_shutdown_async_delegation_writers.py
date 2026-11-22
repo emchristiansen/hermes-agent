@@ -141,7 +141,7 @@ async def _stop_with_live_child(monkeypatch, tmp_path, answer, *, release_on_int
             patch('tools.process_registry.process_registry.kill_all', return_value=0), \
             patch('cron.scheduler.mark_running_jobs_interrupted', return_value=[]), \
             patch('tools.terminal_tool_lifecycle.cleanup_all_environments'), \
-            patch('tools.browser_tool_lifecycle.cleanup_all_browsers'), \
+            patch('tools.browser_session_lifecycle.cleanup_all_browsers'), \
             patch('gateway.status.remove_pid_file'), patch('gateway.status.publish_runtime_status'):
         handle = ad.dispatch_async_delegation(goal='bounded E5 child', context=None, toolsets=None,
             role='leaf', model='test/model', session_key='agent:main:telegram:dm:e5',
@@ -152,6 +152,7 @@ async def _stop_with_live_child(monkeypatch, tmp_path, answer, *, release_on_int
             ad._finalize(handle['delegation_id'], {'status': 'stalled', 'error': 'forced'}, 'stalled')
         runner, _ = make_restart_runner()
         runner._restart_drain_timeout = 0.0
+        runner._cron_drain_timeout = 0.0  # main's drain also waits on background delegations; this schedule interrupts at once
         runner._session_db = child_db
         try:
             await runner.stop()
@@ -286,12 +287,13 @@ async def test_a_dispatch_admitted_before_the_fence_but_not_yet_submitted_keeps_
             patch('tools.process_registry.process_registry.kill_all', return_value=0), \
             patch('cron.scheduler.mark_running_jobs_interrupted', return_value=[]), \
             patch('tools.terminal_tool_lifecycle.cleanup_all_environments'), \
-            patch('tools.browser_tool_lifecycle.cleanup_all_browsers'), \
+            patch('tools.browser_session_lifecycle.cleanup_all_browsers'), \
             patch('gateway.status.remove_pid_file'), patch('gateway.status.publish_runtime_status'):
         dispatcher.start()
         assert await asyncio.to_thread(published.wait, 30)
         runner, _ = make_restart_runner()
         runner._restart_drain_timeout = 0.0
+        runner._cron_drain_timeout = 0.0  # main's drain also waits on background delegations; this schedule interrupts at once
         runner._session_db = child_db
         try:
             await runner.stop()

@@ -31,7 +31,9 @@ LOGICAL = "local-logical-canonical-bot-chat"
 SUCCESSOR = "20261108_141119_successor"
 TASK_TITLE = "Write final outage and containment notice"
 DEFERRED = ["clarify", "memory", "web_extract", "manage_connections"]
-PRE_CONFIG = "agent:\n  disabled_toolsets: []\n"
+# Everything eager before the change (an explicit empty ``defer``): main defers manage_connections by
+# default (853ee49d), and this pre-change state must still carry every tool the change defers.
+PRE_CONFIG = "agent:\n  disabled_toolsets: []\ntools:\n  tool_search:\n    defer: []\n"
 POST_CONFIG = textwrap.dedent(
     """\
     agent:

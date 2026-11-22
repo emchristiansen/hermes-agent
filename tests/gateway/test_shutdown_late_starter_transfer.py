@@ -50,8 +50,8 @@ async def test_api_nested_transfer_must_not_escape_close(monkeypatch, tmp_path, 
     def childclose(*a,**kw):
         try:return real_child_close(*a,**kw)
         finally:child_closed.set()
-    def defer(c,f):
-        nested.append(f); return real_defer(c,f)
+    def defer(c,f,**kw):  # main hands the cleanup tail along (cleanup=)
+        nested.append(f); return real_defer(c,f,**kw)
     def parent():
         parent_entered.set(); assert begin_child.wait(30)
         r=dt._run_single_child(0,'late nested child',child=child,parent_agent=SimpleNamespace())
@@ -132,8 +132,8 @@ async def test_started_api_child_registration_transfer(monkeypatch,tmp_path,late
     def childclose(*a,**kw):
         try:return real_child_close(*a,**kw)
         finally:child_closed.set()
-    def defer(c,f):
-        nested.append(f);return real_defer(c,f)
+    def defer(c,f,**kw):  # main hands the cleanup tail along (cleanup=)
+        nested.append(f);return real_defer(c,f,**kw)
     def parent():
         r=dt._run_single_child(0,'already running nested child',child=child,parent_agent=SimpleNamespace())
         result.append(r);return r

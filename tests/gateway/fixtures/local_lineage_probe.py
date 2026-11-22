@@ -90,7 +90,7 @@ def probe(tmp_path):
                                   text='RECOVER_' + name.upper())
                 assert retry['result']['status'] == 'terminal', retry
             unknown = await rpc(ws, 'session.resume', session_id=sessions['unknown'])
-            assert [p['status'] for p in unknown['result']['pending']] == ['unknown', 'queued'], unknown
+            assert [p['status'] for p in unknown['result']['pending']] == ['unknown'], unknown  # the follower was steered into the lost claim: settled, never replayed
             # A rewritten profile_id no longer hashes to the session id: refused as corrupt.
             for name, reason in [('tampered', 'storage_unavailable'), ('fork', 'storage_unavailable')]:
                 refusal = await rpc(ws, 'session.resume', session_id=sessions[name])
@@ -138,7 +138,7 @@ def probe(tmp_path):
                 pids.append(proc.pid); epochs.append(desc['authority_epoch'])
                 asyncio.run(recovered(desc))
                 assert db_rows() == {'warm-safe': 'terminal', 'warm-reset': 'terminal', 'started': 'unknown',
-                                     'follower': 'queued', 'reset': 'terminal', 'tampered': 'queued', 'fork': 'queued', 'safe': 'terminal'}
+                                     'follower': 'terminal', 'reset': 'terminal', 'tampered': 'queued', 'fork': 'queued', 'safe': 'terminal'}
         assert all(route_targets[name] == targets[name] for name in ('safe', 'reset', 'unknown')), route_targets
         assert all(targets[name] != sessions[name] for name in ('safe', 'reset', 'unknown')), targets
         raw_texts = [next((m.get('content') for m in reversed(r['messages']) if m['role'] == 'user'), '') for r in peer.requests]

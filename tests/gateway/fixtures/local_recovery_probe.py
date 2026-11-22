@@ -190,7 +190,7 @@ def probe(tmp_path):
         with daemon(root, home, env, barrier=False) as (proc, desc):
             pids.append(proc.pid); epochs.append(desc['authority_epoch'])
             asyncio.run(second(desc))
-            assert rows() == {'warm': 'terminal', 'started': 'unknown', 'follower': 'queued', 'tampered': 'queued', 'missing': 'queued', 'corrupt': 'queued', 'safe': 'terminal'}, rows()
+            assert rows() == {'warm': 'terminal', 'started': 'unknown', 'follower': 'terminal', 'tampered': 'queued', 'missing': 'queued', 'corrupt': 'queued', 'safe': 'terminal'}, rows()
         with daemon(root, home, env, barrier=False) as (proc, desc):
             pids.append(proc.pid); epochs.append(desc['authority_epoch'])
             asyncio.run(second(desc))

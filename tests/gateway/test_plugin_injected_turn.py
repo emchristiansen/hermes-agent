@@ -464,9 +464,9 @@ WELL_INSIDE_THE_GRACE = 1.0  # seconds; the grace is 120 s
 # control -> (busy_input_mode, the agent redirects its active turn, the person's text runs as its own
 # turn, what the person sends)
 _BUSY_CONTROLS = {
-    "queue": ("queue", False, True, "B"),
+    "queue": ("queue", False, False, "B"),
     "steer": ("steer", False, False, "B"),
-    "interrupt": ("interrupt", False, True, "B"),
+    "interrupt": ("interrupt", False, False, "B"),
     "redirect": ("interrupt", True, False, "B"),
     "/steer": ("queue", False, False, "/steer B"),
 }
@@ -525,7 +525,7 @@ async def test_every_busy_control_a_person_sends_ends_the_wait(monkeypatch, prob
 
     assert waiting == (False, False, False) and superseded_after < WELL_INSIDE_THE_GRACE
     assert (len(controls), probe.turns, bg.handle.outcome, bg.refine.outcome) == (
-        int(control != "queue" and not refine), ["A", PROMPT, "B"] if own_turn else ["A", PROMPT],
+        int(not refine), ["A", PROMPT, "B"] if own_turn else ["A", PROMPT],
         "cancelled", ["cancelled" if refine else "completed"])
 
 

@@ -11,16 +11,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from gateway.session_contract import Principal, SessionRef
+from gateway.session_contract import SessionActor, SessionRef
 
 REQUEST = 'kanban:' + json.dumps(['theseus-active', 't_exitrec', 42], separators=(',', ':'))
 
 CHILD = """import json, os, signal, sys, time, psutil
+from hermes_cli.process_identity import worker_birth
 me = psutil.Process()
 out = os.fdopen(os.dup(sys.stdout.fileno()), 'wb', buffering=0)
 def send(frame):
     out.write((json.dumps(frame) + '\\n').encode())
-send({'type': 'hello', 'pid': me.pid, 'birth': me.create_time(), 'ancestors': [p.pid for p in me.parents()[:3]]})
+send({'type': 'hello', 'pid': me.pid, 'birth': worker_birth(me), 'ancestors': [p.pid for p in me.parents()[:3]]})
 shape = sys.argv[1]
 for line in sys.stdin.buffer:
     frame = json.loads(line)
@@ -80,7 +81,7 @@ def _run(managed, db, authority, tmp_path, expect_unknown=False):
     from gateway.session_contract import Submission
     from gateway.session_policy import build_policy
     from hermes_state_runtime import claim_session_input
-    actor = Principal('human', 'owned', frozenset({'session:submit', 'session:control'}), 'cli')
+    actor = SessionActor('human', 'owned', frozenset({'session:submit', 'session:control'}), 'cli')
     ref = SessionRef('owned', 's')
     policy = build_policy({'cwd': str(tmp_path), 'model': 'm'}, {}, profile_terminal=False)
 

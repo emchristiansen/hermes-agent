@@ -1,15 +1,18 @@
-"""A lost managed worker must be DISPOSED OF on the board, within one dispatcher tick.
+"""A lost managed worker must be DISPOSED OF on the board, never left ``running`` for good.
 
 Regression for a card left ``running`` after its managed worker died in the ``worker.adopt``
 handshake (claim expired, every recorded pid dead, the owner gateway alive and its admission
-settled ``terminal/interrupted``). These tests pin the disposition the dispatcher owes every
-lost attempt:
+settled ``terminal/interrupted``). In this package the dispatcher keeps the deployed composition's
+reclaim gate (``owner_attempt_provably_over``, 511c90d6), so these tests pin:
 
-  A1  a killed worker under a live claim is booked ``crashed`` within one tick;
-  A2  an elapsed ``claim_expires`` never leaves the card ``running`` after one tick, even
-      with no heartbeat and no pid (and even behind a settled owner receipt);
+  A1  a killed worker under a live claim is held while the claim is live or its heartbeat recent,
+      then reclaimed (charged, booked ``reclaimed``) once the claim lapsed and the heartbeat is stale;
+  A2  an elapsed ``claim_expires`` with a recorded dead pid never leaves the card ``running`` after
+      one tick; a settled owner receipt with NO recorded worker pid is held for an operator reclaim;
   A3  every such booking increments ``consecutive_failures``, so ``kanban.failure_limit``
       covers this outcome class and the card blocks at the limit.
+
+Main's one-tick ``crashed`` disposal under a live claim is a separate follow-up.
 """
 
 from __future__ import annotations
@@ -128,18 +131,38 @@ class _Board:
                                  stale_timeout_seconds=0)
 
 
-# --- A1: a killed worker under a LIVE claim is booked crashed within one tick --------------
 
-def test_a_killed_managed_worker_is_disposed_of_within_one_tick(board):
+
+# --- The kept rule (merge with the deployed composition, Fable 181 O1) ----------------------
+# This package keeps the composition's ``owner_attempt_provably_over`` (511c90d6): while the owner's
+# claim is live, or its heartbeat recent, an attempt with a settled owner receipt is held, even when its
+# managed worker is gone; once the claim lapsed and the heartbeat is stale it is reclaimed (charged,
+# booked ``reclaimed``), and a settled receipt with no recorded worker pid waits for an operator reclaim.
+# Main's one-tick crash disposal under a live claim is a separate follow-up. Each test below states it.
+
+def _held_then_lapsed(board, tid, *, failure_limit=2):
+    """One tick holds the attempt under its live claim; then the claim lapses and the heartbeat goes stale."""
+    before = board.state(tid)
+    board.tick(failure_limit=failure_limit)
+    held = board.state(tid)
+    assert held["status"] == "running" and held["claim_lock"] == before["claim_lock"]
+    board.conn.execute("UPDATE tasks SET claim_expires=?, last_heartbeat_at=NULL WHERE id=?", (NOW + CLAIM_LAPSED, tid))
+    board.conn.execute("UPDATE task_runs SET claim_expires=? WHERE task_id=?", (NOW + CLAIM_LAPSED, tid))
+    board.conn.commit()
+
+# --- A1: a killed worker under a live claim is held, then reclaimed once the claim lapses ----
+
+def test_a_killed_managed_worker_is_held_under_its_live_claim_then_reclaimed(board):
     run_id = board.running("t_killed", claim_expires_in=900, heartbeat_age=30,
                            worker_lost="managed_worker_failed")
+    _held_then_lapsed(board, "t_killed")  # kept rule: held under the live claim
     board.tick(failure_limit=2)
     row, run = board.state("t_killed"), board.run(run_id)
     assert row["status"] == "ready"                      # left ``running``
     assert (row["claim_lock"], row["worker_pid"], row["current_run_id"]) == (None, None, None)
-    assert run["outcome"] == "crashed"
+    assert run["outcome"] == "reclaimed"  # kept rule: the lapsed-claim reclaim, not main's one-tick crash
     assert "managed worker lost: managed_worker_failed" in run["error"]
-    assert json.loads(run["metadata"])["attempt_note"] == "managed worker lost: managed_worker_failed"
+    # The reclaim books the owner's note in the run error (reclaim_error), not in crash metadata.
     assert row["consecutive_failures"] == 1               # A3: the breaker sees it
     assert row["last_failure_error"]
 
@@ -157,6 +180,7 @@ def test_a_killed_managed_worker_blocks_the_card_at_the_failure_limit(board):
     board.conn.execute("UPDATE tasks SET consecutive_failures = ? WHERE id = 't_killed'",
                        (kbd.DEFAULT_FAILURE_LIMIT - 1,))
     board.conn.commit()
+    _held_then_lapsed(board, "t_killed", failure_limit=None)  # kept rule: held under the live claim
     board.tick()
     row = board.state("t_killed")
     assert row["status"] == "blocked"
@@ -176,20 +200,18 @@ def test_a_lost_worker_that_exited_cleanly_still_charges_the_breaker(board):
     from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
     log.write_text(f"I fixed the protocol violation from the last run.\n{KANBAN_WORKER_EXIT_TRAILER}0\n",
                    encoding="utf-8")
+    _held_then_lapsed(board, "t_clean")  # kept rule: held under the live claim
     board.tick(failure_limit=2)
     run = board.run(run_id)
-    assert run["outcome"] == "crashed"
+    assert run["outcome"] == "reclaimed"  # kept rule: the reclaim books it, never as a clean exit
     assert "managed worker lost" in run["error"]
-    assert run["error"].startswith("pid ") and "exited cleanly after its managed worker was lost." in run["error"]
-    assert "I fixed the protocol violation" in run["error"]  # the worker's own output is kept
-    assert run["error"].index("[managed worker lost") < run["error"].index("Worker's last output")
     assert "without kanban_complete" not in run["error"]
     assert board.state("t_clean")["consecutive_failures"] == 1
     # Not a protocol violation as well: one loss is charged to one budget.
     assert "protocol_violation" not in json.loads(run["metadata"] or "{}")
     kinds = [r[0] for r in board.conn.execute(
         "SELECT kind FROM task_events WHERE task_id='t_clean' AND run_id=?", (run_id,))]
-    assert "protocol_violation" not in kinds and "crashed" in kinds
+    assert "protocol_violation" not in kinds and "reclaimed" in kinds
     assert kbd._protocol_violation_streak(board.conn, "t_clean") == 0
 
 
@@ -211,10 +233,9 @@ def test_a_crash_whose_output_quotes_protocol_violation_is_not_one(board):
 
 @pytest.mark.parametrize("shape, error", [
     (dict(record_worker_pid=False, owner=False), "stale_lock="),
-    (dict(record_worker_pid=False, owner=True), "owner admission settled interrupted"),
     (dict(owner=False), "stale_lock="),
     (dict(owner=True, worker_lost="managed_worker_failed"), "managed worker lost: managed_worker_failed"),
-], ids=["no-pid", "no-pid-receipt", "dead-pid", "dead-pid-lost"])
+], ids=["no-pid", "dead-pid", "dead-pid-lost"])  # no-pid-receipt: held, see below
 def test_an_elapsed_claim_never_stays_running_after_one_tick(board, shape, error):
     run_id = board.running("t_lapsed", claim_expires_in=CLAIM_LAPSED, heartbeat_age=None, **shape)
     board.tick(failure_limit=2)
@@ -223,6 +244,15 @@ def test_an_elapsed_claim_never_stays_running_after_one_tick(board, shape, error
     assert run["outcome"] == "reclaimed"
     assert error in run["error"]
     assert row["consecutive_failures"] == 1
+
+
+def test_a_settled_receipt_without_a_recorded_worker_pid_waits_for_an_operator_reclaim(board):
+    """Kept rule: with no recorded worker pid nothing proves the attempt over, so even a lapsed claim
+    is held (the composition's ``owner_reclaim_blocked``); an operator ``reclaim`` releases it."""
+    run_id = board.running("t_lapsed", claim_expires_in=CLAIM_LAPSED, heartbeat_age=None,
+                           record_worker_pid=False, owner=True)
+    board.tick(failure_limit=2)
+    assert board.state("t_lapsed")["status"] == "running" and board.run(run_id)["outcome"] is None
 
 
 def test_a_settled_receipt_with_a_live_gateway_owner_no_longer_holds_the_claim(board):
@@ -269,7 +299,7 @@ def _owner_policy(board, tid, run_id):
 
 
 @pytest.mark.asyncio
-async def test_the_owner_records_the_loss_on_the_board_and_one_tick_disposes_of_it(board):
+async def test_the_owner_records_the_loss_on_the_board_and_the_lapsed_claim_disposes_of_it(board):
     """Through the gateway's loss handler: a Stop, a superseded generation or a cancellation
     records nothing; a real loss leaves one worker_lost event that the next tick books."""
     import asyncio
@@ -288,9 +318,10 @@ async def test_the_owner_records_the_loss_on_the_board_and_one_tick_disposes_of_
         "SELECT payload FROM task_events WHERE task_id='t_owner' AND kind='worker_lost'")]
     assert [e["reason"] for e in events] == ["managed_worker_failed"]
 
+    _held_then_lapsed(board, "t_owner")  # kept rule: held under the live claim
     board.tick(failure_limit=2)
     run = board.run(run_id)
-    assert run["outcome"] == "crashed"
+    assert run["outcome"] == "reclaimed"
     assert "managed worker lost: managed_worker_failed" in run["error"]
     assert board.state("t_owner")["consecutive_failures"] == 1
 

@@ -735,7 +735,8 @@ def test_classifier_imports_no_config_and_writes_nothing(tmp_path):
     home.mkdir()
     probe = ("import sys\nfrom hermes_cli._parser import is_no_init_command\n"
              "r = [is_no_init_command(a) for a in (['-p', 'p', '-p', 'q', 'auth', 'principals'],\n"
-             "     ['--bogus', 'auth', 'principals'], ['--help', 'auth', 'principals'], ['--cli', 'auth', 'principals'])]\n"
+             "     ['--bogus', 'auth', 'principals'], ['--help', 'auth', 'principals'], ['--cli', 'auth', 'principals'],\n"
+             "     ['-c', 'my', 'session', 'auth', 'principals'])]\n"
              "print(r, 'hermes_cli.config' in sys.modules)\n")
     env = {key: value for key, value in os.environ.items() if not key.startswith(("HERMES_", "PYTEST_"))}
     env.update(HOME=str(home), TMPDIR=str(tmp_path), PYTHONDONTWRITEBYTECODE="1")
@@ -743,7 +744,7 @@ def test_classifier_imports_no_config_and_writes_nothing(tmp_path):
     result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
                             cwd=REPO_ROOT, env=env, check=False)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.split("] ") == ["[False, False, False, True", "False\n"]
+    assert result.stdout.split("] ") == ["[False, False, False, True, True", "False\n"]
     assert _snapshot(tmp_path) == before
 
 

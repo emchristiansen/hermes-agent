@@ -191,6 +191,7 @@ async def test_process_watcher_follows_the_owning_profile(
                 _transfer_to_parent(rig, leg)
             if ticks >= 2 or (path == "agent" and owner != "live_handoff"):
                 leg.proc.mark_exited(2)
+                leg.proc._finish_claimed = True  # as _move_to_finished leaves it once its receipt is written
 
         with monkeypatch.context() as clock:
             clock.setattr(asyncio, "sleep", tick)

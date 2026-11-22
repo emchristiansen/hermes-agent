@@ -124,6 +124,8 @@ def __getattr__(name: str) -> Any:
     # ``CODEX_OAUTH_USER_AGENT`` needs the version, which can run ``git``: resolve it on first use, not
     # at import, so importing these constants (the read-only principal projection does) starts nothing.
     if name == "CODEX_OAUTH_USER_AGENT":
+        from hermes_cli.version_info import get_version_info
+
         value = globals()[name] = f"hermes-cli/{get_version_info().base_version}"  # cache: later reads skip this
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

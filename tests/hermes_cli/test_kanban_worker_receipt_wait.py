@@ -15,6 +15,7 @@ import json
 import time
 
 import pytest
+from websockets.protocol import State
 
 from hermes_cli import kanban_worker_client
 from hermes_cli.gateway_client import GatewayClient
@@ -22,6 +23,8 @@ from hermes_cli.gateway_client import GatewayClient
 
 class _SlowReceiptOwner:
     """Admits at once with a running receipt; answers the first poll only after a 120 s stall."""
+
+    state = State.OPEN  # the client refuses to write to a socket that is not open
 
     def __init__(self):
         self.inbox, self.sent = asyncio.Queue(), []
@@ -103,6 +106,8 @@ class _Owner:
     """One owner life on one socket: ``answers[method]`` builds each reply; ``None`` leaves the
     request unanswered and ``'hang-up'`` closes the socket instead."""
 
+    state = State.OPEN
+
     def __init__(self, **answers):
         self.answers, self.inbox, self.sent = answers, asyncio.Queue(), []
 
@@ -121,6 +126,7 @@ class _Owner:
     async def __anext__(self):
         raw = await self.inbox.get()
         if raw is None:
+            self.state = State.CLOSED  # the hang-up closed the socket
             raise StopAsyncIteration
         return raw
 
@@ -197,6 +203,8 @@ async def test_receipt_reads_stop_once_the_owner_has_been_silent_past_the_outage
                      'connect-hangs': ([first, connecting], 1.5)}[next_life]
     _owner_lives(monkeypatch, *lives)
     monkeypatch.setattr(kanban_worker_client, 'RECEIPT_OUTAGE_S', outage)
+    # main jitters the pause between reads (1-2 s); hold it at the 1 s this test's outages are placed around.
+    monkeypatch.setattr('agent.retry_utils.jittered_backoff', lambda *a, **k: 1.0)
     began = time.monotonic()
     with pytest.raises(GatewayClientError, match=rf'^Gateway gave no receipt for admission a1 for {outage:g} s'):
         await asyncio.wait_for(kanban_worker_client.run(_PARAMS, str(tmp_path / 'kanban.db')), 5)
@@ -367,5 +375,5 @@ async def test_a_send_cut_off_by_a_close_reports_an_unknown_delivery():
             raise ConnectionClosedOK(Close(1000, ''), Close(1000, ''), True)
 
     async with GatewayClient(_Closing()) as client:
-        with pytest.raises(GatewayClientError, match='whether the gateway received it is unknown'):
+        with pytest.raises(GatewayClientError, match='outcome is unknown'):
             await client.rpc('prompt.receipt', session_id='s1', admission_id='a1')

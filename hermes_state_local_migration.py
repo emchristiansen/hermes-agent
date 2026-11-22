@@ -38,6 +38,22 @@ def not_client_labels():
     return LEGACY_LOCAL_SOURCES | NOT_CLIENT_LABELS | _messaging_labels()
 
 
+def routed_origin(row):
+    """Whether *row*'s ``origin_json`` names a route. On a local surface's row (a ``session.mutate import``
+    lands as ``cli``) a foreign import's provenance alone, ``{"imported_from": ...}``, is not one: it records
+    where the imported transcript ends (hermes_state_portability.FOREIGN_IMPORT_THROUGH)."""
+    origin_json = row['origin_json']
+    if not origin_json:
+        return False
+    if row['source'] not in LEGACY_LOCAL_SOURCES:
+        return True
+    try:
+        origin = json.loads(origin_json)
+    except (TypeError, ValueError):
+        return True
+    return not (isinstance(origin, dict) and set(origin) == {'imported_from'})
+
+
 def client_label(source):
     """Whether *source* is a client app's own label (``mobile``, ``ios``): not a local surface, a
     shipped messaging platform, or an automation / foreign-writer label."""
@@ -94,7 +110,7 @@ def validate_legacy_row(db, row, *, subject=None):
     # ``authorize_history``'s rule, so it adopts like an unstamped row.
     user_id = row.get('user_id')
     if (not legacy_history_row(row)
-            or any(row.get(k) for k in ('session_key', 'chat_id', 'origin_json'))
+            or any(row.get(k) for k in ('session_key', 'chat_id')) or routed_origin(row)
             or (user_id and not legacy_account_label(row) and not login_owned_by(row, subject))
             or row.get('profile_name') not in (None, '', db._own_profile_name() or 'default')):
         raise RuntimeStoreError('not_found')
@@ -130,8 +146,11 @@ def bind_legacy_target(db, conn, receipt):
     # app's own label is the exception: bound, the row has a route, so the label alone would read it as
     # a messaging chat; it becomes the Desktop chat it resumes as (``created_source`` keeps provenance).
     label = 'desktop' if client_history_row(dict(row)) else row['source']
+    # A foreign import's provenance (and where its transcript ends) stays beside the route it now resumes on.
+    imported = json.loads(row['origin_json']).get('imported_from') if row['origin_json'] else None
+    origin = {**source, 'imported_from': imported} if imported is not None and isinstance(source, dict) else source
     conn.execute('UPDATE sessions SET source=?,session_key=?,chat_id=?,user_id=?,chat_type=?,origin_json=? WHERE id=?',
-                 (label, receipt['route'], receipt['session_id'], receipt['principal_id'], 'dm', _json(source), target))
+                 (label, receipt['route'], receipt['session_id'], receipt['principal_id'], 'dm', _json(origin), target))
     conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (key, _json({
         'session_id': receipt['session_id'], 'profile_id': receipt['profile_id'],
         'principal_id': receipt['principal_id'], 'legacy_session_id': target})))

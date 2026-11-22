@@ -598,11 +598,11 @@ def _loader_frames(board, monkeypatch):
     """The attempt frame for a card through the real effective loader and the real attempt policy
     producer, with route inputs stamped around the config read as a worker does."""
     from dataclasses import asdict
-    from gateway.session_contract import Principal
+    from gateway.session_contract import SessionActor
     from gateway.session_kanban import build_kanban_policy
     from hermes_cli.config_effective import load_user_config_effective
     monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda name: str(board.profile))
-    actor = Principal("owner", str(board.profile), frozenset({"session:create"}), "transport")
+    actor = SessionActor("owner", str(board.profile), frozenset({"session:create"}), "transport")
     connection = SimpleNamespace(authority=SimpleNamespace(profile_id=str(board.profile)), actor=actor, native_owner=True)
 
     def policy_frame(tid):
@@ -712,7 +712,7 @@ def test_the_route_stamp_comes_from_the_policy_capture_not_the_failure(tmp_path,
     scope's, which the real loader overlays (here: a fallback chain the policy did not see)."""
     from contextlib import closing
     from dataclasses import asdict
-    from gateway.session_contract import Principal
+    from gateway.session_contract import SessionActor
     from gateway.session_kanban import build_kanban_policy
     from hermes_cli.kanban_db_connect import connect
     from hermes_cli.kanban_db_provider_wall import wall_from_exception
@@ -737,7 +737,7 @@ def test_the_route_stamp_comes_from_the_policy_capture_not_the_failure(tmp_path,
                                  workspace_path=str(workspace))
         kb.recompute_ready(conn)
         task = kb.claim_task(conn, task_id)
-    actor = Principal("owner", str(tmp_path), frozenset({"session:create"}), "transport")
+    actor = SessionActor("owner", str(tmp_path), frozenset({"session:create"}), "transport")
     connection = SimpleNamespace(authority=SimpleNamespace(profile_id=str(tmp_path)), actor=actor, native_owner=True)
     params = dict(board="owned", task_id=task.id, run_id=task.current_run_id, claim_lock=task.claim_lock)
     pool = _codex_quota_exhausted_error(109934, exhausted="credential_pool")

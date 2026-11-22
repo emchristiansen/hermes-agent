@@ -1621,14 +1621,15 @@ def interrupt_all(reason: str = "shutdown", *, resumable: bool = False) -> int:
     return _interrupt_records(targets, "interrupt_all", reason, "Interrupted %d async delegation(s) (%s)")
 
 
-def shutdown_all(reason: str = "shutdown") -> int:
+def shutdown_all(reason: str = "shutdown", *, resumable: bool = False) -> int:
     """Process shutdown: refuse every new dispatch from now on, then ``interrupt_all``. Fenced first,
     so a dispatch admitted before it is interrupted and a later one refused. ``join_workers`` then
-    tells the closing SessionDB whether the interrupted units have really finished writing."""
+    tells the closing SessionDB whether the interrupted units have really finished writing.
+    ``resumable`` is ``interrupt_all``'s: the gateway's stop passes it, so each child keeps a resumable record."""
     global _shutdown_fenced
     with _records_lock:
         _shutdown_fenced = True
-    return interrupt_all(reason)
+    return interrupt_all(reason, resumable=resumable)
 
 
 def interrupt_for_session(

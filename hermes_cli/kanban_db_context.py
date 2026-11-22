@@ -165,8 +165,10 @@ def _ctx_attempt_entries(runs: list) -> list[tuple[int, list]]:
 
 
 # What the crash sweep books on a rate-limited run; any other key is something the attempt or an
-# operator recorded, so that run keeps its own entry.
-_WALL_BOOKING_KEYS = frozenset({"pid", "claimer", "exit_code", "retry_status", "provider_wall"})
+# operator recorded, so that run keeps its own entry. ``attempt_note`` is the sweep's own clause from
+# the owner's record (``apply_attempt_note``: "owner admission settled failed" on a walled turn); a
+# lost managed worker also books ``worker_lost``, which keeps that run its own entry.
+_WALL_BOOKING_KEYS = frozenset({"pid", "claimer", "exit_code", "retry_status", "provider_wall", "attempt_note"})
 
 
 def _ctx_is_wall(run) -> bool:

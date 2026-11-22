@@ -460,12 +460,13 @@ EXPECTED_SITES = {  # module -> enclosing function -> owner expression per owned
         "_completion_delivery_ready": ["self", "self"],  # session store + the API adapter's SessionDB open
         "_served_api_server_event_scope": ["self"],  # served profiles' state.db ownership read
         "_deliver_completion_notification_scoped": ["self"], "_flush_process_completion_batch": ["self"],
-        "_deliver_async_delegation_group_scoped": ["self"], "_run_process_watcher": ["self"],  # admission reads
+        "_deliver_async_delegation_group_scoped": ["self"], "_watch_process": ["self"],  # admission reads (main moved the loop out of _run_process_watcher)
         "_async_delegation_watcher": ["self"],  # orphaned-completion ledger sweep (durable writes)
     },
     "gateway/session_automation.py": {  # authority admission-ledger reads/writes
         "prepare_heartbeat": ["runner", "runner", "runner"], "withdraw_process_ticks": ["runner"],
         "move_route_wakes": ["runner"], "_fold_queued_kanban_wakes": ["authority.runner"],
+        "_admit_folded_completion": ["authority.runner"],  # the folded completion's waiting check
     },
     "gateway/wake.py": {  # API adapter SessionDB open, continuation resolve, delivery-row write
         "persist_delegation_delivery": ["getattr(adapter, 'gateway_runner', None)"] * 3,

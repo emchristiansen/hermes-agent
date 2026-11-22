@@ -101,7 +101,7 @@ async def _stop_during_maintenance(monkeypatch, *, release_at_quiesce=False, vac
             patch("tools.process_registry.process_registry.kill_all", return_value=0), \
             patch("cron.scheduler.mark_running_jobs_interrupted", return_value=[]), \
             patch("tools.terminal_tool_lifecycle.cleanup_all_environments"), \
-            patch("tools.browser_tool_lifecycle.cleanup_all_browsers"), \
+            patch("tools.browser_session_lifecycle.cleanup_all_browsers"), \
             patch("gateway.status.remove_pid_file"), patch("gateway.status.publish_runtime_status"):
         housekeeping.start()
         assert await asyncio.to_thread(in_pass.wait, 30)

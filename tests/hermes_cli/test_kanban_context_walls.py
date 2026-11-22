@@ -135,6 +135,27 @@ def test_a_wall_that_recorded_more_than_the_sweeps_booking_keeps_its_own_entry(c
     assert "### Attempt 2 — rate_limited" in context and "cmwAUTHOR2" in context and "build-7" in context
 
 
+def test_walls_carrying_the_sweeps_attempt_note_still_fold(conn, clock, monkeypatch):
+    """The crash sweep adds the owner's own clause (``apply_attempt_note``) to a walled turn's booking:
+    still the sweep's booking, so the walls stay one entry; a lost managed worker's run does not fold."""
+    tid = kb.create_task(conn, title="owner", assignee="w")
+    for _ in range(4):
+        _walled_attempt(conn, tid, clock, monkeypatch)
+    rows = conn.execute("SELECT id, metadata FROM task_runs WHERE task_id=? ORDER BY id", (tid,)).fetchall()
+    with kb.write_txn(conn):
+        for row in rows:
+            meta = json.loads(row["metadata"])
+            meta["attempt_note"] = "owner admission settled failed"
+            conn.execute("UPDATE task_runs SET metadata=? WHERE id=?", (json.dumps(meta), row["id"]))
+    assert "### Attempts 1–4 — rate_limited ×4" in kb.build_worker_context(conn, tid)
+    lost = json.loads(rows[2]["metadata"]) | {"attempt_note": "managed worker lost: managed_worker_failed",
+                                              "worker_lost": {"reason": "managed_worker_failed"}}
+    with kb.write_txn(conn):
+        conn.execute("UPDATE task_runs SET metadata=? WHERE id=?", (json.dumps(lost), rows[2]["id"]))
+    context = kb.build_worker_context(conn, tid)
+    assert "### Attempts 1–2 — rate_limited ×2" in context and "### Attempt 3 — rate_limited" in context
+
+
 def test_the_newest_attempts_cap_still_bounds_the_context(conn, clock, monkeypatch):
     tid = kb.create_task(conn, title="owner", assignee="w")
     for n in range(14):

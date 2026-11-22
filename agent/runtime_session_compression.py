@@ -45,8 +45,14 @@ class RuntimeSessionCompressionMixin:
     def get_compression_tip(self, session_id):
         return self._apply('compression.lineage', {'target': session_id})['tip']
 
-    def resolve_resume_session_id(self, session_id):
+    def resolve_resume_session_id(self, session_id, *, strict=False):
+        # strict: a remote read already raises on failure rather than returning the input id.
         return self._apply('compression.lineage', {'target': session_id})['resume']
+
+    def end_conversation_in_place(self, session_id):
+        # A managed worker never ends its conversation in place (ACP /reset runs on the local store).
+        from agent.runtime_session_store import WorkerPersistenceError
+        raise WorkerPersistenceError('unsupported_operation')
 
     def declared_scope_identity(self, session_id):
         return tuple(self._apply('compression.lineage', {'target': session_id})['identity'])

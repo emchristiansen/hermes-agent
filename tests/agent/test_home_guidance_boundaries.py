@@ -660,7 +660,25 @@ def _import(db, producer, tmp_path):
         foreign.write_text("".join(json.dumps({"type": role, "message": {
             "role": role, "content": text if role == "user" else [{"type": "text", "text": text}]}}) + "\n"
             for role, text in FOREIGN), encoding="utf-8")
-        return import_foreign_session("claude", foreign, db=db)
+        # The CLI imports through the gateway's ``session.mutate import`` (the gateway is the only state.db
+        # writer): answer that call with the same runtime mutation the gateway commits, on this db.
+        from unittest import mock
+        from hermes_state_runtime import begin_runtime_epoch
+        epoch = begin_runtime_epoch(db, instance_id="guidance-import")
+
+        def call(method, **params):
+            import hermes_state_runtime
+            from hermes_cli.gateway_client import GatewayClientError
+            assert method == "session.mutate"
+            try:
+                return hermes_state_runtime.mutate_runtime_session(
+                    db, epoch=epoch, principal_id="owner", session_id=params["session_id"],
+                    request_id=params["request_id"], expected_revision=params["expected_revision"],
+                    operation=params["operation"], payload=params["payload"])
+            except (hermes_state_runtime.RuntimeStoreError, ValueError) as exc:  # a refusal crosses the wire
+                raise GatewayClientError(getattr(exc, "reason", "invalid_params")) from exc
+        with mock.patch("hermes_cli.gateway_session_store.session_store", lambda: SimpleNamespace(call=call)):
+            return import_foreign_session("claude", foreign)
     return db.import_foreign_history({"tool": "codex", "path": str(tmp_path / "x.jsonl"), "foreign_session_id": "f-1"},
                                      [{"role": role, "content": text} for role, text in FOREIGN],
                                      title="imported", cwd=None, profile=None)["session_id"]
@@ -1296,53 +1314,46 @@ def test_acp_reset_ends_the_conversation_rows_but_not_the_session(home, tmp_path
 
 
 # ── An import's boundary binds to its own rows (R5-OPUS-02) ─────────────────────────────────────────────────────────
-# The CLI import publishes the session, appends each imported row in its own transaction, then records the boundary.
-# A client can resume the session meanwhile; the boundary binds to the rows the import itself appended, so a Hermes
-# reply written in between is never inside it.
+# The CLI import goes through the gateway's ``session.mutate import``: the session, every imported row and the
+# boundary commit in ONE transaction (``hermes_state_mutations._import``), so no Hermes turn can land before, between
+# or after the imported rows inside it. What a client can still do is resume the session after that commit and before
+# the cosmetic rename that follows it; the boundary is the import's own last row, so that Hermes reply is never inside.
 
 
 @pytest.mark.parametrize("entry", ["construction", "turn"])
-@pytest.mark.parametrize("interleave", ["none", "before-rows", "between-rows", "after-rows"])
+@pytest.mark.parametrize("interleave", ["none", "before-rename"])
 def test_a_hermes_turn_during_a_cli_import_is_never_inside_its_boundary(home, tmp_path, no_network, monkeypatch,
                                                                          interleave, entry):
     """Real CLI import with a real Hermes turn (constructor, turn, persisted reply) interleaved deterministically
-    after the session is published (before the first imported row), between the imported rows, or after them (before
-    the boundary is recorded) — or after the import (``none``). The boundary ends before the first row the import did
-    not append, so the Hermes reply always counts: after prompt loss and file B the next turn carries a notice."""
+    after the import committed and before its rename, or after the whole import (``none``). The imported rows never
+    take the per-row append path, and the boundary ends at the import's last row, so the Hermes reply always counts:
+    after prompt loss and file B the next turn carries a notice."""
     from hermes_state_portability import FOREIGN_IMPORT_THROUGH
     _write_config(home, home_guidance_file=SOURCE)
     db = _real_db(tmp_path)
     try:
-        state = {"import_rows": 0, "resuming": False, "done": False}
+        state = {"row_appends": 0, "done": False}
+        append = db.append_message
 
-        def resume_once(session_id):
+        def append_message(session_id, role, *args, **kwargs):
             if not state["done"]:
-                state["done"] = state["resuming"] = True
-                try:
-                    _continued_in_hermes(home, db, session_id)
-                finally:
-                    state["resuming"] = False
-        if interleave in ("before-rows", "between-rows"):
-            append = db.append_message
+                state["row_appends"] += 1  # an import row written outside the import's own transaction
+            return append(session_id, role, *args, **kwargs)
+        monkeypatch.setattr(db, "append_message", append_message)
+        if interleave == "before-rename":
+            from hermes_state_runtime import mutate_runtime_session as real_mutate
 
-            def append_message(session_id, role, *args, **kwargs):
-                if not state["resuming"]:  # one of the import's own appends
-                    if state["import_rows"] == (0 if interleave == "before-rows" else 1):
-                        resume_once(session_id)
-                    state["import_rows"] += 1
-                return append(session_id, role, *args, **kwargs)
-            monkeypatch.setattr(db, "append_message", append_message)
-        elif interleave == "after-rows":
-            record = db.record_foreign_import
-
-            def record_foreign_import(session_id, origin, *rows):  # any signature: the same interleaving on r5
-                assert len(db.get_messages_as_conversation(session_id)) == len(FOREIGN)  # visible to a resume
-                resume_once(session_id)
-                return record(session_id, origin, *rows)
-            monkeypatch.setattr(db, "record_foreign_import", record_foreign_import)
+            def mutate(db_, **params):
+                if params["operation"] == "rename" and not state["done"]:
+                    state["done"] = True
+                    _continued_in_hermes(home, db, params["session_id"])
+                return real_mutate(db_, **params)
+            monkeypatch.setattr("hermes_state_runtime.mutate_runtime_session", mutate)
         session_id = _import(db, "cli", tmp_path)
+        assert state["row_appends"] == 0
         assert state["done"] == (interleave != "none")
         if interleave == "none":
+            state["done"] = True
             _continued_in_hermes(home, db, session_id)
         through = json.loads(db.get_session(session_id)["origin_json"])["imported_from"][FOREIGN_IMPORT_THROUGH]
         rows = db.get_messages(session_id)
@@ -1350,8 +1361,7 @@ def test_a_hermes_turn_during_a_cli_import_is_never_inside_its_boundary(home, tm
         hermes = [r["id"] for r in rows if r["id"] not in imported]  # the turn's own user row too
         assert len(imported) == len(FOREIGN) and "Hermes reply" in [r["content"] for r in rows]
         assert all(h > through for h in hermes)
-        expected = {"before-rows": 0, "between-rows": imported[0]}.get(interleave, imported[-1])
-        assert through == expected
+        assert through == imported[-1]
         db.update_system_prompt(session_id, None)
         home.core.write_text(CORE_B, encoding="utf-8")
         sent, decided = _next_turn(db, session_id, entry)

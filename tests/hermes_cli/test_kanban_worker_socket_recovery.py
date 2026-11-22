@@ -54,7 +54,7 @@ class _Owner:
         owner = self
 
         @asynccontextmanager
-        async def _connect():
+        async def _connect(ready_timeout=None):
             owner.dials += 1
             owner._step(owner.connects, owner.after)
 
@@ -62,7 +62,7 @@ class _Owner:
                 def __init__(self):
                     self.events = asyncio.Queue()
 
-                async def rpc(self, method, **params):
+                async def rpc(self, method, *, _timeout=None, **params):
                     owner.calls.append(method)
                     if method == "kanban.run":
                         owner._step(owner.submits)
@@ -138,15 +138,24 @@ async def test_a_draining_or_retired_authority_mid_turn_is_asked_again(monkeypat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("lost", [_disconnect(), gateway_client.GatewayRPCError("runtime_draining")],
-                         ids=["answer-lost", "draining"])
-async def test_a_claim_with_no_answer_is_resubmitted(monkeypatch, _worker_env, clock, lost):
-    # No admission id reached the worker, so it asks again; the owner answers a repeated
-    # kanban.run for the same attempt with the same admission.
-    owner = _Owner(connects=[None, None], submits=[lost], receipts=["terminal"])
+async def test_a_refused_claim_is_resubmitted(monkeypatch, _worker_env, clock):
+    # A definite refusal (the claim never reached a live authority) is asked again; the owner
+    # answers a repeated kanban.run for the same attempt with the same admission.
+    owner = _Owner(connects=[None, None], submits=[gateway_client.GatewayRPCError("runtime_draining")],
+                   receipts=["terminal"])
 
     assert await _run(owner, monkeypatch, _worker_env) == 0
     assert owner.calls.count("kanban.run") == 2
+
+
+@pytest.mark.asyncio
+async def test_a_claim_whose_answer_was_lost_is_never_resubmitted(monkeypatch, _worker_env, clock):
+    # The kanban.run may have reached the owner: asking again could run the claim twice.
+    owner = _Owner(connects=[None, None], submits=[_disconnect()], receipts=["terminal"])
+
+    with pytest.raises(gateway_client.GatewayClientError, match="Gateway disconnected"):
+        await _run(owner, monkeypatch, _worker_env)
+    assert owner.calls.count("kanban.run") == 1
 
 
 @pytest.mark.asyncio
@@ -194,7 +203,7 @@ async def test_connecting_is_not_an_answer(monkeypatch, _worker_env, clock):
     # budget, so this still ends at OWNER_WAIT_S instead of redialling forever.
     owner = _Owner(receipts=["pending"] + [_disconnect()] * 200)
 
-    with pytest.raises(gateway_client.GatewayClientError, match=r"owner silent for 1[89]\ds"):
+    with pytest.raises(gateway_client.GatewayClientError, match=r"no receipt for admission a1 for 360 s; .*owner silent for 3[6-9]\ds"):
         await _run(owner, monkeypatch, _worker_env)
     assert owner.calls.count("kanban.run") == 1
 
@@ -210,9 +219,9 @@ async def test_an_owner_silent_for_the_whole_budget_fails_the_worker(monkeypatch
     # Every restart shape still ends at OWNER_WAIT_S when it never clears.
     owner = _Owner(connects=[None], receipts=["pending", _disconnect()], after=fault)
 
-    with pytest.raises(gateway_client.GatewayClientError, match=rf"owner silent for 1[89]\ds: {fault}"):
+    with pytest.raises(gateway_client.GatewayClientError, match=rf"no receipt for admission a1 for 360 s; .*owner silent for 3[6-9]\ds: {fault}"):
         await _run(owner, monkeypatch, _worker_env)
-    assert clock.now >= kanban_worker_client.OWNER_WAIT_S
+    assert clock.now >= kanban_worker_client.RECEIPT_OUTAGE_S
     # Jittered exponential backoff (capped at 8-16 s) between dials, not one dial a second.
     assert 3 < owner.dials < 40 and owner.calls.count("kanban.run") == 1
 
@@ -224,8 +233,10 @@ async def test_giving_up_on_a_refused_handshake_names_the_status(monkeypatch, _w
     refused = InvalidStatus(SimpleNamespace(status_code=403, headers={}, body=b"remote body"))
     owner = _Owner(connects=[None] + [refused] * 60, receipts=["pending", _disconnect()])
 
-    with pytest.raises(gateway_client.GatewayClientError, match=r"InvalidStatus \(HTTP 403\)$"):
+    # An owner refusing the upgrade is an answer: observation ends at once with that refusal.
+    with pytest.raises(InvalidStatus):
         await _run(owner, monkeypatch, _worker_env)
+    assert owner.dials == 2
 
 
 @pytest.mark.asyncio

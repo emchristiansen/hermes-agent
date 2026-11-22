@@ -619,6 +619,8 @@ def embedded_build(installation, monkeypatch):
         if stable_default:
             # The deployed Nix build defaults to stable (nix-config's stable-notifications patch).
             monkeypatch.setattr("hermes_cli.update_channel.default_channel", lambda root=None: "stable")
+        else:  # this deployment's Nix stamp defaults to stable (update_channel.default_channel): another default
+            monkeypatch.setattr("hermes_cli.update_channel.default_channel", lambda root=None: "main")
         responses[f"{api}/releases/latest"] = (200, {"draft": False, "prerelease": False, "tag_name": "v0.22.6"})
         responses[f"{api}/commits/v0.22.6"] = (200, {"sha": release})
         compare_path = f"{api}/compare/{release}...{upstream or FORK_REVISION}"

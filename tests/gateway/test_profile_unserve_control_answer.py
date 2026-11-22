@@ -303,7 +303,7 @@ def test_a_turn_that_outlived_its_stop_is_answered_retained_not_unserved(tmp_pat
     from gateway.control_socket import request_unserve_profile
     from gateway.runtime_ownership import process_ownership
     from gateway.session_authority import LiveSession
-    from gateway.session_contract import Principal, SessionRef, Submission
+    from gateway.session_contract import SessionActor, SessionRef, Submission
     from hermes_cli.gateway_profile_lifecycle import ack_confirmed
     agent = _DeafAgent()
 
@@ -320,7 +320,7 @@ def test_a_turn_that_outlived_its_stop_is_answered_retained_not_unserved(tmp_pat
         authority = runner.session_authorities.for_home(home)
         authority.db.create_session('deaf', source='test')
         authority.sessions['deaf'] = LiveSession(SimpleNamespace(platform=None, user_id='human'), 'route-deaf')
-        actor = Principal('human', authority.profile_id, frozenset({'session:submit', 'session:control'}), 'cli')
+        actor = SessionActor('human', authority.profile_id, frozenset({'session:submit', 'session:control'}), 'cli')
         try:
             call(authority.submit(actor, Submission(request_id='deaf-1', ref=SessionRef(authority.profile_id, 'deaf'),
                                                     payload={'text': 'go'}, intent='queue')))

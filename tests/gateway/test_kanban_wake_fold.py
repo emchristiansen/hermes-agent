@@ -23,7 +23,7 @@ async def busy_local(tmp_path, monkeypatch):
     from gateway.run import GatewayRunner
     from gateway.session import SessionSource
     from gateway.session_authority import initialize_session_authority
-    from gateway.session_contract import Principal
+    from gateway.session_contract import SessionActor
     from gateway.session_local import create_local_session
     from hermes_state import SessionDB
 
@@ -41,7 +41,7 @@ async def busy_local(tmp_path, monkeypatch):
         return "ok"
 
     monkeypatch.setattr(runner, "_handle_message", answer)
-    viewer = Principal("test-owner", "default", frozenset(
+    viewer = SessionActor("test-owner", "default", frozenset(
         {"session:create", "session:submit", "session:read"}), "viewer")
     ref = create_local_session(authority, viewer, dict(request_id="cli", source="cli", model="fixture", toolsets=[]))
     live = authority.sessions[ref.session_id]
