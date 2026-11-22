@@ -354,21 +354,40 @@ def _writers_refusal(conn, task_id, run):
     return None
 
 
-def _origin_refusal(conn, task_id, run_id, loop):
-    """Why run ``run_id``'s loop is not an implementation-lane loop, else None. The continuation
-    lands only in ``ready``, where dispatch makes an ordinary ``claim_task``: a reviewer run's loop
-    would lose its review claim (``source_status=review``, sdlc-review) and its verdict path
-    (``request_changes`` needs a review claim). Review resumption is not offered here; the run's
-    own ``claimed`` event (``kanban_db._retry_status_for_run``) and the loop's recorded
-    ``source_status`` must both say the implementation lane, else refuse."""
+def _continuation_lane(conn, task_id, run_id, loop):
+    """``(lane, None)`` for the lane run ``run_id``'s loop came from, else ``(None, refusal)``.
+
+    The run's own ``claimed`` event (``kanban_db._retry_status_for_run``) and the loop's recorded
+    ``source_status`` must agree. ``ready``: an implementation-lane loop, which continues into
+    ``ready`` where dispatch makes an ordinary ``claim_task``. ``review``: a reviewer run's loop,
+    which continues back into ``review`` -- the same restoration ``unblock_task`` makes for a blocked
+    review-origin card -- so dispatch reclaims it through ``claim_review_task`` with the same
+    assignee, keeping ``source_status=review`` and its verdict path (``request_changes`` needs a
+    review claim). Landing it in ``ready`` would drop that lane, so ``ready`` is never offered for
+    it. Any disagreement, or a lane neither records, is unprovable and refused."""
     from hermes_cli import kanban_db as kb
-    if kb._retry_status_for_run(conn, task_id, run_id) == 'review' or loop.get('source_status') == 'review':
-        return (f'run {run_id} of {task_id} is a review-origin loop (claimed from review); a triage '
-                'continuation lands only in ready and would drop the review lane, so it is refused')
-    if loop.get('source_status') != 'ready':
-        return (f"the lane of run {run_id}'s loop cannot be proven (source_status="
-                f"{loop.get('source_status')!r}); a triage continuation needs an implementation-lane loop")
-    return None
+    claimed = kb._retry_status_for_run(conn, task_id, run_id)
+    recorded = loop.get('source_status')
+    if recorded not in ('ready', 'review'):
+        return None, (f"the lane of run {run_id}'s loop cannot be proven (source_status="
+                      f"{recorded!r}); a triage continuation needs the loop's own lane")
+    if recorded != claimed:
+        return None, (f"the lane of run {run_id}'s loop cannot be proven: the run was claimed from "
+                      f"{claimed} but its loop records source_status={recorded!r}")
+    return recorded, None
+
+
+def continuation_target(conn, task_id, expected_run):
+    """The status an exact-run continuation of ``task_id`` lands in: a triage card's own loop lane
+    (``_continuation_lane``), else ``ready``. Read-only; the continuation's refusals still decide."""
+    from hermes_cli import kanban_db as kb
+    if kb._task_status(conn, task_id) == 'triage' and type(expected_run) is int:
+        loop = _run_event(conn, task_id, expected_run, 'block_loop_detected')
+        if loop is not None:
+            lane, _ = _continuation_lane(conn, task_id, expected_run, loop[1])
+            if lane is not None:
+                return lane
+    return 'ready'
 
 
 def _finished_result(conn, task_id, run_id):
@@ -391,8 +410,8 @@ def triage_continuation_refusal(conn, task_id, expected_run, reason):
     finished with its own bound worker's terminal result (``_finished_result``); any other result
     is refused. Either way the awaited input has arrived, so no missing-input wait is recorded.
     Continuing needs positive proof that nothing can still write for it: the
-    latest run, ended ``blocked``, from the implementation lane (``_origin_refusal``: a review-origin
-    loop is refused), no open run or claim on the card, a ``worker_bound`` under the
+    latest run, ended ``blocked``, from a provable lane (``_continuation_lane``: the run's claim and
+    its loop agree on ``ready`` or ``review``; a review-origin loop continues into ``review``), no open run or claim on the card, a ``worker_bound`` under the
     run's claim, that claim and every binding's issued by THIS host, EVERY worker pid recorded for the run dead or recycled by a successful reading of
     its start identity (``_writers_refusal``), and the run's owner admission recorded and
     terminal. ``reason`` names the awaited input that has now arrived (e.g. a comment id)."""
@@ -418,7 +437,7 @@ def triage_continuation_refusal(conn, task_id, expected_run, reason):
     loop = _run_event(conn, task_id, expected_run, 'block_loop_detected')
     if loop is None:
         return f'run {expected_run} did not route {task_id} to triage (no block_loop_detected on it)'
-    origin = _origin_refusal(conn, task_id, expected_run, loop[1])
+    _lane, origin = _continuation_lane(conn, task_id, expected_run, loop[1])
     if origin is not None:
         return origin
     if _run_event(conn, task_id, expected_run, 'worker_result') is not None and _finished_result(conn, task_id, expected_run) is None:
@@ -434,7 +453,8 @@ def triage_continuation_refusal(conn, task_id, expected_run, reason):
     if owner is not None:
         return f'the owner of run {expected_run} may still be executing it ({owner})'
     if not kb._parents_satisfied(conn, task_id):
-        return (f'{task_id} has unsatisfied parent dependencies; a continuation lands only in ready')
+        return (f'{task_id} has unsatisfied parent dependencies; a triage continuation lands only '
+                'in ready or review, both of which need them')
     return None
 
 
@@ -445,7 +465,8 @@ def continue_ready(conn, task_id, expected_run, *, actor, reason, dry_run):
 
     A ready card stays ``ready``; a ``promoted_manual`` event marked ``from: ready`` on run
     ``expected_run`` is the release the guard honours after the newest PR comment. A triage card
-    moves to ``ready`` with the same assignee, title, body and counters (``block_kind``,
+    moves back to its loop's own lane (``_continuation_lane``: ``ready``, or ``review`` for a
+    reviewer run's loop, recorded as ``to``) with the same assignee, title, body and counters (``block_kind``,
     ``block_recurrences`` and the failure counters are kept, so a same-cause re-block returns it
     to triage); its ``promoted_manual`` (``from: triage``) records the input that arrived and the
     loop run: ``interrupted_run`` with ``worker_result_recorded: false``, or ``finished_run`` with
@@ -462,13 +483,15 @@ def continue_ready(conn, task_id, expected_run, *, actor, reason, dry_run):
     with kb.write_txn(conn):
         refusal = continuation_refusal(conn, task_id, expected_run, reason)
         if refusal is None and kb._task_status(conn, task_id) == 'triage':
-            conn.execute("UPDATE tasks SET status='ready' WHERE id=? AND status='triage'", (task_id,))
+            lane, _ = _continuation_lane(conn, task_id, expected_run,
+                                         _run_event(conn, task_id, expected_run, 'block_loop_detected')[1])
+            conn.execute("UPDATE tasks SET status=? WHERE id=? AND status='triage'", (lane, task_id))
             finished = _finished_result(conn, task_id, expected_run)
             shape = ({'interrupted_run': expected_run, 'worker_result_recorded': False} if finished is None else
                      {'finished_run': expected_run, 'worker_result_recorded': True,
                       'worker_result_event': finished[0], 'worker_exit_code': finished[1]['exit_code']})
             kb._append_event(conn, task_id, 'promoted_manual', {
-                'actor': actor, 'reason': reason, 'from': 'triage', 'continuation': True,
+                'actor': actor, 'reason': reason, 'from': 'triage', 'to': lane, 'continuation': True,
                 'expected_terminal_run': expected_run, **shape,
             }, run_id=expected_run)
         elif refusal is None:

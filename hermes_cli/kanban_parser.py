@@ -392,7 +392,8 @@ _SPECS = [
         _arg("--expected-terminal-run", type=int,
              help="Continue ONE ready card held by the active_pr respawn guard: its exact latest ended run "
                   "(no live claim, owner terminal; orchestrator-only). The card stays ready and respawns. "
-                  "Also moves ONE triage card to ready when that run tripped the loop breaker and was "
+                  "Also moves ONE triage card back to its loop's own lane (ready, or review for a reviewer "
+                  "run's loop, with the same reviewer) when that run tripped the loop breaker and was "
                   "either interrupted with no worker result or finished with its own bound worker's "
                   "result (workers provably dead, owner admission terminal; the event records which); "
                   "the reason must name the awaited input that has arrived. A result whose input is "

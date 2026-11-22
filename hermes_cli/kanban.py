@@ -1195,9 +1195,14 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     results: list[dict[str, object]] = []
     with kbc.connect_closing() as conn:
         for tid in ids:
+            lane = "ready"
+            if fence:
+                from hermes_cli.kanban_db_active_pr import continuation_target
+                lane = continuation_target(conn, tid, expected_run)
             ok, err = kb.promote_task(conn, tid, actor=author, reason=reason, dry_run=dry_run, **fence)
             results.append({"task_id": tid, "promoted": ok, "dry_run": dry_run,
-                            "reason": reason, "error": err, **fence})
+                            "reason": reason, "error": err, **fence,
+                            **({"status": lane} if fence else {})})
 
     failed = [r for r in results if not r["promoted"]]
     if getattr(args, "json", False):
@@ -1207,9 +1212,9 @@ def _cmd_promote(args: argparse.Namespace) -> int:
 
     tag = " (dry)" if dry_run else ""
     label = ("Would continue" if dry_run else "Continued") if fence else ("Would promote" if dry_run else "Promoted")
-    target = f"ready after terminal run {expected_run}" if fence else "ready"
     suffix = f": {reason}" if reason else ""
     for r in results:
+        target = f"{r['status']} after terminal run {expected_run}" if fence else "ready"
         if r["promoted"]:
             print(f"{label} {r['task_id']} -> {target}{tag}{suffix}")
         else:
