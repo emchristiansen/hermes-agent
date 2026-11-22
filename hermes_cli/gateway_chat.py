@@ -267,7 +267,9 @@ def resume_policy_error(keys):
 
 def exit_on_resume_refusal(exc):
     """A refused resume is a usage error on every classic path (interactive startup's copy): ``Error:``, exit 2."""
-    if isinstance(exc, GatewayClientError) and str(exc).startswith((_RESUME_POLICY_MISMATCH, RESUME_KEY_MISMATCH)):
+    from hermes_cli.gateway_session_store import RESUME_REFUSED
+    if isinstance(exc, GatewayClientError) and str(exc).startswith(
+            (_RESUME_POLICY_MISMATCH, RESUME_KEY_MISMATCH, RESUME_REFUSED)):
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(2) from None
 

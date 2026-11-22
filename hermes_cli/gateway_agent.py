@@ -771,14 +771,16 @@ class GatewayAgent:
                 self._give_back_turn_route()  # nothing was sent: the pick is still owed
                 return self._failed(history, user_message, "Stopped before the prompt was sent; nothing was sent.")
             except GatewayRPCError as exc:
-                # The owner answered and refused: not a lost connection. Only its own site code
-                # (session_busy: send again) is a verdict; any other refusal stays unclassified.
-                busy = str(exc) == "session_busy"
-                if busy:
+                # The owner answered and refused: not a lost connection, and not the model's verdict
+                # either, so never main's "Run /model to switch" copy. ``session_busy`` means send again.
+                # The reason alone does not prove the input was never admitted, so the copy names the
+                # refusal and claims nothing about what the owner kept.
+                if str(exc) == "session_busy":
                     # Nothing was admitted: the resend carries the pick (the CLI keeps its restore).
                     self._give_back_turn_route()
-                return self._failed(history, user_message, str(exc),
-                                    failure_reason="session_busy" if busy else None, retryable=busy)
+                    return self._failed(history, user_message, str(exc), failure_reason="session_busy", retryable=True)
+                return self._failed(history, user_message, f"The gateway refused this turn: {exc}.",
+                                    failure_reason="gateway_refusal")
             except GatewayClientError as exc:
                 return self._failed(history, user_message, str(exc), failure_reason="gateway_connection")
             if (receipt or {}).get("voice_stopped") is True:
